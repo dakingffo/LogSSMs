@@ -68,7 +68,6 @@ def test_mtp_argument_parser_is_independent(tmp_path) -> None:
         "--dtype", "bfloat16",
         "--dummy-weight",
         "--max-running-requests", "16",
-        "--linear-attention-backend", "native",
         "--speculative-algorithm", "MTP",
         "--speculative-draft-model-path", model_path,
         "--speculative-num-draft-tokens", "6",
@@ -76,4 +75,3 @@ def test_mtp_argument_parser_is_independent(tmp_path) -> None:
     ])
     assert server_args.speculator_config == MTPSpeculatorConfig(6, 192)
     assert server_args.max_decode_tokens == 48
-    assert server_args.linear_attention_backend == "native"

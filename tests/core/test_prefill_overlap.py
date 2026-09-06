@@ -128,3 +128,22 @@ def test_prefill_adder_continues_from_inflight_device_frontier():
     assert current is not None
     assert current.cached_len == previous.device_len == 4
     assert current.device_len == 8
+
+
+def test_hybrid_chunked_prefill_is_state_checkpoint_aligned():
+    params = SamplingParams(max_tokens=8)
+    pending = PendingRequest(0, torch.arange(200, dtype=torch.int32), params)
+    table_manager = SimpleNamespace(
+        token_pool=torch.empty((1, 256), dtype=torch.int32)
+    )
+    cache_manager = SimpleNamespace(
+        page_size=64,
+        state_table=torch.empty((1, 4), dtype=torch.int32),
+    )
+    adder = PrefillAdder(100, 0, cache_manager, table_manager)
+
+    current = adder._add_one_req(pending, None, table_idx=0, cached_len=0)
+
+    assert isinstance(current, ChunkedRequest)
+    assert current.device_len == 64
+    assert adder.token_budget == 36

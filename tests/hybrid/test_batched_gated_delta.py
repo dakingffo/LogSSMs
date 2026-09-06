@@ -6,7 +6,7 @@ from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_c
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
 from picosgl.layers import GatedDeltaNet
-from picosgl.layers.linear_attention_backend.native import _l2norm
+from picosgl.layers.linear_attention_backend.backend import _l2norm
 from picosgl.models.config import RotaryConfig
 from picosgl.models.qwen3_next import Qwen3_5Config
 from picosgl.utils import torch_dtype

@@ -1,1 +1,2 @@
 graft csrc
+recursive-include python/picosgl/kernel/linear_attention/vendor/fla LICENSE README.md

@@ -12,7 +12,7 @@ from picosgl.core import (
     Batch, 
     Context 
 )
-from picosgl.utils import init_logger, align_ceil
+from picosgl.utils import init_logger, align_ceil, align_down
 
 from .ar import ForwardInput, ForwardOutput
 
@@ -93,6 +93,12 @@ class PrefillAdder:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         is_chunked = chunk_size < remain_len
+        if is_chunked and getattr(self.cache_manager, "state_table", None) is not None:
+            # GDN exposes recurrent checkpoints at 64-token chunk boundaries.
+            # Keep every intermediate ChunkedRequest aligned so its state can
+            # become the exact initial state of the next prefill batch.
+            chunk_size = align_down(chunk_size, 64)
+            assert chunk_size > 0
         CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
         self.reserved_size += align_ceil(remain_len + pending_req.output_len, self.cache_manager.page_size)
@@ -118,6 +124,13 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
+            remain_len = pending_req.input_len - chunked_req.cached_len
+            if (
+                getattr(self.cache_manager, "state_table", None) is not None
+                and remain_len > self.token_budget
+                and self.token_budget < 64
+            ):
+                return None
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
@@ -127,6 +140,15 @@ class PrefillAdder:
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx = resource
+            remain_len = pending_req.input_len - cache_handle.cached_len
+            if (
+                getattr(self.cache_manager, "state_table", None) is not None
+                and remain_len > self.token_budget
+                and self.token_budget < 64
+            ):
+                self.table_manager.free(table_idx)
+                self.cache_manager.unlock(cache_handle)
+                return None
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,

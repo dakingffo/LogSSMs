@@ -11,16 +11,16 @@ if TYPE_CHECKING:
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from picosgl.layers.linear_attention_backend import (
         BaseLinearAttentionBackend,
-        LinearAttentionMetadata,
+        BaseLinearAttentionMetadata,
     )
     from picosgl.layers.moe_backend import BaseMoeBackend
     from picosgl.speculator.hidden_captor import HiddenCaptorBase
 
 
 def _make_default_linear_attention_backend():
-    from picosgl.layers.linear_attention_backend import make_linear_attention_backend
+    from picosgl.layers.linear_attention_backend import LinearAttentionBackend
 
-    return make_linear_attention_backend("native")
+    return LinearAttentionBackend()
 
 
 @dataclass
@@ -114,7 +114,7 @@ class Batch:
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
-    linear_attn_metadata: LinearAttentionMetadata = field(init=False)
+    linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
 
     @property
     def is_prefill(self) -> bool:
