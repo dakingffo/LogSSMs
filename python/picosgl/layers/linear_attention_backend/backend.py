@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from picosgl.core import get_global_ctx
-from picosgl.kernel import recurrent_gated_delta_triton, store_state
+from picosgl.kernel import store_state
 
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
 
@@ -357,6 +357,10 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         config     : GatedDeltaConfig,
         metadata   : LinearAttentionMetadata,
     ) -> torch.Tensor:
+        from picosgl.kernel.linear_attention.vendor.fla import (
+            fused_recurrent_gated_delta_rule,
+        )
+
         ctx = get_global_ctx()
         pool = ctx.linear_state
         layer_idx = config.layer_idx
@@ -390,7 +394,7 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             )
 
             query, key, value = self._split_qkv(req_qkv, config)
-            query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
+            group_output, snapshots = fused_recurrent_gated_delta_rule(
                 query,
                 key,
                 value,
@@ -402,16 +406,12 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
                 ),
                 A_log,
                 dt_bias,
-            )
-            group_output = recurrent_gated_delta_triton(
-                query,
-                key,
-                value,
-                prepared_gate,
-                prepared_beta,
                 pool.recurrent_state[baseline_slots, layer_idx],
-                write_slots,
+            )
+            store_state(
                 pool.recurrent_state[:, layer_idx],
+                write_slots.flatten().to(torch.int64),
+                snapshots.flatten(0, 1),
             )
             output.index_copy_(0, row_indices, group_output.flatten(0, 1))
 
@@ -428,6 +428,10 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         config     : GatedDeltaConfig,
         metadata   : LinearAttentionMetadata,
     ) -> torch.Tensor:
+        from picosgl.kernel.linear_attention.vendor.fla import (
+            fused_recurrent_gated_delta_rule,
+        )
+
         ctx = get_global_ctx()
         pool = ctx.linear_state
         layer_idx = config.layer_idx
@@ -442,7 +446,7 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         pool.conv_state[:, layer_idx].index_copy_(0, write_slots, conv_state)
 
         query, key, value = self._split_qkv(mixed_qkv.transpose(1, 2), config)
-        query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
+        output, states = fused_recurrent_gated_delta_rule(
             query,
             key,
             value,
@@ -450,16 +454,12 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             beta.unsqueeze(1),
             A_log,
             dt_bias,
-        )
-        output = recurrent_gated_delta_triton(
-            query,
-            key,
-            value,
-            prepared_gate,
-            prepared_beta,
             recurrent_state,
-            write_slots.unsqueeze(1),
+        )
+        store_state(
             pool.recurrent_state[:, layer_idx],
+            write_slots,
+            states.squeeze(1),
         )
         return output.squeeze(1)
 

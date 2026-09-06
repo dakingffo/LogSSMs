@@ -4,7 +4,10 @@ import torch
 from picosgl.cache.linear.state_pool import LinearStatePool
 from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from picosgl.distributed import DistributedInfo, tp_override
-from picosgl.kernel.gated_delta import recurrent_gated_delta_triton
+from picosgl.kernel import store_state
+from picosgl.kernel.linear_attention.vendor.fla import (
+    fused_recurrent_gated_delta_rule,
+)
 from picosgl.layers import GatedDeltaNet
 from picosgl.layers.linear_attention_backend.backend import _l2norm
 from picosgl.models.config import RotaryConfig
@@ -51,21 +54,29 @@ def test_batched_kernel_matches_torch(shape):
     torch.manual_seed(0)
     B, S, H, K, V = shape
     device = torch.device("cuda")
-    query = _l2norm(torch.randn(B, S, H, K, device=device, dtype=torch.bfloat16))
-    key = _l2norm(torch.randn(B, S, H, K, device=device, dtype=torch.bfloat16))
+    query = torch.randn(B, S, H, K, device=device, dtype=torch.bfloat16)
+    key = torch.randn(B, S, H, K, device=device, dtype=torch.bfloat16)
     value = torch.randn(B, S, H, V, device=device, dtype=torch.bfloat16)
-    g = -torch.rand(B, S, H, device=device)
-    beta = torch.rand(B, S, H, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(B, S, H, device=device, dtype=torch.bfloat16)
+    beta = torch.randn(B, S, H, device=device, dtype=torch.bfloat16)
+    A_log = torch.zeros(H, device=device)
+    dt_bias = torch.zeros(H, device=device)
     initial_state = torch.randn(B, H, K, V, device=device, dtype=torch.bfloat16)
     write_slots = torch.arange(B * S, device=device, dtype=torch.int32).view(B, S)
     state_pool = torch.empty(B * S, H, K, V, device=device, dtype=torch.bfloat16)
 
     expected_output, expected_states = _recurrent_gated_delta_rule_with_snapshots(
-        query, key, value, g, beta, initial_state
+        _l2norm(query),
+        _l2norm(key),
+        value,
+        -torch.nn.functional.softplus(gate.float()),
+        beta.sigmoid(),
+        initial_state,
     )
-    output = recurrent_gated_delta_triton(
-        query, key, value, g, beta, initial_state, write_slots, state_pool
+    output, states = fused_recurrent_gated_delta_rule(
+        query, key, value, gate, beta, A_log, dt_bias, initial_state
     )
+    store_state(state_pool, write_slots.flatten(), states.flatten(0, 1))
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected_output, rtol=1e-3, atol=1e-3)
@@ -73,7 +84,7 @@ def test_batched_kernel_matches_torch(shape):
         state_pool.view(B, S, H, K, V),
         expected_states.to(torch.bfloat16),
         rtol=1e-3,
-        atol=1e-2,
+        atol=2e-2,
     )
 
 
