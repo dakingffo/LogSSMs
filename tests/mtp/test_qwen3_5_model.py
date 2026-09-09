@@ -157,11 +157,11 @@ def test2_gated_delta_net_math(mcfg):
     )
     # one state slot per page the layer will write (reqs 0,1,2, pages 0..3 cover 256 tokens)
     # the pool is a pure buffer now (free-list lives in CacheManager); hand out distinct slots
-    ctx.state_table = torch.full((4, 8), -1, dtype=torch.int32)
+    ctx.state_table = torch.full((4, 256), -1, dtype=torch.int32)
     slot = iter(range(ctx.linear_state.conv_state.shape[0]))
     for tidx in (0, 1, 2):
         for p in range(4):
-            ctx.state_table[tidx, p] = next(slot)
+            ctx.state_table[tidx, p * ps : (p + 1) * ps] = next(slot)
     set_global_ctx(ctx)
 
     torch.manual_seed(0)
@@ -257,11 +257,10 @@ def test3_full_model(mcfg, loaded=None):
     # one state slot per page the layer writes. All prefill/decode here stays in page 0
     # (the prompt is ~15 tokens < 64); the prefill chunk callback writes page 0 for each
     # request's row, decode reads/writes page 0 too.
-    ctx.state_table = torch.full((8, 16), -1, dtype=torch.int32, device=device)
-    ctx.draft_offset = 16  # no verify batches in this test
+    ctx.state_table = torch.full((8, 1024), -1, dtype=torch.int32, device=device)
     slot = iter(range(ctx.linear_state.conv_state.shape[0]))
     for tidx in (3, 4):
-        ctx.state_table[tidx, 0] = next(slot)
+        ctx.state_table[tidx, :ctx.page_size] = next(slot)
     ctx.page_table = torch.zeros((8, 8192), dtype=torch.int32, device=device)
     # sequential pages per req
     base = torch.arange(num_pages, device=device, dtype=torch.int32).view(1, -1)

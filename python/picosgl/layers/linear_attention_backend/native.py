@@ -92,27 +92,27 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
                 dtype=torch.int64,
                 device=state_table.device,
             )
-            read_pages = torch.tensor(
-                [(req.cached_len - 1) // ctx.page_size for req in reqs],
+            read_positions = torch.tensor(
+                [req.cached_len - 1 for req in reqs],
                 dtype=torch.int64,
                 device=state_table.device,
             )
-            write_pages = torch.tensor(
-                [req.cached_len // ctx.page_size for req in reqs],
+            write_positions = torch.tensor(
+                [req.cached_len for req in reqs],
                 dtype=torch.int64,
                 device=state_table.device,
             )
-            metadata.read_slots = state_table[table_indices, read_pages].to(torch.int64)
-            metadata.write_slots = state_table[table_indices, write_pages].to(torch.int64)
+            metadata.read_slots = state_table[table_indices, read_positions].to(torch.int64)
+            metadata.write_slots = state_table[table_indices, write_positions].to(torch.int64)
         elif batch.is_verify:
-            reserve_offset = ctx.draft_offset
-            assert reserve_offset is not None
+            work_state_table = ctx.work_state_table
+            assert work_state_table is not None
 
             entries_by_len: dict[int, list[tuple[int, int, int]]] = {}
             offset = 0
             for req in batch.reqs:
                 entries_by_len.setdefault(req.extend_len, []).append(
-                    (req.table_idx, req.baseline_slot, offset)
+                    (req.table_idx, req.cached_len - 1, offset)
                 )
                 offset += req.extend_len
 
@@ -121,24 +121,27 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
                 row_indices = torch.tensor(
                     [
                         row
-                        for _table_idx, _baseline_slot, start in entries
+                        for _table_idx, _baseline_position, start in entries
                         for row in range(start, start + seq_len)
                     ],
                     dtype=torch.int64,
                     device=state_table.device,
                 )
                 table_indices = torch.tensor(
-                    [table_idx for table_idx, _baseline_slot, _start in entries],
+                    [table_idx for table_idx, _baseline_position, _start in entries],
                     dtype=torch.int64,
                     device=state_table.device,
                 )
-                baseline_slots = torch.tensor(
-                    [baseline_slot for _table_idx, baseline_slot, _start in entries],
+                baseline_positions = torch.tensor(
+                    [position for _table_idx, position, _start in entries],
                     dtype=torch.int64,
                     device=state_table.device,
                 )
-                write_slots = state_table[
-                    table_indices, reserve_offset : reserve_offset + seq_len
+                baseline_slots = state_table[
+                    table_indices, baseline_positions
+                ].to(torch.int64)
+                write_slots = work_state_table[
+                    table_indices, :seq_len
                 ]
                 groups[seq_len] = row_indices, baseline_slots, write_slots
             metadata.verify_groups = groups
@@ -256,7 +259,7 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             assert cached_len % 64 == 0
             if use_state:
                 baseline_slot = int(
-                    state_table[req.table_idx, (cached_len - 1) // page_size]
+                    state_table[req.table_idx, cached_len - 1]
                 )
 
             req_qkv = mixed_qkv[offset:end_offset].transpose(0, 1).unsqueeze(0)
@@ -286,8 +289,8 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             history_prefix = config.state_len if use_state else 0
             first_page_end = page_size - cached_len % page_size
             for end in range(first_page_end, seq_len, page_size):
-                page = (cached_len + end - 1) // page_size
-                checkpoint_slots.append(state_table[req.table_idx, page])
+                position = cached_len + end - 1
+                checkpoint_slots.append(state_table[req.table_idx, position])
                 checkpoint_chunks.append(chunk_offset + (end - 1) // 64)
                 history = conv_input[0, :, : history_prefix + end]
                 if history.shape[-1] < config.state_len:
@@ -295,8 +298,8 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
                 conv_snapshots.append(history[:, -config.state_len:])
 
             end = seq_len
-            page = (cached_len + end - 1) // page_size
-            checkpoint_slots.append(state_table[req.table_idx, page])
+            position = cached_len + end - 1
+            checkpoint_slots.append(state_table[req.table_idx, position])
             checkpoint_chunks.append(chunk_offset + (end - 1) // 64)
             history = conv_input[0, :, : history_prefix + end]
             if history.shape[-1] < config.state_len:

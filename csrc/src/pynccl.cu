@@ -20,9 +20,7 @@ namespace picosgl {
 using NCCLIDList = tvm::ffi::Array<char>;
 
 void NCCL_CHECK(::ncclResult_t result) {
-  if (result != ::ncclSuccess) {
-    host::runtime_assert(false, ::ncclGetErrorString(result));
-  }
+  host::runtime_assert(result == ::ncclSuccess, ::ncclGetErrorString(result));
 }
 
 ncclUniqueId get_uid(const NCCLIDList& wrapper) {
@@ -94,8 +92,10 @@ public:
 
   void all_reduce(tvm::ffi::TensorView t, std::string op) const {
     using namespace host;
-    runtime_assert(t.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    runtime_assert(
+      t.device().device_type == kDLCUDA,
+      "Tensor must be on CUDA device"
+    );
     runtime_assert(t.is_contiguous(), "Tensor must be contiguous");
     const auto size_dim = static_cast<size_t>(t.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(t.dtype());

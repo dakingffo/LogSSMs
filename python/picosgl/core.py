@@ -47,7 +47,6 @@ class Request:
     cache_handle   : BaseCacheHandle
     max_device_len : int
     device_len     : int  = field(init=False)
-    baseline_slot  : int  = field(default=-1, init=False)  # for verify
     aborted        : bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -150,8 +149,8 @@ class Context:
     kv_cache           : BaseKVCachePool            = field(init=False)   # full attention
     linear_state       : LinearStatePool            = field(init=False)   # linear attention
 
-    state_table : torch.Tensor | None = field(default=None, init=False)
-    draft_offset : int | None         = field(default=None, init=False)
+    state_table        : torch.Tensor | None = field(default=None, init=False)
+    work_state_table   : torch.Tensor | None = field(default=None, init=False)
 
     _batch      : Batch | None        = field(default=None, init=False)
 

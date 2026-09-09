@@ -1,5 +1,5 @@
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
-from .backend import (
+from .native import (
     LinearAttentionBackend,
     LinearAttentionCaptureData,
     LinearAttentionMetadata,

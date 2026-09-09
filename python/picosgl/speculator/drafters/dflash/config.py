@@ -33,18 +33,12 @@ class DFlashSpeculatorConfig(BaseSpeculatorConfig):
         return self.window_size
 
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve:
-        # Qwen3.5 is hybrid: each target verify row needs a rollback-safe linear state.
         return SpeculatorReserve(
-            num_state_slots=max_running_req * self.block_size,
-            state_slots_per_request=self.block_size,
+            num_draft_slots=max_running_req * self.block_size,
+            draft_slots_per_request=self.block_size,
         )
 
     def validate(self, config: EngineConfig) -> None:
-        from picosgl.models.qwen3_next import Qwen3_5Config
-
-        assert isinstance(config.model_config, Qwen3_5Config), (
-            "DFLASH adaptation currently supports a dense Qwen3.5 target"
-        )
         assert config.speculative_draft_model_path is not None
         draft_config = load_model_config(config.speculative_draft_model_path)
         assert getattr(draft_config, "architectures", None) == ["DFlashDraftModel"]

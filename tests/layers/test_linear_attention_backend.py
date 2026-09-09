@@ -5,7 +5,6 @@ import torch
 
 from picosgl.cache.linear.state_pool import LinearStatePool
 from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-from picosgl.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
 from picosgl.layers.gated_delta import GatedDeltaConfig
 from picosgl.layers.linear_attention_backend import LinearAttentionBackend
 
@@ -59,15 +58,16 @@ def _make_request(table_idx: int, cached_len: int, device_len: int) -> Request:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_decode_graph_metadata_uses_capture_buffers() -> None:
     clear_global_ctx()
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     backend = LinearAttentionBackend()
     ctx = Context(page_size=64)
     ctx.linear_state = SimpleNamespace(device=device)  # type: ignore
     ctx.state_table = torch.tensor(
-        [[3, 4], [5, 6], [9, 9]], dtype=torch.int32, device=device
+        [[3] * 64 + [4] * 64, [5] * 64 + [6] * 64, [9] * 128],
+        dtype=torch.int32,
+        device=device,
     )
     real_req = _make_request(0, cached_len=64, device_len=65)
     dummy_req = _make_request(2, cached_len=0, device_len=1)
@@ -90,8 +90,47 @@ def test_decode_graph_metadata_uses_capture_buffers() -> None:
     assert backend.capture.write_slots.tolist() == [4, 9]
 
 
+def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
+    clear_global_ctx()
+    backend = LinearAttentionBackend()
+    ctx = Context(page_size=64)
+    ctx.state_table = torch.tensor(
+        [
+            [11] * 64 + [12] * 64 + [13] * 64,
+            [20] * 64 + [21] * 64 + [22] * 64,
+        ],
+        dtype=torch.int32,
+    )
+    ctx.work_state_table = torch.tensor(
+        [[100, 101, 102], [110, 111, 112]], dtype=torch.int32
+    )
+    req0 = _make_request(0, cached_len=62, device_len=65)
+    req1 = _make_request(1, cached_len=128, device_len=130)
+    batch = Batch(reqs=[req0, req1], phase="verify")
+    batch.padded_reqs = batch.reqs
+
+    set_global_ctx(ctx)
+    try:
+        backend.prepare_metadata(batch)
+    finally:
+        clear_global_ctx()
+
+    groups = batch.linear_attn_metadata.verify_groups
+    assert groups is not None
+    rows3, reads3, writes3 = groups[3]
+    rows2, reads2, writes2 = groups[2]
+    assert rows3.tolist() == [0, 1, 2]
+    assert reads3.tolist() == [11]
+    assert writes3.tolist() == [[100, 101, 102]]
+    assert rows2.tolist() == [3, 4]
+    assert reads2.tolist() == [21]
+    assert writes2.tolist() == [[110, 111]]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_chunk_gated_delta_returns_page_checkpoints() -> None:
+    from picosgl.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
+
     inputs = _make_inputs(seq_len=96)
     query = torch.nn.functional.normalize(inputs["query"], dim=-1)
     key = torch.nn.functional.normalize(inputs["key"], dim=-1)
@@ -152,7 +191,9 @@ def test_packed_prefill_matches_individual_requests() -> None:
     A_log = torch.zeros(config.num_v_heads, device=device)
     dt_bias = torch.zeros(config.num_v_heads, device=device)
     state_table = torch.tensor(
-        [[0, 1, -1], [2, -1, -1]], dtype=torch.int32, device=device
+        [[0] * 64 + [1] * 64, [2] * 64 + [-1] * 64],
+        dtype=torch.int32,
+        device=device,
     )
 
     def make_pool() -> LinearStatePool:
@@ -244,7 +285,9 @@ def test_chunked_prefill_resumes_from_stored_checkpoint() -> None:
     ) * 0.02
     A_log = torch.zeros(config.num_v_heads, device=device)
     dt_bias = torch.zeros(config.num_v_heads, device=device)
-    state_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    state_table = torch.tensor(
+        [[0] * 64 + [1] * 64], dtype=torch.int32, device=device
+    )
 
     def make_pool() -> LinearStatePool:
         return LinearStatePool(

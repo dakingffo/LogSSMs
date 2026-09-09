@@ -76,7 +76,7 @@ class PrefillAdder:
             if (state_table := self.cache_manager.state_table) is not None:
                 matched_indices, matched_state = matched
                 ps = self.cache_manager.page_size
-                state_table[table_idx, : cached_len // ps] = matched_state
+                state_table[table_idx, :cached_len] = matched_state.repeat_interleave(ps)
             else:
                 matched_indices = matched
             page_entry.copy_(matched_indices)

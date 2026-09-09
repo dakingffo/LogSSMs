@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class SpeculatorReserve:
-    num_state_slots        : int = 0
-    state_slots_per_request: int = 0
+    num_draft_slots        : int = 0
+    draft_slots_per_request: int = 0
 
 
 class BaseSpeculatorConfig(ABC):

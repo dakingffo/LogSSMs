@@ -36,8 +36,8 @@ def test_dflash_config_and_arguments() -> None:
     )
     assert config.num_draft_tokens == 7
     assert config.make_reserve(4) == SpeculatorReserve(
-        num_state_slots=32,
-        state_slots_per_request=8,
+        num_draft_slots=32,
+        draft_slots_per_request=8,
     )
     assert kwargs == {}
 

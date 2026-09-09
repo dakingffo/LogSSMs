@@ -235,7 +235,7 @@ class VerifyManager(ARManagerBase):
 
             req.device_len = C + 1
             req.complete_n(num_sampled)
-            # commit the accepted states: pure index ops on the reserve (pin/swap/refill)
+            # Promote the accepted snapshots by swapping reserve and live page slot ids.
             self.cache_manager.state_commit_verify(req, C, num_sampled)
             self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
             st.set_carry(
@@ -272,12 +272,8 @@ class VerifyManager(ARManagerBase):
                     ps = self.page_size
                     C_end = C + num_sampled
                     suffix_end = C + n_drafts + 1  # exclusive
-                    for page in range(C_end // ps, div_ceil(suffix_end, ps)):
-                        if C_end - 1 < page * ps:
-                            p_start = page * ps
-                            self.cache_manager._free(
-                                self.page_table[req.table_idx, p_start: p_start + ps]
-                            )
+                    for page in range(div_ceil(C_end, ps), div_ceil(suffix_end, ps)):
+                        self.cache_manager.free_page_range(req, page, page + 1)
 
                 if finish and req not in self.finished_reqs:
                     self._finish_req(req)

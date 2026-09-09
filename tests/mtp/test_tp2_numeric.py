@@ -356,12 +356,11 @@ def run():
             head_k_dim=config.linear_key_head_dim, head_v_dim=config.linear_value_head_dim,
             device=device, dtype=torch.float32,
         )
-        st = torch.full((4, 8), -1, dtype=torch.int32, device=device)
+        st = torch.full((4, 128), -1, dtype=torch.int32, device=device)
         # hand out one distinct slot per page the layer will snapshot (L=80 -> pages 0,1)
         for p in (0, 1):
-            st[0, p] = p
+            st[0, p * ps : (p + 1) * ps] = p
         ctx.state_table = st
-        ctx.draft_offset = 8
         set_global_ctx(ctx)
         return ctx
 

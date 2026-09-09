@@ -30,8 +30,8 @@ def test_mtp_speculator_config() -> None:
 
     assert config.decode_batch_budget == 12
     assert speculator_config.make_reserve(config.max_running_req) == SpeculatorReserve(
-        num_state_slots=32,
-        state_slots_per_request=4,
+        num_draft_slots=32,
+        draft_slots_per_request=4,
     )
     assert make_data_plane_sizes(config, 1024, 100) == DataPlaneSizes(
         max_hidden_rows=96,

@@ -1,17 +1,8 @@
-"""Verify reserve index ops: CacheManager.state_commit_verify (pure index, zero memcpy).
+"""Verify commit swaps candidate slots into token-indexed live page mappings.
 
-The MTP verify round writes each candidate's post-state into the K+1 reserve columns
-R[0..K]. Committing ``num_sampled`` accepted tokens only SHUFFLES slot ids:
-
-  * no page crossing: swap R[0] <-> R[num_sampled-1] so the accepted state becomes the
-    next round's baseline (R[0]).
-  * page crossing (K+1 <= 5 < page_size, so at most one page): the boundary candidate's
-    state is PINNED into state_table[uid, page], the page slot is freed/refilled, and the
-    accepted state moves to R[0].
-  * boundary token is the LAST accepted: the pinned page slot IS the next baseline; the
-    reserve is left untouched and the baseline is the page slot (early return).
-
-No state data is ever copied -- we assert pool contents are byte-identical before/after.
+Every token in one live page points to the same state slot. Verify writes candidate
+snapshots to a separate reserve table. Commit swaps the last accepted snapshot for each
+touched page with that page's live slot; no state data is copied.
 
 Run: /home/daking/.conda/envs/daking/bin/python tests/hybrid/test_reserve_index_ops.py
 """
@@ -46,7 +37,7 @@ def make_req(table_idx, cached_len):
     )
 
 
-def make_cm(st, nslots):
+def make_cm(st, reserve, nslots):
     pool = LinearStatePool(
         num_slots=nslots, num_linear_layers=1, conv_dim=8, kernel_size=4,
         num_v_heads=4, head_k_dim=4, head_v_dim=4,
@@ -56,17 +47,19 @@ def make_cm(st, nslots):
         num_pages=10, page_size=64,
         page_table=torch.zeros((8, 512), dtype=torch.int32),
         type="hybrid_radix", num_states=nslots,
-        state_table=st, state_pool=pool, draft_offset=8,
+        num_draft_states=reserve.numel(),
+        state_table=st, work_state_table=reserve, state_pool=pool,
     )
     return cm, pool
 
 
-def setup_page(uid, page_slot, reserve):
-    """state_table row: page 1 holds `page_slot`; R[0..K] hold `reserve`."""
-    st = torch.full((8, 12), -1, dtype=torch.int32)
-    st[uid, 1] = page_slot
-    st[uid, 8: 8 + len(reserve)] = torch.tensor(reserve, dtype=torch.int32)
-    return st
+def setup_pages(uid, page_slots, reserve_slots):
+    st = torch.full((8, 512), -1, dtype=torch.int32)
+    for page, slot in page_slots.items():
+        st[uid, page * 64 : (page + 1) * 64] = slot
+    reserve = torch.full((8, len(reserve_slots)), -1, dtype=torch.int32)
+    reserve[uid] = torch.tensor(reserve_slots, dtype=torch.int32)
+    return st, reserve
 
 
 def mark_in_use(cm, slot_ids):
@@ -75,87 +68,68 @@ def mark_in_use(cm, slot_ids):
     cm.free_states = cm.free_states[~torch.isin(cm.free_states, ids)]
 
 
-# -------------------------------------------------------------------------------------
-# 4a. no page crossing: C=120, num_sampled=2 (positions 120,121). B=128 > C_end=122.
-#     R[0] and R[num_sampled-1] swap; the page slot is untouched.
-# -------------------------------------------------------------------------------------
+# 4a. no page crossing: the accepted tail R[1] becomes page 1's live state.
 def test_no_cross_swap():
     setup_ctx()
-    st = setup_page(2, 40, [50, 51, 52, 53])
-    cm, pool = make_cm(st, nslots=200)
+    st, reserve = setup_pages(2, {1: 40}, [50, 51, 52, 53])
+    cm, pool = make_cm(st, reserve, nslots=200)
     mark_in_use(cm, [40, 50, 51, 52, 53])
     r = make_req(2, 120)
     snap = (pool.conv_state.clone(), pool.recurrent_state.clone())
     cm.state_commit_verify(r, 120, 2)
-    assert r.baseline_slot == 51, (r.baseline_slot, st[2].tolist())  # accepted = R[num_sampled-1]
-    assert st[2, 8] == 51 and st[2, 9] == 50, st[2].tolist()         # R[0] <-> R[1]
-    assert st[2, 1] == 40, st[2].tolist()                            # page untouched
-    assert len(cm.free_states) == 200 - 5                            # no free/refill in no-cross
+    assert torch.all(st[2, 64:128] == 51)
+    assert reserve[2].tolist() == [50, 40, 52, 53]
+    assert len(cm.free_states) == 200 - 5
     assert torch.equal(pool.conv_state, snap[0]) and torch.equal(pool.recurrent_state, snap[1])
     print("[4a] commit no-cross swap OK")
 
 
-# -------------------------------------------------------------------------------------
-# 4b. page crossing, boundary candidate NOT the last: C=125, num_sampled=4 (125..128).
-#     B=128, j_b = 127-125 = 2 < num_sampled-1 = 3. Pin R[2] -> page, refill R[2],
-#     accepted R[3] -> R[0].
-# -------------------------------------------------------------------------------------
+# 4b. crossing: R[2] closes page 1 and R[3] becomes page 2's live state.
 def test_cross_pin_refill_swap():
     setup_ctx()
-    st = setup_page(2, 40, [50, 51, 52, 53])
-    cm, pool = make_cm(st, nslots=300)
-    mark_in_use(cm, [40, 50, 51, 52, 53])
+    st, reserve = setup_pages(2, {1: 40, 2: 41}, [50, 51, 52, 53])
+    cm, pool = make_cm(st, reserve, nslots=300)
+    mark_in_use(cm, [40, 41, 50, 51, 52, 53])
     r = make_req(2, 125)
     snap = (pool.conv_state.clone(), pool.recurrent_state.clone())
     cm.state_commit_verify(r, 125, 4)
-    assert st[2, 1] == 52, st[2].tolist()      # page pinned = R[j_b=2]
-    assert st[2, 8] == 53, st[2].tolist()      # accepted (R[3]) -> next baseline R[0]
-    assert st[2, 9] == 51, st[2].tolist()      # R[1] untouched
-    assert st[2, 10] >= 0 and st[2, 10] != 52, st[2].tolist()  # R[2] refilled fresh
-    assert st[2, 11] == 50, st[2].tolist()     # old baseline R[0] swapped out to R[3]
-    assert r.baseline_slot == 53, r.baseline_slot
-    # page slot 40 freed + one refill allocated -> net zero slots consumed
-    assert len(cm.free_states) == 300 - 5, len(cm.free_states)
+    assert torch.all(st[2, 64:128] == 52)
+    assert torch.all(st[2, 128:192] == 53)
+    assert reserve[2].tolist() == [50, 51, 40, 41]
+    assert len(cm.free_states) == 300 - 6
     assert torch.equal(pool.conv_state, snap[0]) and torch.equal(pool.recurrent_state, snap[1])
-    print("[4b] commit crossing pin/refill/swap OK")
+    print("[4b] commit crossing swaps OK")
 
 
-# -------------------------------------------------------------------------------------
-# 4c. boundary token is the LAST accepted: C=126, num_sampled=2 (126,127).
-#     B=128 = C_end => j_b = 1 = num_sampled-1. Pin R[1] -> page, refill R[1],
-#     baseline = page slot, early return (no swap).
-# -------------------------------------------------------------------------------------
+# 4c. boundary token is the last accepted: R[1] closes page 1.
 def test_cross_boundary_last():
     setup_ctx()
-    st = setup_page(2, 40, [50, 51, 52, 53])
-    cm, pool = make_cm(st, nslots=300)
+    st, reserve = setup_pages(2, {1: 40}, [50, 51, 52, 53])
+    cm, pool = make_cm(st, reserve, nslots=300)
     mark_in_use(cm, [40, 50, 51, 52, 53])
     r = make_req(2, 126)
     snap = (pool.conv_state.clone(), pool.recurrent_state.clone())
     cm.state_commit_verify(r, 126, 2)
-    assert st[2, 1] == 51, st[2].tolist()             # pinned = R[j_b=1] (state after 127)
-    assert r.baseline_slot == 51, r.baseline_slot     # baseline = page slot (early return)
-    assert st[2, 8] == 50, st[2].tolist()             # R[0] untouched (no swap)
-    assert st[2, 9] >= 0 and st[2, 9] != 51, st[2].tolist()  # R[1] refilled fresh
-    assert st[2, 10] == 52 and st[2, 11] == 53, st[2].tolist()  # R[2], R[3] untouched
-    assert len(cm.free_states) == 300 - 5             # page slot freed + one refill -> net zero
+    assert torch.all(st[2, 64:128] == 51)
+    assert reserve[2].tolist() == [50, 40, 52, 53]
+    assert len(cm.free_states) == 300 - 5
     assert torch.equal(pool.conv_state, snap[0]) and torch.equal(pool.recurrent_state, snap[1])
-    print("[4c] commit boundary-last pin+baseline OK")
+    print("[4c] commit boundary-last swap OK")
 
 
 def test_stable_reserve_across_overlapping_batches():
     """Different in-flight cohorts keep disjoint table-owned reserve rows."""
     setup_ctx()
-    page_cols, reserve_width, max_running_req = 8, 5, 4
+    reserve_width, max_running_req = 5, 4
     num_states = 100
     st = torch.full(
-        (max_running_req + 1, page_cols + reserve_width), -1, dtype=torch.int32
+        (max_running_req + 1, 512), -1, dtype=torch.int32
     )
-    st[:max_running_req, page_cols:] = torch.arange(
+    reserve = torch.arange(
         num_states, num_states + max_running_req * reserve_width, dtype=torch.int32
     ).view(max_running_req, reserve_width)
     for uid in range(max_running_req):
-        st[uid, 0] = uid
+        st[uid, :64] = uid
 
     pool = LinearStatePool(
         num_slots=num_states + max_running_req * reserve_width,
@@ -168,19 +142,19 @@ def test_stable_reserve_across_overlapping_batches():
         page_table=torch.zeros((max_running_req + 1, 512), dtype=torch.int32),
         type="hybrid_radix", num_states=num_states,
         num_draft_states=max_running_req * reserve_width,
-        state_table=st, state_pool=pool, draft_offset=page_cols,
+        state_table=st, work_state_table=reserve, state_pool=pool,
     )
-    original = st[:, page_cols:].clone()
+    original = reserve.clone()
     cohort_a = [make_req(0, 32), make_req(2, 32)]
     cohort_b = [make_req(1, 32), make_req(3, 32)]
     for req in cohort_a + cohort_b:
         req.device_len = req.cached_len + reserve_width
 
-    cm.allocate_draft_state(cohort_a)
-    cm.allocate_draft_state(cohort_b)
-    assert torch.equal(st[:, page_cols:], original)
-    assert all(req.baseline_slot == req.table_idx for req in cohort_a + cohort_b)
-    assert len(torch.unique(st[:max_running_req, page_cols:])) == max_running_req * reserve_width
+    cm.allocate_state(cohort_a)
+    cm.allocate_state(cohort_b)
+    assert torch.equal(reserve, original)
+    assert all(st[req.table_idx, req.cached_len - 1] == req.table_idx for req in cohort_a + cohort_b)
+    assert len(torch.unique(reserve)) == max_running_req * reserve_width
     print("[4d] stable overlapping-batch reserve OK")
 
 

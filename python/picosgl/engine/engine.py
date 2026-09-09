@@ -22,7 +22,7 @@ from picosgl.cache import (
 from picosgl.layers import set_rope_device
 from picosgl.models import make_model, load_target_weight
 from picosgl.utils import (
-    align_ceil, div_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+    align_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 )
 
 from .config import EngineConfig
@@ -40,11 +40,13 @@ _MIN_KV_PAGES = 2
 
 Indice2D : TypeAlias = tuple[torch.Tensor, torch.Tensor]
 
+
 class ForwardInput(NamedTuple):
     batch      : Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
     write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+
 
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
@@ -64,7 +66,7 @@ class Engine:
     ):
         assert not torch.cuda.is_initialized()
         set_tp_info(config.tp_info)
-        _adjust_config(config)
+        self._adjust_config(config)
         self.config = config
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -142,31 +144,25 @@ class Engine:
         )
         # ======================= Linear state table ========================
         if config.model_config.is_hybrid:
-            page_cols = div_ceil(self.max_seq_len, config.page_size)
             reserve_cols = (
-                self.speculator_reserve.state_slots_per_request
+                self.speculator_reserve.draft_slots_per_request
                 if self.speculator_reserve is not None else 0
             )
             self.ctx.state_table = self.state_table = torch.full(
-                (config.max_running_req + 1, page_cols + reserve_cols),
+                (config.max_running_req + 1, aligned_max_seq_len),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.ctx.draft_offset = self.draft_offset = (
-                page_cols if reserve_cols !=0 else None
-            )
+            self.ctx.work_state_table = self.work_state_table = None
             if reserve_cols != 0:
-                # Every table row permanently owns one K+1 verify reserve.  Slot ids
-                # evolve through commit-time swaps with page checkpoints, so this must
-                # be initialized once rather than rebuilt for each scheduled batch.
                 reserve = torch.arange(
                     self.num_states,
                     self.num_states + self.num_draft_states,
                     dtype=torch.int32,
                     device=self.device,
                 ).view(config.max_running_req, reserve_cols)
-                self.state_table[:config.max_running_req, page_cols:].copy_(reserve)
+                self.ctx.work_state_table = self.work_state_table = reserve
             self.dummy_state_slot = self.num_states + self.num_draft_states
             self.state_table[-1].fill_(self.dummy_state_slot)
 
@@ -225,11 +221,13 @@ class Engine:
         )
         tp_cpu_group = torch.distributed.group.WORLD
         assert tp_cpu_group is not None
-        max_bytes = (
-            config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
-        )
         if config.tp_info.size > 1:
-            enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+            max_bytes=config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
+            enable_pynccl_distributed(
+                config.tp_info,
+                tp_cpu_group,
+                max_bytes=max_bytes
+            )
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> dict[str, torch.Tensor]:
@@ -263,10 +261,11 @@ class Engine:
         # verify states are reserved according to the selected speculator configuration.
         cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
         num_draft_states = (
-            self.speculator_reserve.num_state_slots
+            self.speculator_reserve.num_draft_slots
             if self.speculator_reserve is not None else 0
         )
-        extra_state_slots = num_draft_states + int(config.model_config.is_hybrid)
+        num_dummy_states = 1 if config.model_config.is_hybrid else 0
+        extra_state_slots = num_draft_states + num_dummy_states
         extra_state_bytes = extra_state_slots * cache_per_state
 
         num_pages = config.num_page_override
@@ -282,7 +281,7 @@ class Engine:
                 assert extra_state_slots <= available_states, (
                     f"Not enough memory for {extra_state_slots} reserved linear states: "
                     f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum KV pages. "
-                    f"Raise --memory-ratio / --max-running-req, or pin --num-pages."
+                    f"Raise --memory-ratio / Reduce --max-running-req, or pin --num-pages."
                 )
                 available_memory -= extra_state_bytes
                 num_pages = max(
@@ -327,10 +326,7 @@ class Engine:
     def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:
         self.graph_runner.pad_batch(batch)
         cache_manager.allocate_paged(batch.reqs)
-        if not batch.is_verify:
-            cache_manager.allocate_state(batch.reqs)
-        else:
-            cache_manager.allocate_draft_state(batch.reqs)
+        cache_manager.allocate_state(batch.reqs)
         batch.positions = self._make_positions(batch, self.device)
         input_mapping = self._make_input_tuple(batch, self.device)
         write_mapping = self._make_write_tuple(batch, self.device)
@@ -367,16 +363,13 @@ class Engine:
 
         if batch.is_verify:
             next_tokens_gpu = self.sampler.reject_sample(logits, batch).to(torch.int32)
-            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-            copy_done_event = torch.cuda.Event()
-            copy_done_event.record(self.stream)
-            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
         else: # prefill / decode
             next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-            copy_done_event = torch.cuda.Event()
-            copy_done_event.record(self.stream)
-            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
@@ -423,53 +416,54 @@ class Engine:
         write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
         return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
 
-def _adjust_config(config: EngineConfig):
-    def override(attr: str, value: Any):  # this is dangerous, use with caution
-        object.__setattr__(config, attr, value)
+    @staticmethod
+    def _adjust_config(config: EngineConfig) -> None:
+        def override(attr: str, value: Any):  # this is dangerous, use with caution
+            object.__setattr__(config, attr, value)
 
-    if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else "fa,fi" if is_sm90_supported() else "fi"
-        override("attention_backend", backend)
-        logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
+        if config.attention_backend == "auto":
+            backend = "trtllm" if is_sm100_supported() else "fa,fi" if is_sm90_supported() else "fi"
+            override("attention_backend", backend)
+            logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
-    if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64, 128]:
-        override("page_size", 64)
-        logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
-
-    if config.model_config.is_moe and config.moe_backend == "auto":
-        override("moe_backend", "fused")
-        logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
-
-    if config.model_config.is_hybrid:
-        if getattr(config, "cache_type", "radix") != "hybrid_radix":
-            override("cache_type", "hybrid_radix")
-            logger.info_rank0("Prefix cache set to hybrid_radix for hybrid (linear attention) model.")
-        if config.page_size % 64 != 0:
-            original_page_size = config.page_size
+        if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64, 128]:
             override("page_size", 64)
-            logger.warning_rank0(
-                f"Page size overridden to 64 for hybrid model (must be a multiple of 64, got {original_page_size})."
-            )
-    if config.enable_specualtive_decoding:
-        speculator_config = config.speculator_config
-        assert speculator_config is not None, (
-            "speculator_config is required when speculative decoding is enabled"
-        )
-        assert speculator_config.algorithm == config.speculative_algorithm, (
-            f"Speculator config {type(speculator_config).__name__} belongs to "
-            f"{speculator_config.algorithm}, not {config.speculative_algorithm}."
-        )
-        speculator_config.validate(config)
-        if config.dt_separation:
-            import torch as _torch
+            logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
-            assert _torch.cuda.device_count() > config.tp_info.size, (
-                "--enable-dt-separation requires at least tp_size + 1 GPUs "
-                f"(tp_size={config.tp_info.size})."
+        if config.model_config.is_moe and config.moe_backend == "auto":
+            override("moe_backend", "fused")
+            logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+        if config.model_config.is_hybrid:
+            if getattr(config, "cache_type", "radix") != "hybrid_radix":
+                override("cache_type", "hybrid_radix")
+                logger.info_rank0("Prefix cache set to hybrid_radix for hybrid (linear attention) model.")
+            if config.page_size % 64 != 0:
+                original_page_size = config.page_size
+                override("page_size", 64)
+                logger.warning_rank0(
+                    f"Page size overridden to 64 for hybrid model (must be a multiple of 64, got {original_page_size})."
+                )
+        if config.enable_specualtive_decoding:
+            speculator_config = config.speculator_config
+            assert speculator_config is not None, (
+                "speculator_config is required when speculative decoding is enabled"
             )
-    elif config.speculator_config is not None:
-        raise ValueError("speculator_config requires --speculative-algorithm.")
-    elif config.dt_separation:
-        raise ValueError(
-            "--enable-dt-separation requires --speculative-algorithm."
-        )
+            assert speculator_config.algorithm == config.speculative_algorithm, (
+                f"Speculator config {type(speculator_config).__name__} belongs to "
+                f"{speculator_config.algorithm}, not {config.speculative_algorithm}."
+            )
+            speculator_config.validate(config)
+            if config.dt_separation:
+                import torch as _torch
+
+                assert _torch.cuda.device_count() > config.tp_info.size, (
+                    "--enable-dt-separation requires at least tp_size + 1 GPUs "
+                    f"(tp_size={config.tp_info.size})."
+                )
+        elif config.speculator_config is not None:
+            raise ValueError("speculator_config requires --speculative-algorithm.")
+        elif config.dt_separation:
+            raise ValueError(
+                "--enable-dt-separation requires --speculative-algorithm."
+            )

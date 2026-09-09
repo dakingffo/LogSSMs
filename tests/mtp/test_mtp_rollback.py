@@ -1,17 +1,17 @@
 """Step 8c (rework): MTP verify reserve-commit correctness on the hybrid page cache.
 
 The old circular-buffer rollback_to is gone. The verify forward writes each candidate's
-post-state into the K+1 reserve columns R[0..K], and committing ``num_sampled`` accepted
-tokens is a pure index shuffle (pin / refill / swap, zero state memcpy -- see
-test_reserve_index_ops.py for the index-level contract). This test drives the real 0.8B
+post-state into the separate K+1 reserve table R[0..K], and committing ``num_sampled``
+accepted tokens swaps the selected reserve slots into token-indexed live page mappings.
+This test drives the real 0.8B
 model through the three commit shapes and checks the committed baseline state equals
 "state after num_sampled tokens appended to the prefill terminal state", measured
 against an independent sequential-decode reference:
 
-  * no page crossing    (C=100, num_sampled=3): swap R[0] <-> R[2]; baseline = R[2].
-  * crossing, last      (C=126, num_sampled=2): pin R[1] -> page 1; baseline = page slot.
-  * crossing, mid       (C=125, num_sampled=4): pin R[2] -> page 1, refill R[2],
-                         swap R[0] <-> R[3]; baseline = R[3] (state after 128).
+  * no page crossing    (C=100, num_sampled=3): R[2] becomes page 1's live state.
+  * crossing, last      (C=126, num_sampled=2): R[1] closes page 1.
+  * crossing, mid       (C=125, num_sampled=4): R[2] closes page 1 and R[3] becomes
+                         page 2's live state.
 
 The verify forward and the direct-decode reference feed the same token sequence from the
 same baseline state, so the committed state matches the reference within the bf16 band
@@ -117,12 +117,11 @@ def main():
     for tidx, base in ((4, 0), (5, 2048)):
         ctx.page_table[tidx, :MAX_SEQ] = torch.arange(base, base + MAX_SEQ, device=device)
 
-    # state_table: 16 page columns + D reserve columns (tail). -1 = unallocated.
-    page_cols = (MAX_SEQ + PS - 1) // PS  # 16
-    rb = page_cols
-    st = torch.full((8, page_cols + D), -1, dtype=torch.int32, device=device)
+    # Live state table is token-indexed; every page repeats one slot id.
+    st = torch.full((8, MAX_SEQ), -1, dtype=torch.int32, device=device)
+    reserve = torch.full((8, D), -1, dtype=torch.int32, device=device)
     ctx.state_table = st
-    ctx.draft_offset = rb
+    ctx.work_state_table = reserve
     set_global_ctx(ctx)
     ctx.attn_backend = make_attention_backend("fi", mcfg)
 
@@ -130,12 +129,13 @@ def main():
         num_pages=8, page_size=PS, num_states=64,
         page_table=torch.zeros((8, 16), dtype=torch.int32, device=device),
         type="hybrid_radix", state_table=st, state_pool=pool,
-        draft_offset=rb,
+        num_draft_states=reserve.numel(), work_state_table=reserve,
     )
     # one state slot per page each row's prefill + decode will write
     for tidx, pages in ((4, (0, 1)), (5, (0, 1, 2))):
         for p in pages:
-            st[tidx, p] = int(cm._allocate(needed_states=1)[1][0])
+            slot = int(cm._allocate(needed_states=1)[1][0])
+            st[tidx, p * PS : (p + 1) * PS] = slot
 
     from transformers import AutoTokenizer
 
@@ -181,8 +181,8 @@ def main():
         """Verify window [C, C+n) -> R[0..n); returns (req, n)."""
         n = toks.shape[0]
         req = mk_req(tidx, C + n, cached_len=C)
-        req.baseline_slot = int(st[tidx, (C - 1) // PS])
-        st[tidx, rb : rb + D] = cm._allocate(needed_states=D)[1]  # K+1 reserve slots
+        reserve[tidx] = cm._allocate(needed_states=D)[1]
+        cm.allocate_state([req])
         vb = Batch(reqs=[req], phase="verify")
         vb.input_ids = toks
         vb.positions = torch.arange(C, C + n, device=device)
@@ -229,15 +229,16 @@ def main():
         req, n = run_verify(tidx_v, C, toks)
         assert n == D
         # ---- commit: pure index ops ----
-        old_page_slot = int(st[tidx_v, (C - 1) // PS])
+        old_page_slot = int(st[tidx_v, C - 1])
         cm.state_commit_verify(req, C, num_sampled)
-        committed = read_state(req.baseline_slot)
-        print(f"  committed baseline_slot={req.baseline_slot} (page slot was {old_page_slot})")
+        committed_slot = int(st[tidx_v, C + num_sampled - 1])
+        committed = read_state(committed_slot)
+        print(f"  committed slot={committed_slot} (page slot was {old_page_slot})")
         # ---- reference: fresh prefill to C on the ref row + num_sampled decodes ----
         run_prefill(tidx_r, C)
         for j in range(num_sampled):
             run_decode(tidx_r, C + j, toks[j : j + 1])
-        ref_slot = int(st[tidx_r, (C + num_sampled - 1) // PS])
+        ref_slot = int(st[tidx_r, C + num_sampled - 1])
         ref = read_state(ref_slot)
         rel = cmp("committed vs direct decode", committed, ref)
         # ---- structural: the committed state is NOT the stale prefill terminal state ----
@@ -248,13 +249,11 @@ def main():
         return rel, max(dc, dr)
 
     rels = []
-    # case A: no crossing. C=100, num_sampled=3 -> swap R[0]<->R[2], baseline=R[2].
+    # case A: no crossing. R[2] becomes page 1's live state.
     rels.append(run_case("no-cross swap", C=100, num_sampled=3)[0])
-    # case B: crossing, boundary token is the LAST accepted. C=126, num_sampled=2 ->
-    #         pin R[1]->page 1, baseline = page slot (early return, no swap).
+    # case B: crossing, boundary token is the last accepted. R[1] closes page 1.
     rels.append(run_case("crossing, boundary-last", C=126, num_sampled=2)[0])
-    # case C: crossing, boundary token mid-window. C=125, num_sampled=4 ->
-    #         pin R[2]->page 1, refill R[2], swap R[0]<->R[3], baseline=R[3].
+    # case C: R[2] closes page 1 and R[3] becomes page 2's live state.
     rels.append(run_case("crossing, boundary-mid", C=125, num_sampled=4)[0])
 
     ok = max(rels) < 0.02  # bf16 ULP band (same tolerance as the old rollback test)

@@ -50,12 +50,17 @@ def make_pool(num_slots=400, dtype=torch.float32):
     )
 
 
-def make_cm(state_table, pool, num_pages=20, page_size=64, reserve_off=8, num_states=400):
+def make_cm(
+    state_table, pool, page_table=None,
+    num_pages=20, page_size=64, num_states=400,
+):
+    if page_table is None:
+        page_table = torch.zeros((4, 512), dtype=torch.int32)
     return CacheManager(
         num_pages=num_pages, page_size=page_size,
-        page_table=torch.zeros((4, 512), dtype=torch.int32),
+        page_table=page_table,
         type="hybrid_radix", num_states=num_states,
-        state_table=state_table, state_pool=pool, draft_offset=reserve_off,
+        state_table=state_table, state_pool=pool,
     )
 
 
@@ -102,24 +107,33 @@ def test1_hybrid_radix():
 # =====================================================================================
 def test2_allocate_state():
     pool = make_pool()
-    st = torch.full((4, 8), -1, dtype=torch.int32)
+    st = torch.full((4, 512), -1, dtype=torch.int32)
     cm = make_cm(st, pool)
     req = make_req(100, table_idx=1)
     req.cached_len, req.device_len = 0, 100
+    cm.allocate_paged([req])
     cm.allocate_state([req])
     # pages 0 (0-63) and 1 (64-99) written by a 100-token prefill; page 2 untouched
-    assert st[1, 0] >= 0 and st[1, 1] >= 0 and st[1, 2] == -1, st[1]
+    assert st[1, 0] >= 0 and st[1, 64] >= 0 and st[1, 128] == -1, st[1]
+    assert torch.all(st[1, :64] == st[1, 0])
+    assert torch.all(st[1, 64:128] == st[1, 64])
     assert len(cm.free_states) == 400 - 2, len(cm.free_states)
     # decode step staying inside page 1 -> no new slot
     req.cached_len, req.device_len = 90, 91
     cm.allocate_state([req])
-    assert st[1, 1] >= 0 and st[1, 2] == -1, st[1]
+    assert st[1, 64] >= 0 and st[1, 128] == -1, st[1]
     assert len(cm.free_states) == 400 - 2, len(cm.free_states)
     # decode crossing into page 2 -> allocates page 2's slot
     req.cached_len, req.device_len = 128, 129
+    cm.allocate_paged([req])
     cm.allocate_state([req])
-    assert st[1, 2] >= 0, st[1]
+    assert st[1, 128] >= 0, st[1]
     assert len(cm.free_states) == 400 - 3, len(cm.free_states)
+    # Rejecting page 2 returns its KV page and state slot together.
+    cm.free_page_range(req, 2, 3)
+    assert len(cm.free_pages) == 20 - 2
+    assert len(cm.free_states) == 400 - 2
+    assert torch.all(st[1, 128:192] == -1)
     print("[2] allocate_state OK")
 
 
@@ -129,16 +143,16 @@ def test2_allocate_state():
 def test3_cache_req_lifecycle():
     N, PS = 20, 64
     pool = make_pool(num_slots=400)
-    st = torch.full((4, 8), -1, dtype=torch.int32)
+    st = torch.full((4, 512), -1, dtype=torch.int32)
     pt = torch.zeros((4, 512), dtype=torch.int32)
-    cm = make_cm(st, pool)
+    cm = make_cm(st, pool, pt)
 
     # ---- req 1: prefill 200 tokens (4 pages) ----
     r = make_req(200, table_idx=1)
     r.cached_len, r.device_len = 0, 200
     alloc_pages(cm, pt, 1, 0, 200)
     cm.allocate_state([r])
-    s0, s1, s2, s3 = (int(st[1, i]) for i in range(4))
+    s0, s1, s2, s3 = (int(st[1, i * PS]) for i in range(4))
     assert len(cm.free_states) == 400 - 4   # 4 slots allocated (no dummy slot)
     assert len(cm.free_pages) == N - 4
 
@@ -150,7 +164,7 @@ def test3_cache_req_lifecycle():
     assert r.cache_handle.cached_len == 192
     # slots are re-pointed to the tree's canonical slots (same ids); adopted slots stay
     # ALLOCATED (tree-owned, never freed) so the tree reference stays valid.
-    assert st[1, 0] == s0 and st[1, 1] == s1 and st[1, 2] == s2, st[1]
+    assert st[1, 0] == s0 and st[1, 64] == s1 and st[1, 128] == s2, st[1]
     assert cm.prefix_cache.total_state_pages() == 3
     assert len(cm.free_states) == 400 - 4   # page-3 tail (s3) still this request's
 
@@ -168,11 +182,11 @@ def test3_cache_req_lifecycle():
     r2.cache_handle = match2.cuda_handle
     cm.lock(r2.cache_handle)
     pt[1, 0:64] = 0                         # borrow page 0's KV
-    st[1, 0] = match2.cuda_handle.get_matched_indices()[1][0]   # borrow page 0's state
+    st[1, :64] = match2.cuda_handle.get_matched_indices()[1][0]  # borrow page 0's state
     alloc_pages(cm, pt, 1, 64, 100)         # fresh KV page for [64,100)
-    r2.cached_len, r2.device_len = 0, 100
+    r2.cached_len, r2.device_len = 64, 100
     cm.allocate_state([r2])
-    assert st[1, 0] == s0 and st[1, 1] >= 0 and st[1, 1] != s1, (st[1], s1)
+    assert st[1, 0] == s0 and st[1, 64] >= 0 and st[1, 64] != s1, (st[1], s1)
     assert len(cm.free_states) == 400 - 4   # one fresh slot popped
     assert len(cm.free_pages) == N - 4      # 3 tree + 1 fresh (64-100)
 

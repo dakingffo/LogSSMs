@@ -212,8 +212,9 @@ class DraftAttentionBackend:
         indices   : torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        key   = pool.k[indices.to(torch.int64)]
-        value = pool.v[indices.to(torch.int64)]
+        indices = indices.masked_fill(~valid_mask, 0).to(torch.int64)
+        key   = pool.k[indices]
+        value = pool.v[indices]
         n_rep = self.num_qo_heads // self.num_kv_heads
         if n_rep > 1:
             key = key.repeat_interleave(n_rep, dim=2)

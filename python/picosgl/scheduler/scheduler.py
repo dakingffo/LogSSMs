@@ -59,8 +59,8 @@ class Scheduler(SchedulerIOMixin):
             num_states=self.engine.num_states,
             num_draft_states=self.engine.num_draft_states,
             state_table=getattr(self.engine, "state_table", None),
+            work_state_table=getattr(self.engine, "work_state_table", None),
             state_pool=getattr(self.engine, "linear_state", None),
-            draft_offset=getattr(self.engine, "draft_offset", None),
         )
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -186,12 +186,11 @@ class Scheduler(SchedulerIOMixin):
         if inflight: # The inflight aborted req has been allocated at [cached_len, device_len)
             C, D = req.cached_len, req.device_len
             ps = self.cache_manager.page_size
-            for page in range(div_ceil(C, ps), div_ceil(D, ps)):
-                p_start = page * ps
-                tid = req.table_idx
-                self.cache_manager._free(
-                    self.table_manager.page_table[tid, p_start: p_start + ps]
-                )
+            self.cache_manager.free_page_range(
+                req,
+                div_ceil(C, ps),
+                div_ceil(D, ps),
+            )
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 

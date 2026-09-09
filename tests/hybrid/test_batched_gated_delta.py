@@ -9,7 +9,7 @@ from picosgl.kernel.linear_attention.vendor.fla import (
     fused_recurrent_gated_delta_rule,
 )
 from picosgl.layers import GatedDeltaNet
-from picosgl.layers.linear_attention_backend.backend import _l2norm
+from picosgl.layers.linear_attention_backend.native import _l2norm
 from picosgl.models.config import RotaryConfig
 from picosgl.models.qwen3_next import Qwen3_5Config
 from picosgl.utils import torch_dtype
@@ -175,11 +175,11 @@ def test_variable_length_layer_batch_matches_per_request():
     reference_pool.conv_state.copy_(pool.conv_state)
     reference_pool.recurrent_state.copy_(pool.recurrent_state)
 
-    reserve_offset = 2
-    state_table = torch.full((4, reserve_offset + 5), -1, dtype=torch.int32, device=device)
+    state_table = torch.full((4, 64), -1, dtype=torch.int32, device=device)
+    work_state_table = torch.full((4, 5), -1, dtype=torch.int32, device=device)
     for table_idx in range(3):
-        state_table[table_idx, 0] = table_idx
-        state_table[table_idx, reserve_offset:] = torch.arange(
+        state_table[table_idx] = table_idx
+        work_state_table[table_idx] = torch.arange(
             3 + table_idx * 5,
             3 + (table_idx + 1) * 5,
             dtype=torch.int32,
@@ -187,9 +187,8 @@ def test_variable_length_layer_batch_matches_per_request():
         )
 
     lengths = [5, 3, 5]
-    baselines = [3, 1, 13]  # Include R[0]-as-baseline for rows 0 and 2.
     reqs = []
-    for table_idx, (seq_len, baseline) in enumerate(zip(lengths, baselines)):
+    for table_idx, seq_len in enumerate(lengths):
         req = Request(
             input_ids=torch.zeros(10 + seq_len, dtype=torch.int32),
             table_idx=table_idx,
@@ -200,7 +199,6 @@ def test_variable_length_layer_batch_matches_per_request():
             cache_handle=None,
             max_device_len=10 + seq_len + 4,
         )
-        req.baseline_slot = baseline
         reqs.append(req)
 
     x = torch.randn(sum(lengths), config.hidden_size, dtype=torch.bfloat16, device=device)
@@ -210,7 +208,7 @@ def test_variable_length_layer_batch_matches_per_request():
     ctx = Context(page_size=64)
     ctx.linear_state = pool
     ctx.state_table = state_table.clone()
-    ctx.draft_offset = reserve_offset
+    ctx.work_state_table = work_state_table.clone()
     set_global_ctx(ctx)
     try:
         ctx.linear_attn_backend.prepare_metadata(batch)
@@ -222,7 +220,7 @@ def test_variable_length_layer_batch_matches_per_request():
     reference_ctx = Context(page_size=64)
     reference_ctx.linear_state = reference_pool
     reference_ctx.state_table = state_table.clone()
-    reference_ctx.draft_offset = reserve_offset
+    reference_ctx.work_state_table = work_state_table.clone()
     reference_output = torch.empty_like(x)
     set_global_ctx(reference_ctx)
     try:
@@ -239,7 +237,7 @@ def test_variable_length_layer_batch_matches_per_request():
         clear_global_ctx()
 
     slots = torch.cat(
-        [state_table[i, reserve_offset : reserve_offset + length] for i, length in enumerate(lengths)]
+        [work_state_table[i, :length] for i, length in enumerate(lengths)]
     ).to(torch.int64)
     torch.testing.assert_close(output, reference_output, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(pool.conv_state[slots], reference_pool.conv_state[slots])

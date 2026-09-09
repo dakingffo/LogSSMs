@@ -23,21 +23,16 @@ class MTPSpeculatorConfig(BaseSpeculatorConfig):
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve:
         width = self.num_draft_tokens + 1
         return SpeculatorReserve(
-            num_state_slots=max_running_req * width,
-            state_slots_per_request=width,
+            num_draft_slots=max_running_req * width,
+            draft_slots_per_request=width,
         )
 
     def validate(self, config: EngineConfig) -> None:
-        from picosgl.models.qwen3_next import Qwen3_5Config
-
         assert config.speculative_draft_model_path == config.model_path, (
             "--speculative-draft-model-path must equal --model-path under MTP "
             f"(got {config.speculative_draft_model_path!r} vs {config.model_path!r})."
         )
-        assert (
-            isinstance(config.model_config, Qwen3_5Config)
-            and config.model_config.mtp_num_hidden_layers > 0
-        ), (
+        assert getattr(config.model_config, "mtp_num_hidden_layers", 0) > 0, (
             "MTP speculative decoding requires a model with an MTP head "
             "(mtp_num_hidden_layers > 0)."
         )
