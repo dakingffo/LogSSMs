@@ -11,16 +11,16 @@ if TYPE_CHECKING:
     from picosgl.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from picosgl.layers.linear_attention_backend import (
         BaseLinearAttentionBackend,
-        LinearAttentionMetadata,
+        BaseLinearAttentionMetadata,
     )
     from picosgl.layers.moe_backend import BaseMoeBackend
     from picosgl.speculator.hidden_captor import HiddenCaptorBase
 
 
 def _make_default_linear_attention_backend():
-    from picosgl.layers.linear_attention_backend import make_linear_attention_backend
+    from picosgl.layers.linear_attention_backend import LinearAttentionBackend
 
-    return make_linear_attention_backend("native")
+    return LinearAttentionBackend()
 
 
 @dataclass
@@ -47,7 +47,6 @@ class Request:
     cache_handle   : BaseCacheHandle
     max_device_len : int
     device_len     : int  = field(init=False)
-    baseline_slot  : int  = field(default=-1, init=False)  # for verify
     aborted        : bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -66,11 +65,17 @@ class Request:
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
 
-    def complete_to_device_len(self) -> None:
-        self.cached_len = self.device_len
+    def extend_device_n(self, n: int) -> None:
+        self.device_len += min(n, self.max_device_len - self.device_len)
+
+    def complete_to_device_len(self, progress: int = -1) -> None:
+        self.cached_len = (
+            self.device_len if progress < 0 else
+            self.cached_len + min(progress, self.device_len - self.cached_len)
+        )
 
     def complete_n(self, n: int) -> None:
-        self.device_len += n
+        self.device_len += min(n, self.max_device_len - self.device_len)
         self.cached_len = self.device_len - 1
 
     def append_host(self, next_token: torch.Tensor) -> None:
@@ -114,7 +119,7 @@ class Batch:
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
-    linear_attn_metadata: LinearAttentionMetadata = field(init=False)
+    linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -150,8 +155,8 @@ class Context:
     kv_cache           : BaseKVCachePool            = field(init=False)   # full attention
     linear_state       : LinearStatePool            = field(init=False)   # linear attention
 
-    state_table : torch.Tensor | None = field(default=None, init=False)
-    draft_offset : int | None         = field(default=None, init=False)
+    state_table        : torch.Tensor | None = field(default=None, init=False)
+    work_state_table   : torch.Tensor | None = field(default=None, init=False)
 
     _batch      : Batch | None        = field(default=None, init=False)
 

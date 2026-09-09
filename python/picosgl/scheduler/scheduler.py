@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 import torch
 
+from picosgl.cache import CacheResources, StandardCacheManager
 from picosgl.core import Request
 from picosgl.message import (
     AbortBackendMsg,
@@ -13,11 +14,10 @@ from picosgl.message import (
     UserMsg,
 )
 from picosgl.speculator import make_speculator_client
-from picosgl.utils import init_logger, load_tokenizer, div_ceil
+from picosgl.utils import init_logger, load_tokenizer
 from picosgl.engine import Engine, ForwardOutput, ForwardData
 
 from .ar import ForwardInput
-from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
@@ -40,9 +40,10 @@ class Scheduler(SchedulerIOMixin):
         speculator_start_event: mp.synchronize.Event | None = None,
         speculator_ready_event: mp.synchronize.Event | None = None,
         speculator_data_plane : DataPlane | None = None,
+        shutdown_event         : mp.synchronize.Event | None = None,
     ):
         self.engine = Engine(config, speculator_start_event, speculator_ready_event)
-        super().__init__(config, self.engine.tp_cpu_group)
+        super().__init__(config, self.engine.tp_cpu_group, shutdown_event)
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
@@ -52,14 +53,20 @@ class Scheduler(SchedulerIOMixin):
         # initialize other managers
         self.config = config
         self.speculator_data_plane = speculator_data_plane
-        self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
+        self.cache_resources = CacheResources(
+            kv_pool=self.engine.kv_cache,
+            page_table=self.engine.page_table,
+            linear_state=self.engine.linear_state,
+            state_table=self.engine.state_table,
+            work_state_table=self.engine.work_state_table,
+        )
+        self.table_manager = TableManager(
+            config.max_running_req, self.cache_resources.page_table
+        )
+        self.cache_manager = StandardCacheManager(
+            self.engine.num_pages, config.page_size, self.cache_resources, config.cache_type,
             num_states=self.engine.num_states,
             num_draft_states=self.engine.num_draft_states,
-            state_table=getattr(self.engine, "state_table", None),
-            state_pool=getattr(self.engine, "linear_state", None),
-            draft_offset=getattr(self.engine, "draft_offset", None),
         )
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -183,14 +190,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _free_req_resources(self, req: Request, inflight: bool = False) -> None:
         if inflight: # The inflight aborted req has been allocated at [cached_len, device_len)
-            C, D = req.cached_len, req.device_len
-            ps = self.cache_manager.page_size
-            for page in range(div_ceil(C, ps), div_ceil(D, ps)):
-                p_start = page * ps
-                tid = req.table_idx
-                self.cache_manager._free(
-                    self.table_manager.page_table[tid, p_start: p_start + ps]
-                )
+            self.cache_manager.free_to_cached(req)
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 

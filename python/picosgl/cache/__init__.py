@@ -1,33 +1,29 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 import torch
 
 from picosgl.distributed import DistributedInfo, try_get_tp_info
-from picosgl.utils import Registry, div_even
+from picosgl.utils import div_even
 
 if TYPE_CHECKING:    
     from picosgl.models import ModelConfig
 
-from .kv.base import BaseKVCachePool
-from .linear.state_pool import LinearStatePool
-from .base import (
+from .kv_pool.base import BaseKVCachePool
+from .linear_pool.state_pool import LinearStatePool
+from .prefix_cache import SUPPORTED_PREFIX_CACHE, make_prefix_cache
+from .prefix_cache.base import (
     BaseCacheHandle,
     BasePrefixCache,
     MatchResult,
     SizeInfo,
 )
+from .base import BaseCacheManager, CacheResources
+from .standard import StandardCacheManager
 
 # Fallback when TP info is unset (unit tests build pools without an engine).
 _TP_DEFAULT = DistributedInfo(rank=0, size=1)
-
-
-class CacheManagerCreator(Protocol):
-    def __call__(self, device: torch.device) -> BasePrefixCache: ...
-
-
-SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
 def make_kvcache_pool(
@@ -37,7 +33,7 @@ def make_kvcache_pool(
     dtype       : torch.dtype,
     device      : torch.device,
 ) -> BaseKVCachePool:
-    from .kv.mha_pool import MHAKVCachePool  # TODO: support other variants (e.g. MLA)
+    from .kv_pool.mha_pool import MHAKVCachePool  # TODO: support other variants (e.g. MLA)
 
     return MHAKVCachePool(
         num_kv_heads=model_config.num_kv_heads,
@@ -99,32 +95,10 @@ def make_linear_state_pool(
     )
 
 
-@SUPPORTED_CACHE_MANAGER.register("naive")
-def make_naive_cache(device: torch.device):
-    from .naive_prefix_cache import NaivePrefixCache
-
-    return NaivePrefixCache(device=device)
-
-
-@SUPPORTED_CACHE_MANAGER.register("radix")
-def make_radix_cache(device: torch.device):
-    from .radix_prefix_cache import RadixTreeNode, RadixPrefixCache
-
-    return RadixPrefixCache(device=device, node_type=RadixTreeNode)
-
-
-@SUPPORTED_CACHE_MANAGER.register("hybrid_radix")
-def make_hybrid_radix_cache(device: torch.device):
-    from .radix_prefix_cache import HybridRadixTreeNode, RadixPrefixCache
-
-    return RadixPrefixCache(device=device, node_type=HybridRadixTreeNode)
-
-
-def make_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
-    return SUPPORTED_CACHE_MANAGER[type](device)
-
-
 __all__ = [
+    "BaseCacheManager",
+    "CacheResources",
+    "StandardCacheManager",
     "make_kvcache_pool",
     "make_linear_state_pool",
     "make_prefix_cache",
@@ -134,5 +108,5 @@ __all__ = [
     "BasePrefixCache",
     "SizeInfo",
     "MatchResult",
-    "SUPPORTED_CACHE_MANAGER",
+    "SUPPORTED_PREFIX_CACHE",
 ]

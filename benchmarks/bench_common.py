@@ -86,7 +86,7 @@ def parse_full(argv: list[str], extra: dict[str, dict[str, Any]] | None = None):
 
     from picosgl.server.args import parse_args
 
-    server_args, _ = parse_args(server_argv)
+    server_args = parse_args(server_argv)
     return server_args, bench_ns, server_argv
 
 

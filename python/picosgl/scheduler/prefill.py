@@ -17,10 +17,9 @@ from picosgl.utils import init_logger, align_ceil
 from .ar import ForwardInput, ForwardOutput
 
 if TYPE_CHECKING:
-    from picosgl.cache import BaseCacheHandle
+    from picosgl.cache import BaseCacheHandle, BaseCacheManager
     from picosgl.message import UserMsg
 
-    from .cache import CacheManager
     from .table import TableManager
 
 logger = init_logger(__name__)
@@ -46,42 +45,39 @@ class PendingRequest:
 class PrefillAdder:
     token_budget : int
     reserved_size: int
-    cache_manager: CacheManager
+    cache_manager: BaseCacheManager
     table_manager: TableManager
 
-    def _try_allocate_one(self, req: PendingRequest) -> tuple[BaseCacheHandle, int] | None:
+    def _try_allocate_one(
+        self,
+        req: PendingRequest,
+    ) -> tuple[BaseCacheHandle, int, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
-        # TODO: better estimate policy
-        extend_len = req.input_len - cached_len
-        estimated_len = align_ceil(extend_len + req.output_len, self.cache_manager.page_size)
-
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        remain_len = req.input_len - cached_len
+        chunk_size = self.cache_manager.plan_prefill_chunk(
+            remain_len, self.token_budget
+        )
+        if chunk_size == 0:
             return None
-        self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
-            return self.cache_manager.unlock(handle)
+
+        # TODO: better estimate policy
+        estimated_len = align_ceil(remain_len + req.output_len, self.cache_manager.page_size)
+        total_len = estimated_len + self.reserved_size
+        if not self.cache_manager.prefill_acquire(total_len, handle):
+            return None
 
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-            page_entry = self.table_manager.page_table[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            matched = handle.get_matched_indices()
-            # borrow the matched pages' linear-state slots (per page) instead of allocating
-            if (state_table := self.cache_manager.state_table) is not None:
-                matched_indices, matched_state = matched
-                ps = self.cache_manager.page_size
-                state_table[table_idx, : cached_len // ps] = matched_state
-            else:
-                matched_indices = matched
-            page_entry.copy_(matched_indices)
+            self.cache_manager.init_with_handle(table_idx, handle)
 
-        return handle, table_idx
+        return handle, table_idx, chunk_size
 
     def _add_one_req(
         self,
@@ -89,9 +85,9 @@ class PrefillAdder:
         cache_handle: BaseCacheHandle,
         table_idx   : int,
         cached_len  : int,
+        chunk_size  : int,
     ) -> Request | ChunkedRequest:
         remain_len = pending_req.input_len - cached_len
-        chunk_size = min(self.token_budget, remain_len)
         is_chunked = chunk_size < remain_len
         CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
@@ -118,20 +114,28 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
+            remain_len = pending_req.input_len - chunked_req.cached_len
+            chunk_size = self.cache_manager.plan_prefill_chunk(
+                remain_len, self.token_budget
+            )
+            if chunk_size == 0:
+                return None
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
+                chunk_size=chunk_size,
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx = resource
+            cache_handle, table_idx, chunk_size = resource
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=cache_handle.cached_len,
+                chunk_size=chunk_size,
             )
 
         return None

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import glob
+import json
+import os
 import re
+from collections.abc import Collection
 from typing import Dict, Iterator, Tuple
 
 import safetensors
@@ -36,6 +39,90 @@ _SLOT_NAMES = {
     ".up_proj": "up",
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
+
+
+def _checkpoint_files(model_folder: str) -> tuple[str, list[str]]:
+    """Return the preferred checkpoint format and its ordered shard paths."""
+    candidates = (
+        ("safetensors", "model.safetensors.index.json", "model.safetensors"),
+        ("pytorch", "pytorch_model.bin.index.json", "pytorch_model.bin"),
+    )
+    for checkpoint_format, index_name, weight_name in candidates:
+        index_path = os.path.join(model_folder, index_name)
+        if os.path.isfile(index_path):
+            with open(index_path, encoding="utf-8") as file:
+                index = json.load(file)
+            filenames = dict.fromkeys(index["weight_map"].values())
+            return checkpoint_format, [
+                os.path.join(model_folder, filename) for filename in filenames
+            ]
+
+        weight_path = os.path.join(model_folder, weight_name)
+        if os.path.isfile(weight_path):
+            return checkpoint_format, [weight_path]
+
+        pattern = (
+            "model-*.safetensors"
+            if checkpoint_format == "safetensors"
+            else "pytorch_model-*.bin"
+        )
+        paths = sorted(glob.glob(os.path.join(model_folder, pattern)))
+        if paths:
+            return checkpoint_format, paths
+
+    # Some converted checkpoints use non-standard safetensors names. Preserve support
+    # for them, but prefer the standard model files above and ignore auxiliary exports.
+    paths = sorted(glob.glob(os.path.join(model_folder, "*.safetensors")))
+    filtered = [path for path in paths if not path.endswith("consolidated.safetensors")]
+    if filtered or paths:
+        return "safetensors", filtered or paths
+
+    raise FileNotFoundError(
+        f"No safetensors or PyTorch checkpoint found in {model_folder}"
+    )
+
+
+def iter_checkpoint_weights(
+    model_path   : str,
+    device       : torch.device | str = "cpu",
+    *,
+    names        : Collection[str] | None = None,
+    show_progress: bool = False,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Yield raw checkpoint tensors without model-specific name or layout changes.
+
+    Safetensors and PyTorch ``pytorch_model*.bin`` checkpoints, including their sharded
+    index formats, share this interface. Safetensors is preferred when both are present.
+    """
+    model_folder = resolve_model_path(model_path)
+    checkpoint_format, files = _checkpoint_files(model_folder)
+    selected_names = set(names) if names is not None else None
+
+    for path in tqdm(files, desc="Loading weights", disable=not show_progress):
+        if checkpoint_format == "safetensors":
+            with safetensors.safe_open(path, framework="pt", device=str(device)) as file:
+                for name in file.keys():
+                    if selected_names is None or name in selected_names:
+                        yield name, file.get_tensor(name)
+            continue
+
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            checkpoint = checkpoint["state_dict"]
+        for name, tensor in checkpoint.items():
+            if selected_names is not None and name not in selected_names:
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"Checkpoint entry {name!r} in {path} is not a tensor"
+                )
+            yield name, tensor.to(device)
+        del checkpoint
 
 
 def _shard_tensor(
@@ -105,13 +192,12 @@ def load_weight(
     skip_prefixes: tuple[str, ...] = (),
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
-    and on device. Peak CPU memory: one full tensor + a small merge buffer."""
+    and on device. Peak CPU memory is one tensor for safetensors or one PyTorch shard,
+    plus the model-specific merge buffers."""
     from .register import make_model_config
 
     model_folder = resolve_model_path(model_path)
     config = make_model_config(load_model_config(model_folder))
-    files = glob.glob(f"{model_folder}/*.safetensors")
-    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
 
     # Fused linear-attention in_proj_qkv = [q; k; v] with different region sizes; naive
@@ -126,49 +212,51 @@ def load_weight(
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
-    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for checkpoint_name in f.keys():
-                # Skip vision/projector weights from multimodal wrappers.
-                if checkpoint_name.startswith(
-                    ("vision_tower.", "multi_modal_projector.", "model.visual.")
-                ):
-                    continue
-                name = checkpoint_name
-                name = name.removeprefix("language_model.")
-                # Qwen3.5: text weights live under model.language_model.*.
-                name = name.replace("model.language_model.", "model.", 1)
-                if name.startswith(skip_prefixes):
-                    continue
-                raw = f.get_tensor(checkpoint_name)
-                tensor = _shard_tensor(
-                    name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, qkv_regions
-                )
-                del raw
+    weights = iter_checkpoint_weights(
+        model_folder,
+        device,
+        show_progress=tp_info.is_primary(),
+    )
+    for checkpoint_name, raw in weights:
+        # Skip vision/projector weights from multimodal wrappers.
+        if checkpoint_name.startswith(
+            ("vision_tower.", "multi_modal_projector.", "model.visual.")
+        ):
+            continue
+        name = checkpoint_name
+        name = name.removeprefix("language_model.")
+        # Qwen3.5: text weights live under model.language_model.*.
+        name = name.replace("model.language_model.", "model.", 1)
+        if name.startswith(skip_prefixes):
+            continue
+        tensor = _shard_tensor(
+            name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, qkv_regions
+        )
+        del raw
 
-                info = _get_merge_info(name)
-                if info is None:
-                    out = (name, tensor)
-                else:
-                    merged_key, slot, all_slots = info
-                    merge_buf.setdefault(merged_key, {})[slot] = tensor
-                    if not all(s in merge_buf[merged_key] for s in all_slots):
-                        continue
-                    parts = [merge_buf[merged_key][s] for s in all_slots]
-                    del merge_buf[merged_key]
-                    out = (merged_key, torch.cat(parts, dim=0))
+        info = _get_merge_info(name)
+        if info is None:
+            out = (name, tensor)
+        else:
+            merged_key, slot, all_slots = info
+            merge_buf.setdefault(merged_key, {})[slot] = tensor
+            if not all(s in merge_buf[merged_key] for s in all_slots):
+                continue
+            parts = [merge_buf[merged_key][s] for s in all_slots]
+            del merge_buf[merged_key]
+            out = (merged_key, torch.cat(parts, dim=0))
 
-                if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
-                    packed_key, expert_idx = expert_info
-                    slots = expert_buf.setdefault(packed_key, {})
-                    slots[expert_idx] = out[1]
-                    if len(slots) != config.num_experts:
-                        continue
-                    experts = [slots[idx] for idx in range(config.num_experts)]
-                    del expert_buf[packed_key]
-                    yield packed_key, torch.stack(experts, dim=0)
-                else:  # Normal dense model
-                    yield out[0], out[1]
+        if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
+            packed_key, expert_idx = expert_info
+            slots = expert_buf.setdefault(packed_key, {})
+            slots[expert_idx] = out[1]
+            if len(slots) != config.num_experts:
+                continue
+            experts = [slots[idx] for idx in range(config.num_experts)]
+            del expert_buf[packed_key]
+            yield packed_key, torch.stack(experts, dim=0)
+        else:  # Normal dense model
+            yield out[0], out[1]
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"

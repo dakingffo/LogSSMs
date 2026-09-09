@@ -18,15 +18,23 @@ from picosgl.message.queue import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSu
 from picosgl.utils import init_logger
 
 if TYPE_CHECKING:
+    import multiprocessing as mp
+
     from .config import SchedulerConfig
 
 logger = init_logger(__name__)
 
 
 class SchedulerIOMixin:
-    def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
+    def __init__(
+        self,
+        config         : SchedulerConfig,
+        tp_cpu_group   : torch.distributed.ProcessGroup,
+        shutdown_event : mp.synchronize.Event | None = None,
+    ):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        self._shutdown_event: Final = shutdown_event
         self._idle = False
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
@@ -45,11 +53,9 @@ class SchedulerIOMixin:
                 encoder=BaseTokenizerMsg.encoder,
             )
 
+        distributed_timeout_ms = int(config.distributed_timeout * 1000)
+        self._idle_poll_ms: Final = max(1, min(1000, distributed_timeout_ms // 4))
         if tp_info.size > 1:
-            distributed_timeout_ms = int(config.distributed_timeout * 1000)
-            self._collective_idle_poll_ms: Final = max(
-                1, min(1000, distributed_timeout_ms // 4)
-            )
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
                 send = self._reply_tokenizer_rank0
@@ -94,13 +100,21 @@ class SchedulerIOMixin:
         if received:
             self._idle = False
 
+    def _shutdown_requested(self) -> bool:
+        return self._shutdown_event is not None and self._shutdown_event.is_set()
+
     def _recv_msg_single_rank(self, blocking: bool = False) -> list[BaseBackendMsg]:
         pending_msgs: list[BaseBackendMsg] = []
         if blocking:
             self._enter_idle()
+            while not self._recv_from_tokenizer.wait(self._idle_poll_ms):
+                if self._shutdown_requested():
+                    raise KeyboardInterrupt
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
+        if self._shutdown_requested():
+            raise KeyboardInterrupt
         self._leave_idle(bool(pending_msgs))
         return pending_msgs
 
@@ -109,14 +123,17 @@ class SchedulerIOMixin:
         pending_raw_msgs: list[bytes] = []
         if blocking:
             self._enter_idle()
-            if self._recv_from_tokenizer.wait(self._collective_idle_poll_ms):
+            if self._recv_from_tokenizer.wait(self._idle_poll_ms):
                 pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
         # broadcast the number of raw messages to all ranks
-        src_tensor = torch.tensor(len(pending_raw_msgs))
+        shutdown = self._shutdown_requested()
+        src_tensor = torch.tensor(-1 if shutdown else len(pending_raw_msgs))
         self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
+        if shutdown:
+            raise KeyboardInterrupt
 
         for raw in pending_raw_msgs:
             self._send_into_ranks.put_raw(raw)
@@ -133,6 +150,8 @@ class SchedulerIOMixin:
         dst_tensor = torch.tensor(-1)
         self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
         dst_length = int(dst_tensor.item())
+        if dst_length == -1:
+            raise KeyboardInterrupt
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())

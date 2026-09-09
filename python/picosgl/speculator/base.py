@@ -16,13 +16,14 @@ if TYPE_CHECKING:
         SpeculatorStepMsg,
     )
     from picosgl.scheduler.config import SchedulerConfig
+    from picosgl.models import ModelConfig
     from picosgl.models.drafters import BaseDrafterModel
 
 
 @dataclass(frozen=True)
 class SpeculatorReserve:
-    num_state_slots        : int = 0
-    state_slots_per_request: int = 0
+    num_draft_slots        : int = 0
+    draft_slots_per_request: int = 0
 
 
 class BaseSpeculatorConfig(ABC):
@@ -34,8 +35,15 @@ class BaseSpeculatorConfig(ABC):
         return 1
 
     @property
+    def requires_model_resolution(self) -> bool:
+        return False
+
+    @property
     @abstractmethod
     def max_init_hidden_rows(self) -> int: ...
+
+    def resolve(self, model_config: ModelConfig) -> BaseSpeculatorConfig:
+        return self
 
     @abstractmethod
     def make_reserve(self, max_running_req: int) -> SpeculatorReserve: ...

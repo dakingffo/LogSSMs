@@ -3,6 +3,8 @@ from picosgl.utils import Registry
 from ..args import SpeculatorArgumentParserBase
 from ..base import BaseSpeculatorConfig
 from ..hidden_captor import HiddenCaptorBase
+from .dflash.args import DFlashArgumentParser as _DFlashArgumentParser
+from .dflash.hidden_captor import DFlashHiddenCaptor as _DFlashHiddenCaptor
 from .eagle3.args import Eagle3ArgumentParser as _Eagle3ArgumentParser
 from .eagle3.hidden_captor import Eagle3HiddenCaptor as _Eagle3HiddenCaptor
 from .mtp.args import MTPArgumentParser as _MTPArgumentParser
@@ -14,9 +16,11 @@ SUPPORTED_SPECULATOR_ARGUMENT_PARSERS = Registry[
 ]("Speculator Argument Parser")
 SUPPORTED_SPECULATOR_ARGUMENT_PARSERS.register("MTP")(_MTPArgumentParser)
 SUPPORTED_SPECULATOR_ARGUMENT_PARSERS.register("EAGLE3")(_Eagle3ArgumentParser)
+SUPPORTED_SPECULATOR_ARGUMENT_PARSERS.register("DFLASH")(_DFlashArgumentParser)
 SUPPORTED_HIDDEN_CAPTORS = Registry[type[HiddenCaptorBase]]("Hidden Captor")
 SUPPORTED_HIDDEN_CAPTORS.register("MTP")(_MTPHiddenCaptor)
 SUPPORTED_HIDDEN_CAPTORS.register("EAGLE3")(_Eagle3HiddenCaptor)
+SUPPORTED_HIDDEN_CAPTORS.register("DFLASH")(_DFlashHiddenCaptor)
 
 
 def make_speculator_argument_parser(

@@ -4,6 +4,8 @@ from picosgl.core import SamplingParams
 from picosgl.distributed import DistributedInfo
 from picosgl.message import BaseSpeculatorMsg, make_handshake_message, make_init_message
 from picosgl.message.speculator.eagle3 import Eagle3HandshakeMsg, Eagle3InitMsg
+from picosgl.models.llama import LlamaConfig
+from picosgl.models.config import RotaryConfig
 from picosgl.scheduler import SchedulerConfig
 from picosgl.speculator import DataPlaneSizes, make_data_plane_sizes
 from picosgl.speculator.drafters import (
@@ -52,6 +54,25 @@ def test_eagle3_config_and_hidden_capture() -> None:
     expected = torch.cat(list(layers.values()), dim=-1)
     torch.testing.assert_close(captor.full_hidden, expected)
     torch.testing.assert_close(captor.select(slice(1, 3)).full_hidden, expected[1:3])
+
+
+def test_eagle3_default_layers_follow_target_depth() -> None:
+    target_config = LlamaConfig(
+        num_layers=16,
+        num_qo_heads=32,
+        num_kv_heads=8,
+        head_dim=64,
+        hidden_size=2048,
+        vocab_size=128256,
+        rms_norm_eps=1e-5,
+        rotary_config=RotaryConfig(64, 131072, 500000.0, None),
+        tie_word_embeddings=True,
+        architectures=["LlamaForCausalLM"],
+        intermediate_size=8192,
+        hidden_act="silu",
+    )
+    config = Eagle3SpeculatorConfig().resolve(target_config)
+    assert config.target_layer_ids == (2, 8, 13)
 
 
 def test_eagle3_messages_and_arguments() -> None:

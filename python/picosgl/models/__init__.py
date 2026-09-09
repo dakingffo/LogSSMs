@@ -1,7 +1,7 @@
 from .base import BaseLLMModel
 from .config import ModelConfig, RotaryConfig
 from .register import get_model_class, make_model_config
-from .weight import load_target_weight, load_weight
+from .weight import iter_checkpoint_weights, load_target_weight, load_weight
 
 
 def make_model(model_config: ModelConfig) -> BaseLLMModel:
@@ -11,6 +11,7 @@ def make_model(model_config: ModelConfig) -> BaseLLMModel:
 __all__ = [
     "ModelConfig",
     "RotaryConfig",
+    "iter_checkpoint_weights",
     "load_target_weight",
     "load_weight",
     "make_model",

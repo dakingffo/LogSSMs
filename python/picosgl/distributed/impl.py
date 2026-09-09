@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Literal, Protocol, cast
+from ctypes import c_void_p
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
     from picosgl.distributed import DistributedInfo
-
-    from .pynccl import PyNCCLCommunicator
 
 
 @dataclass
@@ -33,7 +32,12 @@ class NoopDistributedImpl(DistributedImpl):
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
-    comm: PyNCCLCommunicator
+    class NCCLWrapper(Protocol):
+        def all_reduce(self, input: torch.Tensor, op: Literal["sum"]) -> None: ...
+        def all_gather(self, output: torch.Tensor, input: torch.Tensor) -> None: ...
+        def get_buffer(self) -> c_void_p: ...
+
+    comm: NCCLWrapper
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         self.comm.all_reduce(x, "sum")
@@ -71,13 +75,13 @@ def enable_pynccl_distributed(
 
     # Wrap the raw PyNCCL FFI object so its all_reduce(x, "sum") signature matches the
     # DistributedImpl protocol (callers invoke impl.all_reduce(x)).
-    comm = init_pynccl(
+    wrapper = init_pynccl(
         tp_rank=tp_info.rank,
         tp_size=tp_info.size,
         tp_cpu_group=tp_cpu_group,
         max_size_bytes=max_bytes,
     )
-    DistributedCommunicator.impl = PyNCCLDistributedImpl(comm=comm)
+    DistributedCommunicator.impl = PyNCCLDistributedImpl(comm=wrapper)
 
 
 def destroy_distributed() -> None:

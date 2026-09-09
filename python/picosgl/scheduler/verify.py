@@ -21,7 +21,7 @@ from .ar import ARManagerBase, ForwardInput
 if TYPE_CHECKING:
     from picosgl.speculator import SpeculatorClientBase
 
-    from .cache import CacheManager
+    from picosgl.cache import BaseCacheManager
     from .config import SchedulerConfig
     from .table import TableManager
 
@@ -50,7 +50,7 @@ class VerifyManager(ARManagerBase):
         self,
         config        : SchedulerConfig,
         device        : torch.device,
-        cache_manager : CacheManager,
+        cache_manager : BaseCacheManager,
         table_manager : TableManager,
         eos_token_id  : int,
         client        : SpeculatorClientBase,
@@ -62,7 +62,6 @@ class VerifyManager(ARManagerBase):
         speculative_algorithm = config.speculative_algorithm
         assert speculative_algorithm is not None
 
-        self.page_table = table_manager.page_table
         self.speculative_algorithm = speculative_algorithm
         self.speculator_config = speculator_config
         self.num_spec_tokens = speculator_config.num_draft_tokens
@@ -111,13 +110,13 @@ class VerifyManager(ARManagerBase):
         self.inflight_uids[0] = self.inflight_uids[1]
         self.inflight_uids[1] = set()
 
-        K = self.num_spec_tokens       
+        K = self.num_spec_tokens
+
         if (0 < len(self.inflight_uids[0]) * K < self.token_budget 
             and len(self.running_reqs) > len(self.inflight_uids[0])):
             # skip one iteration to try achieving a larger batch size
             return None
 
-        
         scheduled_token = 0
         reqs = []
         step_reqs = []
@@ -128,11 +127,11 @@ class VerifyManager(ARManagerBase):
             elif uid not in self.inflight_uids[0]:
                 self.inflight_uids[1].add(uid)
                 reqs.append(req)
-                scheduled_token += K
                 C = req.cached_len
                 remain = req.remain_len
                 n_drafts = min(K, remain - 1) if remain > 0 else 0
-                req.device_len = C + n_drafts + 1
+                scheduled_token += n_drafts + 1
+                req.extend_device_n(n_drafts)
                 toks, pos, hids = self._state_table[req.table_idx].get_carry()
                 step_reqs.append(
                     SpeculatorStepReq(
@@ -174,7 +173,6 @@ class VerifyManager(ARManagerBase):
         draft_probs: torch.Tensor | None = None
         for i, req in enumerate(reqs):
             st = self._state_table[req.table_idx]
-            C = req.cached_len
             st.draft_tokens = reply_by_uid[req.uid].draft_tokens
             if req.uid in probs_by_uid:
                 st.draft_probs = probs_by_uid[req.uid]
@@ -185,6 +183,7 @@ class VerifyManager(ARManagerBase):
                 n = st.draft_probs.shape[0]
                 draft_probs[i, :n] = st.draft_probs
             if st.draft_tokens:
+                C = req.cached_len
                 self.token_pool[req.table_idx, C + 1: C + 1 + len(st.draft_tokens)].copy_(
                     torch.tensor(st.draft_tokens, dtype=torch.int32, device=self.device)
                 )
@@ -206,56 +205,49 @@ class VerifyManager(ARManagerBase):
         if not batch.is_verify:
             return super().process(ctx, forward_input, output)  # prefill commit
 
-        extend_token = output.next_tokens_gpu  # (bs, K+1) int32
+        extend_tokens = output.next_tokens_gpu  # (bs, K+1) int32
         hidden_captor = batch.hidden_captor
         assert hidden_captor is not None
-        offset = 0
-        committed: list[tuple[int, int, list[int], int]] = [tuple()] * len(batch.reqs)
-
-        for i, (req, extend_token) in enumerate(zip(forward_input.batch.reqs, extend_token)):
-            num_sampled = req.extend_len
-            row_start = offset
-            offset += num_sampled
-            if req.uid not in self.running_reqs:
-                continue
-            st = self._state_table.get(req.table_idx, None)
-            n_drafts = num_sampled - 1
-            C = req.cached_len
-
-            sampled_token = []
-            for j in range(n_drafts):
-                tok = int(extend_token[j].item())
-                if tok != st.draft_tokens[j]:
-                    sampled_token.append(tok)
-                    break
-                sampled_token.append(tok)
-            else:
-                sampled_token.append(int(extend_token[n_drafts].item()))  # full-accept bonus
-            num_sampled = len(sampled_token)
-
-            req.device_len = C + 1
-            req.complete_n(num_sampled)
-            # commit the accepted states: pure index ops on the reserve (pin/swap/refill)
-            self.cache_manager.state_commit_verify(req, C, num_sampled)
-            self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
-            st.set_carry(
-                sampled_token,
-                list(range(C + 1, C + 1 + num_sampled)),
-                hidden_captor.get_carry_hidden(
-                    slice(row_start, row_start + num_sampled)
-                ),
-            )
-            committed[i] = (C, num_sampled, sampled_token, n_drafts)
-
         reply: list[DetokenizeMsg] = []
         new_finished: set[Request] = set()
+        offset = 0
 
         with self.cache_manager.lazy_free_region():
-            for req, com in zip(batch.reqs, committed):
+            for req, target_tokens in zip(batch.reqs, extend_tokens):
+                verify_len = req.extend_len
+                row_start = offset
+                offset += verify_len
                 if req.uid not in self.running_reqs:
                     continue
-                st = self._state_table.get(req.table_idx, None)
-                C, num_sampled, sampled_token, n_drafts = com
+
+                st = self._state_table[req.table_idx]
+                n_drafts = verify_len - 1
+                C = req.cached_len
+
+                sampled_token = []
+                for j in range(n_drafts):
+                    tok = int(target_tokens[j].item())
+                    sampled_token.append(tok)
+                    if tok != st.draft_tokens[j]:
+                        break
+                else:
+                    sampled_token.append(
+                        int(target_tokens[n_drafts].item())  # full-accept bonus
+                    )
+                num_sampled = len(sampled_token)
+
+                req.complete_to_device_len(progress=num_sampled)
+                # Promote the accepted snapshots by swapping reserve and live page slot ids.
+                self.cache_manager.commit_speculative(req, C, num_sampled)
+                self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
+                st.set_carry(
+                    sampled_token,
+                    list(range(C + 1, C + 1 + num_sampled)),
+                    hidden_captor.get_carry_hidden(
+                        slice(row_start, row_start + num_sampled)
+                    ),
+                )
+                self.cache_manager.free_to_cached(req)
 
                 stop, finish = num_sampled, not req.can_decode
                 for idx, tok in enumerate(sampled_token):
@@ -267,17 +259,6 @@ class VerifyManager(ARManagerBase):
                     DetokenizeMsg(uid=req.uid, next_token=sampled_token[:stop], finished=finish)
                 )
                 req.append_host(torch.tensor(sampled_token, dtype=torch.int32))
-
-                if num_sampled <= n_drafts:
-                    ps = self.page_size
-                    C_end = C + num_sampled
-                    suffix_end = C + n_drafts + 1  # exclusive
-                    for page in range(C_end // ps, div_ceil(suffix_end, ps)):
-                        if C_end - 1 < page * ps:
-                            p_start = page * ps
-                            self.cache_manager._free(
-                                self.page_table[req.table_idx, p_start: p_start + ps]
-                            )
 
                 if finish and req not in self.finished_reqs:
                     self._finish_req(req)

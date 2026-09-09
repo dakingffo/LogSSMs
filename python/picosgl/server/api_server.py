@@ -8,17 +8,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-import psutil
 import uvicorn
 import fastapi
 import pydantic
 from fastapi.responses import StreamingResponse
-from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
-from starlette.background import BackgroundTask
 
 from picosgl.core import SamplingParams
-from picosgl.env import ENV
 from picosgl.message import (
     AbortMsg,
     BaseFrontendMsg,
@@ -316,95 +311,7 @@ async def available_models():
     return Modellist(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
 
-async def shell_completion(req: OpenAICompletionRequest):
-    state = get_global_state()
-    assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [msg.model_dump() for msg in req.messages]
-
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
-    )
-
-    async def _abort():
-        await state.abort_user(uid)
-
-    return StreamingResponse(
-        state.stream_generate(uid),
-        media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
-    )
-
-
-
-async def shell():
-    session = PromptSession("$ ", completer=WordCompleter(["/exit", "/reset"]))
-
-    try:
-        history: list[tuple[str, str]] = []
-        while True:
-            cmd = (await session.prompt_async()).strip()
-            if cmd == "":
-                continue
-            if cmd.startswith("/"):
-                if cmd == "/exit":
-                    return
-                if cmd == "/reset":
-                    history = []
-                    continue
-                raise ValueError(f"Unknown command: {cmd}")
-            history_messages: list[Message] = []
-            for user_msg, assistant_msg in history:
-                history_messages.append(Message(role="user", content=user_msg))
-                history_messages.append(Message(role="assistant", content=assistant_msg))
-            # send to server
-            req = OpenAICompletionRequest(
-                model="",
-                messages=history_messages + [Message(role="user", content=cmd)],
-                max_tokens=ENV.SHELL_MAX_TOKENS.value,
-                top_k=ENV.SHELL_TOP_K.value,
-                top_p=ENV.SHELL_TOP_P.value,
-                temperature=ENV.SHELL_TEMPERATURE.value,
-                stream=True,
-            )
-            cur_msg = ""
-            async for chunk in (await shell_completion(req)).body_iterator:
-                msg = chunk.decode()  # type: ignore
-                assert msg.startswith("data: "), msg
-                msg = msg[6:]
-                assert msg.endswith("\n"), msg
-                msg = msg[:-1]
-                if msg == "[DONE]":
-                    continue
-                cur_msg += msg
-                print(msg, end="", flush=True)
-            print("", flush=True)
-            history.append((cmd, cur_msg))
-    except EOFError:
-        # user pressed Ctrl-D
-        pass
-    finally:
-        print("Exiting shell...")
-        await asyncio.sleep(0.1)
-        get_global_state().shutdown()
-
-        parent = psutil.Process()
-        for child in parent.children(recursive=True):
-            child.kill()
-
-
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(config: ServerArgs, start_backend: Callable[[], None]) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -412,13 +319,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         config: Server configuration (host/port, ZMQ IPC addresses, etc).
         start_backend: Callback that launches the backend worker processes (TP schedulers +
             tokenizer/detokenizer).
-        run_shell: If True, run an interactive terminal shell instead of starting uvicorn.
     """
 
     global _GLOBAL_STATE
-
-    if run_shell:
-        assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
 
     host = config.server_host
     port = config.server_port
@@ -442,7 +345,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     start_backend()
 
     logger.info(f"API server is ready to serve on {host}:{port}")
-    if not run_shell:
-        uvicorn.run(app, host=host, port=port)
-    else:
-        asyncio.run(shell())
+    uvicorn.run(app, host=host, port=port)

@@ -8,7 +8,7 @@ import torch
 from picosgl.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
-    from picosgl.core import Batch, Request
+    from picosgl.core import Batch
 
 
 @dataclass
@@ -114,13 +114,6 @@ class Sampler:
             ),
         )
 
-    @nvtx_annotate("Sampler")
-    def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
-        if args.is_greedy:  # greedy sampling
-            return torch.argmax(logits, dim=-1)
-        else:
-            return sample_impl(logits.float(), args)
-
     def probabilities(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         assert args.temperatures is not None
         return normalize_probs(
@@ -133,40 +126,80 @@ class Sampler:
         )
 
     @nvtx_annotate("Sampler")
+    def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
+        if args.is_greedy:  # greedy sampling
+            return torch.argmax(logits, dim=-1)
+        else:
+            return sample_impl(logits.float(), args)
+
+    def _greedy_reject(
+        self,
+        target_logits: torch.Tensor,
+        drafts       : torch.Tensor,
+    ) -> torch.Tensor:
+        target_tokens = target_logits.argmax(dim=-1).to(torch.int32)
+        num_drafts = drafts.shape[1]
+        if num_drafts == 0:
+            return target_tokens[:, :1]
+
+        matches = target_tokens[:, :num_drafts] == drafts
+        accepted = matches.to(torch.int64).cumprod(dim=1).sum(dim=1)
+        positions = torch.arange(num_drafts, device=self.device)
+        output = torch.where(
+            positions[None, :] < accepted[:, None],
+            drafts,
+            -1,
+        )
+        output = torch.cat(
+            [output, output.new_full((output.shape[0], 1), -1)],
+            dim=1,
+        )
+        bonus = target_tokens.gather(1, accepted[:, None])
+        output.scatter_(1, accepted[:, None], bonus)
+        return output
+
+    def _sampling_reject(
+        self,
+        target_logits: torch.Tensor,
+        drafts       : torch.Tensor,
+        draft_probs  : torch.Tensor | None,
+        params       : list,
+    ) -> torch.Tensor:
+        import flashinfer.sampling as sampling
+
+        batch_size, seq_len, _ = target_logits.shape
+        args = self.prepare_params([
+            param for param in params for _ in range(seq_len)
+        ])
+        target_probs = self.probabilities(
+            target_logits.flatten(0, 1), args
+        ).view(batch_size, seq_len, self.vocab_size)
+        if drafts.shape[1] == 0:
+            return sampling.sampling_from_probs(target_probs[:, 0]).unsqueeze(1)
+
+        assert draft_probs is not None, "sampling verify batch needs draft_probs"
+        output, _, _ = sampling.chain_speculative_sampling(
+            draft_probs,
+            drafts,
+            target_probs,
+        )
+        return output
+
+    @nvtx_annotate("Sampler")
     def reject_sample(self, logits, batch) -> torch.Tensor:
-        """Spec-decode rejection sampling. Returns extend_token (bs, K+1) int32.
-
-        Row layout per request: [draft_0, ..., draft_{num_sampled-2}, new_bonus, PAD...]
-        (PAD = -1). VerifyManager derives num_sampled by comparing extend_token against its
-        own draft_tokens: the first differing index i gives num_sampled = i+1 (if every draft
-        matched, num_sampled = K+1 and the bonus is extend_token[K]).
-
-        greedy  : drafts are argmax (delta distribution); accept draft_i iff
-                  argmax(logits[C+i]) == draft_i; bonus = argmax there (never equals the
-                  rejected draft).
-        sampling: drafts are sampled from the MTP head; accept draft_i with prob
-                  min(1, p_target(d_i)/p_draft(d_i)); on rejection the bonus is drawn via
-                  residual-Gumbel from max(0, p_target - p_draft) -- the residual at the
-                  rejected draft is 0 (rejection implies p_target(d) < p_draft(d)), so the
-                  bonus never equals it, which keeps the count-by-comparison safe. When all
-                  drafts are accepted the bonus is sampled from p_target at the last window
-                  position.
-
-        ``logits`` is (T, vocab) full-position logits; each request's n_drafts+1 rows are
-        sliced by ``req.extend_len`` in batch.reqs order (same segmentation as the input tuple).
-        """
+        """Return accepted drafts followed by one target bonus token and -1 padding."""
         bs = batch.size
         K = 0 if batch.draft_tokens is None else batch.draft_tokens.shape[1]
         extend_token = torch.full((bs, K + 1), -1, dtype=torch.int32, device=self.device)
         if K == 0:
             return extend_token
 
-        groups: dict[tuple[bool, int], list[tuple[int, int, Request]]] = {}
+        groups: dict[tuple[bool, int], list[tuple[int, int]]] = {}
         offset = 0
         for batch_idx, req in enumerate(batch.reqs):
             num_drafts = req.extend_len - 1
             groups.setdefault((req.sampling_params.is_greedy, num_drafts), []).append(
-                (batch_idx, offset, req)
+                (batch_idx, offset)
             )
             offset += num_drafts + 1
         assert offset == logits.shape[0]
@@ -174,12 +207,12 @@ class Sampler:
         for (is_greedy, num_drafts), entries in groups.items():
             seq_len = num_drafts + 1
             batch_indices = torch.tensor(
-                [batch_idx for batch_idx, _offset, _req in entries],
+                [batch_idx for batch_idx, _offset in entries],
                 dtype=torch.int64,
                 device=self.device,
             )
             row_indices = torch.tensor(
-                [row for _batch_idx, begin, _req in entries
+                [row for _batch_idx, begin in entries
                  for row in range(begin, begin + seq_len)],
                 dtype=torch.int64,
                 device=self.device,
@@ -192,48 +225,24 @@ class Sampler:
             )[:, :num_drafts].contiguous()
 
             if is_greedy:
-                target_tokens = target_logits.argmax(dim=-1).to(torch.int32)
-                if num_drafts == 0:
-                    accepted = torch.zeros(len(entries), dtype=torch.int64, device=self.device)
-                else:
-                    matches = target_tokens[:, :num_drafts] == drafts
-                    accepted = matches.to(torch.int64).cumprod(dim=1).sum(dim=1)
-                output = torch.full(
-                    (len(entries), seq_len), -1, dtype=torch.int32, device=self.device
-                )
-                if num_drafts > 0:
-                    positions = torch.arange(num_drafts, device=self.device)
-                    output[:, :num_drafts] = torch.where(
-                        positions[None, :] < accepted[:, None], drafts, -1
-                    )
-                bonus = target_tokens.gather(1, accepted[:, None])
-                output.scatter_(1, accepted[:, None], bonus)
+                output = self._greedy_reject(target_logits, drafts)
             else:
                 params = [
-                    req.sampling_params
-                    for _batch_idx, _offset, req in entries
-                    for _ in range(seq_len)
+                    batch.reqs[batch_idx].sampling_params
+                    for batch_idx, _offset in entries
                 ]
-                args = self.prepare_params(params)
-                target_probs = self.probabilities(
-                    target_logits.flatten(0, 1), args
-                ).view(len(entries), seq_len, self.vocab_size)
-                if num_drafts == 0:
-                    import flashinfer.sampling as sampling
-
-                    output = sampling.sampling_from_probs(target_probs[:, 0]).unsqueeze(1)
-                else:
-                    import flashinfer.sampling as sampling
-
-                    assert batch.draft_probs is not None, (
-                        "sampling verify batch needs draft_probs"
-                    )
-                    draft_probs = batch.draft_probs.index_select(
+                draft_probs = (
+                    batch.draft_probs.index_select(
                         0, batch_indices
                     )[:, :num_drafts].contiguous()
-                    output, _, _ = sampling.chain_speculative_sampling(
-                        draft_probs, drafts, target_probs
-                    )
+                    if batch.draft_probs is not None else None
+                )
+                output = self._sampling_reject(
+                    target_logits,
+                    drafts,
+                    draft_probs,
+                    params,
+                )
             extend_token[batch_indices, :seq_len] = output
 
         return extend_token

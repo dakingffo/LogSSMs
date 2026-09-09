@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import glob
-import os
-
-import safetensors
 import torch
 
 from picosgl.layers import (
@@ -16,6 +12,7 @@ from picosgl.layers import (
     RotaryAttention,
     VocabParallelEmbedding,
 )
+from picosgl.models.weight import iter_checkpoint_weights
 
 from .base import BaseDrafterModel
 
@@ -102,13 +99,6 @@ class Eagle3Drafter(BaseDrafterModel):
         return self._hot_token_id
 
     def load_weights(self, model_path: str, device: torch.device) -> None:
-        checkpoint_path = os.path.join(model_path, "pytorch_model.bin")
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
-        )
         state_dict: dict[str, torch.Tensor] = {}
         merge_groups = {
             "midlayer.self_attn.qkv_proj.weight": (
@@ -121,21 +111,37 @@ class Eagle3Drafter(BaseDrafterModel):
                 "midlayer.mlp.up_proj.weight",
             ),
         }
-        consumed = {name for names in merge_groups.values() for name in names}
-        for target_name, source_names in merge_groups.items():
-            state_dict[target_name] = torch.cat(
-                [checkpoint[name] for name in source_names], dim=0
-            ).to(device)
-        for name, tensor in checkpoint.items():
-            if name in consumed or name in ("d2t", "t2d"):
+        source_info = {
+            source_name: (target_name, source_index)
+            for target_name, source_names in merge_groups.items()
+            for source_index, source_name in enumerate(source_names)
+        }
+        merge_buf: dict[str, dict[int, torch.Tensor]] = {}
+        d2t: torch.Tensor | None = None
+        for name, tensor in iter_checkpoint_weights(model_path):
+            if name == "d2t":
+                d2t = tensor
                 continue
-            state_dict[name] = tensor.to(device)
+            if name == "t2d":
+                continue
+            if name not in source_info:
+                state_dict[name] = tensor.to(device)
+                continue
 
-        d2t = checkpoint["d2t"]
+            target_name, source_index = source_info[name]
+            parts = merge_buf.setdefault(target_name, {})
+            parts[source_index] = tensor
+            if len(parts) == len(merge_groups[target_name]):
+                state_dict[target_name] = torch.cat(
+                    [parts[index] for index in range(len(parts))], dim=0
+                ).to(device)
+                del merge_buf[target_name]
+
+        assert not merge_buf, f"Incomplete EAGLE3 merge groups: {list(merge_buf)}"
+        assert d2t is not None, f"Checkpoint {model_path} does not contain d2t"
         self._hot_token_id = (
             d2t + torch.arange(d2t.shape[0], dtype=d2t.dtype)
         ).to(device)
-        del checkpoint
         self.load_state_dict(state_dict)
 
     def load_target_embedding(
@@ -144,16 +150,13 @@ class Eagle3Drafter(BaseDrafterModel):
         device    : torch.device,
     ) -> None:
         key = "model.embed_tokens.weight"
-        for path in glob.glob(os.path.join(model_path, "*.safetensors")):
-            with safetensors.safe_open(path, framework="pt", device="cpu") as file:
-                if key in file.keys():
-                    weight = file.get_tensor(key)
-                    assert weight.shape == self._embed_tokens.weight.shape
-                    self._embed_tokens.weight = weight.to(
-                        device=device,
-                        dtype=self._embed_tokens.weight.dtype,
-                    )
-                    return
+        for _, weight in iter_checkpoint_weights(model_path, names={key}):
+            assert weight.shape == self._embed_tokens.weight.shape
+            self._embed_tokens.weight = weight.to(
+                device=device,
+                dtype=self._embed_tokens.weight.dtype,
+            )
+            return
         raise KeyError(f"Target checkpoint does not contain {key}")
 
     def prepare_cache_rows(

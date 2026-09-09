@@ -29,7 +29,7 @@ class Eagle3ArgumentParser(SpeculatorArgumentParserBase):
     @staticmethod
     def make_config(kwargs: dict) -> Eagle3SpeculatorConfig:
         target_layer_ids = kwargs.pop("eagle3_target_layer_ids")
-        if len(target_layer_ids) != 3:
+        if target_layer_ids is not None and len(target_layer_ids) != 3:
             raise ValueError("--eagle3-target-layer-ids requires exactly three layers")
         return Eagle3SpeculatorConfig(
             num_draft_tokens=kwargs.pop("speculative_num_draft_tokens"),

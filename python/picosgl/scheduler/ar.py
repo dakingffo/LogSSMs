@@ -12,7 +12,7 @@ from picosgl.utils import align_ceil
 if TYPE_CHECKING:
     from picosgl.speculator import HiddenCaptorBase
 
-    from .cache import CacheManager
+    from picosgl.cache import BaseCacheManager
     from .config import SchedulerConfig
     from .table import TableManager
 
@@ -22,7 +22,7 @@ class ARManagerBase:
         self,
         config       : SchedulerConfig,
         device       : torch.device,
-        cache_manager: CacheManager,
+        cache_manager: BaseCacheManager,
         table_manager: TableManager,
         eos_token_id : int,
     ) -> None:

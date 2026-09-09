@@ -11,11 +11,11 @@ from picosgl.speculator import make_local_data_plane_pair, speculator_worker
 from picosgl.tokenizer import tokenize_worker, detokenize_worker
 
 
-def launch_server(run_shell: bool = False) -> None:
+def launch_server() -> None:
     from .api_server import run_api_server
     from .args import parse_args
 
-    server_args, run_shell = parse_args(sys.argv[1:], run_shell)
+    server_args = parse_args(sys.argv[1:])
     logger = init_logger(__name__, "initializer")
 
     def start_subprocess() -> None:
@@ -23,6 +23,7 @@ def launch_server(run_shell: bool = False) -> None:
 
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue[str] = mp.Queue()
+        scheduler_shutdown_event = mp.Event()
         enable_speculator_worker = server_args.speculative_algorithm is not None
         speculator_start_event = (
             mp.Event()
@@ -50,6 +51,7 @@ def launch_server(run_shell: bool = False) -> None:
                 "speculator_start_event": speculator_start_event,
                 "speculator_ready_event": speculator_ready_event,
                 "speculator_data_plane": target_data_plane if i == 0 else None,
+                "shutdown_event": scheduler_shutdown_event,
             }
             mp.Process(
                 target=schedule_worker,
@@ -106,7 +108,7 @@ def launch_server(run_shell: bool = False) -> None:
         for _ in range(num_workers):
             logger.info(ack_queue.get())
 
-    run_api_server(server_args, start_subprocess, run_shell=run_shell)
+    run_api_server(server_args, start_subprocess)
 
 
 if __name__ == "__main__":

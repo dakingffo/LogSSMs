@@ -24,6 +24,7 @@ from .data_plane import (
 )
 from .drafters.mtp import MTPDraftManager, MTPEngine
 from .drafters.eagle3 import Eagle3DraftManager, Eagle3Engine
+from .drafters.dflash import DFlashDraftManager, DFlashEngine
 from .runner import SpeculatorRunner
 from .client import (
     BroadcastSpeculatorClient,
@@ -42,6 +43,8 @@ SUPPORTED_DRAFT_MANAGER.register("MTP")(MTPDraftManager)
 SUPPORTED_DRAFTER_ENGINE.register("MTP")(MTPEngine)
 SUPPORTED_DRAFT_MANAGER.register("EAGLE3")(Eagle3DraftManager)
 SUPPORTED_DRAFTER_ENGINE.register("EAGLE3")(Eagle3Engine)
+SUPPORTED_DRAFT_MANAGER.register("DFLASH")(DFlashDraftManager)
+SUPPORTED_DRAFTER_ENGINE.register("DFLASH")(DFlashEngine)
 logger = init_logger(__name__)
 
 

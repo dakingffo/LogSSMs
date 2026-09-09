@@ -13,6 +13,7 @@ from picosgl.utils import init_logger, nvtx_annotate
 
 if TYPE_CHECKING:
     from picosgl.layers.attention_backend import BaseAttnBackend
+    from picosgl.layers.linear_attention_backend import BaseLinearAttentionBackend
     from picosgl.models import BaseLLMModel
 
 logger = init_logger(__name__)
@@ -73,16 +74,17 @@ def get_free_memory(device: torch.device) -> int:
 class GraphRunner:
     def __init__(
         self,
-        stream           : torch.cuda.Stream,
-        device           : torch.device,
-        model            : BaseLLMModel,
-        attn_backend     : BaseAttnBackend,
-        cuda_graph_bs    : list[int] | None,
-        cuda_graph_max_bs: int | None,
-        free_memory      : int,
-        max_seq_len      : int,
-        vocab_size       : int,
-        dummy_req        : Request,
+        stream             : torch.cuda.Stream,
+        device             : torch.device,
+        model              : BaseLLMModel,
+        attn_backend       : BaseAttnBackend,
+        linear_attn_backend: BaseLinearAttentionBackend | None,
+        cuda_graph_bs      : list[int] | None,
+        cuda_graph_max_bs  : int | None,
+        free_memory        : int,
+        max_seq_len        : int,
+        vocab_size         : int,
+        dummy_req          : Request,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -90,6 +92,7 @@ class GraphRunner:
             free_memory=free_memory,
         )
         self.attn_backend = attn_backend
+        self.linear_attn_backend = linear_attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
@@ -103,6 +106,10 @@ class GraphRunner:
             return logger.info_rank0("CUDA graph is disabled.")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
+        if self.linear_attn_backend is not None:
+            self.linear_attn_backend.init_capture_graph(
+                max_seq_len=max_seq_len, bs_list=self.graph_bs_list
+            )
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -129,6 +136,8 @@ class GraphRunner:
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
+            if self.linear_attn_backend is not None:
+                self.linear_attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward() # trigger JIT
@@ -149,6 +158,8 @@ class GraphRunner:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
         self.attn_backend.prepare_for_replay(batch)
+        if self.linear_attn_backend is not None:
+            self.linear_attn_backend.prepare_for_replay(batch)
         self.graph_map[batch.padded_size].replay()
         return self.buffer.logits[:batch.size]
 

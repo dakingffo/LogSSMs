@@ -86,10 +86,8 @@ class MTPEngine(EngineBase):
         device: torch.device, config: EngineConfig
     ) -> Qwen3_5MTPDrafter:
         from picosgl.layers import set_rope_device
-        from picosgl.models.qwen3_next import Qwen3_5Config
 
         mc = config.model_config
-        assert isinstance(mc, Qwen3_5Config)
         set_rope_device(device)
         with torch.device("meta"), torch_dtype(config.dtype):
             drafter = Qwen3_5MTPDrafter(mc)

@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from tqdm.asyncio import tqdm
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 ModelSource = Literal["huggingface", "modelscope"]
 
@@ -37,11 +38,32 @@ def _load_config_json(model_path: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def _make_config_namespace(config: dict[str, Any]) -> Any:
+    from types import SimpleNamespace
+
+    dict_keys = ("rope_parameters", "rope_scaling")
+    return SimpleNamespace(
+        **{
+            key: (
+                _make_config_namespace(value)
+                if isinstance(value, dict) and key not in dict_keys else
+                value
+            )
+            for key, value in config.items()
+        }
+    )
+
+
 def load_model_config(
     model_path: str,
     source    : ModelSource = "huggingface",
 ) -> PretrainedConfig:
     model_path = resolve_model_path(model_path, source, download_weights=False)
+    raw_config = _load_config_json(model_path)
+    model_type = raw_config.get("model_type")
+    if model_type is not None and model_type not in CONFIG_MAPPING:
+        return _make_config_namespace(raw_config)
+
     try:
         config = _load_transformers_config(model_path)
         return type(config)(**config.to_dict())
@@ -49,23 +71,9 @@ def load_model_config(
         # Fallback for architectures not yet registered in this transformers version
         # (e.g. Qwen3Next). Builds a lightweight attribute object mirroring the config;
         # picosgl only reads attributes off it, so this is sufficient.
-        from types import SimpleNamespace
-
         logger = __import__("logging").getLogger("picosgl.platform")
         logger.warning("AutoConfig failed for %s, falling back to raw config.json", model_path)
-        # Mirror HF PretrainedConfig: dicts become attribute-accessible namespaces, except
-        # rope_parameters / rope_scaling which picosgl reads as dicts.
-        _DICT_KEYS = ("rope_parameters", "rope_scaling")
-
-        def _ns(d: dict) -> Any:
-            return SimpleNamespace(
-                **{
-                    k: (_ns(v) if isinstance(v, dict) and k not in _DICT_KEYS else v)
-                    for k, v in d.items()
-                }
-            )
-
-        return _ns(_load_config_json(model_path))
+        return _make_config_namespace(raw_config)
 
 
 def resolve_model_path(
@@ -81,9 +89,9 @@ def resolve_model_path(
     if os.path.isdir(model_path):
         return model_path
 
-    unsupported_weight_patterns = ["*.bin", "*.pt", "*.ckpt", "*.gguf"]
+    unsupported_weight_patterns = ["*.pt", "*.ckpt", "*.gguf"]
     ignore_patterns = unsupported_weight_patterns + (
-        [] if download_weights else ["*.safetensors"]
+        [] if download_weights else ["*.safetensors", "*.bin"]
     )
 
     try:

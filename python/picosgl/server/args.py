@@ -22,7 +22,7 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
-def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bool]:
+def parse_args(args: list[str]) -> ServerArgs:
     """
     Parse command line arguments and return an EngineConfig.
 
@@ -33,8 +33,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         EngineConfig instance with parsed arguments
     """
     from picosgl.layers.attention_backend import validate_attn_backend
-    from picosgl.layers.linear_attention_backend import SUPPORTED_LINEAR_ATTENTION_BACKENDS
-    from picosgl.cache import SUPPORTED_CACHE_MANAGER
+    from picosgl.cache import SUPPORTED_PREFIX_CACHE
     from picosgl.layers.moe_backend import SUPPORTED_MOE_BACKENDS
     from picosgl.speculator.drafters import (
         SUPPORTED_SPECULATOR_ARGUMENT_PARSERS,
@@ -188,13 +187,6 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--linear-attention-backend",
-        default=ServerArgs.linear_attention_backend,
-        choices=["auto"] + SUPPORTED_LINEAR_ATTENTION_BACKENDS.supported_names(),
-        help="The linear attention backend used by hybrid models.",
-    )
-
-    parser.add_argument(
         "--model-source",
         type=str,
         default="huggingface",
@@ -206,7 +198,7 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         "--cache-type",
         type=str,
         default=ServerArgs.cache_type,
-        choices=SUPPORTED_CACHE_MANAGER.supported_names(),
+        choices=SUPPORTED_PREFIX_CACHE.supported_names(),
         help="The KV cache management strategy.",
     )
 
@@ -215,12 +207,6 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
         help="The MoE backend to use.",
-    )
-
-    parser.add_argument(
-        "--shell-mode",
-        action="store_true",
-        help="Run the server in shell mode.",
     )
 
     parser.add_argument(
@@ -251,13 +237,6 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     kwargs = parser.parse_args(args).__dict__.copy()
 
     assert kwargs["num_tokenizer"] >= 1, "--num-tokenizer must be >= 1"
-
-    # resolve some arguments
-    run_shell |= kwargs.pop("shell_mode")
-    if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
-        kwargs["max_running_req"] = 1
-        kwargs["silent_output"] = True
 
     if speculator_parser is not None:
         kwargs["speculator_config"] = speculator_parser.make_config(kwargs)
@@ -291,6 +270,17 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
             )
         )
 
+    speculator_config = kwargs.get("speculator_config")
+    if (
+        speculator_config is not None
+        and speculator_config.requires_model_resolution
+    ):
+        from picosgl.models import make_model_config
+        from picosgl.utils import load_model_config
+
+        model_config = make_model_config(load_model_config(kwargs["model_path"]))
+        kwargs["speculator_config"] = speculator_config.resolve(model_config)
+
     if (dtype_str := kwargs["dtype"]) == "auto":
         from picosgl.utils import load_model_config
 
@@ -316,4 +306,4 @@ def parse_args(args: list[str], run_shell: bool = False) -> tuple[ServerArgs, bo
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
-    return result, run_shell
+    return result

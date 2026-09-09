@@ -22,7 +22,6 @@ class EngineConfig:
     dtype                   : torch.dtype
     max_running_req         : int              = 128
     attention_backend       : str              = "auto"
-    linear_attention_backend: str              = "auto"
     moe_backend             : str              = "auto"
     cuda_graph_bs           : list[int] | None = None
     cuda_graph_max_bs       : int | None       = None

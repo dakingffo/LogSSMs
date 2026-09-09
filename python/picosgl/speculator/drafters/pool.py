@@ -137,6 +137,13 @@ class DraftKVPool:
         assert batch_rows.numel() <= self.max_batch_size
         return self.scratch_table[batch_rows, depth]
 
+    def scratch_block(self, batch_rows: torch.Tensor, block_size: int) -> torch.Tensor:
+        """Return request-major scratch slots for a whole parallel draft block."""
+        assert batch_rows.ndim == 1
+        assert 0 < block_size <= self.num_spec_tokens
+        assert batch_rows.numel() <= self.max_batch_size
+        return self.scratch_table.index_select(0, batch_rows)[:, :block_size].flatten()
+
     def batch_indices(
         self,
         table_indices: list[int],

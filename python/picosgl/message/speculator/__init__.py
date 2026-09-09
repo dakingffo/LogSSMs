@@ -23,6 +23,7 @@ from .base import (
 )
 from . import mtp as _mtp
 from . import eagle3 as _eagle3
+from . import dflash as _dflash
 
 if TYPE_CHECKING:
     from picosgl.speculator import BaseSpeculatorConfig, HiddenCaptorBase
@@ -53,6 +54,8 @@ SUPPORTED_HANDSHAKE_MESSAGE.register("MTP")(_mtp.make_mtp_handshake_message)
 SUPPORTED_INIT_MESSAGE.register("MTP")(_mtp.make_mtp_init_message)
 SUPPORTED_HANDSHAKE_MESSAGE.register("EAGLE3")(_eagle3.make_eagle3_handshake_message)
 SUPPORTED_INIT_MESSAGE.register("EAGLE3")(_eagle3.make_eagle3_init_message)
+SUPPORTED_HANDSHAKE_MESSAGE.register("DFLASH")(_dflash.make_dflash_handshake_message)
+SUPPORTED_INIT_MESSAGE.register("DFLASH")(_dflash.make_dflash_init_message)
 
 
 def make_handshake_message(
@@ -112,6 +115,9 @@ _MESSAGE_TYPES = {
         _eagle3.Eagle3HandshakeAckMsg,
         _eagle3.Eagle3HandshakeMsg,
         _eagle3.Eagle3InitMsg,
+        _dflash.DFlashHandshakeAckMsg,
+        _dflash.DFlashHandshakeMsg,
+        _dflash.DFlashInitMsg,
         SamplingParams,
     )
 }
