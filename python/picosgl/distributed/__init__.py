@@ -1,7 +1,6 @@
 from .info import DistributedInfo, get_tp_info, set_tp_info, tp_override, try_get_tp_info
 from .impl import DistributedCommunicator, destroy_distributed, enable_pynccl_distributed
 from .pynccl import (
-    PyNCCLCommunicator,
     make_nccl_uid_bytes,
     init_pynccl,
     init_pynccl_drafter_target_separation,
@@ -16,7 +15,6 @@ __all__ = [
     "DistributedCommunicator",
     "try_get_tp_info",
     "destroy_distributed",
-    "PyNCCLCommunicator",
     "make_nccl_uid_bytes",
     "init_pynccl",
     "init_pynccl_drafter_target_separation",

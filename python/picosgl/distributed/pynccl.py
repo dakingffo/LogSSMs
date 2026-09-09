@@ -91,5 +91,4 @@ def init_pynccl_drafter_target_separation(
 
     module = _load_nccl_module()
     cls = _get_pynccl_wrapper_cls()
-    return cls(rank, world_size, max_size_bytes, _nccl_uid_to_ffi(nccl_uid)),
-    
+    return cls(rank, world_size, max_size_bytes, _nccl_uid_to_ffi(nccl_uid))

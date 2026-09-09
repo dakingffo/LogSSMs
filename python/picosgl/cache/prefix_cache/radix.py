@@ -122,10 +122,8 @@ class HybridRadixTreeNode(RadixTreeNode):
         kv_indices: torch.Tensor,
         st_indices: torch.Tensor,
     ) -> None:
-        assert len(st_indices) == len(kv_indices) // self.page_size
+        assert len(st_indices) == len(kv_indices)
         super().set(begin, end, inputy_ids, kv_indices)
-        begin //= self.page_size
-        end //= self.page_size
         self._st = st_indices[begin: end].clone()
 
     def split_at(self, pos: int) -> RadixTreeNode:
@@ -247,7 +245,7 @@ class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
             values = node.value
             evicted_indices.append(values[0])
             if len(values) > 1:
-                evicted_state.append(values[1])
+                evicted_state.append(values[1][:: self.page_size])
             self.evictable_size -= node.length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
@@ -301,10 +299,10 @@ class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
                         f" length {node.length}."
                     )
                 if isinstance(node, HybridRadixTreeNode):
-                    expected_states = node.length // self.page_size
+                    expected_states = node.length
                     if len(node.st) != expected_states:
                         raise RuntimeError(
-                            f"Radix node {node.uuid} has {len(node.st)} state slots;"
+                            f"Radix node {node.uuid} has {len(node.st)} state indices;"
                             f" expected {expected_states}."
                         )
                 if node.ref_count == 0:
@@ -333,7 +331,7 @@ class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
         while stack:
             node = stack.pop()
             if not node.is_root() and len(node.value) > 1:
-                total += len(node.value[1])
+                total += len(node.value[1]) // self.page_size
             stack.extend(node.children.values())
         return total
 

@@ -2,104 +2,102 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING
 
 import torch
 
+from picosgl.core import Request
 
-@dataclass(frozen=True)
-class BaseCacheHandle(ABC):
-    cached_len: int
+from .kv_pool.base import BaseKVCachePool
+from .linear_pool.state_pool import LinearStatePool
+from .prefix_cache import make_prefix_cache
+from .prefix_cache.base import BaseCacheHandle, MatchResult
 
-    @abstractmethod
-    def get_matched_indices(self) -> tuple[torch.Tensor, ...] | torch.Tensor: ...
+if TYPE_CHECKING:
+    from picosgl.scheduler.prefill import PendingRequest
 
 
-class SizeInfo(NamedTuple):
-    evictable_size: int
-    protected_size: int
+@dataclass
+class CacheResources:
+    kv_pool         : BaseKVCachePool
+    page_table      : torch.Tensor
+    linear_state    : LinearStatePool | None
+    state_table     : torch.Tensor | None
+    work_state_table: torch.Tensor | None
+
+
+class BaseCacheManager(ABC):
+    def __init__(
+        self,
+        page_size: int,
+        resources: CacheResources,
+        type     : str,
+    ) -> None:
+        self.device = resources.page_table.device
+        self.page_size = page_size
+        self.resources = resources
+        self.prefix_cache = make_prefix_cache(device=self.device, type=type)
 
     @property
-    def total_size(self) -> int:
-        return self.evictable_size + self.protected_size
+    def page_table(self) -> torch.Tensor:
+        return self.resources.page_table
 
+    @property
+    def state_table(self) -> torch.Tensor | None:
+        return self.resources.state_table
 
-class InsertResult(NamedTuple):
-    cached_len: int  # length already in cache before insertion (should be freed)
-    handle    : BaseCacheHandle  # cache handle for the inserted prefix
+    @property
+    def work_state_table(self) -> torch.Tensor | None:
+        return self.resources.work_state_table
 
+    @property
+    def state_pool(self) -> LinearStatePool | None:
+        return self.resources.linear_state
 
-class MatchResult(NamedTuple):
-    cuda_handle: BaseCacheHandle
-    # TODO: support HiCache
+    def match_req(self, req: PendingRequest) -> MatchResult:
+        input_len = req.input_len
+        assert input_len > 0, "Input length must be greater than 0."
+        return self.prefix_cache.match_prefix(req.input_ids[: input_len - 1])
 
+    def lock(self, handle: BaseCacheHandle) -> None:
+        self.prefix_cache.lock_handle(handle, unlock=False)
 
-class BasePrefixCache(ABC):
-    @abstractmethod
-    def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
-        """
-        Lock or unlock a cache handle.
-        This operation will not modify the cache, but change the size info only.
-        When a handle is locked, it cannot be evicted.
-        Handles must be locked before the previously-returned tensor of `match_prefix` is used.
-        Otherwise it may be evicted by calling evict.
+    def unlock(self, handle: BaseCacheHandle) -> None:
+        self.prefix_cache.lock_handle(handle, unlock=True)
 
-        Args:
-            handle (BaseCacheHandle): The cache handle to lock or unlock.
-            unlock (bool): Whether to unlock the handle. Defaults to False.
-        """
-
-    @abstractmethod
-    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
-        """
-        Match prefix and return the indices of the matched prefix in the cache.
-        This operation will not modify the cache.
-        The returned indices is only safe to use when the handle is locked.
-
-        Args:
-            input_ids (torch.Tensor): The input ids to match. Shape: (seq_len,)
-        Returns:
-            MatchResult: The match result containing the cache handles.
-        """
-
-    @abstractmethod
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
-        """
-        Insert a new prefix into the cache.
-        This operation will modify the cache.
-        Args:
-            input_ids (torch.Tensor): The input ids to insert. Shape: (seq_len,)
-            indices (torch.Tensor): The indices to store the new prefix. Shape: (seq_len,)
-
-        Returns:
-            InsertResult: The result of the insertion.
-        """
-
-    @abstractmethod
-    def evict(self, size: int) -> torch.Tensor:
-        """
-        Evict some prefixes from the cache to free up space.
-        This operation will modify the cache.
-        Note that evict 0 is always safe and does nothing.
-        Note that the actual evict size may be larger than the requested size.
-        Args:
-            size (int): The size to evict.
-
-        Returns:
-            torch.Tensor: The indices evicted. Shape: (evict_size,)
-        Raises:
-            RuntimeError: If the requested size is larger than the evictable size.
-        """
-
-    @abstractmethod
-    def reset(self) -> None:
-        """Reset the cache manager and the underlying cache."""
+    def prefill_acquire(self, total_len: int, handle: BaseCacheHandle) -> bool:
+        if total_len > self.available_size:
+            return False
+        self.lock(handle)
+        if total_len > self.available_size:
+            self.unlock(handle)
+            return False
+        return True
 
     @property
     @abstractmethod
-    def size_info(self) -> SizeInfo:
-        """Get the size information of the cache."""
+    def available_size(self) -> int: ...
 
     @abstractmethod
-    def check_integrity(self) -> None:
-        """Check the integrity of the cache. Raise an error if the cache is corrupted."""
+    def plan_prefill_chunk(self, remain_len: int, token_budget: int) -> int: ...
+
+    @abstractmethod
+    def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None: ...
+
+    @abstractmethod
+    def allocate(self, reqs: list[Request]) -> None: ...
+
+    @abstractmethod
+    def cache_req(self, req: Request, *, finished: bool) -> None: ...
+
+    @abstractmethod
+    def free_to_cached(self, req: Request) -> None: ...
+
+    @abstractmethod
+    def commit_speculative(self, req: Request, C: int, num_sampled: int) -> None: ...
+
+    @abstractmethod
+    def check_integrity(self) -> None: ...
+
+    @abstractmethod
+    def lazy_free_region(self): ...

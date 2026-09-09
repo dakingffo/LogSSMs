@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from picosgl.cache.linear.state_pool import LinearStatePool
+from picosgl.cache.linear_pool.state_pool import LinearStatePool
 from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from picosgl.layers.gated_delta import GatedDeltaConfig
 from picosgl.layers.linear_attention_backend import LinearAttentionBackend

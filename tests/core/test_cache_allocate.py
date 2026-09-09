@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import picosgl.core as core
-from picosgl.scheduler.cache import CacheManager
+from picosgl.cache import CacheResources, StandardCacheManager
 
 
 @pytest.fixture(autouse=True)
@@ -20,15 +20,26 @@ def reset_global_ctx():
     core._GLOBAL_CTX = old_ctx
 
 
-def _make_cache_manager(num_pages: int, page_size: int) -> CacheManager:
+def _make_cache_manager(num_pages: int, page_size: int) -> StandardCacheManager:
     """Helper to create a CacheManager with radix cache on CPU."""
     page_table = torch.empty((1,))
     ctx = core.Context(page_size=page_size)
     core.set_global_ctx(ctx)
-    return CacheManager(num_pages, page_size, page_table, type="radix")
+    resources = CacheResources(
+        kv_pool=None,  # type: ignore[arg-type]
+        page_table=page_table,
+        linear_state=None,
+        state_table=None,
+        work_state_table=None,
+    )
+    return StandardCacheManager(num_pages, page_size, resources, type="radix")
 
 
-def _insert_evictable(cm: CacheManager, input_ids: torch.Tensor, indices: torch.Tensor):
+def _insert_evictable(
+    cm: StandardCacheManager,
+    input_ids: torch.Tensor,
+    indices: torch.Tensor,
+):
     """Insert a prefix into the radix cache so it becomes evictable."""
     cm.prefix_cache.insert_prefix(input_ids, indices)
 

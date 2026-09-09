@@ -17,8 +17,8 @@ import torch
 
 import picosgl.core as core
 from picosgl.core import Context, Request, SamplingParams, set_global_ctx
-from picosgl.scheduler.cache import CacheManager
-from picosgl.cache.linear.state_pool import LinearStatePool
+from picosgl.cache import CacheResources, StandardCacheManager
+from picosgl.cache.linear_pool.state_pool import LinearStatePool
 
 
 def setup_ctx() -> None:
@@ -43,12 +43,18 @@ def make_cm(st, reserve, nslots):
         num_v_heads=4, head_k_dim=4, head_v_dim=4,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    cm = CacheManager(
-        num_pages=10, page_size=64,
+    resources = CacheResources(
+        kv_pool=None,  # type: ignore[arg-type]
         page_table=torch.zeros((8, 512), dtype=torch.int32),
+        linear_state=pool,
+        state_table=st,
+        work_state_table=reserve,
+    )
+    cm = StandardCacheManager(
+        num_pages=10, page_size=64,
+        resources=resources,
         type="hybrid_radix", num_states=nslots,
         num_draft_states=reserve.numel(),
-        state_table=st, work_state_table=reserve, state_pool=pool,
     )
     return cm, pool
 
@@ -76,7 +82,7 @@ def test_no_cross_swap():
     mark_in_use(cm, [40, 50, 51, 52, 53])
     r = make_req(2, 120)
     snap = (pool.conv_state.clone(), pool.recurrent_state.clone())
-    cm.state_commit_verify(r, 120, 2)
+    cm.commit_speculative(r, 120, 2)
     assert torch.all(st[2, 64:128] == 51)
     assert reserve[2].tolist() == [50, 40, 52, 53]
     assert len(cm.free_states) == 200 - 5
@@ -92,7 +98,7 @@ def test_cross_pin_refill_swap():
     mark_in_use(cm, [40, 41, 50, 51, 52, 53])
     r = make_req(2, 125)
     snap = (pool.conv_state.clone(), pool.recurrent_state.clone())
-    cm.state_commit_verify(r, 125, 4)
+    cm.commit_speculative(r, 125, 4)
     assert torch.all(st[2, 64:128] == 52)
     assert torch.all(st[2, 128:192] == 53)
     assert reserve[2].tolist() == [50, 51, 40, 41]
@@ -109,7 +115,7 @@ def test_cross_boundary_last():
     mark_in_use(cm, [40, 50, 51, 52, 53])
     r = make_req(2, 126)
     snap = (pool.conv_state.clone(), pool.recurrent_state.clone())
-    cm.state_commit_verify(r, 126, 2)
+    cm.commit_speculative(r, 126, 2)
     assert torch.all(st[2, 64:128] == 51)
     assert reserve[2].tolist() == [50, 40, 52, 53]
     assert len(cm.free_states) == 300 - 5
@@ -137,12 +143,18 @@ def test_stable_reserve_across_overlapping_batches():
         num_v_heads=4, head_k_dim=4, head_v_dim=4,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    cm = CacheManager(
-        num_pages=10, page_size=64,
+    resources = CacheResources(
+        kv_pool=None,  # type: ignore[arg-type]
         page_table=torch.zeros((max_running_req + 1, 512), dtype=torch.int32),
+        linear_state=pool,
+        state_table=st,
+        work_state_table=reserve,
+    )
+    cm = StandardCacheManager(
+        num_pages=10, page_size=64,
+        resources=resources,
         type="hybrid_radix", num_states=num_states,
         num_draft_states=max_running_req * reserve_width,
-        state_table=st, work_state_table=reserve, state_pool=pool,
     )
     original = reserve.clone()
     cohort_a = [make_req(0, 32), make_req(2, 32)]
@@ -150,8 +162,8 @@ def test_stable_reserve_across_overlapping_batches():
     for req in cohort_a + cohort_b:
         req.device_len = req.cached_len + reserve_width
 
-    cm.allocate_state(cohort_a)
-    cm.allocate_state(cohort_b)
+    cm.allocate(cohort_a)
+    cm.allocate(cohort_b)
     assert torch.equal(reserve, original)
     assert all(st[req.table_idx, req.cached_len - 1] == req.table_idx for req in cohort_a + cohort_b)
     assert len(torch.unique(reserve)) == max_running_req * reserve_width

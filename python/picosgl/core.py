@@ -65,11 +65,17 @@ class Request:
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
 
-    def complete_to_device_len(self) -> None:
-        self.cached_len = self.device_len
+    def extend_device_n(self, n: int) -> None:
+        self.device_len += min(n, self.max_device_len - self.device_len)
+
+    def complete_to_device_len(self, progress: int = -1) -> None:
+        self.cached_len = (
+            self.device_len if progress < 0 else
+            self.cached_len + min(progress, self.device_len - self.cached_len)
+        )
 
     def complete_n(self, n: int) -> None:
-        self.device_len += n
+        self.device_len += min(n, self.max_device_len - self.device_len)
         self.cached_len = self.device_len - 1
 
     def append_host(self, next_token: torch.Tensor) -> None:

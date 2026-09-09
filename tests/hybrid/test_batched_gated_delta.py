@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from picosgl.cache.linear.state_pool import LinearStatePool
+from picosgl.cache.linear_pool.state_pool import LinearStatePool
 from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from picosgl.distributed import DistributedInfo, tp_override
 from picosgl.kernel import store_state

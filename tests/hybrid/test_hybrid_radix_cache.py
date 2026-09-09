@@ -2,10 +2,9 @@
 
 CPU-only. Verifies the per-page linear-state caching design end to end:
 
-  1. HybridRadixTreeNode: nodes carry one state slot per page; split preserves
-     state; evict returns both KV pages and state slots.
-  2. CacheManager.allocate_state: allocates a slot exactly for each page the batch
-     will write (skip already-allocated), never the never-written baseline page.
+  1. HybridRadixTreeNode: nodes carry token-indexed state mappings; split preserves
+     state; evict returns both KV pages and unique state slots.
+  2. CacheManager.allocate: allocates KV pages and state slots together.
   3. CacheManager.cache_req lifecycle: tree adopts a request's full pages + their
      slots (slots stay allocated, tree-owned), a finished request frees its tail page
      slot and wipes its state_table row, a cache-hit reuses the borrowed slot, and
@@ -23,10 +22,10 @@ sys.path.insert(0, _REPO)
 import torch
 
 from picosgl.core import Context, Request, SamplingParams, set_global_ctx
-from picosgl.scheduler.cache import CacheManager
+from picosgl.cache import CacheResources, StandardCacheManager
 from picosgl.scheduler.prefill import PendingRequest
-from picosgl.cache.linear.state_pool import LinearStatePool
-from picosgl.cache.radix_prefix_cache import HybridRadixTreeNode, RadixPrefixCache
+from picosgl.cache.linear_pool.state_pool import LinearStatePool
+from picosgl.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
 
 
 def make_req(input_len, table_idx, output_len=10):
@@ -56,22 +55,18 @@ def make_cm(
 ):
     if page_table is None:
         page_table = torch.zeros((4, 512), dtype=torch.int32)
-    return CacheManager(
-        num_pages=num_pages, page_size=page_size,
+    resources = CacheResources(
+        kv_pool=None,  # type: ignore[arg-type]
         page_table=page_table,
-        type="hybrid_radix", num_states=num_states,
-        state_table=state_table, state_pool=pool,
+        linear_state=pool,
+        state_table=state_table,
+        work_state_table=None,
     )
-
-
-def alloc_pages(cm, pt, tidx, lo, hi):
-    """Pop KV pages from the manager's free pool and map [lo, hi) to them page-granular."""
-    n = len(range(lo, hi, cm.page_size))
-    pages = cm.free_pages[:n]
-    cm.free_pages = cm.free_pages[n:]
-    for i, pos in enumerate(range(lo, hi, cm.page_size)):
-        pt[tidx, pos: min(pos + cm.page_size, hi)] = pages[i]
-    return pages
+    return StandardCacheManager(
+        num_pages=num_pages, page_size=page_size,
+        resources=resources,
+        type="hybrid_radix", num_states=num_states,
+    )
 
 
 # =====================================================================================
@@ -80,22 +75,26 @@ def alloc_pages(cm, pt, tidx, lo, hi):
 def test1_hybrid_radix():
     hc = RadixPrefixCache(device=torch.device("cpu"), node_type=HybridRadixTreeNode)
     ids = torch.arange(192, dtype=torch.int32)       # 3 pages
-    state = torch.tensor([10, 11, 12], dtype=torch.int32)
+    state = torch.tensor([10] * 64 + [11] * 64 + [12] * 64, dtype=torch.int32)
     res = hc.insert_prefix(ids, ids.clone(), state)
     assert res.handle.cached_len == 192
     matched_indices, matched_state = res.handle.get_matched_indices()
     assert matched_indices.tolist() == list(range(192))
-    assert matched_state.tolist() == [10, 11, 12]
+    assert matched_state.tolist() == state.tolist()
     assert hc.size_info.evictable_size == 192
     # partial match -> split at page 2 (128 tokens): matched state = pages [0,2)
     m = hc.match_prefix(torch.arange(128, dtype=torch.int32))
     assert m.cuda_handle.cached_len == 128
-    assert m.cuda_handle.get_matched_indices()[1].tolist() == [10, 11]
+    assert m.cuda_handle.get_matched_indices()[1].tolist() == state[:128].tolist()
     # extending with a new suffix creates a sibling node; state preserved through split
     ids2 = torch.arange(256, dtype=torch.int32)
-    hc.insert_prefix(ids2, ids2.clone(), torch.tensor([10, 11, 12, 13], dtype=torch.int32))
+    state2 = torch.tensor(
+        [10] * 64 + [11] * 64 + [12] * 64 + [13] * 64,
+        dtype=torch.int32,
+    )
+    hc.insert_prefix(ids2, ids2.clone(), state2)
     m2 = hc.match_prefix(ids2)
-    assert m2.cuda_handle.get_matched_indices()[1].tolist() == [10, 11, 12, 13]
+    assert m2.cuda_handle.get_matched_indices()[1].tolist() == state2.tolist()
     # evict 2 pages -> returns 2 state slots
     ev_idx, ev_state = hc.evict(128)
     assert ev_state is not None and len(ev_state) == 2, (ev_idx, ev_state)
@@ -103,16 +102,15 @@ def test1_hybrid_radix():
 
 
 # =====================================================================================
-# 2. allocate_state: one slot per page actually written
+# 2. allocate: one KV page and state slot per page actually written
 # =====================================================================================
-def test2_allocate_state():
+def test2_allocate():
     pool = make_pool()
     st = torch.full((4, 512), -1, dtype=torch.int32)
     cm = make_cm(st, pool)
     req = make_req(100, table_idx=1)
     req.cached_len, req.device_len = 0, 100
-    cm.allocate_paged([req])
-    cm.allocate_state([req])
+    cm.allocate([req])
     # pages 0 (0-63) and 1 (64-99) written by a 100-token prefill; page 2 untouched
     assert st[1, 0] >= 0 and st[1, 64] >= 0 and st[1, 128] == -1, st[1]
     assert torch.all(st[1, :64] == st[1, 0])
@@ -120,21 +118,33 @@ def test2_allocate_state():
     assert len(cm.free_states) == 400 - 2, len(cm.free_states)
     # decode step staying inside page 1 -> no new slot
     req.cached_len, req.device_len = 90, 91
-    cm.allocate_state([req])
+    cm.allocate([req])
     assert st[1, 64] >= 0 and st[1, 128] == -1, st[1]
     assert len(cm.free_states) == 400 - 2, len(cm.free_states)
+    # Rolling back within one page frees nothing, but must restore the live frontier.
+    req.device_len = 95
+    cm.free_to_cached(req)
+    assert req.device_len == 91
+    assert len(cm.free_pages) == 20 - 2
+    assert len(cm.free_states) == 400 - 2
     # decode crossing into page 2 -> allocates page 2's slot
     req.cached_len, req.device_len = 128, 129
-    cm.allocate_paged([req])
-    cm.allocate_state([req])
+    cm.allocate([req])
     assert st[1, 128] >= 0, st[1]
     assert len(cm.free_states) == 400 - 3, len(cm.free_states)
     # Rejecting page 2 returns its KV page and state slot together.
-    cm.free_page_range(req, 2, 3)
+    freed_page = int(cm.page_table[1, 128])
+    freed_state = int(st[1, 128])
+    with cm.lazy_free_region():
+        cm.free_to_cached(req)
+        assert len(cm.free_pages) == 20 - 3
+        assert len(cm.free_states) == 400 - 3
     assert len(cm.free_pages) == 20 - 2
     assert len(cm.free_states) == 400 - 2
+    assert int(cm.free_pages[-1]) == freed_page
+    assert int(cm.free_states[-1]) == freed_state
     assert torch.all(st[1, 128:192] == -1)
-    print("[2] allocate_state OK")
+    print("[2] allocate OK")
 
 
 # =====================================================================================
@@ -150,8 +160,7 @@ def test3_cache_req_lifecycle():
     # ---- req 1: prefill 200 tokens (4 pages) ----
     r = make_req(200, table_idx=1)
     r.cached_len, r.device_len = 0, 200
-    alloc_pages(cm, pt, 1, 0, 200)
-    cm.allocate_state([r])
+    cm.allocate([r])
     s0, s1, s2, s3 = (int(st[1, i * PS]) for i in range(4))
     assert len(cm.free_states) == 400 - 4   # 4 slots allocated (no dummy slot)
     assert len(cm.free_pages) == N - 4
@@ -181,11 +190,11 @@ def test3_cache_req_lifecycle():
     assert match2.cuda_handle.cached_len == 64
     r2.cache_handle = match2.cuda_handle
     cm.lock(r2.cache_handle)
-    pt[1, 0:64] = 0                         # borrow page 0's KV
-    st[1, :64] = match2.cuda_handle.get_matched_indices()[1][0]  # borrow page 0's state
-    alloc_pages(cm, pt, 1, 64, 100)         # fresh KV page for [64,100)
+    matched_pages, matched_states = match2.cuda_handle.get_matched_indices()
+    pt[1, :64] = matched_pages
+    st[1, :64] = matched_states
     r2.cached_len, r2.device_len = 64, 100
-    cm.allocate_state([r2])
+    cm.allocate([r2])
     assert st[1, 0] == s0 and st[1, 64] >= 0 and st[1, 64] != s1, (st[1], s1)
     assert len(cm.free_states) == 400 - 4   # one fresh slot popped
     assert len(cm.free_pages) == N - 4      # 3 tree + 1 fresh (64-100)
@@ -213,9 +222,41 @@ def test3_cache_req_lifecycle():
     print("[3] cache_req lifecycle + check_integrity OK")
 
 
+def test4_concurrent_insert_repoints_to_canonical_slots():
+    pool = make_pool(num_slots=400)
+    st = torch.full((4, 512), -1, dtype=torch.int32)
+    pt = torch.zeros((4, 512), dtype=torch.int32)
+    cm = make_cm(st, pool, pt)
+    reqs = [make_req(200, table_idx=i) for i in (1, 2)]
+    for req in reqs:
+        handle = cm.match_req(PendingRequest(req.uid, req.input_ids, req.sampling_params))
+        req.cache_handle = handle.cuda_handle
+        cm.lock(req.cache_handle)
+        req.cached_len, req.device_len = 0, 200
+
+    cm.allocate(reqs)
+    for req in reqs:
+        req.cached_len = 200
+    duplicate_pages = pt[2, :192:64].clone()
+    duplicate_states = st[2, :192:64].clone()
+
+    with cm.lazy_free_region():
+        cm.cache_req(reqs[0], finished=False)
+        cm.cache_req(reqs[1], finished=False)
+        assert len(cm.free_pages) == 20 - 8
+        assert len(cm.free_states) == 400 - 8
+
+    assert torch.equal(pt[2, :192], pt[1, :192])
+    assert torch.equal(st[2, :192], st[1, :192])
+    assert torch.equal(cm.free_pages[-3:], duplicate_pages)
+    assert torch.equal(cm.free_states[-3:], duplicate_states)
+    print("[4] concurrent insert canonical re-point OK")
+
+
 if __name__ == "__main__":
     set_global_ctx(Context(page_size=64))
     test1_hybrid_radix()
-    test2_allocate_state()
+    test2_allocate()
     test3_cache_req_lifecycle()
+    test4_concurrent_insert_repoints_to_canonical_slots()
     print("\nALL HYBRID RADIX CACHE TESTS PASSED")

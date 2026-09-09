@@ -72,11 +72,11 @@ def main():
 
     from picosgl.core import Batch, Context, Request, set_global_ctx
     from picosgl.cache import make_kvcache_pool
-    from picosgl.cache.linear.state_pool import LinearStatePool
+    from picosgl.cache.linear_pool.state_pool import LinearStatePool
     from picosgl.layers.attention_backend import make_attention_backend
     from picosgl.models.qwen3_next import Qwen3NextForCausalLM
     from picosgl.models.weight import load_target_weight
-    from picosgl.scheduler.cache import CacheManager
+    from picosgl.cache import CacheResources, StandardCacheManager
 
     loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -94,15 +94,15 @@ def main():
         + mcfg.linear_num_value_heads * mcfg.linear_value_head_dim
     )
     ctx = Context(page_size=PS)
-    # KV cache is per-token pages (page_size=1); the 64-granular pages below are STATE
-    # pages (state_table columns), indexed by the layer, not by the attention backend.
-    kv_pages = 4096
+    num_pages = 32
     ctx.kv_cache = make_kvcache_pool(
-        model_config=mcfg, num_pages=kv_pages, page_size=1,
+        model_config=mcfg, num_pages=num_pages, page_size=PS,
         dtype=torch.bfloat16, device=device,
     )
+    num_work_states = 8 * D
     pool = LinearStatePool(
-        num_slots=64, num_linear_layers=mcfg.num_linear_layers, conv_dim=conv_dim,
+        num_slots=num_pages + num_work_states,
+        num_linear_layers=mcfg.num_linear_layers, conv_dim=conv_dim,
         kernel_size=mcfg.linear_conv_kernel_dim,
         num_v_heads=mcfg.linear_num_value_heads,
         head_k_dim=mcfg.linear_key_head_dim,
@@ -113,29 +113,32 @@ def main():
 
     MAX_SEQ = 1024
     ctx.page_table = torch.zeros((8, MAX_SEQ), dtype=torch.int32, device=device)
-    # disjoint per-token KV page ranges: row V=4 (verify), row R=5 (decode reference)
-    for tidx, base in ((4, 0), (5, 2048)):
-        ctx.page_table[tidx, :MAX_SEQ] = torch.arange(base, base + MAX_SEQ, device=device)
 
     # Live state table is token-indexed; every page repeats one slot id.
     st = torch.full((8, MAX_SEQ), -1, dtype=torch.int32, device=device)
-    reserve = torch.full((8, D), -1, dtype=torch.int32, device=device)
+    reserve = torch.arange(
+        num_pages,
+        num_pages + num_work_states,
+        dtype=torch.int32,
+        device=device,
+    ).view(8, D)
     ctx.state_table = st
     ctx.work_state_table = reserve
     set_global_ctx(ctx)
     ctx.attn_backend = make_attention_backend("fi", mcfg)
 
-    cm = CacheManager(
-        num_pages=8, page_size=PS, num_states=64,
-        page_table=torch.zeros((8, 16), dtype=torch.int32, device=device),
-        type="hybrid_radix", state_table=st, state_pool=pool,
-        num_draft_states=reserve.numel(), work_state_table=reserve,
+    resources = CacheResources(
+        kv_pool=ctx.kv_cache,
+        page_table=ctx.page_table,
+        linear_state=pool,
+        state_table=st,
+        work_state_table=reserve,
     )
-    # one state slot per page each row's prefill + decode will write
-    for tidx, pages in ((4, (0, 1)), (5, (0, 1, 2))):
-        for p in pages:
-            slot = int(cm._allocate(needed_states=1)[1][0])
-            st[tidx, p * PS : (p + 1) * PS] = slot
+    cm = StandardCacheManager(
+        num_pages=num_pages, page_size=PS, num_states=num_pages,
+        resources=resources,
+        type="hybrid_radix", num_draft_states=reserve.numel(),
+    )
 
     from transformers import AutoTokenizer
 
@@ -145,15 +148,6 @@ def main():
     ).input_ids[0]
     ids = torch.cat([ids, ids[:1].expand(150)]).to(device)  # >= 131 tokens for the window
     N = ids.shape[0]
-
-    kv = ctx.kv_cache
-    storage = kv._storage_shape
-
-    def zero_window(tidx, lo, hi):
-        for layer in range(kv.num_layers):
-            for p in range(lo, hi):
-                kv.k_cache(layer).view(storage)[p].zero_()
-                kv.v_cache(layer).view(storage)[p].zero_()
 
     def mk_req(tidx, n_tokens, cached_len):
         return Request(
@@ -166,6 +160,7 @@ def main():
     def run_prefill(tidx, n):
         """Fresh prefill of ids[:n] on row tidx; returns the Request."""
         req = mk_req(tidx, n, cached_len=0)
+        cm.allocate([req])
         pb = Batch(reqs=[req], phase="prefill")
         pb.input_ids = ids[:n]
         pb.positions = torch.arange(n, device=device)
@@ -181,8 +176,7 @@ def main():
         """Verify window [C, C+n) -> R[0..n); returns (req, n)."""
         n = toks.shape[0]
         req = mk_req(tidx, C + n, cached_len=C)
-        reserve[tidx] = cm._allocate(needed_states=D)[1]
-        cm.allocate_state([req])
+        cm.allocate([req])
         vb = Batch(reqs=[req], phase="verify")
         vb.input_ids = toks
         vb.positions = torch.arange(C, C + n, device=device)
@@ -197,6 +191,7 @@ def main():
     def run_decode(tidx, pos, tok):
         """Single decode step at position pos (KV + state read/write on row tidx)."""
         req = mk_req(tidx, pos + 1, cached_len=pos)
+        cm.allocate([req])
         db = Batch(reqs=[req], phase="decode")
         db.input_ids = tok
         db.positions = torch.tensor([pos], device=device)
@@ -225,7 +220,6 @@ def main():
         run_prefill(tidx_v, C)
         # ---- verify window [C, C+D) using the REAL continuation ids as drafts ----
         toks = ids[C : C + D]
-        zero_window(tidx_v, C, C + D)  # the mini-prefill window must be clean KV
         req, n = run_verify(tidx_v, C, toks)
         assert n == D
         # ---- commit: pure index ops ----
@@ -250,11 +244,15 @@ def main():
 
     rels = []
     # case A: no crossing. R[2] becomes page 1's live state.
-    rels.append(run_case("no-cross swap", C=100, num_sampled=3)[0])
+    rels.append(run_case("no-cross swap", C=100, num_sampled=3, tidx_v=0, tidx_r=1)[0])
     # case B: crossing, boundary token is the last accepted. R[1] closes page 1.
-    rels.append(run_case("crossing, boundary-last", C=126, num_sampled=2)[0])
+    rels.append(run_case(
+        "crossing, boundary-last", C=126, num_sampled=2, tidx_v=2, tidx_r=3
+    )[0])
     # case C: R[2] closes page 1 and R[3] becomes page 2's live state.
-    rels.append(run_case("crossing, boundary-mid", C=125, num_sampled=4)[0])
+    rels.append(run_case(
+        "crossing, boundary-mid", C=125, num_sampled=4, tidx_v=4, tidx_r=5
+    )[0])
 
     ok = max(rels) < 0.02  # bf16 ULP band (same tolerance as the old rollback test)
     print(f"\nRESERVE COMMIT: {'PASS' if ok else 'CHECK'} "

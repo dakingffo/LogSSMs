@@ -123,6 +123,9 @@ class Engine:
 
         # ======================= Linear attention state pool ========================
         self.num_states = 0
+        self.linear_state = None
+        self.state_table = None
+        self.work_state_table = None
         if config.model_config.is_hybrid:
             self.num_states = self.num_pages
             self.ctx.linear_state = self.linear_state = make_linear_state_pool(
@@ -154,7 +157,6 @@ class Engine:
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.ctx.work_state_table = self.work_state_table = None
             if reserve_cols != 0:
                 reserve = torch.arange(
                     self.num_states,
@@ -325,8 +327,7 @@ class Engine:
 
     def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:
         self.graph_runner.pad_batch(batch)
-        cache_manager.allocate_paged(batch.reqs)
-        cache_manager.allocate_state(batch.reqs)
+        cache_manager.allocate(batch.reqs)
         batch.positions = self._make_positions(batch, self.device)
         input_mapping = self._make_input_tuple(batch, self.device)
         write_mapping = self._make_write_tuple(batch, self.device)

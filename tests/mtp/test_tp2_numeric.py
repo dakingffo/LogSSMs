@@ -311,7 +311,7 @@ def run():
     # ---------------- GatedDeltaNet (out_proj all_reduce) ----------------
     print("=" * 60)
     print("GatedDeltaNet prefill (out_proj all_reduce)")
-    from picosgl.cache.linear.state_pool import LinearStatePool
+    from picosgl.cache.linear_pool.state_pool import LinearStatePool
     from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
     from picosgl.layers import GatedDeltaNet
 

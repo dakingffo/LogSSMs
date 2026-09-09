@@ -1,63 +1,60 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
 
 import torch
 from picosgl.core import Request
-from picosgl.cache import BaseCacheHandle, MatchResult, make_prefix_cache
-from picosgl.utils import align_down, div_ceil
+from picosgl.utils import align_ceil, align_down, div_ceil
 
-if TYPE_CHECKING:
-    from .prefill import PendingRequest
+from .base import BaseCacheManager, CacheResources
+from .prefix_cache.base import BaseCacheHandle
 
 
-class CacheManager:
+class StandardCacheManager(BaseCacheManager):
     def __init__(
         self,
         num_pages       : int,
         page_size       : int,
-        page_table      : torch.Tensor,
+        resources       : CacheResources,
         type            : str,
         num_states      : int                 = 0,
         num_draft_states: int                 = 0,
-        state_table     : torch.Tensor | None = None,
-        work_state_table: torch.Tensor | None = None,
-        state_pool      : object              = None,
     ):
-        device = page_table.device
+        super().__init__(page_size, resources, type)
         # The `_free_pages` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_pages` may look like [0, 2, 4, 6, ...], and each slot represents a page.
-        self.free_pages = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        self.free_states = torch.arange(num_states, dtype=torch.int32, device=device)
-        self.prefix_cache = make_prefix_cache(device=device, type=type)
-        self.device = device
+        self.free_pages = torch.arange(
+            num_pages, dtype=torch.int32, device=self.device
+        ) * page_size
+        self.free_states = torch.arange(
+            num_states, dtype=torch.int32, device=self.device
+        )
         self.num_pages = num_pages
-        self.page_table = page_table
-        self.page_size = page_size
-        # hybrid linear-state wiring (None for non-hybrid models)
         self.num_states = num_states
         self.num_draft_states = num_draft_states
-        self.state_table = state_table
-        self.work_state_table = work_state_table
-        self.state_pool = state_pool
-
-    def match_req(self, req: PendingRequest) -> MatchResult:
-        input_len = req.input_len
-        assert input_len > 0, "Input length must be greater than 0."
-        return self.prefix_cache.match_prefix(req.input_ids[: input_len - 1])
 
     @property
     def available_size(self) -> int:
         return self.prefix_cache.size_info.evictable_size + len(self.free_pages) * self.page_size
 
-    def lock(self, handle: BaseCacheHandle) -> None:
-        self.prefix_cache.lock_handle(handle, unlock=False)
+    def plan_prefill_chunk(self, remain_len: int, token_budget: int) -> int:
+        chunk_size = min(remain_len, token_budget)
+        if chunk_size < remain_len and self.state_pool is not None:
+            chunk_size = align_down(chunk_size, 64)
+        return chunk_size
 
-    def unlock(self, handle: BaseCacheHandle) -> None:
-        self.prefix_cache.lock_handle(handle, unlock=True)
+    def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None:
+        matched = handle.get_matched_indices()
+        page_entry = self.page_table[table_idx][:handle.cached_len]
+        if (state_table := self.state_table) is not None:
+            page_indices, state_indices = matched
+            page_entry.copy_(page_indices)
+            state_entry = state_table[table_idx][:handle.cached_len]
+            state_entry.copy_(state_indices)
+        else:
+            page_entry.copy_(matched)
 
-    def allocate_paged(self, reqs: list[Request]) -> None:
+    def allocate(self, reqs: list[Request]) -> None:
         needed_pages = 0
         allocation_info: list[tuple[int, int, int]] = []
         for req in reqs:
@@ -66,120 +63,101 @@ class CacheManager:
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
-        if needed_pages > 0:
-            allocated = self._page_to_token(self._allocate(needed_pages=needed_pages)[0])
-            self._write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
-    def allocate_state(self, reqs: list[Request]) -> None:
-        if self.state_pool is None or self.state_table is None:
-            return
-        needed_states = 0
-        allocation_info: list[tuple[int, int, int]] = []
-        for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
-            last_page = div_ceil(req.device_len, self.page_size)
-            if last_page > first_page:
-                needed_states += last_page - first_page
-                allocation_info.append((req.table_idx, first_page, last_page))
-        if needed_states > 0:
-            allocated = self._allocate(needed_states=needed_states)[1]
-            assert allocated is not None
-            self._write_page_table(
-                self.state_table,
-                allocated.repeat_interleave(self.page_size),
-                allocation_info,
-                self.page_size,
+        if needed_pages > 0:
+            allocated = self._allocate(
+                needed_pages=needed_pages,
+                needed_states=needed_pages if self.state_pool is not None else 0,
             )
+            if allocated[0] is not None:
+                self._write_page_table(
+                    self.page_table,
+                    self._page_to_token(allocated[0]),
+                    allocation_info,
+                    self.page_size,
+                )
+            if allocated[1] is not None:
+                assert self.state_table is not None
+                self._write_page_table(
+                    self.state_table,
+                    allocated[1].repeat_interleave(self.page_size),
+                    allocation_info,
+                    self.page_size,
+                )
 
     def cache_req(self, req: Request, *, finished: bool) -> None:
-        # ==================================== valid cache region ====================================
-        # [0, req.cached_len)                       This part is valid for attention kernel read/write.
-        # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
-        # [old_handle.cached_len, req.cached_len)   This part is allocated by cache manager for this request.
-        # ================================== allocated cache region ==================================
-        # [old_handle.cached_len, cached_len)       This part was not in the prefix cache when prefill,
-        #                                           but later cached by other requests.
-        #                                           We must free them to avoid memory leak.
-        # [cached_len, new_handle.cached_len)       This part is newly inserted into the prefix cache.
-        # [new_handle.cached_len, req.cached_len)   This part is tailing part that can not inserted into the prefix cache.
-        #                                           We should free it if the request has finished.
         insert_ids = req.input_ids[: req.cached_len]
         page_indices = self.page_table[req.table_idx, :req.cached_len]
+        state_indices = (
+            self.state_table[req.table_idx, :req.cached_len]
+            if self.state_table is not None else None
+        )
         old_handle = req.cache_handle
         insert_len = align_down(req.cached_len, self.page_size)
-        state_slots = None
-        if self.state_table is not None and insert_len > 0:
-            state_slots = self.state_table[
-                req.table_idx,
-                self.page_size - 1 : insert_len : self.page_size,
-            ]
-        if state_slots is not None:  # hybrid: the tree stores one state slot per page
-            cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices, state_slots)
+
+        if state_indices is not None:  # hybrid: keep token-indexed state mappings with KV
+            prefix_len, new_handle = self.prefix_cache.insert_prefix(
+                insert_ids, page_indices, state_indices
+            )
         else:  # dense: NaivePrefixCache / RadixPrefixCache take no state slots
-            cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+            prefix_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         # unlock until all operations on handle is done
         self.unlock(old_handle)
-        # this part is already in the prefix cache, free it
-        self._free(page_indices[old_handle.cached_len: cached_len])
+        self._free(
+            page_indices[old_handle.cached_len: prefix_len],
+            state_indices=(
+                state_indices[old_handle.cached_len: prefix_len]
+                if state_indices is not None else None
+            ),
+        )
         if finished:  # this tail part should be freed
-            self._free(page_indices[new_handle.cached_len:])
+            self._free(
+                page_indices[new_handle.cached_len:],
+                state_indices=(
+                    state_indices[new_handle.cached_len:]
+                    if state_indices is not None else None
+                ),
+            )
+            if self.state_table is not None:
+                self.state_table[req.table_idx] = -1
         else:  # keep the tail part, update the handle
             req.cache_handle = new_handle
             self.lock(new_handle)
+            matched = new_handle.get_matched_indices()
+            if self.state_table is not None:
+                matched_pages, matched_states = matched
+                self.page_table[req.table_idx, :insert_len].copy_(matched_pages)
+                self.state_table[req.table_idx, :insert_len].copy_(matched_states)
+            else:
+                self.page_table[req.table_idx, :insert_len].copy_(matched)
 
-        if self.state_table is not None:
-            self._cache_req_state(
-                req, old_handle, cached_len, insert_len, new_handle, finished
-            )
-
-    def _cache_req_state(
+    def _free(
         self,
-        req       : Request,
-        old_handle: BaseCacheHandle,
-        prefix_len: int,
-        insert_len: int,
-        new_handle: BaseCacheHandle,
-        finished  : bool,
+        page_indices : torch.Tensor,
+        state_indices: torch.Tensor | None = None,
     ) -> None:
-        uid = req.table_idx
-        # 1) free this request's own slots absorbed by the tree since prefill (they are
-        #    no longer referenced once we re-point below). Free BEFORE the re-point.
-        self._free_state_pages(
-            uid, old_handle.cached_len // self.page_size, prefix_len // self.page_size
-        )
-        # 2) free the tail (partially-consumed pages) if finished
-        if finished:
-            self._free_state_pages(
-                uid, insert_len // self.page_size, div_ceil(req.cached_len, self.page_size)
+        if len(page_indices) > 0:
+            self.free_pages = torch.cat([self.free_pages, page_indices[:: self.page_size]])
+        if state_indices is not None and len(state_indices) > 0:
+            self.free_states = torch.cat([self.free_states, state_indices[:: self.page_size]])
+
+    def free_to_cached(self, req: Request) -> None:
+        C = align_ceil(req.cached_len, self.page_size)
+        D = align_ceil(req.device_len, self.page_size)
+        assert C <= D
+        if C < D:
+            self._free(
+                self.page_table[req.table_idx, C:D],
+                (
+                    self.state_table[req.table_idx, C:D]
+                    if self.state_table is not None else None
+                ),
             )
-            # 3) wipe this request's live token-to-state mapping. Verify reserves
-            #    permanently belong to a separate table and survive table_idx reuse.
-            self.state_table[uid] = -1
-        else:
-            # 3) re-point matched pages to the tree's canonical slots
-            _matched_indices, matched_state = new_handle.get_matched_indices()
-            self.state_table[uid, :insert_len] = matched_state.repeat_interleave(
-                self.page_size
-            )
+            if self.state_table is not None:
+                self.state_table[req.table_idx, C:D] = -1
+        req.device_len = min(req.cached_len + 1, req.max_device_len)
 
-    def _free_state_pages(self, uid: int, lo: int, hi: int) -> None:
-        if self.state_pool is None or lo >= hi:
-            return
-        begin, end = lo * self.page_size, hi * self.page_size
-        slots = self.state_table[uid, begin:end:self.page_size]
-        live = slots[slots >= 0]
-        if len(live) > 0:
-            self.free_states = torch.cat([self.free_states, live])
-        self.state_table[uid, begin:end] = -1
-
-    def free_page_range(self, req: Request, first_page: int, last_page: int) -> None:
-        if first_page >= last_page:
-            return
-        begin, end = first_page * self.page_size, last_page * self.page_size
-        self._free(self.page_table[req.table_idx, begin:end])
-        self._free_state_pages(req.table_idx, first_page, last_page)
-
-    def state_commit_verify(self, req: Request, C: int, num_sampled: int) -> None:
+    def commit_speculative(self, req: Request, C: int, num_sampled: int) -> None:
         if self.state_pool is None or self.state_table is None:
             return
         uid = req.table_idx
@@ -214,7 +192,7 @@ class CacheManager:
             assert torch.all(self.free_pages % self.page_size == 0)
         if self.state_pool is not None and self.state_table is not None:
             # Idle (the only time this runs): live rows have no request-owned refs.
-            # The last row belongs to CUDA Graph padding; verify reserves remain populated.
+            # The last row belongs to CUDA Graph padding; work slots remain populated.
             free_state = len(self.free_states)
             live_state = int(
                 (self.state_table[:-1, ::self.page_size] >= 0).sum().item()
@@ -239,20 +217,38 @@ class CacheManager:
                     or len(torch.unique(reserve)) != len(reserve)
                 ):
                     raise RuntimeError(
-                        "CacheManager state integrity check failed: verify reserve "
+                        "CacheManager state integrity check failed: work state table "
                         "contains missing or duplicate slot references."
                     )
 
     @contextmanager
     def lazy_free_region(self):
-        lazy_free_list: list[torch.Tensor] = []
+        lazy_free_pages: list[torch.Tensor] = []
+        lazy_free_states: list[torch.Tensor] = []
         self_free = self._free
+
+        def lazy_free(
+            page_indices : torch.Tensor,
+            state_indices: torch.Tensor | None = None,
+        ) -> None:
+            if len(page_indices) > 0:
+                lazy_free_pages.append(
+                    page_indices[:: self.page_size].clone()
+                )
+            if state_indices is not None and len(state_indices) > 0:
+                lazy_free_states.append(
+                    state_indices[:: self.page_size].clone()
+                )
+
         try:
-            self._free = lambda indices: lazy_free_list.append(indices[:: self.page_size])
+            self._free = lazy_free
             yield
         finally:
             self._free = self_free
-            self.free_pages = torch.cat([self.free_pages] + lazy_free_list)
+            if lazy_free_pages:
+                self.free_pages = torch.cat([self.free_pages] + lazy_free_pages)
+            if lazy_free_states:
+                self.free_states = torch.cat([self.free_states] + lazy_free_states)
 
     def _allocate(self, needed_pages: int = 0, needed_states: int = 0) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         free_pages = len(self.free_pages)
@@ -291,10 +287,6 @@ class CacheManager:
             self.free_states = self.free_states[needed_states:]
 
         return allocated_pages, allocated_states
-
-    def _free(self, indices: torch.Tensor) -> None:
-        if len(indices) > 0:
-            self.free_pages = torch.cat([self.free_pages, indices[:: self.page_size]])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

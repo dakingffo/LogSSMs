@@ -120,7 +120,12 @@ def test_prefill_adder_continues_from_inflight_device_frontier():
     table_manager = SimpleNamespace(
         token_pool=torch.empty((1, 32), dtype=torch.int32)
     )
-    cache_manager = SimpleNamespace(page_size=1)
+    cache_manager = SimpleNamespace(
+        page_size=1,
+        plan_prefill_chunk=lambda remain_len, token_budget: min(
+            remain_len, token_budget
+        ),
+    )
     adder = PrefillAdder(4, 0, cache_manager, table_manager)
 
     current = adder.try_add_one(pending)
@@ -138,11 +143,14 @@ def test_hybrid_chunked_prefill_is_state_checkpoint_aligned():
     )
     cache_manager = SimpleNamespace(
         page_size=64,
-        state_table=torch.empty((1, 4), dtype=torch.int32),
+        plan_prefill_chunk=lambda remain_len, token_budget: 64,
     )
     adder = PrefillAdder(100, 0, cache_manager, table_manager)
 
-    current = adder._add_one_req(pending, None, table_idx=0, cached_len=0)
+    chunk_size = cache_manager.plan_prefill_chunk(pending.input_len, adder.token_budget)
+    current = adder._add_one_req(
+        pending, None, table_idx=0, cached_len=0, chunk_size=chunk_size
+    )
 
     assert isinstance(current, ChunkedRequest)
     assert current.device_len == 64
