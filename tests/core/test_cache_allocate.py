@@ -8,7 +8,11 @@ import pytest
 import torch
 
 import picosgl.core as core
-from picosgl.cache import CacheResources, StandardCacheManager
+from picosgl.cache import (
+    CacheResources,
+    StandardCacheManager,
+    StandardPrefixValue,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +36,9 @@ def _make_cache_manager(num_pages: int, page_size: int) -> StandardCacheManager:
         state_table=None,
         work_state_table=None,
     )
-    return StandardCacheManager(num_pages, page_size, resources, type="radix")
+    return StandardCacheManager(
+        num_pages, page_size, resources, prefix_cache_type="radix"
+    )
 
 
 def _insert_evictable(
@@ -41,7 +47,7 @@ def _insert_evictable(
     indices: torch.Tensor,
 ):
     """Insert a prefix into the radix cache so it becomes evictable."""
-    cm.prefix_cache.insert_prefix(input_ids, indices)
+    cm.prefix_cache.insert_prefix(input_ids, StandardPrefixValue(indices))
 
 
 def _assert_all_page_aligned(tensor: torch.Tensor, page_size: int, label: str = ""):

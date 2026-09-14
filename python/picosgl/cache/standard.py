@@ -1,26 +1,57 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from picosgl.core import Request
-from picosgl.utils import align_ceil, align_down, div_ceil
+from picosgl.utils import align_ceil, align_down, div_ceil, init_logger
 
 from .base import BaseCacheManager, CacheResources
+from .factory import (
+    BaseCacheFactory,
+    CachePlan,
+    SUPPORTED_CACHE_FACTORIES,
+)
+from .pools import (
+    linear_state_slot_bytes_for_config,
+    make_kvcache_pool,
+    make_linear_state_pool,
+)
 from .prefix_cache.base import BaseCacheHandle
+from .prefix_cache.standard import StandardPrefixValue
+
+if TYPE_CHECKING:
+    from picosgl.engine import EngineConfig
+    from picosgl.speculator import SpeculatorReserve
+
+
+logger = init_logger(__name__)
+
+_MIN_KV_PAGES = 2
+
+
+@dataclass(frozen=True)
+class StandardCachePlan(CachePlan):
+    num_states             : int
+    num_draft_states       : int
+    draft_slots_per_request: int
+    cache_per_page         : int
+    cache_per_state        : int
 
 
 class StandardCacheManager(BaseCacheManager):
     def __init__(
         self,
-        num_pages       : int,
-        page_size       : int,
-        resources       : CacheResources,
-        type            : str,
-        num_states      : int                 = 0,
-        num_draft_states: int                 = 0,
+        num_pages        : int,
+        page_size        : int,
+        resources        : CacheResources,
+        prefix_cache_type: str,
+        num_states       : int                 = 0,
+        num_draft_states : int                 = 0,
     ):
-        super().__init__(page_size, resources, type)
+        super().__init__(page_size, resources, prefix_cache_type)
         # The `_free_pages` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_pages` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         self.free_pages = torch.arange(
@@ -95,12 +126,8 @@ class StandardCacheManager(BaseCacheManager):
         old_handle = req.cache_handle
         insert_len = align_down(req.cached_len, self.page_size)
 
-        if state_indices is not None:  # hybrid: keep token-indexed state mappings with KV
-            prefix_len, new_handle = self.prefix_cache.insert_prefix(
-                insert_ids, page_indices, state_indices
-            )
-        else:  # dense: NaivePrefixCache / RadixPrefixCache take no state slots
-            prefix_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        value = StandardPrefixValue(page_indices, state_indices)
+        prefix_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, value)
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         self._free(
@@ -321,3 +348,179 @@ class StandardCacheManager(BaseCacheManager):
         table_idx = table_idx_host.to(page_table.device, non_blocking=True)
         positions = positions_host.to(page_table.device, non_blocking=True)
         page_table[table_idx, positions] = allocated
+
+
+class StandardCacheFactory(BaseCacheFactory):
+    def __init__(self, prefix_cache_type: str) -> None:
+        self.prefix_cache_type = prefix_cache_type
+
+    def plan(
+        self,
+        config            : EngineConfig,
+        available_memory  : int,
+        speculator_reserve: SpeculatorReserve | None,
+    ) -> StandardCachePlan:
+        from picosgl.distributed import try_get_tp_info
+        from picosgl.utils import div_even
+
+        tp_info = try_get_tp_info()
+        assert tp_info is not None
+        cache_per_page = (
+            2
+            * config.model_config.head_dim
+            * div_even(
+                config.model_config.num_kv_heads,
+                tp_info.size,
+                allow_replicate=True,
+            )
+            * config.page_size
+            * config.dtype.itemsize
+            * config.model_config.num_attention_layers
+        )
+        cache_per_state = linear_state_slot_bytes_for_config(
+            config.model_config, config.dtype
+        )
+        num_draft_states = (
+            speculator_reserve.num_draft_slots
+            if speculator_reserve is not None else 0
+        )
+        draft_slots_per_request = (
+            speculator_reserve.draft_slots_per_request
+            if speculator_reserve is not None else 0
+        )
+        num_dummy_states = int(config.model_config.is_hybrid)
+        extra_state_slots = num_draft_states + num_dummy_states
+        extra_state_bytes = extra_state_slots * cache_per_state
+
+        num_pages = config.num_page_override
+        if num_pages is None:
+            if config.model_config.is_hybrid:
+                min_pages_bytes = _MIN_KV_PAGES * (
+                    cache_per_page + cache_per_state
+                )
+                available_states = (
+                    available_memory - min_pages_bytes
+                ) // cache_per_state
+                assert extra_state_slots <= available_states, (
+                    f"Not enough memory for {extra_state_slots} reserved linear states: "
+                    f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum "
+                    "KV pages. Raise --memory-ratio / Reduce --max-running-req, "
+                    "or pin --num-pages."
+                )
+                num_pages = max(
+                    _MIN_KV_PAGES,
+                    (available_memory - extra_state_bytes)
+                    // (cache_per_page + cache_per_state),
+                )
+            else:
+                num_pages = available_memory // cache_per_page
+
+        assert num_pages > 1, (
+            "Not enough memory for cache allocation. Raise --memory-ratio or "
+            "reduce --num-pages."
+        )
+        num_tokens = num_pages * config.page_size
+        max_seq_len = min(config.max_seq_len, num_tokens)
+        return StandardCachePlan(
+            num_pages=num_pages,
+            num_tokens=num_tokens,
+            max_seq_len=max_seq_len,
+            aligned_max_seq_len=align_ceil(max_seq_len, 32),
+            num_states=num_pages if config.model_config.is_hybrid else 0,
+            num_draft_states=num_draft_states,
+            draft_slots_per_request=draft_slots_per_request,
+            cache_per_page=cache_per_page,
+            cache_per_state=cache_per_state,
+        )
+
+    def allocate(
+        self,
+        config: EngineConfig,
+        plan  : CachePlan,
+        device: torch.device,
+        dtype : torch.dtype,
+    ) -> CacheResources:
+        assert isinstance(plan, StandardCachePlan)
+        kv_pool = make_kvcache_pool(
+            model_config=config.model_config,
+            num_pages=plan.num_pages + 1,
+            page_size=config.page_size,
+            device=device,
+            dtype=dtype,
+        )
+        page_table = torch.zeros(
+            (config.max_running_req + 1, plan.aligned_max_seq_len),
+            dtype=torch.int32,
+            device=device,
+        )
+        page_table[-1].fill_(plan.num_tokens)
+
+        linear_state = None
+        state_table = None
+        work_state_table = None
+        if config.model_config.is_hybrid:
+            linear_state = make_linear_state_pool(
+                model_config=config.model_config,
+                num_slots=plan.num_states + plan.num_draft_states + 1,
+                device=device,
+                dtype=dtype,
+            )
+            state_table = torch.full(
+                (config.max_running_req + 1, plan.aligned_max_seq_len),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            reserve_cols = plan.draft_slots_per_request
+            if reserve_cols != 0:
+                work_state_table = torch.arange(
+                    plan.num_states,
+                    plan.num_states + plan.num_draft_states,
+                    dtype=torch.int32,
+                    device=device,
+                ).view(config.max_running_req, reserve_cols)
+            state_table[-1].fill_(plan.num_states + plan.num_draft_states)
+
+        kv_cache_bytes = plan.num_pages * plan.cache_per_page
+        logger.info(
+            f"Allocating {plan.num_tokens} tokens for KV cache, K + V = "
+            f"{kv_cache_bytes / (1 << 30):.2f} GiB"
+        )
+        if config.model_config.is_hybrid:
+            state_slots = plan.num_states + plan.num_draft_states + 1
+            state_cache_bytes = state_slots * plan.cache_per_state
+            logger.info(
+                f"Allocating {state_slots} "
+                "linear state slots = "
+                f"{state_cache_bytes / (1 << 30):.2f} GiB"
+            )
+        return CacheResources(
+            kv_pool=kv_pool,
+            page_table=page_table,
+            linear_state=linear_state,
+            state_table=state_table,
+            work_state_table=work_state_table,
+        )
+
+    def make_manager(
+        self,
+        config   : EngineConfig,
+        plan     : CachePlan,
+        resources: CacheResources,
+    ) -> StandardCacheManager:
+        assert isinstance(plan, StandardCachePlan)
+        prefix_cache_type = self.prefix_cache_type
+        if config.model_config.is_hybrid:
+            prefix_cache_type = "hybrid_" + prefix_cache_type
+        return StandardCacheManager(
+            num_pages=plan.num_pages,
+            page_size=config.page_size,
+            resources=resources,
+            prefix_cache_type=prefix_cache_type,
+            num_states=plan.num_states,
+            num_draft_states=plan.num_draft_states,
+        )
+
+
+SUPPORTED_CACHE_FACTORIES.register("naive")(StandardCacheFactory("naive"))
+SUPPORTED_CACHE_FACTORIES.register("radix")(StandardCacheFactory("radix"))

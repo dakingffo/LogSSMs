@@ -30,10 +30,17 @@ import time
 from typing import Any
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, "python"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 if os.path.isdir("/home/daking/.conda/envs/daking"):
     os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
+
+from datasets.parser import (
+    load_dataset,
+    resolve_dataset_path as _resolve_dataset_path,
+    sample_dataset,
+)
 
 
 # -------------------------------------------------------------------------------------
@@ -53,7 +60,10 @@ BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
     "--dataset": {
         "type": str,
         "default": None,
-        "help": "JSON/JSONL dataset path or a name under benchmarks/datasets",
+        "help": (
+            "Dataset name, directory, or JSON/JSONL/Parquet path understood by "
+            "datasets/parser.py"
+        ),
     },
     "--dataset-category": {
         "type": str,
@@ -102,67 +112,15 @@ def parse_int_list(s: str | None, default: int) -> list[int]:
 # prompt generation (deterministic, seeded)
 # -------------------------------------------------------------------------------------
 
-_DATASET_DIR = os.path.join(_REPO, "benchmarks", "datasets")
-
-
 def resolve_dataset_path(dataset: str) -> str:
-    candidates = [dataset]
-    for name in (dataset, dataset.replace("-", "_")):
-        candidates.append(os.path.join(_DATASET_DIR, name))
-        if not name.endswith((".json", ".jsonl")):
-            candidates.append(os.path.join(_DATASET_DIR, name + ".jsonl"))
-            candidates.append(os.path.join(_DATASET_DIR, name + ".json"))
-    for path in candidates:
-        if os.path.isfile(path):
-            return os.path.abspath(path)
-    raise FileNotFoundError(
-        f"Dataset {dataset!r} was not found as a path or under {_DATASET_DIR}"
-    )
-
-
-def _prompt_from_record(record: dict[str, Any]) -> str:
-    if turns := record.get("turns"):
-        # Spec-Bench's first 80 records are multi-turn MT-Bench questions. A serving
-        # throughput batch has no preceding assistant response, so only turn 0 is a
-        # self-contained prompt.
-        return str(turns[0])
-    for key in ("prompt", "question", "text", "instruction"):
-        if value := record.get(key):
-            return str(value)
-    if conversations := record.get("conversations"):
-        for turn in conversations:
-            if turn.get("role", turn.get("from")) in ("user", "human"):
-                return str(turn.get("content", turn.get("value", "")))
-    raise ValueError(f"Cannot find a user prompt in dataset record: {record!r}")
+    return str(_resolve_dataset_path(dataset))
 
 
 def load_dataset_prompts(
     dataset   : str,
     categories: str | None = None,
 ) -> list[str]:
-    path = resolve_dataset_path(dataset)
-    with open(path, encoding="utf-8") as f:
-        if path.endswith(".jsonl"):
-            records = [json.loads(line) for line in f if line.strip()]
-        else:
-            records = json.load(f)
-    if isinstance(records, dict):
-        records = records.get("data", records.get("questions", []))
-    assert isinstance(records, list), f"Dataset root must be a list: {path}"
-
-    selected_categories = (
-        {value.strip() for value in categories.split(",") if value.strip()}
-        if categories else None
-    )
-    prompts = [
-        _prompt_from_record(record)
-        for record in records
-        if selected_categories is None or record.get("category") in selected_categories
-    ]
-    if not prompts:
-        suffix = f" for categories {sorted(selected_categories)}" if selected_categories else ""
-        raise ValueError(f"Dataset {path} contains no usable prompts{suffix}")
-    return prompts
+    return [record.prompt for record in load_dataset(dataset, categories)]
 
 
 def _take_dataset_prompts(
@@ -171,15 +129,10 @@ def _take_dataset_prompts(
     count     : int,
     seed      : int,
 ) -> list[str]:
-    prompts = load_dataset_prompts(dataset, categories)
-    if count > len(prompts):
-        raise ValueError(
-            f"Requested {count} prompts, but dataset selection only contains "
-            f"{len(prompts)}; refusing to repeat prompts because prefix-cache hits "
-            "would distort the benchmark"
-        )
-    random.Random(seed).shuffle(prompts)
-    return prompts[:count]
+    return [
+        record.prompt
+        for record in sample_dataset(dataset, count, seed, categories)
+    ]
 
 
 def _dataset_prompt_len(tokenizer: Any, prompt: str) -> int:

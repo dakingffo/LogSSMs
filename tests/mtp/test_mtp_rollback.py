@@ -137,7 +137,7 @@ def main():
     cm = StandardCacheManager(
         num_pages=num_pages, page_size=PS, num_states=num_pages,
         resources=resources,
-        type="hybrid_radix", num_draft_states=reserve.numel(),
+        prefix_cache_type="hybrid_radix", num_draft_states=reserve.numel(),
     )
 
     from transformers import AutoTokenizer

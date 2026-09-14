@@ -10,6 +10,10 @@ __pycache__/
 # json files
 *.json
 *.jsonl
+datasets/swe_bench/
+datasets/sharegpt/
+datasets/lmsys_chat_1m/
+datasets/spec_bench/
 
 # profiling data
 *.nsys-rep

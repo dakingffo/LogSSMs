@@ -13,11 +13,11 @@ from picosgl.utils import align_down
 
 from .base import (
     BaseCacheHandle, 
-    BasePrefixCache, 
     InsertResult, 
     MatchResult, 
     SizeInfo
 )
+from .standard import StandardPrefixCacheBase, StandardPrefixValue
 
 
 KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
@@ -171,7 +171,7 @@ class RadixCacheHandle(BaseCacheHandle):
 
 
 NodeT = TypeVar("NodeT", bound=RadixTreeNode)
-class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
+class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
     def __init__(self, device: torch.device, node_type: type[NodeT]):
         super().__init__()
         self.NodeType: type[NodeT] = node_type
@@ -209,26 +209,34 @@ class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
 
     def insert_prefix(
         self,
-        input_ids : torch.Tensor,
-        *tensors
+        input_ids: torch.Tensor,
+        value    : StandardPrefixValue,
     ) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
         node, prefix_len = self._tree_walk(input_ids)
         if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
             new_node = self.NodeType(self.key_fn, self.page_size)
-            new_node.set(prefix_len, insert_len, input_ids, *tensors)
+            if isinstance(new_node, HybridRadixTreeNode):
+                assert value.state_indices is not None
+                new_node.set(
+                    prefix_len, insert_len, input_ids,
+                    value.kv_indices, value.state_indices,
+                )
+            else:
+                assert value.state_indices is None
+                new_node.set(prefix_len, insert_len, input_ids, value.kv_indices)
             new_node.set_parent(node)
             self.evictable_size += new_node.length
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node, self.empty_tensor))
 
-    def evict(self, size: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def evict(self, size: int) -> StandardPrefixValue:
         """Evict prefixes. Returns (evicted KV page indices, evicted state slots).
 
         For the non-hybrid radix cache the state slots are None.
         """
         if size == 0:
-            return self.empty_tensor, None
+            return StandardPrefixValue(self.empty_tensor)
         assert size <= self.evictable_size, f"Can't evict {size}, only {self.evictable_size}"
 
         leave_nodes = self._collect_leave_nodes_for_evict()
@@ -253,8 +261,9 @@ class RadixPrefixCache(BasePrefixCache, Generic[NodeT]):
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
-        return torch.cat(evicted_indices), (
-            torch.cat(evicted_state) if evicted_state else None
+        return StandardPrefixValue(
+            torch.cat(evicted_indices),
+            torch.cat(evicted_state) if evicted_state else None,
         )
 
     def reset(self) -> None:

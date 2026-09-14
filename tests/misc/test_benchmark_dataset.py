@@ -8,6 +8,7 @@ from benchmarks.bench_common import (
     load_dataset_prompts,
     resolve_dataset_path,
 )
+from datasets.parser import iter_dataset, sample_dataset
 
 
 class FakeTokenizer:
@@ -25,7 +26,7 @@ def test_load_spec_bench():
         path = resolve_dataset_path("spec-bench")
     except FileNotFoundError:
         pytest.skip("Spec-Bench is an optional local benchmark dataset")
-    assert path.endswith("benchmarks/datasets/spec_bench.jsonl")
+    assert path.endswith("datasets/spec_bench")
     assert len(load_dataset_prompts(path)) == 480
     assert len(load_dataset_prompts("spec_bench", "coding")) == 10
     assert len(load_dataset_prompts("spec_bench", "qa,rag")) == 160
@@ -56,3 +57,65 @@ def test_dataset_sampling_is_deterministic_and_never_repeats(tmp_path):
 def test_dataset_token_length_includes_chat_template():
     tokenizer = FakeTokenizer()
     assert _dataset_prompt_len(tokenizer, "one two three") == 3
+
+
+def test_sharegpt_normalizes_messages(tmp_path):
+    pytest.importorskip("ijson")
+    path = tmp_path / "sharegpt"
+    path.mkdir()
+    (path / "ShareGPT_V3_unfiltered_cleaned_split.json").write_text(
+        json.dumps([
+            {
+                "id": "conversation-1",
+                "conversations": [
+                    {"from": "human", "value": "hello"},
+                    {"from": "gpt", "value": "hi"},
+                ],
+            }
+        ]),
+        encoding="utf-8",
+    )
+    record = next(iter_dataset(path))
+    assert record.uid == "conversation-1"
+    assert [(message.role, message.content) for message in record.messages] == [
+        ("user", "hello"),
+        ("assistant", "hi"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "raw", "expected"),
+    [
+        (
+            "swe_bench",
+            {
+                "instance_id": "repo-1",
+                "repo": "org/repo",
+                "problem_statement": "fix this bug",
+            },
+            ("repo-1", "org/repo", "fix this bug"),
+        ),
+        (
+            "lmsys_chat_1m",
+            {
+                "conversation_id": "chat-1",
+                "language": "English",
+                "conversation": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ],
+            },
+            ("chat-1", "English", "hello"),
+        ),
+    ],
+)
+def test_parquet_datasets_normalize_and_sample(tmp_path, name, raw, expected):
+    parquet = pytest.importorskip("pyarrow.parquet")
+    pyarrow = pytest.importorskip("pyarrow")
+    path = tmp_path / name / "data"
+    path.mkdir(parents=True)
+    filename = "test-00000.parquet" if name == "swe_bench" else "train-00000.parquet"
+    parquet.write_table(pyarrow.Table.from_pylist([raw]), path / filename)
+
+    record = sample_dataset(path.parent, count=1, seed=7)[0]
+    assert (record.uid, record.category, record.prompt) == expected

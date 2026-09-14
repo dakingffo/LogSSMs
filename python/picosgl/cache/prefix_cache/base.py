@@ -63,35 +63,6 @@ class BasePrefixCache(ABC):
         """
 
     @abstractmethod
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
-        """
-        Insert a new prefix into the cache.
-        This operation will modify the cache.
-        Args:
-            input_ids (torch.Tensor): The input ids to insert. Shape: (seq_len,)
-            indices (torch.Tensor): The indices to store the new prefix. Shape: (seq_len,)
-
-        Returns:
-            InsertResult: The result of the insertion.
-        """
-
-    @abstractmethod
-    def evict(self, size: int) -> torch.Tensor:
-        """
-        Evict some prefixes from the cache to free up space.
-        This operation will modify the cache.
-        Note that evict 0 is always safe and does nothing.
-        Note that the actual evict size may be larger than the requested size.
-        Args:
-            size (int): The size to evict.
-
-        Returns:
-            torch.Tensor: The indices evicted. Shape: (evict_size,)
-        Raises:
-            RuntimeError: If the requested size is larger than the evictable size.
-        """
-
-    @abstractmethod
     def reset(self) -> None:
         """Reset the cache manager and the underlying cache."""
 

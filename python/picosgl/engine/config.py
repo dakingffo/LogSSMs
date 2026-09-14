@@ -31,6 +31,7 @@ class EngineConfig:
     use_dummy_weight        : bool             = False
     max_seq_len_override    : int | None       = None
     num_page_override       : int | None       = None  # if not None, will override the number of pages
+    cache_type              : str              = "radix"
 
     speculative_algorithm        : str | None                  = None
     speculative_draft_model_path : str | None                  = None

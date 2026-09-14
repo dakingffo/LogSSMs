@@ -33,7 +33,7 @@ def parse_args(args: list[str]) -> ServerArgs:
         EngineConfig instance with parsed arguments
     """
     from picosgl.layers.attention_backend import validate_attn_backend
-    from picosgl.cache import SUPPORTED_PREFIX_CACHE
+    from picosgl.cache import SUPPORTED_CACHE_FACTORIES
     from picosgl.layers.moe_backend import SUPPORTED_MOE_BACKENDS
     from picosgl.speculator.drafters import (
         SUPPORTED_SPECULATOR_ARGUMENT_PARSERS,
@@ -198,8 +198,8 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--cache-type",
         type=str,
         default=ServerArgs.cache_type,
-        choices=SUPPORTED_PREFIX_CACHE.supported_names(),
-        help="The KV cache management strategy.",
+        choices=SUPPORTED_CACHE_FACTORIES.supported_names(),
+        help="The cache management strategy.",
     )
 
     parser.add_argument(

@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, NoReturn
 
 import torch
 
-from picosgl.cache import CacheResources, StandardCacheManager
 from picosgl.core import Request
 from picosgl.message import (
     AbortBackendMsg,
@@ -53,21 +52,11 @@ class Scheduler(SchedulerIOMixin):
         # initialize other managers
         self.config = config
         self.speculator_data_plane = speculator_data_plane
-        self.cache_resources = CacheResources(
-            kv_pool=self.engine.kv_cache,
-            page_table=self.engine.page_table,
-            linear_state=self.engine.linear_state,
-            state_table=self.engine.state_table,
-            work_state_table=self.engine.work_state_table,
-        )
+        self.cache_resources = self.engine.cache_resources
         self.table_manager = TableManager(
             config.max_running_req, self.cache_resources.page_table
         )
-        self.cache_manager = StandardCacheManager(
-            self.engine.num_pages, config.page_size, self.cache_resources, config.cache_type,
-            num_states=self.engine.num_states,
-            num_draft_states=self.engine.num_draft_states,
-        )
+        self.cache_manager = self.engine.cache_manager
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool

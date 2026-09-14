@@ -10,7 +10,6 @@ from picosgl.core import Request
 
 from .kv_pool.base import BaseKVCachePool
 from .linear_pool.state_pool import LinearStatePool
-from .prefix_cache import make_prefix_cache
 from .prefix_cache.base import BaseCacheHandle, MatchResult
 
 if TYPE_CHECKING:
@@ -29,14 +28,18 @@ class CacheResources:
 class BaseCacheManager(ABC):
     def __init__(
         self,
-        page_size: int,
-        resources: CacheResources,
-        type     : str,
+        page_size        : int,
+        resources        : CacheResources,
+        prefix_cache_type: str,
     ) -> None:
+        from .prefix_cache import make_prefix_cache
+
         self.device = resources.page_table.device
         self.page_size = page_size
         self.resources = resources
-        self.prefix_cache = make_prefix_cache(device=self.device, type=type)
+        self.prefix_cache = make_prefix_cache(
+            device=self.device, type=prefix_cache_type
+        )
 
     @property
     def page_table(self) -> torch.Tensor:

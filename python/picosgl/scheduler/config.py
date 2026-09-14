@@ -10,7 +10,6 @@ from picosgl.engine import EngineConfig
 class SchedulerConfig(EngineConfig):
     max_prefill_tokens: int = 8192  # chunk-prefill batch budget in tokens
     max_decode_tokens : int | None = None  # decode/verify batch budget in tokens; None => auto (decode_batch_budget)
-    cache_type        : str  = "radix"
     offline_mode      : bool = False
     _unique_suffix    : str  = field(default_factory=lambda: f".pid={os.getpid()}")
 

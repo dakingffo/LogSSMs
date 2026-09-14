@@ -22,7 +22,11 @@ sys.path.insert(0, _REPO)
 import torch
 
 from picosgl.core import Context, Request, SamplingParams, set_global_ctx
-from picosgl.cache import CacheResources, StandardCacheManager
+from picosgl.cache import (
+    CacheResources,
+    StandardCacheManager,
+    StandardPrefixValue,
+)
 from picosgl.scheduler.prefill import PendingRequest
 from picosgl.cache.linear_pool.state_pool import LinearStatePool
 from picosgl.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
@@ -65,7 +69,7 @@ def make_cm(
     return StandardCacheManager(
         num_pages=num_pages, page_size=page_size,
         resources=resources,
-        type="hybrid_radix", num_states=num_states,
+        prefix_cache_type="hybrid_radix", num_states=num_states,
     )
 
 
@@ -76,7 +80,7 @@ def test1_hybrid_radix():
     hc = RadixPrefixCache(device=torch.device("cpu"), node_type=HybridRadixTreeNode)
     ids = torch.arange(192, dtype=torch.int32)       # 3 pages
     state = torch.tensor([10] * 64 + [11] * 64 + [12] * 64, dtype=torch.int32)
-    res = hc.insert_prefix(ids, ids.clone(), state)
+    res = hc.insert_prefix(ids, StandardPrefixValue(ids.clone(), state))
     assert res.handle.cached_len == 192
     matched_indices, matched_state = res.handle.get_matched_indices()
     assert matched_indices.tolist() == list(range(192))
@@ -92,7 +96,7 @@ def test1_hybrid_radix():
         [10] * 64 + [11] * 64 + [12] * 64 + [13] * 64,
         dtype=torch.int32,
     )
-    hc.insert_prefix(ids2, ids2.clone(), state2)
+    hc.insert_prefix(ids2, StandardPrefixValue(ids2.clone(), state2))
     m2 = hc.match_prefix(ids2)
     assert m2.cuda_handle.get_matched_indices()[1].tolist() == state2.tolist()
     # evict 2 pages -> returns 2 state slots

@@ -23,6 +23,13 @@ def make_naive_cache(device: torch.device):
     return NaivePrefixCache(device=device)
 
 
+@SUPPORTED_PREFIX_CACHE.register("hybrid_naive")
+def make_hybrid_naive_cache(device: torch.device):
+    from .naive import NaivePrefixCache
+
+    return NaivePrefixCache(device=device, with_state=True)
+
+
 @SUPPORTED_PREFIX_CACHE.register("radix")
 def make_radix_cache(device: torch.device):
     from .radix import RadixTreeNode, RadixPrefixCache

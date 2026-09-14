@@ -14,15 +14,11 @@ from picosgl.distributed import (
     enable_pynccl_distributed,
     set_tp_info,
 )
-from picosgl.cache import (
-    make_kvcache_pool,
-    make_linear_state_pool,
-    linear_state_slot_bytes_for_config,
-)
+from picosgl.cache import get_cache_factory
 from picosgl.layers import set_rope_device
 from picosgl.models import make_model, load_target_weight
 from picosgl.utils import (
-    align_ceil, div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+    init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 )
 
 from .config import EngineConfig
@@ -33,10 +29,6 @@ if TYPE_CHECKING:
     import multiprocessing as mp
 
 logger = init_logger(__name__)
-
-# Smallest KV cache we will ever build; the MTP draft-state pool must fit alongside it.
-_MIN_KV_PAGES = 2
-
 
 Indice2D : TypeAlias = tuple[torch.Tensor, torch.Tensor]
 
@@ -111,62 +103,41 @@ class Engine:
         else:
             self.speculator_reserve = None
 
-        self.num_pages, num_tokens, self.num_draft_states = self._determine_num_pages(init_free_memory, config)
-        # ======================= KV cache initialization ========================
-        self.ctx.kv_cache = self.kv_cache = make_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
+        current_free_memory = self._sync_get_memory()[0]
+        model_memory = init_free_memory - current_free_memory
+        available_memory = (
+            int(config.memory_ratio * init_free_memory) - model_memory
+        )
+        cache_factory = get_cache_factory(config.cache_type)
+        self.cache_plan = cache_factory.plan(
+            config=config,
+            available_memory=available_memory,
+            speculator_reserve=self.speculator_reserve,
+        )
+        self.cache_resources = cache_factory.allocate(
+            config=config,
+            plan=self.cache_plan,
             device=self.device,
             dtype=self.dtype,
         )
-
-        # ======================= Linear attention state pool ========================
-        self.num_states = 0
-        self.linear_state = None
-        self.state_table = None
-        self.work_state_table = None
-        if config.model_config.is_hybrid:
-            self.num_states = self.num_pages
-            self.ctx.linear_state = self.linear_state = make_linear_state_pool(
-                model_config=config.model_config,
-                num_slots=self.num_states + self.num_draft_states + 1,
-                device=self.device,
-                dtype=self.dtype,
-            )
-
-
-        # ======================= Page table initialization ========================
-        # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = align_ceil(self.max_seq_len, 32)
-        self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
-            (config.max_running_req + 1, aligned_max_seq_len),
-            dtype=torch.int32,
-            device=self.device,
+        self.cache_manager = cache_factory.make_manager(
+            config=config,
+            plan=self.cache_plan,
+            resources=self.cache_resources,
         )
-        # ======================= Linear state table ========================
-        if config.model_config.is_hybrid:
-            reserve_cols = (
-                self.speculator_reserve.draft_slots_per_request
-                if self.speculator_reserve is not None else 0
-            )
-            self.ctx.state_table = self.state_table = torch.full(
-                (config.max_running_req + 1, aligned_max_seq_len),
-                -1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if reserve_cols != 0:
-                reserve = torch.arange(
-                    self.num_states,
-                    self.num_states + self.num_draft_states,
-                    dtype=torch.int32,
-                    device=self.device,
-                ).view(config.max_running_req, reserve_cols)
-                self.ctx.work_state_table = self.work_state_table = reserve
-            self.dummy_state_slot = self.num_states + self.num_draft_states
-            self.state_table[-1].fill_(self.dummy_state_slot)
+
+        self.num_pages = self.cache_plan.num_pages
+        self.max_seq_len = self.cache_plan.max_seq_len
+        self.kv_cache = self.cache_resources.kv_pool
+        self.page_table = self.cache_resources.page_table
+        self.linear_state = self.cache_resources.linear_state
+        self.state_table = self.cache_resources.state_table
+        self.work_state_table = self.cache_resources.work_state_table
+        self.ctx.kv_cache = self.kv_cache
+        self.ctx.page_table = self.page_table
+        self.ctx.linear_state = self.linear_state
+        self.ctx.state_table = self.state_table
+        self.ctx.work_state_table = self.work_state_table
 
         # ======================= Attention & MoE backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = make_attention_backend(
@@ -194,7 +165,6 @@ class Engine:
             cache_handle=None,  # type: ignore
             max_device_len=2,
         )
-        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
 
         speculative_skip_graphs = config.enable_specualtive_decoding
         self.graph_runner = GraphRunner(
@@ -208,7 +178,7 @@ class Engine:
             cuda_graph_bs=[] if speculative_skip_graphs else config.cuda_graph_bs,
             cuda_graph_max_bs=0 if speculative_skip_graphs else config.cuda_graph_max_bs,
             free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
+            max_seq_len=self.cache_plan.aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
@@ -246,70 +216,6 @@ class Engine:
                 k: v.to(param_dtypes.get(k, self.dtype))
                 for k, v in load_target_weight(config.model_path, self.device)
             }
-
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> tuple[int, int, int | None]:
-        # min free across ranks: the non-DT speculator worker shares rank0's device, so
-        # its bytes must shrink the budget (max would ignore the tightest rank).
-        new_free_memory = self._sync_get_memory()[0]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_attention_layers
-        )
-        # For hybrid models every KV page also owns one linear-state slot. Target-side
-        # verify states are reserved according to the selected speculator configuration.
-        cache_per_state = linear_state_slot_bytes_for_config(config.model_config, self.dtype)
-        num_draft_states = (
-            self.speculator_reserve.num_draft_slots
-            if self.speculator_reserve is not None else 0
-        )
-        num_dummy_states = 1 if config.model_config.is_hybrid else 0
-        extra_state_slots = num_draft_states + num_dummy_states
-        extra_state_bytes = extra_state_slots * cache_per_state
-
-        num_pages = config.num_page_override
-        if num_pages is None:
-            model_memory = old_free_memory - new_free_memory
-            available_memory = (
-                int(config.memory_ratio * old_free_memory)
-                - model_memory
-            )
-            if config.model_config.is_hybrid:
-                min_pages_bytes = _MIN_KV_PAGES * (cache_per_page + cache_per_state)
-                available_states = (available_memory - min_pages_bytes) // cache_per_state
-                assert extra_state_slots <= available_states, (
-                    f"Not enough memory for {extra_state_slots} reserved linear states: "
-                    f"only {available_states} fit alongside {_MIN_KV_PAGES} minimum KV pages. "
-                    f"Raise --memory-ratio / Reduce --max-running-req, or pin --num-pages."
-                )
-                available_memory -= extra_state_bytes
-                num_pages = max(
-                    _MIN_KV_PAGES,
-                    available_memory // (cache_per_page + cache_per_state),
-                )
-            else:
-                num_pages = available_memory // cache_per_page
-
-        assert num_pages > 1, (
-            "Not enough memory for KV cache, try reducing --num-pages. "
-            f"(hybrid: cache_per_page={mem_GB(cache_per_page)}, cache_per_state="
-            f"{mem_GB(cache_per_state)}, reserve_bytes={mem_GB(extra_state_bytes)})"
-        )
-        num_tokens = num_pages * config.page_size
-        logger.info(f"Allocating {num_tokens} tokens for KV cache,\
-                     K + V = {mem_GB(num_pages * cache_per_page)}")
-        if config.model_config.is_hybrid:
-            logger.info(
-                f"Allocating {num_pages + extra_state_slots}"
-                f" linear state slots = "
-                f"{mem_GB(num_pages * cache_per_state + extra_state_bytes)}"
-            )
-            return num_pages, num_tokens, num_draft_states
-        else:
-            return num_pages, num_tokens, None
 
     def _sync_get_memory(self) -> tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
@@ -436,9 +342,6 @@ class Engine:
             logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 
         if config.model_config.is_hybrid:
-            if getattr(config, "cache_type", "radix") != "hybrid_radix":
-                override("cache_type", "hybrid_radix")
-                logger.info_rank0("Prefix cache set to hybrid_radix for hybrid (linear attention) model.")
             if config.page_size % 64 != 0:
                 original_page_size = config.page_size
                 override("page_size", 64)

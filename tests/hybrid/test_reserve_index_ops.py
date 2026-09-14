@@ -53,7 +53,7 @@ def make_cm(st, reserve, nslots):
     cm = StandardCacheManager(
         num_pages=10, page_size=64,
         resources=resources,
-        type="hybrid_radix", num_states=nslots,
+        prefix_cache_type="hybrid_radix", num_states=nslots,
         num_draft_states=reserve.numel(),
     )
     return cm, pool
@@ -153,7 +153,7 @@ def test_stable_reserve_across_overlapping_batches():
     cm = StandardCacheManager(
         num_pages=10, page_size=64,
         resources=resources,
-        type="hybrid_radix", num_states=num_states,
+        prefix_cache_type="hybrid_radix", num_states=num_states,
         num_draft_states=max_running_req * reserve_width,
     )
     original = reserve.clone()
