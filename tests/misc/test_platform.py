@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from picosgl.utils.platform import resolve_model_path
+from logssms.utils.platform import resolve_model_path
 
 
 @pytest.mark.parametrize(

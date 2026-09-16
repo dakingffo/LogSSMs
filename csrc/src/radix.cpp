@@ -8,9 +8,9 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/object.h>
 
-#include <picosgl/utils.hpp>
+#include <logssms/utils.hpp>
 
-namespace picosgl {
+namespace logssms {
 class Radix {
 public:
   static std::size_t fast_compare_key(
@@ -50,6 +50,6 @@ private:
           (tensor.dtype().bits == 32 || tensor.dtype().bits == 64);
   }
 };
-} // namespace picosgl
+} // namespace logssms
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_key, picosgl::Radix::fast_compare_key);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_key, logssms::Radix::fast_compare_key);

@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
-from picosgl.core import Batch, clear_global_ctx, set_global_ctx
-from picosgl.speculator.hidden_captor import (
+from logssms.core import Batch, clear_global_ctx, set_global_ctx
+from logssms.speculator.hidden_captor import (
     HiddenCaptorBase,
     HiddenCapturePoint,
     with_speculator,

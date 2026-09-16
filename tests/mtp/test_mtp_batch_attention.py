@@ -5,8 +5,8 @@ import torch.nn.functional as F
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_indexed_native_kv_pool_matches_dense_batch_attention() -> None:
-    from picosgl.speculator.drafters.attention import DraftAttentionBackend
-    from picosgl.speculator.drafters.pool import DraftKVPool
+    from logssms.speculator.drafters.attention import DraftAttentionBackend
+    from logssms.speculator.drafters.pool import DraftKVPool
 
     device = torch.device("cuda")
     num_qo_heads = 4

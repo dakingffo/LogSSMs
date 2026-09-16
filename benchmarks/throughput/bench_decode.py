@@ -1,9 +1,9 @@
 """Decode-throughput benchmark: short prompts, long generations.
 
-Launches a pico-sglang HTTP server (tp-size from --tp-size), streams a batch of
+Launches a LogSSMs HTTP server (tp-size from --tp-size), streams a batch of
 ``--output-len``-token generations through ``/v1/chat/completions`` and reports decode
 throughput (output-tok/s), total throughput, TPOT and TTFT. Server flags are parsed by
-the library's ``picosgl.server.args.parse_args`` -- nothing is redefined here.
+the library's ``logssms.server.args.parse_args`` -- nothing is redefined here.
 
 Examples:
   python benchmarks/throughput/bench_decode.py --model-path <model> --tp-size 2 \

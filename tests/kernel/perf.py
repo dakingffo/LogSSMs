@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Tuple
 
-from picosgl.utils import init_logger
+from logssms.utils import init_logger
 
 logger = init_logger(__name__)
 

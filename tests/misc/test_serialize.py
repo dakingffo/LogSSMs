@@ -2,11 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from picosgl.core import SamplingParams
+from logssms.core import SamplingParams
 import torch
-from picosgl.message import BatchBackendMsg, UserMsg
-from picosgl.message.utils import serialize_type, deserialize_type
-from picosgl.utils import call_if_main, init_logger
+from logssms.message import BatchBackendMsg, UserMsg
+from logssms.message.utils import serialize_type, deserialize_type
+from logssms.utils import call_if_main, init_logger
 
 logger = init_logger(__name__)
 

@@ -3,10 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from picosgl.cache.linear_pool.state_pool import LinearStatePool
-from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-from picosgl.layers.gated_delta import GatedDeltaConfig
-from picosgl.layers.linear_attention_backend import LinearAttentionBackend
+from logssms.cache.linear_pool.state_pool import LinearStatePool
+from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+from logssms.layers.gated_delta import GatedDeltaConfig
+from logssms.layers.linear_attention_backend import LinearAttentionBackend
 
 
 def _make_inputs(seq_len: int) -> dict:
@@ -129,7 +129,7 @@ def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_chunk_gated_delta_returns_page_checkpoints() -> None:
-    from picosgl.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
+    from logssms.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
 
     inputs = _make_inputs(seq_len=96)
     query = torch.nn.functional.normalize(inputs["query"], dim=-1)

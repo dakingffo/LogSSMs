@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from picosgl.kernel import store_state
+from logssms.kernel import store_state
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

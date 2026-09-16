@@ -30,17 +30,18 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
-_REPO = "/home/daking/PROJECT/pico-sglang"
-sys.path.insert(0, os.path.join(_REPO, "python"))
-sys.path.insert(0, _REPO)
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "python"))
+sys.path.insert(0, str(_REPO))
 
 import torch
 
-from picosgl.core import SamplingParams
-from picosgl.message import UserMsg
+from logssms.core import SamplingParams
+from logssms.message import UserMsg
 from test_mtp_e2e import OfflineScheduler, make_config
 from transformers import AutoTokenizer
 

@@ -1,16 +1,16 @@
 import torch
 
-from picosgl.distributed import DistributedInfo
-from picosgl.scheduler import SchedulerConfig
-from picosgl.server.args import parse_args
-from picosgl.speculator import (
+from logssms.distributed import DistributedInfo
+from logssms.scheduler import SchedulerConfig
+from logssms.server.args import parse_args
+from logssms.speculator import (
     DataPlaneSizes,
     SpeculatorReserve,
     make_data_plane_sizes,
 )
-from picosgl.speculator.drafters import make_hidden_captor, make_speculator_argument_parser
-from picosgl.speculator.drafters.mtp import MTPHiddenCaptor, MTPSpeculatorConfig
-from picosgl.speculator.hidden_captor import HiddenCapturePoint
+from logssms.speculator.drafters import make_hidden_captor, make_speculator_argument_parser
+from logssms.speculator.drafters.mtp import MTPHiddenCaptor, MTPSpeculatorConfig
+from logssms.speculator.hidden_captor import HiddenCapturePoint
 
 
 def test_mtp_speculator_config() -> None:

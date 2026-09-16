@@ -1,6 +1,6 @@
 """Step 8g: Qwen3-1.7B non-MTP regression — transformers greedy reference comparison.
 
-Loads the non-MTP pico-sglang run JSON (tests/mtp/test_mtp_e2e.py --mtp 0) and a
+Loads the non-MTP LogSSMs run JSON (tests/mtp/test_mtp_e2e.py --mtp 0) and a
 transformers greedy decode of the same 5 prompts, then compares token-for-token.
 
 Qwen3-1.7B is dense (num_linear_layers=0), so the depth-D linear state pool is inert and
@@ -14,11 +14,12 @@ Run: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_nonmtp_byte_ident
 import json
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-_REPO = "/home/daking/PROJECT/pico-sglang"
-sys.path.insert(0, os.path.join(_REPO, "python"))
-sys.path.insert(0, _REPO)
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "python"))
+sys.path.insert(0, str(_REPO))
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -44,7 +45,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(MODEL)
     eos = tok.eos_token_id
 
-    # pico-sglang non-MTP greedy streams (from the harness run)
+    # LogSSMs non-MTP greedy streams (from the harness run)
     sgl = {name: [int(t) for t in result["tokens"][name]] for name, _ in PROMPTS}
 
     # transformers greedy reference (raw-tokenized prompt, no chat template — the harness

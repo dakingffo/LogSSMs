@@ -14,22 +14,23 @@ Run: /home/daking/.conda/envs/daking/bin/python tests/hybrid/test_hybrid_radix_c
 """
 import os
 import sys
+from pathlib import Path
 
-_REPO = "/home/daking/PROJECT/pico-sglang"
-sys.path.insert(0, os.path.join(_REPO, "python"))
-sys.path.insert(0, _REPO)
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "python"))
+sys.path.insert(0, str(_REPO))
 
 import torch
 
-from picosgl.core import Context, Request, SamplingParams, set_global_ctx
-from picosgl.cache import (
+from logssms.core import Context, Request, SamplingParams, set_global_ctx
+from logssms.cache import (
     CacheResources,
     StandardCacheManager,
     StandardPrefixValue,
 )
-from picosgl.scheduler.prefill import PendingRequest
-from picosgl.cache.linear_pool.state_pool import LinearStatePool
-from picosgl.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
+from logssms.scheduler.prefill import PendingRequest
+from logssms.cache.linear_pool.state_pool import LinearStatePool
+from logssms.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
 
 
 def make_req(input_len, table_idx, output_len=10):

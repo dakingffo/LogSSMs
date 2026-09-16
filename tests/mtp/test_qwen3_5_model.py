@@ -10,6 +10,7 @@ Tests:
 """
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
@@ -20,24 +21,24 @@ import torch
 #   QWEN3_5_MODEL=/path/to/model python tests/mtp/test_qwen3_5_model.py
 MODEL_PATH = os.environ.get("QWEN3_5_MODEL", "/home/daking/models/huggingface/Qwen3.5-2B")
 
-sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
-from picosgl.utils import load_model_config, torch_dtype
+from logssms.utils import load_model_config, torch_dtype
 
 
 def setup():
-    from picosgl.distributed import DistributedInfo, set_tp_info
+    from logssms.distributed import DistributedInfo, set_tp_info
 
     set_tp_info(DistributedInfo(rank=0, size=1))
-    from picosgl.models import make_model_config
+    from logssms.models import make_model_config
 
     mcfg = make_model_config(load_model_config(MODEL_PATH))
     return mcfg
 
 
 def load_model(mcfg, loaded=None):
-    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
-    from picosgl.models.weight import load_target_weight
+    from logssms.models.qwen3_next import Qwen3NextForCausalLM
+    from logssms.models.weight import load_target_weight
 
     if loaded is None:
         loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
@@ -72,7 +73,7 @@ def test1_weight_loading(mcfg, model, loaded):
 
 
 def make_req(table_idx, cached_len, device_len, output_len=4):
-    from picosgl.core import Request
+    from logssms.core import Request
 
     return Request(
         input_ids=torch.tensor([0] * device_len, dtype=torch.int32),
@@ -87,7 +88,7 @@ def make_req(table_idx, cached_len, device_len, output_len=4):
 
 
 def make_batch(reqs, phase, input_ids, positions):
-    from picosgl.core import Batch
+    from logssms.core import Batch
 
     batch = Batch(reqs=reqs, phase=phase)
     batch.input_ids = input_ids
@@ -136,9 +137,9 @@ def _set_tree(module, name, v):
 def test2_gated_delta_net_math(mcfg):
     print("=" * 60)
     print("Test 2: GatedDeltaNet prefill vs decode math (random weights)")
-    from picosgl.core import Context, get_global_ctx, set_global_ctx
-    from picosgl.cache import LinearStatePool
-    from picosgl.layers import GatedDeltaNet
+    from logssms.core import Context, get_global_ctx, set_global_ctx
+    from logssms.cache import LinearStatePool
+    from logssms.layers import GatedDeltaNet
 
     hidden = mcfg.hidden_size
     conv_dim = (
@@ -217,7 +218,7 @@ def test2_gated_delta_net_math(mcfg):
     assert err < 1e-3, f"chunked continuation mismatch {err}"
     print("  chunked continuation (use_state=True) == full prefill  ✓")
     print("  PASS")
-    from picosgl.core import clear_global_ctx
+    from logssms.core import clear_global_ctx
 
     clear_global_ctx()
 
@@ -225,9 +226,9 @@ def test2_gated_delta_net_math(mcfg):
 def test3_full_model(mcfg, loaded=None):
     print("=" * 60)
     print("Test 3: full model prefill vs decode logits (paged flashinfer)")
-    from picosgl.core import Context, get_global_ctx, set_global_ctx, Request
-    from picosgl.cache import make_kvcache_pool, LinearStatePool
-    from picosgl.layers.attention_backend import make_attention_backend
+    from logssms.core import Context, get_global_ctx, set_global_ctx, Request
+    from logssms.cache import make_kvcache_pool, LinearStatePool
+    from logssms.layers.attention_backend import make_attention_backend
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)

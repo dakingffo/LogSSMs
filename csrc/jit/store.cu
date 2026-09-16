@@ -4,11 +4,11 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <picosgl/tensor.hpp>
-#include <picosgl/utils.hpp>
-#include <picosgl/warp.hpp>
+#include <logssms/tensor.hpp>
+#include <logssms/utils.hpp>
+#include <logssms/warp.hpp>
 
-namespace picosgl {
+namespace logssms {
 
 struct KVStoreKernelParams {
   void *__restrict__       k_cache;
@@ -126,8 +126,8 @@ struct KVStoreKernel {
     };
 
     constexpr auto kWarpsPerBlock =
-        num_threads / picosgl::device::kWarpThreads;
-    static_assert(num_threads % picosgl::device::kWarpThreads == 0);
+        num_threads / logssms::device::kWarpThreads;
+    static_assert(num_threads % logssms::device::kWarpThreads == 0);
     const auto num_blocks = div_ceil(params.length, kWarpsPerBlock);
     const auto use_int32  = indices_dtype.unwrap().bits == 32;
     const auto kernel =
@@ -234,8 +234,8 @@ struct StateStoreKernel {
     };
 
     constexpr auto kWarpsPerBlock =
-        num_threads / picosgl::device::kWarpThreads;
-    static_assert(num_threads % picosgl::device::kWarpThreads == 0);
+        num_threads / logssms::device::kWarpThreads;
+    static_assert(num_threads % logssms::device::kWarpThreads == 0);
     const auto num_blocks = div_ceil(params.length, kWarpsPerBlock);
     const auto use_int32  = indices_dtype.unwrap().bits == 32;
     const auto kernel =
@@ -248,4 +248,4 @@ struct StateStoreKernel {
   }
 };
 
-} // namespace picosgl
+} // namespace logssms

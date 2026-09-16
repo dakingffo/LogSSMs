@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from perf import compare_memory_kernel_perf
 import torch
-from picosgl.kernel import store_cache
-from picosgl.utils import call_if_main
+from logssms.kernel import store_cache
+from logssms.utils import call_if_main
 
 
 @call_if_main(__name__)

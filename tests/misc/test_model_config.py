@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-from picosgl.models import make_model_config
-from picosgl.models.qwen3 import Qwen3Config, Qwen3MoeConfig
-from picosgl.models.qwen3_next import Qwen3_5Config, Qwen3_5MoeConfig, Qwen3NextConfig
+from logssms.models import make_model_config
+from logssms.models.qwen3 import Qwen3Config, Qwen3MoeConfig
+from logssms.models.qwen3_next import Qwen3_5Config, Qwen3_5MoeConfig, Qwen3NextConfig
 
 
 def _config(**kwargs):

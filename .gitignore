@@ -14,6 +14,10 @@ datasets/swe_bench/
 datasets/sharegpt/
 datasets/lmsys_chat_1m/
 datasets/spec_bench/
+datasets/swe_agent/trajs/
+datasets/agentic_coding_trajectories/.cache/
+datasets/agentic_coding_trajectories/sessions.parquet
+experiment/results/
 
 # profiling data
 *.nsys-rep

@@ -35,5 +35,5 @@ repos:
         args: [--style=file, --verbose]
         exclude: |
           (?x)^(
-            python/picosgl/kernel/csrc/include/picosgl/nccl227.h
+            python/logssms/kernel/csrc/include/logssms/nccl227.h
           )

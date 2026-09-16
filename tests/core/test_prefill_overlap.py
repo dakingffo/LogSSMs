@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
-from picosgl.core import ChunkedRequest, Request, SamplingParams
-from picosgl.scheduler.prefill import PendingRequest, PrefillAdder, PrefillManager
+from logssms.core import ChunkedRequest, Request, SamplingParams
+from logssms.scheduler.prefill import PendingRequest, PrefillAdder, PrefillManager
 
 
 class FakeAdder:

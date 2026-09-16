@@ -1,6 +1,6 @@
-"""Shared online throughput-benchmark harness for pico-sglang.
+"""Shared online throughput-benchmark harness for LogSSMs.
 
-bench_prefill / bench_decode / bench_spec_decode all launch a real pico-sglang HTTP
+bench_prefill / bench_decode / bench_spec_decode all launch a real LogSSMs HTTP
 server as a subprocess, wait for it to be ready, then drive a streaming
 ``/v1/chat/completions`` workload against it over httpx. The workload code is
 byte-identical across tp sizes and MTP on/off -- the ONLY thing that changes is the
@@ -8,7 +8,7 @@ server's launch flags (``--tensor-parallel-size`` / ``--speculative-algorithm``)
 is a controlled-variable comparison.
 
 Server arguments are NOT redefined here: the library's
-``picosgl.server.args.parse_args`` is the single source of truth. This module only
+``logssms.server.args.parse_args`` is the single source of truth. This module only
 splits off the bench-only workload flags via ``parse_known_args`` and hands the rest
 to the library unchanged.
 
@@ -50,7 +50,7 @@ from datasets.parser import (
 # Bench-only flags. Every other flag (--model-path, --tp-size, --dtype, --host/--port,
 # --page-size, --num-pages, --max-running-requests, --memory-ratio,
 # --speculative-num-draft-tokens, ...) is parsed by the library's
-# picosgl.server.args.parse_args.
+# logssms.server.args.parse_args.
 BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
     "--num-prompts": {"type": str, "default": None,
                       "help": "comma-separated concurrent request counts (default 32)"},
@@ -94,7 +94,7 @@ def parse_full(argv: list[str], extra: dict[str, dict[str, Any]] | None = None):
         p.add_argument(name, **kw)
     bench_ns, server_argv = p.parse_known_args(argv)
 
-    from picosgl.server.args import parse_args
+    from logssms.server.args import parse_args
 
     server_args = parse_args(server_argv)
     return server_args, bench_ns, server_argv
@@ -295,7 +295,7 @@ def _flag_value(argv: list[str], name: str) -> str | None:
 
 
 def resolve_num_spec_tokens(server_argv: list[str]) -> int:
-    from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
+    from logssms.speculator.drafters.mtp import MTPSpeculatorConfig
 
     value = _flag_value(server_argv, "--speculative-num-draft-tokens")
     return int(value) if value is not None else MTPSpeculatorConfig.num_draft_tokens
@@ -334,11 +334,11 @@ def make_server_cmd(server_argv: list[str], *, port: int, enable_specualtive_dec
                  "--speculative-draft-model-path", model_path]
         if enable_dt:
             argv += ["--enable-dt-separation"]
-    return [sys.executable, "-m", "picosgl"] + argv
+    return [sys.executable, "-m", "logssms"] + argv
 
 
 def launch_server(server_argv: list[str], *, port: int, enable_specualtive_decoding: bool, num_spec_tokens: int, enable_dt: bool = False):
-    """Spawn the pico-sglang server in its own process group. Returns (Popen, log path)."""
+    """Spawn the LogSSMs server in its own process group. Returns (Popen, log path)."""
     cmd = make_server_cmd(
         server_argv,
         port=port,
@@ -348,7 +348,7 @@ def launch_server(server_argv: list[str], *, port: int, enable_specualtive_decod
     )
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.join(_REPO, "python") + os.pathsep + env.get("PYTHONPATH", "")
-    log_path = f"/tmp/picosgl_bench_{port}.log"
+    log_path = f"/tmp/logssms_bench_{port}.log"
     print(f"  launching: {' '.join(cmd)}", flush=True)
     print(f"  server log: {log_path}", flush=True)
     with open(log_path, "w") as log:

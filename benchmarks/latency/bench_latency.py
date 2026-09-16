@@ -1,6 +1,6 @@
 """Latency benchmark: TTFT and TPOT across input/output length sweeps.
 
-Launches a pico-sglang HTTP server once and drives a streaming
+Launches a LogSSMs HTTP server once and drives a streaming
 ``/v1/chat/completions`` workload for each (input_len, output_len) config,
 reporting TTFT / TPOT percentiles per config plus a sweep summary table.
 
@@ -21,7 +21,7 @@ zipped (a length-1 list broadcasts), so the common sweeps are:
       --dataset spec_bench --dataset-category coding,math_reasoning \
       --num-prompts 8 --output-lens 64
 
-Server flags are parsed by the library's ``picosgl.server.args.parse_args`` --
+Server flags are parsed by the library's ``logssms.server.args.parse_args`` --
 nothing is redefined here.
 """
 import asyncio

@@ -8,17 +8,18 @@ Run: /home/daking/.conda/envs/daking/bin/python tests/hybrid/test_reserve_index_
 """
 import os
 import sys
+from pathlib import Path
 
-_REPO = "/home/daking/PROJECT/pico-sglang"
-sys.path.insert(0, os.path.join(_REPO, "python"))
-sys.path.insert(0, _REPO)
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "python"))
+sys.path.insert(0, str(_REPO))
 
 import torch
 
-import picosgl.core as core
-from picosgl.core import Context, Request, SamplingParams, set_global_ctx
-from picosgl.cache import CacheResources, StandardCacheManager
-from picosgl.cache.linear_pool.state_pool import LinearStatePool
+import logssms.core as core
+from logssms.core import Context, Request, SamplingParams, set_global_ctx
+from logssms.cache import CacheResources, StandardCacheManager
+from logssms.cache.linear_pool.state_pool import LinearStatePool
 
 
 def setup_ctx() -> None:

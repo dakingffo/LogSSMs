@@ -2,15 +2,15 @@ from types import SimpleNamespace
 
 import torch
 
-import picosgl.core as core
-from picosgl.cache import (
+import logssms.core as core
+from logssms.cache import (
     CacheResources,
     StandardCachePlan,
     SUPPORTED_CACHE_FACTORIES,
     get_cache_factory,
 )
-from picosgl.cache.prefix_cache.naive import NaivePrefixCache
-from picosgl.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
+from logssms.cache.prefix_cache.naive import NaivePrefixCache
+from logssms.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
 
 
 def _make_resources() -> CacheResources:

@@ -13,7 +13,7 @@ class BuildPyWithCSrc(_build_py):
         repository_root = Path(__file__).resolve().parent
         copytree(
             repository_root / "csrc",
-            Path(self.build_lib) / "picosgl" / "csrc",
+            Path(self.build_lib) / "logssms" / "csrc",
             dirs_exist_ok=True,
         )
 

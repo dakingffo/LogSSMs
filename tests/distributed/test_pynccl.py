@@ -1,10 +1,10 @@
 import os
 import time
 import torch
-from picosgl.distributed import DistributedInfo, init_pynccl, set_tp_info
+from logssms.distributed import DistributedInfo, init_pynccl, set_tp_info
 from tqdm import tqdm
 
-from picosgl.utils import init_logger
+from logssms.utils import init_logger
 
 
 logger = init_logger(__name__)

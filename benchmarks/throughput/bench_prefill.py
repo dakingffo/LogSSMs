@@ -1,9 +1,9 @@
 """Prefill-throughput benchmark: long prompts, tiny outputs.
 
-Launches a pico-sglang HTTP server (tp-size from --tp-size), streams a batch of
+Launches a LogSSMs HTTP server (tp-size from --tp-size), streams a batch of
 ``--input-len``-token prompts through ``/v1/chat/completions`` and reports prefill
 throughput (input-tok/s), TTFT and req/s. Server flags are parsed by the library's
-``picosgl.server.args.parse_args`` -- nothing is redefined here.
+``logssms.server.args.parse_args`` -- nothing is redefined here.
 
 Examples:
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \

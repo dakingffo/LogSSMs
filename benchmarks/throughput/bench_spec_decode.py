@@ -4,7 +4,7 @@ Both runs use the SAME seeded prompt batch, the SAME httpx load driver and the S
 metrics -- the only thing that differs is the server's ``--speculative-algorithm`` flag
 (``--speculative-num-draft-tokens`` defaults to 4). tp size comes
 from ``--tp-size``. Server flags are parsed by the library's
-``picosgl.server.args.parse_args`` -- nothing is redefined here.
+``logssms.server.args.parse_args`` -- nothing is redefined here.
 
 Examples:
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> --tp-size 2 \

@@ -1,18 +1,18 @@
 import pytest
 import torch
 
-from picosgl.cache.linear_pool.state_pool import LinearStatePool
-from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-from picosgl.distributed import DistributedInfo, tp_override
-from picosgl.kernel import store_state
-from picosgl.kernel.linear_attention.vendor.fla import (
+from logssms.cache.linear_pool.state_pool import LinearStatePool
+from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+from logssms.distributed import DistributedInfo, tp_override
+from logssms.kernel import store_state
+from logssms.kernel.linear_attention.vendor.fla import (
     fused_recurrent_gated_delta_rule,
 )
-from picosgl.layers import GatedDeltaNet
-from picosgl.layers.linear_attention_backend.native import _l2norm
-from picosgl.models.config import RotaryConfig
-from picosgl.models.qwen3_next import Qwen3_5Config
-from picosgl.utils import torch_dtype
+from logssms.layers import GatedDeltaNet
+from logssms.layers.linear_attention_backend.native import _l2norm
+from logssms.models.config import RotaryConfig
+from logssms.models.qwen3_next import Qwen3_5Config
+from logssms.utils import torch_dtype
 
 
 def _recurrent_gated_delta_rule_with_snapshots(

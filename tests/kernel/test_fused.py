@@ -7,7 +7,7 @@ def test_sigmoid_and_mul(dtype: torch.dtype) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
-    from picosgl.kernel import sigmoid_and_mul
+    from logssms.kernel import sigmoid_and_mul
 
     generator = torch.Generator(device="cuda").manual_seed(17)
     input = torch.randn((7, 4, 128), dtype=dtype, device="cuda", generator=generator)

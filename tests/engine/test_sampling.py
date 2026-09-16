@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from picosgl.core import SamplingParams
-from picosgl.engine import Sampler
+from logssms.core import SamplingParams
+from logssms.engine import Sampler
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

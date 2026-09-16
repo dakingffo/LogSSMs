@@ -1,6 +1,6 @@
 import torch
 
-from picosgl.speculator.drafters.pool import DraftKVPool
+from logssms.speculator.drafters.pool import DraftKVPool
 
 
 def _make_pool() -> DraftKVPool:

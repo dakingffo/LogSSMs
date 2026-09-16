@@ -3,7 +3,7 @@ import json
 import safetensors.torch
 import torch
 
-from picosgl.models.weight import iter_checkpoint_weights
+from logssms.models.weight import iter_checkpoint_weights
 
 
 def test_iter_checkpoint_weights_from_pytorch(tmp_path):

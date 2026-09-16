@@ -83,6 +83,85 @@ def test_sharegpt_normalizes_messages(tmp_path):
     ]
 
 
+def test_swe_agent_normalizes_trajectory(tmp_path):
+    path = tmp_path / "swe_agent" / "trajs"
+    path.mkdir(parents=True)
+    (path / "org__repo-1.traj").write_text(
+        json.dumps({
+            "history": [
+                {"role": "system", "content": "instructions"},
+                {"role": "user", "content": "fix this"},
+                {"role": "assistant", "content": "working"},
+            ]
+        }),
+        encoding="utf-8",
+    )
+
+    record = next(iter_dataset(path.parent))
+    assert (record.uid, record.category, record.prompt) == (
+        "org__repo-1",
+        "org/repo",
+        "fix this",
+    )
+
+
+def test_agentic_coding_preserves_tool_messages(tmp_path):
+    parquet = pytest.importorskip("pyarrow.parquet")
+    pyarrow = pytest.importorskip("pyarrow")
+    path = tmp_path / "agentic_coding_trajectories"
+    path.mkdir()
+    tool_calls = [{
+        "function": {
+            "arguments": json.dumps({"command": "pwd"}),
+            "name": "execute_bash",
+        },
+        "id": "call-1",
+        "type": "function",
+    }]
+    raw = {
+        "session_id"           : "session-1",
+        "source_dataset"       : "openhands",
+        "source_id"            : "instance-1",
+        "agent_framework"      : "OpenHands",
+        "recorded_model"       : "model",
+        "messages_json"        : json.dumps([
+            {"role": "user", "content": "fix this"},
+            {
+                "role"           : "assistant",
+                "content"        : "",
+                "tool_calls_json": json.dumps(tool_calls),
+            },
+            {
+                "role"        : "tool",
+                "content"     : "/workspace",
+                "tool_call_id": "call-1",
+            },
+        ]),
+        "n_turns"              : 1,
+        "max_isl"              : 4096,
+        "total_tokens"         : 5000,
+        "ground_truth_meta_json": "{}",
+    }
+    parquet.write_table(
+        pyarrow.Table.from_pylist([raw]),
+        path / "sessions.parquet",
+    )
+
+    record = next(iter_dataset(path))
+    assert record.category == "openhands"
+    assert record.metadata["max_isl"] == 4096
+    assert record.messages[1].content == ""
+    assert record.messages[1].tool_calls == ({
+        "function": {
+            "arguments": {"command": "pwd"},
+            "name": "execute_bash",
+        },
+        "id": "call-1",
+        "type": "function",
+    },)
+    assert record.messages[2].tool_call_id == "call-1"
+
+
 @pytest.mark.parametrize(
     ("name", "raw", "expected"),
     [

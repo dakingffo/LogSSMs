@@ -1,23 +1,23 @@
 import torch
 
-from picosgl.core import SamplingParams
-from picosgl.distributed import DistributedInfo
-from picosgl.message import BaseSpeculatorMsg, make_handshake_message, make_init_message
-from picosgl.message.speculator.dflash import DFlashHandshakeMsg, DFlashInitMsg
-from picosgl.scheduler import SchedulerConfig
-from picosgl.speculator import DataPlaneSizes, SpeculatorReserve, make_data_plane_sizes
-from picosgl.speculator.drafters import (
+from logssms.core import SamplingParams
+from logssms.distributed import DistributedInfo
+from logssms.message import BaseSpeculatorMsg, make_handshake_message, make_init_message
+from logssms.message.speculator.dflash import DFlashHandshakeMsg, DFlashInitMsg
+from logssms.scheduler import SchedulerConfig
+from logssms.speculator import DataPlaneSizes, SpeculatorReserve, make_data_plane_sizes
+from logssms.speculator.drafters import (
     make_hidden_captor,
     make_speculator_argument_parser,
 )
-from picosgl.speculator.drafters.attention import DraftAttentionBackend
-from picosgl.speculator.drafters.dflash import (
+from logssms.speculator.drafters.attention import DraftAttentionBackend
+from logssms.speculator.drafters.dflash import (
     DFlashHiddenCaptor,
     DFlashSpeculatorConfig,
     DFlashState,
 )
-from picosgl.speculator.drafters.pool import DraftKVPool
-from picosgl.speculator.hidden_captor import HiddenCapturePoint
+from logssms.speculator.drafters.pool import DraftKVPool
+from logssms.speculator.hidden_captor import HiddenCapturePoint
 
 
 def test_dflash_config_and_arguments() -> None:

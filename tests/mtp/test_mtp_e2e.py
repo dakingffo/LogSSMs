@@ -16,20 +16,21 @@ import json
 import multiprocessing as mp
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
-sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 import torch
 
-from picosgl.core import Batch, SamplingParams
-from picosgl.distributed import DistributedInfo
-from picosgl.message import UserMsg
-from picosgl.scheduler.config import SchedulerConfig
-from picosgl.scheduler.scheduler import Scheduler
-from picosgl.speculator import make_local_data_plane_pair, speculator_worker
-from picosgl.speculator.drafters.mtp import MTPSpeculatorConfig
+from logssms.core import Batch, SamplingParams
+from logssms.distributed import DistributedInfo
+from logssms.message import UserMsg
+from logssms.scheduler.config import SchedulerConfig
+from logssms.scheduler.scheduler import Scheduler
+from logssms.speculator import make_local_data_plane_pair, speculator_worker
+from logssms.speculator.drafters.mtp import MTPSpeculatorConfig
 
 MODEL = os.environ.get("QWEN3_NEXT_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
 
@@ -90,7 +91,7 @@ class OfflineScheduler(Scheduler):
                     "ack_queue": ack_queue,
                 },
                 daemon=False,
-                name="picosgl-test-speculator",
+                name="logssms-test-speculator",
             )
             self.speculator_process.start()
             try:

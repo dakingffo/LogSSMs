@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
-from picosgl.core import SamplingParams
-from picosgl.message import (
+from logssms.core import SamplingParams
+from logssms.message import (
     BaseSpeculatorMsg,
     SpeculatorReplyMsg,
     SpeculatorStepMsg,
@@ -11,17 +11,17 @@ from picosgl.message import (
     make_handshake_message,
     make_init_message,
 )
-from picosgl.message.speculator.mtp import (
+from logssms.message.speculator.mtp import (
     MTPHandshakeAckMsg,
     MTPHandshakeMsg,
     MTPInitMsg,
 )
-from picosgl.speculator.drafters.mtp import (
+from logssms.speculator.drafters.mtp import (
     MTPDraftManager,
     MTPHiddenCaptor,
     MTPSpeculatorConfig,
 )
-from picosgl.speculator.hidden_captor import HiddenCapturePoint
+from logssms.speculator.hidden_captor import HiddenCapturePoint
 
 
 class FakeEngine:
@@ -61,9 +61,9 @@ def test_mtp_message_factories_and_roundtrip():
 
 
 def test_mtp_types_are_not_exported_from_generic_packages():
-    import picosgl.message as message
-    import picosgl.message.speculator as speculator_message
-    import picosgl.speculator as speculator
+    import logssms.message as message
+    import logssms.message.speculator as speculator_message
+    import logssms.speculator as speculator
 
     message_types = ("MTPHandshakeMsg", "MTPHandshakeAckMsg", "MTPInitMsg")
     speculator_types = (

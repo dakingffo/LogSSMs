@@ -1,6 +1,6 @@
-"""Interactive terminal chat for a running pico-sglang server.
+"""Interactive terminal chat for a running LogSSMs server.
 
-The client uses pico-sglang's OpenAI-compatible API and keeps multiple conversations in
+The client uses LogSSMs's OpenAI-compatible API and keeps multiple conversations in
 memory. Run ``python examples/chat.py`` and enter ``/help`` for available commands.
 """
 
@@ -277,7 +277,7 @@ class Chat:
         self.active.messages.append({"role": "assistant", "content": "".join(reply)})
 
     def run(self) -> None:
-        print("\npico-sglang chat")
+        print("\nLogSSMs chat")
         print(f"model: {self.model}")
         print("Use /help for commands; Ctrl-D exits.\n")
         self._configure_completion()
@@ -346,7 +346,7 @@ def main() -> int:
             system_prompt=args.system,
         )
     except Exception as exc:
-        print(f"Cannot connect to pico-sglang: {exc}", file=sys.stderr)
+        print(f"Cannot connect to LogSSMs: {exc}", file=sys.stderr)
         return 1
     chat.run()
     return 0

@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
-from picosgl.core import Request, SamplingParams
-from picosgl.scheduler.verify import VerifyManager
+from logssms.core import Request, SamplingParams
+from logssms.scheduler.verify import VerifyManager
 
 
 def test_inflight_verify_reserves_from_committed_frontier():

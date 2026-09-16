@@ -1,22 +1,22 @@
 import torch
 
-from picosgl.core import SamplingParams
-from picosgl.distributed import DistributedInfo
-from picosgl.message import BaseSpeculatorMsg, make_handshake_message, make_init_message
-from picosgl.message.speculator.eagle3 import Eagle3HandshakeMsg, Eagle3InitMsg
-from picosgl.models.llama import LlamaConfig
-from picosgl.models.config import RotaryConfig
-from picosgl.scheduler import SchedulerConfig
-from picosgl.speculator import DataPlaneSizes, make_data_plane_sizes
-from picosgl.speculator.drafters import (
+from logssms.core import SamplingParams
+from logssms.distributed import DistributedInfo
+from logssms.message import BaseSpeculatorMsg, make_handshake_message, make_init_message
+from logssms.message.speculator.eagle3 import Eagle3HandshakeMsg, Eagle3InitMsg
+from logssms.models.llama import LlamaConfig
+from logssms.models.config import RotaryConfig
+from logssms.scheduler import SchedulerConfig
+from logssms.speculator import DataPlaneSizes, make_data_plane_sizes
+from logssms.speculator.drafters import (
     make_hidden_captor,
     make_speculator_argument_parser,
 )
-from picosgl.speculator.drafters.eagle3 import (
+from logssms.speculator.drafters.eagle3 import (
     Eagle3HiddenCaptor,
     Eagle3SpeculatorConfig,
 )
-from picosgl.speculator.hidden_captor import HiddenCapturePoint
+from logssms.speculator.hidden_captor import HiddenCapturePoint
 
 
 def test_eagle3_config_and_hidden_capture() -> None:

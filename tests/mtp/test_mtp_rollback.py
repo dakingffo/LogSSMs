@@ -22,23 +22,24 @@ Run: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_mtp_rollback.py
 """
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
 MODEL_PATH = os.environ.get("QWEN3_5_MODEL", "/home/daking/models/huggingface/Qwen3.5-0.8B")
-sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 import torch
 
-from picosgl.utils import load_model_config, torch_dtype
+from logssms.utils import load_model_config, torch_dtype
 
 
 def setup():
-    from picosgl.distributed import DistributedInfo, set_tp_info
+    from logssms.distributed import DistributedInfo, set_tp_info
 
     set_tp_info(DistributedInfo(rank=0, size=1))
-    from picosgl.models import make_model_config
+    from logssms.models import make_model_config
 
     return make_model_config(load_model_config(MODEL_PATH))
 
@@ -70,13 +71,13 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
-    from picosgl.core import Batch, Context, Request, set_global_ctx
-    from picosgl.cache import make_kvcache_pool
-    from picosgl.cache.linear_pool.state_pool import LinearStatePool
-    from picosgl.layers.attention_backend import make_attention_backend
-    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
-    from picosgl.models.weight import load_target_weight
-    from picosgl.cache import CacheResources, StandardCacheManager
+    from logssms.core import Batch, Context, Request, set_global_ctx
+    from logssms.cache import make_kvcache_pool
+    from logssms.cache.linear_pool.state_pool import LinearStatePool
+    from logssms.layers.attention_backend import make_attention_backend
+    from logssms.models.qwen3_next import Qwen3NextForCausalLM
+    from logssms.models.weight import load_target_weight
+    from logssms.cache import CacheResources, StandardCacheManager
 
     loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):

@@ -9,7 +9,7 @@ def test_rms_norm_gated(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
-    from picosgl.kernel import rms_norm_gated
+    from logssms.kernel import rms_norm_gated
 
     generator = torch.Generator(device="cuda").manual_seed(17)
     hidden = torch.randn(shape, dtype=dtype, device="cuda", generator=generator)

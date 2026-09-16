@@ -7,11 +7,11 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/container/tuple.h>
 
-#include <picosgl/tensor.hpp>
-#include <picosgl/utils.hpp>
-#include <picosgl/warp.hpp>
+#include <logssms/tensor.hpp>
+#include <logssms/utils.hpp>
+#include <logssms/warp.hpp>
 
-namespace picosgl {
+namespace logssms {
 
 struct IndexKernelParams {
   void *__restrict__       output;
@@ -154,7 +154,7 @@ struct IndexKernel {
     }
 
     constexpr auto kWarpsPerBlock =
-        num_threads / picosgl::device::kWarpThreads;
+        num_threads / logssms::device::kWarpThreads;
     const auto total_warps = num_splits * num_indices.unwrap();
     const auto num_blocks  = div_ceil(total_warps, kWarpsPerBlock);
     const auto params = IndexKernelParams{
@@ -192,4 +192,4 @@ struct IndexKernel {
   }
 };
 
-} // namespace picosgl
+} // namespace logssms

@@ -20,17 +20,18 @@ Run: /home/daking/.conda/envs/daking/bin/python tests/mtp/test_tp2_numeric.py
 """
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
-sys.path.insert(0, "/home/daking/PROJECT/pico-sglang/python")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 import torch
 import torch.nn.functional as F
 
-from picosgl.distributed import DistributedInfo, set_tp_info
-from picosgl.distributed.impl import DistributedCommunicator, DistributedImpl, NoopDistributedImpl
-from picosgl.models.config import RotaryConfig
-from picosgl.models.qwen3_next import Qwen3_5Config
+from logssms.distributed import DistributedInfo, set_tp_info
+from logssms.distributed.impl import DistributedCommunicator, DistributedImpl, NoopDistributedImpl
+from logssms.models.config import RotaryConfig
+from logssms.models.qwen3_next import Qwen3_5Config
 
 
 # -------------------------------------------------------------------------------------
@@ -100,7 +101,7 @@ def _set_tree(module, name, v):
 
 
 def reset_tp(rank, size):
-    import picosgl.distributed.info as _info
+    import logssms.distributed.info as _info
 
     _info._TP_INFO = None
     set_tp_info(DistributedInfo(rank=rank, size=size))
@@ -119,7 +120,7 @@ def build_full_sd(config: Qwen3_5Config, seed: int) -> dict:
     """Build the tp=1 full model and return its state_dict with REAL values (on cpu)."""
     reset_tp(0, 1)
     torch.manual_seed(seed)
-    from picosgl.models.qwen3_next import Qwen3NextForCausalLM
+    from logssms.models.qwen3_next import Qwen3NextForCausalLM
 
     model = Qwen3NextForCausalLM(config)
     for name, p in model.state_dict().items():
@@ -128,7 +129,7 @@ def build_full_sd(config: Qwen3_5Config, seed: int) -> dict:
 
 
 def shard_sd(full_sd, rank, size, num_kv_heads, config=None):
-    from picosgl.models.weight import _shard_tensor
+    from logssms.models.weight import _shard_tensor
 
     qkv_regions = None
     if config is not None and config.is_hybrid and config.linear_num_key_heads:
@@ -218,7 +219,7 @@ def run():
     # ---------------- VocabParallelEmbedding ----------------
     print("=" * 60)
     print("VocabParallelEmbedding (all_reduce)")
-    from picosgl.layers.embedding import VocabParallelEmbedding
+    from logssms.layers.embedding import VocabParallelEmbedding
 
     reset_tp(0, 1)
     emb_full = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
@@ -236,7 +237,7 @@ def run():
     # ---------------- GatedMLP ----------------
     print("=" * 60)
     print("GatedMLP (down_proj all_reduce)")
-    from picosgl.layers import GatedMLP
+    from logssms.layers import GatedMLP
 
     reset_tp(0, 1)
     mlp_kwargs = dict(
@@ -259,7 +260,7 @@ def run():
     # ---------------- GatedRotaryAttention (local reference attention) ----------------
     print("=" * 60)
     print("GatedRotaryAttention projection + o_proj all_reduce")
-    from picosgl.layers import GatedRotaryAttention
+    from logssms.layers import GatedRotaryAttention
 
     positions = torch.arange(T, dtype=torch.int64, device=device)
     rotary_config = config.rotary_config
@@ -311,9 +312,9 @@ def run():
     # ---------------- GatedDeltaNet (out_proj all_reduce) ----------------
     print("=" * 60)
     print("GatedDeltaNet prefill (out_proj all_reduce)")
-    from picosgl.cache.linear_pool.state_pool import LinearStatePool
-    from picosgl.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
-    from picosgl.layers import GatedDeltaNet
+    from logssms.cache.linear_pool.state_pool import LinearStatePool
+    from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+    from logssms.layers import GatedDeltaNet
 
     def make_gated_delta_net():
         return GatedDeltaNet(
@@ -396,7 +397,7 @@ def run():
     # ---------------- ParallelLMHead (all_gather) ----------------
     print("=" * 60)
     print("ParallelLMHead (all_gather vocab)")
-    from picosgl.layers.embedding import ParallelLMHead
+    from logssms.layers.embedding import ParallelLMHead
 
     reset_tp(0, 1)
     lm_full = ParallelLMHead(config.vocab_size, config.hidden_size, tie_word_embeddings=False)

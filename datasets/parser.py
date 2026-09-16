@@ -4,19 +4,21 @@ import json
 import random
 from bisect import bisect_right
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 
-DatasetRole = Literal["system", "user", "assistant"]
+DatasetRole = Literal["system", "user", "assistant", "tool"]
 RecordParser = Callable[[dict[str, Any]], "DatasetRecord"]
 
 
 @dataclass(frozen=True)
 class DatasetMessage:
-    role   : DatasetRole
-    content: str
+    role        : DatasetRole
+    content     : str
+    tool_calls  : tuple[dict[str, Any], ...] | None = None
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ class DatasetRecord:
     uid     : str
     category: str | None
     messages: tuple[DatasetMessage, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def prompt(self) -> str:
@@ -39,10 +42,14 @@ _ALIASES = {
     "spec_bench"      : "spec_bench",
     "swebench"        : "swe_bench",
     "swe_bench"       : "swe_bench",
+    "swe_agent"       : "swe_agent",
+    "sweagent"        : "swe_agent",
     "sharegpt"        : "sharegpt",
     "lmsys"           : "lmsys_chat_1m",
     "lmsys_chat"      : "lmsys_chat_1m",
     "lmsys_chat_1m"   : "lmsys_chat_1m",
+    "agentic_coding"  : "agentic_coding_trajectories",
+    "agentic_coding_trajectories": "agentic_coding_trajectories",
 }
 
 
@@ -82,17 +89,44 @@ def resolve_dataset_path(dataset: str | Path) -> Path:
     )
 
 
-def _message(role: str, content: Any) -> DatasetMessage | None:
+def _message(
+    role        : str,
+    content     : Any,
+    tool_calls  : Any = None,
+    tool_call_id: Any = None,
+) -> DatasetMessage | None:
     role = {
         "human": "user",
         "gpt"  : "assistant",
     }.get(role.lower(), role.lower())
-    if role not in ("system", "user", "assistant"):
+    if role not in ("system", "user", "assistant", "tool"):
         return None
-    content = str(content).strip()
-    if not content:
+    if isinstance(tool_calls, str):
+        tool_calls = json.loads(tool_calls)
+    normalized_calls = None
+    if tool_calls:
+        calls = []
+        for tool_call in tool_calls:
+            tool_call = dict(tool_call)
+            function = tool_call.get("function")
+            if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                function = dict(function)
+                try:
+                    function["arguments"] = json.loads(function["arguments"])
+                except json.JSONDecodeError:
+                    function["arguments"] = {"value": function["arguments"]}
+                tool_call["function"] = function
+            calls.append(tool_call)
+        normalized_calls = tuple(calls)
+    content = "" if content is None else str(content).strip()
+    if not content and normalized_calls is None:
         return None
-    return DatasetMessage(role=role, content=content)  # type: ignore[arg-type]
+    return DatasetMessage(
+        role=role,  # type: ignore[arg-type]
+        content=content,
+        tool_calls=normalized_calls,
+        tool_call_id=str(tool_call_id) if tool_call_id else None,
+    )
 
 
 def _parse_spec_bench(record: dict[str, Any]) -> DatasetRecord:
@@ -150,6 +184,50 @@ def _parse_lmsys(record: dict[str, Any]) -> DatasetRecord:
     )
 
 
+def _parse_swe_agent(record: dict[str, Any]) -> DatasetRecord:
+    uid = str(record["_uid"])
+    messages = tuple(
+        message
+        for turn in record.get("history", ())
+        if (message := _message(
+            str(turn.get("role", "")),
+            turn.get("content", ""),
+        )) is not None
+    )
+    return DatasetRecord(
+        uid=uid,
+        category=uid.rsplit("-", 1)[0].replace("__", "/"),
+        messages=messages,
+    )
+
+
+def _parse_agentic_coding(record: dict[str, Any]) -> DatasetRecord:
+    raw_messages = json.loads(record["messages_json"])
+    messages = tuple(
+        message
+        for turn in raw_messages
+        if (message := _message(
+            str(turn.get("role", "")),
+            turn.get("content", ""),
+            turn.get("tool_calls_json", turn.get("tool_calls")),
+            turn.get("tool_call_id"),
+        )) is not None
+    )
+    return DatasetRecord(
+        uid=str(record["session_id"]),
+        category=str(record["source_dataset"]),
+        messages=messages,
+        metadata={
+            "source_id"      : record["source_id"],
+            "agent_framework": record["agent_framework"],
+            "recorded_model" : record["recorded_model"],
+            "n_turns"        : record["n_turns"],
+            "max_isl"        : record["max_isl"],
+            "total_tokens"   : record["total_tokens"],
+        },
+    )
+
+
 def _parse_custom(record: dict[str, Any]) -> DatasetRecord:
     if "turns" in record:
         messages = tuple(
@@ -197,6 +275,17 @@ def _iter_json(path: Path) -> Iterator[dict[str, Any]]:
         yield from ijson.items(file, "item")
 
 
+def _iter_swe_agent(path: Path) -> Iterator[dict[str, Any]]:
+    paths = sorted(path.glob("trajs/*.traj")) if path.is_dir() else [path]
+    if not paths:
+        raise FileNotFoundError(f"No SWE-agent trajectories found under {path}")
+    for trajectory_path in paths:
+        with trajectory_path.open(encoding="utf-8") as file:
+            record = json.load(file)
+        record["_uid"] = trajectory_path.stem
+        yield record
+
+
 def _iter_parquet(paths: list[Path]) -> Iterator[dict[str, Any]]:
     try:
         import pyarrow.parquet as parquet
@@ -207,7 +296,7 @@ def _iter_parquet(paths: list[Path]) -> Iterator[dict[str, Any]]:
 
     for path in paths:
         parquet_file = parquet.ParquetFile(path)
-        for batch in parquet_file.iter_batches(batch_size=4096):
+        for batch in parquet_file.iter_batches(batch_size=256):
             yield from batch.to_pylist()
 
 
@@ -223,7 +312,10 @@ def _parquet_source(
         paths = sorted(path.rglob("*.parquet"))
     if not paths:
         raise FileNotFoundError(f"No parquet files found under {path}")
-    parser = _parse_swe_bench if name == "swe_bench" else _parse_lmsys
+    parser = {
+        "swe_bench"                  : _parse_swe_bench,
+        "agentic_coding_trajectories": _parse_agentic_coding,
+    }.get(name, _parse_lmsys)
     return paths, parser
 
 
@@ -242,7 +334,13 @@ def _dataset_source(
             if path.is_dir() else path
         )
         return _iter_json(source), _parse_sharegpt
-    elif name in ("swe_bench", "lmsys_chat_1m"):
+    elif name == "swe_agent":
+        return _iter_swe_agent(path), _parse_swe_agent
+    elif name in (
+        "swe_bench",
+        "lmsys_chat_1m",
+        "agentic_coding_trajectories",
+    ):
         paths, parser = _parquet_source(path, name)
         return _iter_parquet(paths), parser
     elif name == "custom":

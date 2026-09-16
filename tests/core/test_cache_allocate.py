@@ -7,8 +7,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-import picosgl.core as core
-from picosgl.cache import (
+import logssms.core as core
+from logssms.cache import (
     CacheResources,
     StandardCacheManager,
     StandardPrefixValue,

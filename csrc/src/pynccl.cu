@@ -11,11 +11,11 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 
-#include <picosgl/nccl227.h>
-#include <picosgl/tensor.hpp>
-#include <picosgl/utils.hpp>
+#include <logssms/nccl227.h>
+#include <logssms/tensor.hpp>
+#include <logssms/utils.hpp>
 
-namespace picosgl {
+namespace logssms {
 
 using NCCLIDList = tvm::ffi::Array<char>;
 
@@ -183,7 +183,7 @@ public:
   }
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
-    "picosgl.NCCLWrapper", NCCLWrapper, tvm::ffi::Object
+    "logssms.NCCLWrapper", NCCLWrapper, tvm::ffi::Object
   );
 
 private:
@@ -206,4 +206,4 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create_nccl_uid, &create_uid);
 
-} // namespace picosgl
+} // namespace logssms
