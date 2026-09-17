@@ -2,25 +2,30 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 
 from logssms.core import Request
 
 from .kv_pool.base import BaseKVCachePool
+from .linear_pool.logstate_pool import LogStatePool
 from .linear_pool.state_pool import LinearStatePool
-from .prefix_cache.base import BaseCacheHandle, MatchResult
+from .prefix_cache.base import BaseCacheHandle, BasePrefixCache, MatchResult
 
 if TYPE_CHECKING:
+    from logssms.core import Batch
     from logssms.scheduler.prefill import PendingRequest
+
+
+LinearCachePool: TypeAlias = LinearStatePool | LogStatePool
 
 
 @dataclass
 class CacheResources:
     kv_pool         : BaseKVCachePool
     page_table      : torch.Tensor
-    linear_state    : LinearStatePool | None
+    linear_state    : LinearCachePool | None
     state_table     : torch.Tensor | None
     work_state_table: torch.Tensor | None
 
@@ -30,16 +35,23 @@ class BaseCacheManager(ABC):
         self,
         page_size        : int,
         resources        : CacheResources,
-        prefix_cache_type: str,
+        prefix_cache_type: str | None       = None,
+        prefix_cache     : BasePrefixCache | None = None,
     ) -> None:
-        from .prefix_cache import make_prefix_cache
-
         self.device = resources.page_table.device
         self.page_size = page_size
         self.resources = resources
-        self.prefix_cache = make_prefix_cache(
-            device=self.device, type=prefix_cache_type
+        assert (prefix_cache_type is None) != (prefix_cache is None), (
+            "Provide exactly one of prefix_cache_type and prefix_cache."
         )
+        if prefix_cache is None:
+            from .prefix_cache import make_prefix_cache
+
+            assert prefix_cache_type is not None
+            prefix_cache = make_prefix_cache(
+                device=self.device, type=prefix_cache_type
+            )
+        self.prefix_cache = prefix_cache
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -54,8 +66,13 @@ class BaseCacheManager(ABC):
         return self.resources.work_state_table
 
     @property
-    def state_pool(self) -> LinearStatePool | None:
+    def linear_pool(self) -> LinearCachePool | None:
         return self.resources.linear_state
+
+    @property
+    def state_pool(self) -> LinearCachePool | None:
+        # Compatibility name used by the standard checkpoint manager.
+        return self.linear_pool
 
     def match_req(self, req: PendingRequest) -> MatchResult:
         input_len = req.input_len
@@ -76,6 +93,10 @@ class BaseCacheManager(ABC):
             self.unlock(handle)
             return False
         return True
+
+    def prepare_batch(self, batch: Batch) -> None:
+        """Prepare cache-specific work after allocation and before model metadata."""
+        return None
 
     @property
     @abstractmethod

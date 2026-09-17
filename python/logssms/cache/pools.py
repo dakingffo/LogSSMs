@@ -8,6 +8,7 @@ from logssms.distributed import DistributedInfo, try_get_tp_info
 from logssms.utils import div_even
 
 from .kv_pool.base import BaseKVCachePool
+from .linear_pool.logstate_pool import LogStatePool, LogStateSlotLayout
 from .linear_pool.state_pool import LinearStatePool
 
 if TYPE_CHECKING:
@@ -88,3 +89,54 @@ def make_linear_state_pool(
         dtype=dtype,
     )
 
+
+def make_logstate_pool(
+    model_config: ModelConfig,
+    num_slots   : int,
+    page_size   : int,
+    device      : torch.device,
+    dtype       : torch.dtype,
+) -> LogStatePool:
+    num_k_heads, num_v_heads = local_linear_head_counts(model_config)
+    conv_dim = (
+        num_k_heads * model_config.linear_key_head_dim * 2
+        + num_v_heads * model_config.linear_value_head_dim
+    )
+    return LogStatePool(
+        num_slots=num_slots,
+        page_size=page_size,
+        num_linear_layers=model_config.num_linear_layers,
+        num_key_heads=num_k_heads,
+        num_value_heads=num_v_heads,
+        head_k_dim=model_config.linear_key_head_dim,
+        head_v_dim=model_config.linear_value_head_dim,
+        conv_dim=conv_dim,
+        state_len=model_config.linear_conv_kernel_dim - 1,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def logstate_slot_bytes_for_config(
+    model_config: ModelConfig,
+    page_size   : int,
+    dtype       : torch.dtype,
+) -> int:
+    if not model_config.is_hybrid:
+        return 0
+    num_k_heads, num_v_heads = local_linear_head_counts(model_config)
+    conv_dim = (
+        num_k_heads * model_config.linear_key_head_dim * 2
+        + num_v_heads * model_config.linear_value_head_dim
+    )
+    return LogStateSlotLayout(
+        page_size=page_size,
+        num_linear_layers=model_config.num_linear_layers,
+        num_key_heads=num_k_heads,
+        num_value_heads=num_v_heads,
+        head_k_dim=model_config.linear_key_head_dim,
+        head_v_dim=model_config.linear_value_head_dim,
+        conv_dim=conv_dim,
+        state_len=model_config.linear_conv_kernel_dim - 1,
+        dtype=dtype,
+    ).slot_bytes

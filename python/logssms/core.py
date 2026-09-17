@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 if TYPE_CHECKING:
-    from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearStatePool
+    from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from logssms.layers.linear_attention_backend import (
         BaseLinearAttentionBackend,
@@ -153,7 +153,7 @@ class Context:
     )
     moe_backend        : BaseMoeBackend             = field(init=False)
     kv_cache           : BaseKVCachePool            = field(init=False)   # full attention
-    linear_state       : LinearStatePool            = field(init=False)   # linear attention
+    linear_state       : LinearCachePool            = field(init=False)   # linear attention
 
     state_table        : torch.Tensor | None = field(default=None, init=False)
     work_state_table   : torch.Tensor | None = field(default=None, init=False)

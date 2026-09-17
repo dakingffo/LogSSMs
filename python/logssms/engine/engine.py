@@ -238,6 +238,7 @@ class Engine:
         input_mapping = self._make_input_tuple(batch, self.device)
         write_mapping = self._make_write_tuple(batch, self.device)
         batch.out_loc = self.page_table[input_mapping]
+        cache_manager.prepare_batch(batch)
         self.attn_backend.prepare_metadata(batch)
         if self.config.model_config.is_hybrid:
             self.linear_attn_backend.prepare_metadata(batch)
