@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import torch
 
 from logssms.core import Batch, SamplingParams
+from logssms.cache import StandardCacheConfig
 from logssms.distributed import DistributedInfo
 from logssms.message import UserMsg
 from logssms.scheduler.config import SchedulerConfig
@@ -105,6 +106,8 @@ class OfflineScheduler(Scheduler):
             assert ack_queue.get() == "Speculator is ready"
         else:
             super().__init__(config)
+        self.receive_msg = self.offline_receive_msg
+        self.send_result = self.offline_send_result
 
     def offline_receive_msg(self, blocking: bool = False) -> list:
         out, self._pending = self._pending, []
@@ -133,7 +136,7 @@ def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> Sche
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
         max_running_req=8,
-        page_size=1,
+        cache_config=StandardCacheConfig(page_size=1),
         num_page_override=num_pages,
         cache_type="radix",
         cuda_graph_max_bs=0,
@@ -143,7 +146,6 @@ def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> Sche
             MTPSpeculatorConfig(num_draft_tokens=K)
             if enable_specualtive_decoding else None
         ),
-        offline_mode=True,
     )
 
 

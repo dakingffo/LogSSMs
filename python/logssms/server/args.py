@@ -33,27 +33,39 @@ def parse_args(args: list[str]) -> ServerArgs:
         EngineConfig instance with parsed arguments
     """
     from logssms.layers.attention_backend import validate_attn_backend
-    from logssms.cache import SUPPORTED_CACHE_FACTORIES
+    from logssms.cache import (
+        SUPPORTED_CACHE_ARGUMENT_PARSERS,
+        make_cache_argument_parser,
+    )
     from logssms.layers.moe_backend import SUPPORTED_MOE_BACKENDS
     from logssms.speculator.drafters import (
         SUPPORTED_SPECULATOR_ARGUMENT_PARSERS,
         make_speculator_argument_parser,
     )
 
-    algorithm_parser = argparse.ArgumentParser(add_help=False)
-    algorithm_parser.add_argument(
+    selection_parser = argparse.ArgumentParser(add_help=False)
+    selection_parser.add_argument(
         "--speculative-algorithm",
         choices=SUPPORTED_SPECULATOR_ARGUMENT_PARSERS.supported_names(),
         default=None,
     )
-    known_args, _ = algorithm_parser.parse_known_args(args)
+    selection_parser.add_argument(
+        "--cache-type",
+        choices=SUPPORTED_CACHE_ARGUMENT_PARSERS.supported_names(),
+        default=ServerArgs.cache_type,
+    )
+    known_args, _ = selection_parser.parse_known_args(args)
     speculator_parser = (
         make_speculator_argument_parser(known_args.speculative_algorithm)
         if known_args.speculative_algorithm is not None else None
     )
+    cache_parser = make_cache_argument_parser(known_args.cache_type)
+    parents = [cache_parser.parser]
+    if speculator_parser is not None:
+        parents.append(speculator_parser.parser)
     parser = argparse.ArgumentParser(
         description="logssms Server Arguments",
-        parents=[speculator_parser.parser] if speculator_parser is not None else [],
+        parents=parents,
     )
 
     parser.add_argument(
@@ -99,7 +111,10 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--memory-ratio",
         type=float,
         default=ServerArgs.memory_ratio,
-        help="The fraction of GPU memory to use for KV cache.",
+        help=(
+            "The fraction of initially free GPU memory available to model weights "
+            "and runtime caches."
+        ),
     )
 
     assert ServerArgs.use_dummy_weight == False
@@ -171,13 +186,6 @@ def parse_args(args: list[str]) -> ServerArgs:
     )
 
     parser.add_argument(
-        "--page-size",
-        type=int,
-        default=ServerArgs.page_size,
-        help="Set the page size for system management.",
-    )
-
-    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
@@ -198,7 +206,7 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--cache-type",
         type=str,
         default=ServerArgs.cache_type,
-        choices=SUPPORTED_CACHE_FACTORIES.supported_names(),
+        choices=SUPPORTED_CACHE_ARGUMENT_PARSERS.supported_names(),
         help="The cache management strategy.",
     )
 
@@ -235,6 +243,8 @@ def parse_args(args: list[str]) -> ServerArgs:
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    kwargs["cache_config"] = cache_parser.make_config(kwargs)
 
     assert kwargs["num_tokenizer"] >= 1, "--num-tokenizer must be >= 1"
 

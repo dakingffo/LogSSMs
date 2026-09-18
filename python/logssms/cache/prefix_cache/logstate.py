@@ -308,13 +308,16 @@ class LogRadixTree(BasePrefixCache):
             )
         else:
             inserted_len = cache_len
-        assert previous_len <= inserted_len <= usable_len
+        assert 0 <= inserted_len <= usable_len
         assert inserted_len % self.granularity == 0
-        assert (inserted_len - previous_len) % self.page_size == 0, (
-            "New LogState cache admission must consist of complete physical pages."
-        )
+        if cache_len is None:
+            assert (inserted_len - previous_len) % self.page_size == 0, (
+                "New LogState cache admission must consist of complete physical pages."
+            )
 
-        if previous_len != inserted_len:
+        if inserted_len < previous_len:
+            node = self._node_at_depth(node, inserted_len)
+        elif previous_len < inserted_len:
             new_node = LogRadixTreeNode(self.key_fn, self.granularity)
             new_node.set(
                 previous_len, inserted_len, input_ids, kv_indices
@@ -503,7 +506,11 @@ class LogRadixTree(BasePrefixCache):
             endpoint = self._node_at_depth(node, cached_len)
         trace = LogRadixTrace(endpoint, cached_len, endpoint.length)
         recovery, lock_node = self._recovery_for_trace(trace)
-        assert recovery.position == cached_len
+        assert recovery.position == cached_len, (
+            f"Cannot recover LogState handle at {cached_len}: recovery stops at "
+            f"{recovery.position}; endpoint depth={endpoint.depth}, "
+            f"entries={self.matched_entries(endpoint)}"
+        )
         return LogStateCacheHandle(
             cached_len=cached_len,
             node=endpoint,

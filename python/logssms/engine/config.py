@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -12,7 +12,14 @@ from logssms.utils import load_model_config
 from logssms.models import ModelConfig, make_model_config
 
 if TYPE_CHECKING:
+    from logssms.cache import BaseCacheConfig
     from logssms.speculator import BaseSpeculatorConfig
+
+
+def _make_default_cache_config() -> BaseCacheConfig:
+    from logssms.cache import StandardCacheConfig
+
+    return StandardCacheConfig()
 
 
 @dataclass(frozen=True)
@@ -25,13 +32,15 @@ class EngineConfig:
     moe_backend             : str              = "auto"
     cuda_graph_bs           : list[int] | None = None
     cuda_graph_max_bs       : int | None       = None
-    page_size               : int              = 256
-    memory_ratio            : float            = 0.85
+    memory_ratio            : float            = 0.9
     distributed_timeout     : float            = 60.0
     use_dummy_weight        : bool             = False
     max_seq_len_override    : int | None       = None
     num_page_override       : int | None       = None  # if not None, will override the number of pages
     cache_type              : str              = "radix"
+    cache_config            : BaseCacheConfig  = field(
+        default_factory=_make_default_cache_config
+    )
 
     speculative_algorithm        : str | None                  = None
     speculative_draft_model_path : str | None                  = None
@@ -41,6 +50,10 @@ class EngineConfig:
     @property
     def enable_specualtive_decoding(self) -> bool:
         return self.speculative_algorithm is not None
+
+    @property
+    def page_size(self) -> int:
+        return self.cache_config.page_size
 
     @cached_property
     def pretrained_config(self) -> PretrainedConfig:

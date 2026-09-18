@@ -135,10 +135,10 @@ class GraphRunner:
             graph = torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
+            self.buffer.set_batch(batch)
             self.attn_backend.prepare_for_capture(batch)
             if self.linear_attn_backend is not None:
                 self.linear_attn_backend.prepare_for_capture(batch)
-            self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward() # trigger JIT
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):

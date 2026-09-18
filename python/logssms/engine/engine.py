@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import torch
 
 from logssms.layers.attention_backend import make_attention_backend
-from logssms.layers.linear_attention_backend import LinearAttentionBackend
+from logssms.layers.linear_attention_backend import make_linear_attention_backend
 from logssms.layers.moe_backend import make_moe_backend
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.distributed import (
@@ -144,7 +145,9 @@ class Engine:
             config.attention_backend, config.model_config
         )
         if config.model_config.is_hybrid:
-            self.ctx.linear_attn_backend = self.linear_attn_backend = LinearAttentionBackend()
+            self.ctx.linear_attn_backend = self.linear_attn_backend = (
+                make_linear_attention_backend(config.cache_type)
+            )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = make_moe_backend(config.moe_backend)
 
@@ -329,13 +332,19 @@ class Engine:
         def override(attr: str, value: Any):  # this is dangerous, use with caution
             object.__setattr__(config, attr, value)
 
+        def override_page_size(value: int) -> None:
+            from logssms.cache import StandardCacheConfig
+
+            assert isinstance(config.cache_config, StandardCacheConfig)
+            override("cache_config", replace(config.cache_config, page_size=value))
+
         if config.attention_backend == "auto":
             backend = "trtllm" if is_sm100_supported() else "fa,fi" if is_sm90_supported() else "fi"
             override("attention_backend", backend)
             logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
         if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64, 128]:
-            override("page_size", 64)
+            override_page_size(64)
             logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
         if config.model_config.is_moe and config.moe_backend == "auto":
@@ -345,7 +354,7 @@ class Engine:
         if config.model_config.is_hybrid:
             if config.page_size % 64 != 0:
                 original_page_size = config.page_size
-                override("page_size", 64)
+                override_page_size(64)
                 logger.warning_rank0(
                     f"Page size overridden to 64 for hybrid model (must be a multiple of 64, got {original_page_size})."
                 )

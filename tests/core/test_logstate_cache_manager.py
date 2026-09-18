@@ -8,6 +8,7 @@ from logssms.cache import CacheResources
 from logssms.cache.linear_pool.logstate_pool import LogStatePool
 from logssms.cache.logstate import LogStateCacheManager
 from logssms.cache.prefix_cache.logstate import LogStateCacheHandle
+from logssms.cache.prefix_cache.logstate import LogStateEntry
 from logssms.cache.prefix_cache.logstate import LogStateKind
 from logssms.core import Batch, Request, SamplingParams
 from logssms.scheduler.prefill import PendingRequest
@@ -28,7 +29,7 @@ def make_manager(
         num_slots=num_states + num_work_states,
         page_size=PAGE_SIZE,
         num_linear_layers=1,
-        num_key_heads=1,
+        num_key_heads=2,
         num_value_heads=2,
         head_k_dim=4,
         head_v_dim=4,
@@ -114,6 +115,50 @@ def test_complete_pages_move_from_request_to_tree_and_tail_is_released():
     manager.check_integrity()
 
 
+def test_allocate_maps_only_valid_suffix_of_last_physical_page():
+    manager = make_manager()
+    req = new_req(manager, torch.arange(MAX_SEQ_LEN, dtype=torch.int32))
+    req.cached_len = MAX_SEQ_LEN - 48
+    req.max_device_len = MAX_SEQ_LEN
+
+    manager.allocate([req])
+
+    pages = manager._live_pages[req.table_idx]
+    assert len(pages) == 1
+    page = pages[0]
+    assert (page.begin, page.end) == (MAX_SEQ_LEN - 48, MAX_SEQ_LEN + 16)
+    torch.testing.assert_close(
+        manager.page_table[req.table_idx, page.begin:MAX_SEQ_LEN],
+        page.kv_page + torch.arange(48, dtype=torch.int32),
+    )
+    assert torch.all(
+        manager.state_table[req.table_idx, page.begin:MAX_SEQ_LEN]
+        == page.state_slot
+    )
+
+    manager._release_live_pages(req.table_idx, pages)
+    manager._live_pages[req.table_idx] = []
+    manager.unlock(req.cache_handle)
+    manager.check_integrity()
+
+
+def test_cache_boundary_carries_conv_state_into_request_work_slot():
+    manager = make_manager()
+    req = new_req(manager, torch.arange(PAGE_SIZE, dtype=torch.int32))
+    manager.allocate([req])
+    page = manager._live_pages[req.table_idx][0]
+    source = manager.logstate_pool.conv_state[page.state_slot, :, -1]
+    source.copy_(torch.arange(source.numel()).view_as(source))
+
+    req.cached_len = PAGE_SIZE
+    manager.cache_req(req, finished=False)
+
+    work_slot = int(manager.work_state_table[req.table_idx, 0])
+    torch.testing.assert_close(
+        manager.logstate_pool.conv_state[work_slot, :, 0], source
+    )
+
+
 def test_sixteen_token_branch_hit_carries_recovery_into_work_state_plan():
     manager = make_manager()
     original = new_req(manager, torch.arange(130, dtype=torch.int32))
@@ -142,6 +187,36 @@ def test_sixteen_token_branch_hit_carries_recovery_into_work_state_plan():
     assert manager.pending_recoveries[1] == handle.recovery
     assert torch.equal(manager.page_table[1, :80], handle.kv_indices)
     manager.unlock(handle)
+
+
+def test_branch_at_first_granule_reuses_kv_through_sixteen_tokens():
+    manager = make_manager(num_pages=12, num_states=12)
+    original_ids = torch.arange(130, dtype=torch.int32)
+    original = new_req(manager, original_ids)
+    manager.allocate([original])
+    original.cached_len = len(original_ids)
+    manager.cache_req(original, finished=True)
+
+    branch_ids = torch.cat([
+        original_ids[:16],
+        torch.arange(1000, 1032, dtype=torch.int32),
+    ])
+    branch = new_req(manager, branch_ids, table_idx=1)
+
+    assert branch.cached_len == 16
+    assert len(branch.cache_handle.kv_indices) == 16
+    torch.testing.assert_close(
+        branch.cache_handle.kv_indices,
+        manager.tree.matched_kv(branch.cache_handle.node),
+    )
+    manager.init_with_handle(branch.table_idx, branch.cache_handle)
+    torch.testing.assert_close(
+        manager.page_table[branch.table_idx, :16],
+        branch.cache_handle.kv_indices,
+    )
+
+    manager.unlock(branch.cache_handle)
+    manager.check_integrity()
 
 
 def test_work_state_slots_are_reserved_outside_general_allocator():
@@ -218,7 +293,10 @@ def test_prepare_batch_applies_branch_protection_and_commits_plan():
         torch.arange(1000, 1032, dtype=torch.int32),
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
-    with patch("logssms.cache.logstate.reconstruct_log_states"):
+    with (
+        patch("logssms.cache.logstate.reconstruct_log_states"),
+        patch("logssms.cache.logstate.materialize_log_states_inplace"),
+    ):
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
     assert manager.last_plan is not None
@@ -243,18 +321,12 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
 
     request = new_req(manager, input_ids, table_idx=1)
     batch = Batch(reqs=[request], phase="prefill")
-    with patch("logssms.cache.logstate.reconstruct_log_states"):
+    with (
+        patch("logssms.cache.logstate.reconstruct_log_states"),
+        patch("logssms.cache.logstate.materialize_log_states_inplace"),
+    ):
         manager.prepare_batch(batch)
 
-    checkpoints = manager.tree.iter_entries()
-    assert len(checkpoints) == 2
-    assert all(
-        entry.kind is LogStateKind.CHECKPOINT
-        and entry.merge_level == 0
-        for entry in checkpoints
-    )
-
-    manager.prepare_batch(batch)
     checkpoints = manager.tree.iter_entries()
     assert len(checkpoints) == 1
     assert checkpoints[0].kind is LogStateKind.CHECKPOINT
@@ -263,4 +335,104 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
     assert checkpoints[0].merge_level == 1
 
     manager.unlock(request.cache_handle)
+    manager.check_integrity()
+
+
+def test_state_admission_can_end_before_existing_kv_prefix():
+    manager = make_manager(num_pages=12, num_states=12)
+    original_ids = torch.arange(130, dtype=torch.int32)
+    original = new_req(manager, original_ids)
+    manager.allocate([original])
+    original.cached_len = len(original_ids)
+    manager.cache_req(original, finished=True)
+
+    entries = manager.tree.iter_entries()
+    assert len(entries) == 2
+    left, right = entries
+    leaf = manager.tree.leaves()[0]
+    manager.tree.detach_entry(left.slot)
+    manager.tree.detach_entry(right.slot)
+    manager.tree.attach_entry(
+        leaf,
+        LogStateEntry(
+            slot=right.slot,
+            kind=LogStateKind.CHECKPOINT,
+            begin=0,
+            end=128,
+            merge_level=1,
+        ),
+    )
+    manager._return_slots(
+        torch.empty(0, dtype=torch.int32),
+        torch.tensor([left.slot], dtype=torch.int32),
+    )
+
+    branch_ids = torch.cat([
+        original_ids[:96],
+        torch.arange(1000, 1014, dtype=torch.int32),
+    ])
+    branch = new_req(manager, branch_ids, table_idx=1)
+    assert branch.cached_len == 0
+    manager.allocate([branch])
+    branch.cached_len = len(branch_ids)
+    manager.cache_req(branch, finished=False)
+
+    assert branch.cache_handle.cached_len == 64
+    assert any(
+        entry.kind is LogStateKind.LOG
+        and entry.begin == 0
+        and entry.end == 64
+        for entry in manager.tree.iter_entries()
+    )
+    manager.cache_req(branch, finished=True)
+    manager.check_integrity()
+
+
+def test_active_branch_recovery_anchor_survives_same_round_maintenance():
+    manager = make_manager(num_pages=12, num_states=12)
+    history = torch.arange(128, dtype=torch.int32)
+    original = new_req(manager, history)
+    manager.allocate([original])
+    original.cached_len = len(history)
+    manager.cache_req(original, finished=True)
+
+    entries = manager.tree.iter_entries()
+    assert len(entries) == 2
+    for entry in entries:
+        owner = manager.tree.entry_owner(entry)
+        manager.tree.detach_entry(entry.slot)
+        manager.tree.attach_entry(
+            owner,
+            LogStateEntry(
+                slot=entry.slot,
+                kind=LogStateKind.CHECKPOINT,
+                begin=entry.begin,
+                end=entry.end,
+                merge_level=0,
+            ),
+        )
+
+    branch_ids = torch.cat([
+        history[:96],
+        torch.arange(1000, 1032, dtype=torch.int32),
+    ])
+    branch = new_req(manager, branch_ids, table_idx=1)
+    assert branch.cached_len == 64
+    with patch("logssms.cache.logstate.reconstruct_log_states"):
+        manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
+
+    checkpoints = [
+        entry
+        for entry in manager.tree.iter_entries()
+        if entry.kind is LogStateKind.CHECKPOINT
+    ]
+    assert {(entry.begin, entry.end) for entry in checkpoints} == {
+        (0, 64), (64, 128)
+    }
+
+    manager.allocate([branch])
+    branch.cached_len = len(branch_ids)
+    manager.cache_req(branch, finished=False)
+    assert branch.cache_handle.cached_len == 128
+    manager.cache_req(branch, finished=True)
     manager.check_integrity()

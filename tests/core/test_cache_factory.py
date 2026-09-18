@@ -37,8 +37,10 @@ def _make_plan() -> StandardCachePlan:
     )
 
 
-def test_standard_factories_are_public_cache_strategies():
-    assert SUPPORTED_CACHE_FACTORIES.supported_names() == ["naive", "radix"]
+def test_cache_factories_are_public_cache_strategies():
+    assert SUPPORTED_CACHE_FACTORIES.supported_names() == [
+        "logstate", "naive", "radix"
+    ]
 
 
 def test_hybrid_backend_selection_is_internal_to_standard_factory():
@@ -61,4 +63,3 @@ def test_hybrid_backend_selection_is_internal_to_standard_factory():
         assert radix.prefix_cache.NodeType is HybridRadixTreeNode
     finally:
         core._GLOBAL_CTX = old_ctx
-

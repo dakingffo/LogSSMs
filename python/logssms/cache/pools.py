@@ -94,6 +94,7 @@ def make_logstate_pool(
     model_config: ModelConfig,
     num_slots   : int,
     page_size   : int,
+    granularity : int,
     device      : torch.device,
     dtype       : torch.dtype,
 ) -> LogStatePool:
@@ -105,6 +106,7 @@ def make_logstate_pool(
     return LogStatePool(
         num_slots=num_slots,
         page_size=page_size,
+        granularity=granularity,
         num_linear_layers=model_config.num_linear_layers,
         num_key_heads=num_k_heads,
         num_value_heads=num_v_heads,
@@ -120,6 +122,7 @@ def make_logstate_pool(
 def logstate_slot_bytes_for_config(
     model_config: ModelConfig,
     page_size   : int,
+    granularity : int,
     dtype       : torch.dtype,
 ) -> int:
     if not model_config.is_hybrid:
@@ -131,6 +134,7 @@ def logstate_slot_bytes_for_config(
     )
     return LogStateSlotLayout(
         page_size=page_size,
+        granularity=granularity,
         num_linear_layers=model_config.num_linear_layers,
         num_key_heads=num_k_heads,
         num_value_heads=num_v_heads,

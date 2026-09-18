@@ -10,6 +10,8 @@ Examples:
       --input-len 2048 --num-prompts 64
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
       --dataset spec_bench --num-prompts 64 --output-len 8
+  python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
+      --dataset spec_bench --num-prompts 16 --num-turns 2 --output-len 8
 """
 import asyncio
 import os
@@ -19,14 +21,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from bench_common import (
     input_label,
     launch_server,
-    make_prompts,
     parse_full,
     parse_int_list,
     print_stats,
     resolve_port,
-    run_online_bench,
+    run_benchmark_point,
     save_json,
-    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -49,36 +49,31 @@ def main() -> int:
         base = wait_server_ready(port)
         results: dict[str, dict] = {}
         for point_idx, c in enumerate(parse_int_list(bench.num_prompts, 32)):
-            warmup = not bench.no_warmup
-            prompts, in_lens = make_prompts(
-                server_args.model_path,
-                bench.input_len,
-                c + int(warmup),
-                bench.seed + point_idx,
-                dataset=bench.dataset,
-                dataset_categories=bench.dataset_category,
-            )
-            warmup_prompt, prompts, in_lens = split_warmup_prompt(
-                prompts, in_lens, warmup
-            )
-            out_lens = [bench.output_len] * c
-            stats = asyncio.run(
-                run_online_bench(
+            stats, in_lens = asyncio.run(
+                run_benchmark_point(
                     base,
                     server_args.model_path,
-                    prompts,
-                    in_lens,
-                    out_lens,
-                    mtp=False,
-                    warmup_prompt=warmup_prompt,
+                    bench.input_len,
+                    bench.output_len,
+                    c,
+                    bench.seed + point_idx,
+                    num_turns=bench.num_turns,
+                    dataset=bench.dataset,
+                    dataset_categories=bench.dataset_category,
+                    warmup=not bench.no_warmup,
                     pbar=not bench.no_pbar,
                 )
             )
             assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
+            input_desc = (
+                f"multi(avg={stats['in_tokens'] / stats['n']:.0f})"
+                if bench.num_turns > 1
+                else input_label(bench.dataset, in_lens, bench.input_len)
+            )
             print_stats(
                 f"bench_prefill tp={server_args.tp_info.size} "
-                f"in={input_label(bench.dataset, in_lens, bench.input_len)} "
-                f"out={bench.output_len} conc={c}",
+                f"in={input_desc} "
+                f"out={bench.output_len} conc={c} turns={bench.num_turns}",
                 stats,
             )
             results[str(c)] = stats

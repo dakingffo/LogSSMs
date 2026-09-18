@@ -36,6 +36,9 @@ class LogStateSlotLayout:
         assert self.num_linear_layers > 0
         assert self.num_key_heads > 0
         assert self.num_value_heads > 0
+        assert self.num_key_heads == self.num_value_heads, (
+            "The in-place LogState layout requires one key head per value head."
+        )
         assert self.head_k_dim > 0
         assert self.head_v_dim > 0
         assert self.conv_dim > 0
@@ -90,27 +93,43 @@ class LogStateSlotLayout:
         return self.log_key_numel * self.dtype.itemsize
 
     @property
-    def log_value_offset(self) -> int:
-        return self.log_key_bytes
+    def head_log_key_bytes(self) -> int:
+        return self.page_size * self.head_k_dim * self.dtype.itemsize
+
+    @property
+    def head_log_value_offset(self) -> int:
+        return self.head_log_key_bytes
+
+    @property
+    def head_log_value_bytes(self) -> int:
+        return self.page_size * self.head_v_dim * self.dtype.itemsize
 
     @property
     def log_value_bytes(self) -> int:
         return self.log_value_numel * self.dtype.itemsize
 
     @property
-    def log_decay_offset(self) -> int:
+    def head_log_decay_offset(self) -> int:
         return _align_up(
-            self.log_value_offset + self.log_value_bytes,
+            self.head_log_value_offset + self.head_log_value_bytes,
             torch.float32.itemsize,
         )
+
+    @property
+    def head_log_decay_bytes(self) -> int:
+        return self.page_size * torch.float32.itemsize
 
     @property
     def log_decay_bytes(self) -> int:
         return self.log_decay_numel * torch.float32.itemsize
 
     @property
-    def log_payload_bytes(self) -> int:
-        return self.log_decay_offset + self.log_decay_bytes
+    def head_log_payload_bytes(self) -> int:
+        return self.head_log_decay_offset + self.head_log_decay_bytes
+
+    @property
+    def head_recurrent_state_bytes(self) -> int:
+        return self.head_k_dim * self.head_v_dim * self.dtype.itemsize
 
     @property
     def recurrent_state_bytes(self) -> int:
@@ -118,10 +137,28 @@ class LogStateSlotLayout:
 
     @property
     def payload_bytes(self) -> int:
-        return _align_up(
-            max(self.log_payload_bytes, self.recurrent_state_bytes),
+        head_payload_bytes = _align_up(
+            max(
+                self.head_log_payload_bytes,
+                self.head_recurrent_state_bytes,
+            ),
             max(self.dtype.itemsize, torch.float32.itemsize),
         )
+        return (
+            self.num_linear_layers
+            * self.num_value_heads
+            * head_payload_bytes
+        )
+
+    @property
+    def head_payload_bytes(self) -> int:
+        return self.payload_bytes // (
+            self.num_linear_layers * self.num_value_heads
+        )
+
+    @property
+    def layer_payload_bytes(self) -> int:
+        return self.num_value_heads * self.head_payload_bytes
 
     @property
     def conv_state_offset(self) -> int:
@@ -162,10 +199,12 @@ class LinearCacheSlot:
 class LogStatePool:
     """Physical storage for page-sized linear-attention cache slots.
 
-    A slot covers ``page_size`` tokens. Its log representation stores realized
-    low-rank updates for every token, while its checkpoint representation stores
-    one full recurrent state in the same payload bytes. Convolution snapshots are
-    common side data and are retained at every ``granularity``-token boundary.
+    A slot covers ``page_size`` tokens. Each layer/head owns an independent
+    payload whose log representation stores realized low-rank updates and whose
+    checkpoint representation stores one recurrent state in the same bytes.
+    This head-local overlay lets one CUDA block consume a complete log before it
+    overwrites that payload in place. Convolution snapshots are common side data
+    and are retained at every ``granularity``-token boundary.
 
     The allocation and compression unit is one complete slot. Granules only make
     an admitted log page recoverable at finer boundaries; a partially-filled slot
@@ -213,25 +252,47 @@ class LogStatePool:
 
         L = num_linear_layers
         P = page_size
+        H = num_value_heads
         G = self.layout.num_granules
-        self.key_log = self._view(
+        head_stride = self.layout.head_payload_bytes
+        layer_stride = self.layout.layer_payload_bytes
+        self.key_log = self._strided_view(
             offset=0,
-            shape=(L, P, num_key_heads, head_k_dim),
+            shape=(L, P, H, head_k_dim),
+            strides=(
+                layer_stride,
+                head_k_dim * self._dtype.itemsize,
+                head_stride,
+                self._dtype.itemsize,
+            ),
             dtype=dtype,
         )
-        self.residual_value_log = self._view(
-            offset=self.layout.log_value_offset,
-            shape=(L, P, num_value_heads, head_v_dim),
+        self.residual_value_log = self._strided_view(
+            offset=self.layout.head_log_value_offset,
+            shape=(L, P, H, head_v_dim),
+            strides=(
+                layer_stride,
+                head_v_dim * self._dtype.itemsize,
+                head_stride,
+                self._dtype.itemsize,
+            ),
             dtype=dtype,
         )
-        self.decay_log = self._view(
-            offset=self.layout.log_decay_offset,
-            shape=(L, P, num_value_heads),
+        self.decay_log = self._strided_view(
+            offset=self.layout.head_log_decay_offset,
+            shape=(L, P, H),
+            strides=(layer_stride, torch.float32.itemsize, head_stride),
             dtype=torch.float32,
         )
-        self.recurrent_state = self._view(
+        self.recurrent_state = self._strided_view(
             offset=0,
-            shape=(L, num_value_heads, head_k_dim, head_v_dim),
+            shape=(L, H, head_k_dim, head_v_dim),
+            strides=(
+                layer_stride,
+                head_stride,
+                head_v_dim * self._dtype.itemsize,
+                self._dtype.itemsize,
+            ),
             dtype=dtype,
         )
         self.conv_state = self._view(
@@ -254,6 +315,28 @@ class LogStatePool:
         assert offset + num_bytes <= self.layout.slot_bytes
         return self._storage[:, offset : offset + num_bytes].view(dtype).view(
             self.num_slots, *shape
+        )
+
+    def _strided_view(
+        self,
+        offset : int,
+        shape  : tuple[int, ...],
+        strides: tuple[int, ...],
+        dtype  : torch.dtype,
+    ) -> torch.Tensor:
+        itemsize = dtype.itemsize
+        assert offset % itemsize == 0
+        assert self.layout.slot_bytes % itemsize == 0
+        assert all(stride % itemsize == 0 for stride in strides)
+        storage = self._storage.view(dtype)
+        return torch.as_strided(
+            storage,
+            size=(self.num_slots, *shape),
+            stride=(
+                self.layout.slot_bytes // itemsize,
+                *(stride // itemsize for stride in strides),
+            ),
+            storage_offset=offset // itemsize,
         )
 
     def slot(self, index: int) -> LinearCacheSlot:

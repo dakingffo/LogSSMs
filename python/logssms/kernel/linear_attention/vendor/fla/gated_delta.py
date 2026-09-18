@@ -25,6 +25,53 @@ def chunk_gated_delta_rule(
     cu_seqlens   : torch.Tensor,
     chunk_size   : int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output, final_state, chunk_states, _ = _chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        chunk_size,
+    )
+    return output, final_state, chunk_states
+
+
+@torch.compiler.disable
+def chunk_gated_delta_rule_with_log(
+    query        : torch.Tensor,
+    key          : torch.Tensor,
+    value        : torch.Tensor,
+    gate         : torch.Tensor,
+    beta         : torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens   : torch.Tensor,
+    chunk_size   : int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run packed GDN and also return every token's realized value update."""
+    return _chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        initial_state,
+        cu_seqlens,
+        chunk_size,
+    )
+
+
+def _chunk_gated_delta_rule(
+    query        : torch.Tensor,
+    key          : torch.Tensor,
+    value        : torch.Tensor,
+    gate         : torch.Tensor,
+    beta         : torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens   : torch.Tensor,
+    chunk_size   : int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run packed variable-length GDN and expose every post-chunk state.
 
     Inputs use ``[1, total_tokens, heads, dim]`` and ``cu_seqlens`` describes
@@ -93,7 +140,7 @@ def chunk_gated_delta_rule(
     # above have been enqueued. In particular, the solved intra-chunk matrix is
     # otherwise released immediately after producing ``w`` and ``u``.
     del inverse
-    return output, final_state, chunk_states
+    return output, final_state, chunk_states, value_new
 
 
-__all__ = ["chunk_gated_delta_rule"]
+__all__ = ["chunk_gated_delta_rule", "chunk_gated_delta_rule_with_log"]

@@ -10,6 +10,18 @@ from .prefix_cache.base import (
 )
 from .prefix_cache.standard import StandardPrefixCacheBase, StandardPrefixValue
 from .base import BaseCacheManager, CacheResources, LinearCachePool
+from .args import (
+    CacheArgumentParserBase,
+    SUPPORTED_CACHE_ARGUMENT_PARSERS,
+    make_cache_argument_parser,
+)
+from .config import (
+    BaseCacheConfig,
+    LOG_STATE_GRANULARITIES,
+    LOG_STATE_PAGE_SIZE,
+    LogStateCacheConfig,
+    StandardCacheConfig,
+)
 from .factory import (
     BaseCacheFactory,
     CachePlan,
@@ -20,6 +32,8 @@ from .logstate import (
     BranchProtection,
     CheckpointCoalesce,
     LogStateCacheManager,
+    LogStateCacheFactory,
+    LogStateCachePlan,
     LogStatePlan,
     LogStateRound,
     OnlineAnalysisScheduler,
@@ -39,7 +53,9 @@ from .standard import StandardCacheFactory, StandardCacheManager, StandardCacheP
 
 __all__ = [
     "BaseCacheManager",
+    "BaseCacheConfig",
     "BaseCacheFactory",
+    "CacheArgumentParserBase",
     "CacheResources",
     "LinearCachePool",
     "CachePlan",
@@ -62,11 +78,19 @@ __all__ = [
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_FACTORIES",
+    "SUPPORTED_CACHE_ARGUMENT_PARSERS",
+    "StandardCacheConfig",
+    "LogStateCacheConfig",
+    "LOG_STATE_GRANULARITIES",
+    "LOG_STATE_PAGE_SIZE",
+    "make_cache_argument_parser",
     "BranchProtection",
     "CheckpointCoalesce",
     "LogStatePlan",
     "LogStateRound",
     "LogStateCacheManager",
+    "LogStateCacheFactory",
+    "LogStateCachePlan",
     "OnlineAnalysisScheduler",
     "PageMaterialize",
     "WorkStateRestore",

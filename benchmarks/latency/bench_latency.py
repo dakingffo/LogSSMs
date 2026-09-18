@@ -21,6 +21,10 @@ zipped (a length-1 list broadcasts), so the common sweeps are:
       --dataset spec_bench --dataset-category coding,math_reasoning \
       --num-prompts 8 --output-lens 64
 
+  # Closed-loop multi-turn sessions; concurrency counts sessions, not requests
+  python benchmarks/latency/bench_latency.py --model-path <model> \
+      --dataset sharegpt --num-prompts 8 --num-turns 4 --output-lens 64
+
 Server flags are parsed by the library's ``logssms.server.args.parse_args`` --
 nothing is redefined here.
 """
@@ -32,14 +36,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from bench_common import (
     launch_server,
-    make_prompts,
     parse_full,
     parse_int_list,
     print_stats,
     resolve_port,
-    run_online_bench,
+    run_benchmark_point,
     save_json,
-    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -99,38 +101,32 @@ def main() -> int:
         point_idx = 0
         for c in concs:
             for in_len, out_len in configs:
-                warmup = not bench.no_warmup
-                prompts, in_lens = make_prompts(
-                    server_args.model_path,
-                    in_len,
-                    c + int(warmup),
-                    bench.seed + point_idx,
-                    dataset=bench.dataset,
-                    dataset_categories=bench.dataset_category,
-                )
-                warmup_prompt, prompts, in_lens = split_warmup_prompt(
-                    prompts, in_lens, warmup
-                )
-                display_in_len = (
-                    round(sum(in_lens) / len(in_lens)) if bench.dataset else in_len
-                )
-                out_lens = [out_len] * c
-                stats = asyncio.run(
-                    run_online_bench(
+                stats, in_lens = asyncio.run(
+                    run_benchmark_point(
                         base,
                         server_args.model_path,
-                        prompts,
-                        in_lens,
-                        out_lens,
-                        mtp=False,
-                        warmup_prompt=warmup_prompt,
+                        in_len,
+                        out_len,
+                        c,
+                        bench.seed + point_idx,
+                        num_turns=bench.num_turns,
+                        dataset=bench.dataset,
+                        dataset_categories=bench.dataset_category,
+                        warmup=not bench.no_warmup,
                         pbar=not bench.no_pbar,
                     )
                 )
+                if bench.num_turns > 1:
+                    display_in_len = round(stats["in_tokens"] / max(stats["n"], 1))
+                else:
+                    display_in_len = (
+                        round(sum(in_lens) / len(in_lens)) if bench.dataset else in_len
+                    )
                 assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
                 print_stats(
                     f"bench_latency tp={server_args.tp_info.size} "
-                    f"in={display_in_len} out={out_len} conc={c}",
+                    f"in={display_in_len} out={out_len} conc={c} "
+                    f"turns={bench.num_turns}",
                     stats,
                 )
                 rows.append((c, display_in_len, out_len, stats))

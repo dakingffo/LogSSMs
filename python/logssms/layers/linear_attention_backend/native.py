@@ -52,7 +52,11 @@ def _causal_conv1d_update(
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    x_float = x.float()
+    output = x_float * torch.rsqrt(
+        (x_float * x_float).sum(dim=dim, keepdim=True) + eps
+    )
+    return output.to(x.dtype)
 
 
 def _prepare_gdn(
@@ -71,7 +75,13 @@ def _prepare_gdn(
     query = _l2norm(query)
     key = _l2norm(key)
     gate = -A_log.float().exp() * F.softplus(gate.float() + dt_bias)
-    return query, key, value, gate, beta.sigmoid()
+    return (
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        gate.contiguous(),
+        beta.float().sigmoid().contiguous(),
+    )
 
 
 class LinearAttentionBackend(BaseLinearAttentionBackend):
@@ -216,9 +226,15 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         )
         seq_len = mixed_qkv.shape[1]
         return (
-            query.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_k_dim),
-            key.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_k_dim),
-            value.reshape(mixed_qkv.shape[0], seq_len, -1, config.head_v_dim),
+            query.reshape(
+                mixed_qkv.shape[0], seq_len, -1, config.head_k_dim
+            ).contiguous(),
+            key.reshape(
+                mixed_qkv.shape[0], seq_len, -1, config.head_k_dim
+            ).contiguous(),
+            value.reshape(
+                mixed_qkv.shape[0], seq_len, -1, config.head_v_dim
+            ).contiguous(),
         )
 
     def _forward_prefill(
@@ -311,6 +327,11 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
 
         mixed_qkv = torch.cat(qkv_segments).unsqueeze(0)
         query, key, value = self._split_qkv(mixed_qkv, config)
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int64,
+            device=mixed_qkv.device,
+        )
         query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
             query,
             key,
@@ -319,11 +340,6 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             beta.unsqueeze(0),
             A_log,
             dt_bias,
-        )
-        cu_seqlens = torch.tensor(
-            [0, *torch.tensor(lengths).cumsum(0).tolist()],
-            dtype=torch.int64,
-            device=mixed_qkv.device,
         )
         output, _final_state, chunk_states = chunk_gated_delta_rule(
             query,

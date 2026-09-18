@@ -41,6 +41,27 @@ def test_dataset_uses_first_turn(tmp_path):
     assert load_dataset_prompts(str(path)) == ["first"]
 
 
+def test_dataset_exposes_user_turns_and_filters_multiturn_records(tmp_path):
+    path = tmp_path / "multi_turn.jsonl"
+    path.write_text(
+        "\n".join([
+            json.dumps({"id": "single", "turns": ["only"]}),
+            json.dumps({"id": "multi", "turns": ["first", "second", "third"]}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    record = sample_dataset(str(path), 1, seed=7, min_turns=3)[0]
+    assert record.uid == "multi"
+    assert record.num_turns == 3
+    assert [message.content for message in record.user_turns] == [
+        "first", "second", "third",
+    ]
+
+    with pytest.raises(ValueError, match="at least 4 user turns"):
+        sample_dataset(str(path), 1, seed=7, min_turns=4)
+
+
 def test_dataset_sampling_is_deterministic_and_never_repeats(tmp_path):
     path = tmp_path / "prompts.json"
     path.write_text(

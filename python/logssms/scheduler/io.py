@@ -36,10 +36,6 @@ class SchedulerIOMixin:
         self.tp_cpu_group: Final = tp_cpu_group
         self._shutdown_event: Final = shutdown_event
         self._idle = False
-        if config.offline_mode:
-            self.receive_msg = self.offline_receive_msg
-            self.send_result = self.offline_send_result
-            return  # early exit
 
         if tp_info.is_primary():
             self._recv_from_tokenizer: Final = ZmqPullQueue(
@@ -80,12 +76,6 @@ class SchedulerIOMixin:
         self.send_result = send
 
     def run_when_idle(self):
-        raise NotImplementedError("should be implemented")
-
-    def offline_receive_msg(self, blocking: bool = False) -> list[BaseBackendMsg]:
-        raise NotImplementedError("should be implemented")
-
-    def offline_send_result(self, reply: list[DetokenizeMsg]) -> None:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:

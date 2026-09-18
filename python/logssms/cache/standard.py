@@ -360,9 +360,11 @@ class StandardCacheFactory(BaseCacheFactory):
         available_memory  : int,
         speculator_reserve: SpeculatorReserve | None,
     ) -> StandardCachePlan:
+        from logssms.cache.config import StandardCacheConfig
         from logssms.distributed import try_get_tp_info
         from logssms.utils import div_even
 
+        assert isinstance(config.cache_config, StandardCacheConfig)
         tp_info = try_get_tp_info()
         assert tp_info is not None
         cache_per_page = (

@@ -10,7 +10,7 @@ def make_pool(page_size: int = 64) -> LogStatePool:
         page_size=page_size,
         num_linear_layers=2,
         num_key_heads=2,
-        num_value_heads=4,
+        num_value_heads=2,
         head_k_dim=8,
         head_v_dim=6,
         conv_dim=32,
@@ -27,9 +27,9 @@ def test_logstate_pool_is_composed_of_page_sized_slots():
     assert pool.page_size == 64
     assert pool.num_granules == 4
     assert pool.key_log.shape == (3, 2, 64, 2, 8)
-    assert pool.residual_value_log.shape == (3, 2, 64, 4, 6)
-    assert pool.decay_log.shape == (3, 2, 64, 4)
-    assert pool.recurrent_state.shape == (3, 2, 4, 8, 6)
+    assert pool.residual_value_log.shape == (3, 2, 64, 2, 6)
+    assert pool.decay_log.shape == (3, 2, 64, 2)
+    assert pool.recurrent_state.shape == (3, 2, 2, 8, 6)
     assert pool.conv_state.shape == (3, 2, 4, 32, 3)
     assert pool._storage.shape == (3, pool.slot_bytes)
 
@@ -63,8 +63,8 @@ def test_granule_returns_sixteen_token_log_and_shared_conv_slot():
     granule = pool.granule(1, 2)
 
     assert granule.log.key.shape == (2, 16, 2, 8)
-    assert granule.log.residual_value.shape == (2, 16, 4, 6)
-    assert granule.log.decay.shape == (2, 16, 4)
+    assert granule.log.residual_value.shape == (2, 16, 2, 6)
+    assert granule.log.decay.shape == (2, 16, 2)
     assert granule.conv_state.shape == (2, 32, 3)
     assert granule.log.key.data_ptr() == pool.key_log[1, :, 32:48].data_ptr()
     assert granule.conv_state.data_ptr() == pool.conv_state[1, :, 2].data_ptr()

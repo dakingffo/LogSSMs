@@ -27,6 +27,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +38,8 @@ if os.path.isdir("/home/daking/.conda/envs/daking"):
     os.environ.setdefault("CUDA_HOME", "/home/daking/.conda/envs/daking")
 
 from datasets.parser import (
+    DatasetMessage,
+    DatasetRecord,
     load_dataset,
     resolve_dataset_path as _resolve_dataset_path,
     sample_dataset,
@@ -70,6 +73,14 @@ BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
         "default": None,
         "help": "comma-separated dataset categories to include",
     },
+    "--num-turns": {
+        "type": int,
+        "default": 1,
+        "help": (
+            "number of sequential user turns per concurrent session; values greater "
+            "than one enable the multi-turn workload"
+        ),
+    },
     "--out": {
         "type": str,
         "default": None,
@@ -93,6 +104,8 @@ def parse_full(argv: list[str], extra: dict[str, dict[str, Any]] | None = None):
     for name, kw in flags.items():
         p.add_argument(name, **kw)
     bench_ns, server_argv = p.parse_known_args(argv)
+    if bench_ns.num_turns < 1:
+        p.error("--num-turns must be positive")
 
     from logssms.server.args import parse_args
 
@@ -143,6 +156,89 @@ def _dataset_prompt_len(tokenizer: Any, prompt: str) -> int:
         add_generation_prompt=True,
     )
     return len(tokenizer.encode(text))
+
+
+def _chat_prompt_len(tokenizer: Any, messages: list[dict[str, Any]]) -> int:
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return len(tokenizer.encode(text))
+
+
+def _message_dict(message: DatasetMessage) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "role"   : message.role,
+        "content": message.content,
+    }
+    if message.tool_calls is not None:
+        result["tool_calls"] = list(message.tool_calls)
+    if message.tool_call_id is not None:
+        result["tool_call_id"] = message.tool_call_id
+    return result
+
+
+@dataclass(frozen=True)
+class BenchmarkConversation:
+    uid             : str
+    initial_messages: tuple[DatasetMessage, ...]
+    user_turns      : tuple[DatasetMessage, ...]
+
+
+def _conversation_from_record(
+    record   : DatasetRecord,
+    num_turns: int,
+) -> BenchmarkConversation:
+    assert record.num_turns >= num_turns
+    return BenchmarkConversation(
+        uid=record.uid,
+        initial_messages=record.initial_messages,
+        user_turns=record.user_turns[:num_turns],
+    )
+
+
+def make_conversations(
+    model_path        : str,
+    input_len         : int,
+    num_conversations : int,
+    num_turns         : int,
+    seed              : int,
+    *,
+    dataset           : str | None = None,
+    dataset_categories: str | None = None,
+) -> list[BenchmarkConversation]:
+    """Build deterministic sessions for the closed-loop multi-turn workload."""
+    if num_turns < 1:
+        raise ValueError(f"num_turns must be positive, got {num_turns}")
+    if dataset is not None:
+        records = sample_dataset(
+            dataset,
+            num_conversations,
+            seed,
+            dataset_categories,
+            min_turns=num_turns,
+        )
+        return [
+            _conversation_from_record(record, num_turns)
+            for record in records
+        ]
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    random.seed(seed)
+    return [
+        BenchmarkConversation(
+            uid=f"random-{index}",
+            initial_messages=(),
+            user_turns=tuple(
+                DatasetMessage(role="user", content=generate_prompt(tokenizer, input_len))
+                for _ in range(num_turns)
+            ),
+        )
+        for index in range(num_conversations)
+    ]
 
 
 def generate_prompt(tokenizer: Any, n: int) -> str:
@@ -248,6 +344,16 @@ def split_warmup_prompt(
         return None, prompts, input_lens
     assert prompts, "warmup requires one extra prompt"
     return prompts[-1], prompts[:-1], input_lens[:-1]
+
+
+def split_warmup_conversation(
+    conversations: list[BenchmarkConversation],
+    warmup      : bool,
+) -> tuple[BenchmarkConversation | None, list[BenchmarkConversation]]:
+    if not warmup:
+        return None, conversations
+    assert conversations, "warmup requires one extra conversation"
+    return conversations[-1], conversations[:-1]
 
 
 def save_json(path: str | None, data: Any) -> None:
@@ -416,8 +522,21 @@ class _Progress:
             print(f"\r  requests done: {self.done}/{self.total}", end="", file=sys.stderr, flush=True)
 
 
-async def stream_one(client: Any, base: str, model: str, prompt: str, output_len: int, progress: _Progress | None = None):
-    """Stream one chat-completions request; tic on every SSE chunk.
+@dataclass(frozen=True)
+class StreamResult:
+    tics  : list[float]
+    output: str
+
+
+async def stream_messages(
+    client    : Any,
+    base      : str,
+    model     : str,
+    messages  : list[dict[str, Any]],
+    output_len: int,
+    progress  : _Progress | None = None,
+) -> StreamResult:
+    """Stream one chat-completions request and retain its assistant text.
 
     Every ``data: {json}`` line is exactly one detokenizer ack (one token per ack on the
     non-MTP path, one verify round per ack on the MTP path). ``data: [DONE]`` is the
@@ -428,7 +547,7 @@ async def stream_one(client: Any, base: str, model: str, prompt: str, output_len
     """
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": output_len,
         "temperature": 0.0,
         "top_k": 1,
@@ -436,6 +555,7 @@ async def stream_one(client: Any, base: str, model: str, prompt: str, output_len
         "ignore_eos": True,
     }
     tics = [time.perf_counter()]
+    output = []
     async with client.stream("POST", f"{base}/v1/chat/completions", json=payload) as resp:
         resp.raise_for_status()
         async for line in resp.aiter_lines():
@@ -445,10 +565,215 @@ async def stream_one(client: Any, base: str, model: str, prompt: str, output_len
             if data == "[DONE]":
                 tics.append(time.perf_counter())
                 break
+            chunk = json.loads(data)
+            delta = chunk["choices"][0]["delta"]
+            if content := delta.get("content"):
+                output.append(content)
             tics.append(time.perf_counter())
     if progress is not None:
         progress.tick()
-    return tics
+    return StreamResult(tics=tics, output="".join(output))
+
+
+async def stream_one(
+    client    : Any,
+    base      : str,
+    model     : str,
+    prompt    : str,
+    output_len: int,
+    progress  : _Progress | None = None,
+) -> list[float]:
+    result = await stream_messages(
+        client,
+        base,
+        model,
+        [{"role": "user", "content": prompt}],
+        output_len,
+        progress,
+    )
+    return result.tics
+
+
+async def _run_conversation(
+    client      : Any,
+    base        : str,
+    model       : str,
+    conversation: BenchmarkConversation,
+    output_len  : int,
+    progress    : _Progress | None,
+) -> list[tuple[StreamResult, list[dict[str, Any]]]]:
+    history = [_message_dict(message) for message in conversation.initial_messages]
+    results = []
+    for user_turn in conversation.user_turns:
+        history.append(_message_dict(user_turn))
+        request_messages = [dict(message) for message in history]
+        result = await stream_messages(
+            client,
+            base,
+            model,
+            request_messages,
+            output_len,
+            progress,
+        )
+        results.append((result, request_messages))
+        history.append({"role": "assistant", "content": result.output})
+    return results
+
+
+async def run_multiturn_bench(
+    base               : str,
+    model              : str,
+    conversations      : list[BenchmarkConversation],
+    output_len         : int,
+    *,
+    mtp                : bool = False,
+    warmup_conversation: BenchmarkConversation | None = None,
+    pbar               : bool = True,
+) -> dict:
+    """Run closed-loop sessions: turns serialize within a session, sessions overlap."""
+    import httpx
+    from transformers import AutoTokenizer
+
+    if not conversations:
+        raise ValueError("multi-turn benchmark requires at least one conversation")
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None),
+        limits=httpx.Limits(max_connections=1024, max_keepalive_connections=128),
+    )
+    try:
+        if warmup_conversation is not None:
+            await _run_conversation(
+                client,
+                base,
+                model,
+                warmup_conversation,
+                min(8, output_len),
+                None,
+            )
+        num_turns = len(conversations[0].user_turns) if conversations else 0
+        assert all(
+            len(conversation.user_turns) == num_turns
+            for conversation in conversations
+        )
+        progress = _Progress(
+            len(conversations) * num_turns,
+            on=pbar and len(conversations) * num_turns > 1,
+        )
+        session_results = await asyncio.gather(*[
+            _run_conversation(
+                client,
+                base,
+                model,
+                conversation,
+                output_len,
+                progress,
+            )
+            for conversation in conversations
+        ])
+    finally:
+        await client.aclose()
+    if progress.on:
+        print(file=sys.stderr, flush=True)
+
+    flat = [request for session in session_results for request in session]
+    tics_all = [result.tics for result, _messages in flat]
+    input_lengths = [
+        _chat_prompt_len(tokenizer, messages)
+        for _result, messages in flat
+    ]
+    output_lengths = [output_len] * len(flat)
+    summary = summarize(tics_all, input_lengths, output_lengths, mtp=mtp)
+    summary["sessions"] = len(conversations)
+    summary["num_turns"] = num_turns
+    summary["session_per_s"] = (
+        len(conversations) / summary["duration_s"]
+        if summary["duration_s"] > 0 else 0.0
+    )
+    summary["turn_stats"] = []
+    for turn in range(num_turns):
+        turn_requests = [session[turn] for session in session_results]
+        turn_tics = [result.tics for result, _messages in turn_requests]
+        turn_input_lengths = [
+            _chat_prompt_len(tokenizer, messages)
+            for _result, messages in turn_requests
+        ]
+        turn_stats = summarize(
+            turn_tics,
+            turn_input_lengths,
+            [output_len] * len(turn_requests),
+            mtp=mtp,
+        )
+        summary["turn_stats"].append({"turn": turn + 1, **turn_stats})
+    return summary
+
+
+async def run_benchmark_point(
+    base               : str,
+    model              : str,
+    input_len          : int,
+    output_len         : int,
+    concurrency        : int,
+    seed               : int,
+    *,
+    num_turns          : int = 1,
+    dataset            : str | None = None,
+    dataset_categories : str | None = None,
+    mtp                : bool = False,
+    warmup             : bool = True,
+    pbar               : bool = True,
+) -> tuple[dict, list[int]]:
+    """Construct and execute one single- or multi-turn benchmark point."""
+    if num_turns < 1:
+        raise ValueError(f"num_turns must be positive, got {num_turns}")
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be positive, got {concurrency}")
+    if num_turns > 1:
+        conversations = make_conversations(
+            model,
+            input_len,
+            concurrency + int(warmup),
+            num_turns,
+            seed,
+            dataset=dataset,
+            dataset_categories=dataset_categories,
+        )
+        warmup_conversation, conversations = split_warmup_conversation(
+            conversations, warmup
+        )
+        stats = await run_multiturn_bench(
+            base,
+            model,
+            conversations,
+            output_len,
+            mtp=mtp,
+            warmup_conversation=warmup_conversation,
+            pbar=pbar,
+        )
+        return stats, [round(stats["in_tokens"] / max(stats["n"], 1))]
+
+    prompts, input_lengths = make_prompts(
+        model,
+        input_len,
+        concurrency + int(warmup),
+        seed,
+        dataset=dataset,
+        dataset_categories=dataset_categories,
+    )
+    warmup_prompt, prompts, input_lengths = split_warmup_prompt(
+        prompts, input_lengths, warmup
+    )
+    stats = await run_online_bench(
+        base,
+        model,
+        prompts,
+        input_lengths,
+        [output_len] * concurrency,
+        mtp=mtp,
+        warmup_prompt=warmup_prompt,
+        pbar=pbar,
+    )
+    return stats, input_lengths
 
 
 async def run_online_bench_tics(
@@ -638,9 +963,10 @@ def _fmt_ms(x: float) -> str:
 def print_stats(title: str, s: dict, *, note: str = "") -> None:
     t, p, e = s["ttft_ms"], s["tpot_ms"], s["e2e_s"]
     short = "" if s["out_tokens"] == s["requested_out"] else f"  (delivered {s['out_tokens']} of {s['requested_out']})"
+    unit = "requests" if "sessions" in s else "prompts"
     print("=" * 64)
     print(f"  {title}{'  [' + note + ']' if note else ''}")
-    print(f"  prompts: {s['n']}  input: {s['in_tokens']} tok  output: {s['out_tokens']} tok"
+    print(f"  {unit}: {s['n']}  input: {s['in_tokens']} tok  output: {s['out_tokens']} tok"
           f"{short}  duration: {s['duration_s']:.2f}s")
     print(f"  prefill: {s['prefill_tok_per_s']:10.1f} input-tok/s")
     print(f"  output:  {s['output_tok_per_s']:10.1f} output-tok/s   {s['req_per_s']:8.2f} req/s")
@@ -652,6 +978,18 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
           f"p99 {e[3]:>7.3f}  max {e[4]:>7.3f}")
     if s.get("is_mtp"):
         print(f"  verify rounds: {s['rounds']}  avg_accept: {s['avg_accept']:.2f} drafts/round")
+    if "sessions" in s:
+        print(
+            f"  sessions: {s['sessions']}  turns/session: {s['num_turns']}  "
+            f"session/s: {s['session_per_s']:.2f}"
+        )
+        print(f"  {'turn':>6} {'input':>10} {'output':>10} {'TTFT p50':>10} {'E2E p50':>10}")
+        for turn in s["turn_stats"]:
+            print(
+                f"  {turn['turn']:>6} {turn['in_tokens']:>10} "
+                f"{turn['out_tokens']:>10} {turn['ttft_ms'][1]:>10.2f} "
+                f"{turn['e2e_s'][1]:>10.3f}"
+            )
     print("=" * 64)
 
 

@@ -8,12 +8,21 @@ from typing import TYPE_CHECKING, Sequence
 import torch
 
 from logssms.core import Request
-from logssms.kernel.linear_attention import reconstruct_log_states
-from logssms.utils import align_down, div_ceil
+from logssms.kernel.linear_attention import (
+    materialize_log_states_inplace,
+    reconstruct_log_states,
+)
+from logssms.utils import align_ceil, align_down, div_ceil, init_logger
 
 from .base import BaseCacheManager, CacheResources
+from .factory import BaseCacheFactory, CachePlan, SUPPORTED_CACHE_FACTORIES
 from .linear_pool.logstate_pool import LOG_STATE_GRANULARITY
 from .linear_pool.logstate_pool import LogStatePool
+from .pools import (
+    logstate_slot_bytes_for_config,
+    make_kvcache_pool,
+    make_logstate_pool,
+)
 from .prefix_cache.base import BaseCacheHandle
 from .prefix_cache.logstate import (
     LogStateCacheHandle,
@@ -27,6 +36,19 @@ from .prefix_cache.logstate import (
 
 if TYPE_CHECKING:
     from logssms.core import Batch
+    from logssms.engine import EngineConfig
+    from logssms.speculator import SpeculatorReserve
+
+
+logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class LogStateCachePlan(CachePlan):
+    num_states        : int
+    num_work_states   : int
+    cache_per_page    : int
+    cache_per_log_slot: int
 
 
 class WorkStateRestoreMode(Enum):
@@ -91,12 +113,6 @@ class LogStatePlan:
     materialize  : tuple[PageMaterialize, ...]
     coalesce     : tuple[CheckpointCoalesce, ...]
 
-    @property
-    def output_slots(self) -> int:
-        # Branch restoration targets the request's fixed work_state_table row.
-        return len(self.materialize)
-
-
 @dataclass
 class _BatchPrefixNode:
     depth          : int
@@ -133,16 +149,24 @@ class _ReconstructionTask:
     output_conv_granule: int
 
 
+@dataclass(frozen=True)
+class _MaterializeChain:
+    base_slot       : int | None
+    logs            : tuple[LogStateEntry, ...]
+    checkpoint_slots: frozenset[int]
+
+
 class OnlineAnalysisScheduler:
     """Generate deterministic LogState maintenance plans.
 
     This first policy has no online cost model. It detects branch endpoints at
     the 16-token recovery granularity, protects the complete log page containing
-    each endpoint, materializes complete unprotected log pages in the next round,
-    and coalesces adjacent equal-level checkpoints one level per round. Branch
-    restoration writes directly to ``work_state_table`` and does not create a
-    persistent checkpoint. This class never allocates slots, launches kernels or
-    mutates the persistent tree.
+    each endpoint, and materializes complete unprotected log pages in the next
+    round. Newly materialized checkpoints immediately participate in one level
+    of adjacent equal-level coalescing in that same round. Branch restoration
+    writes directly to ``work_state_table`` and does not create a persistent
+    checkpoint. This class never allocates slots, launches kernels or mutates the
+    persistent tree.
     """
 
     def __init__(
@@ -191,7 +215,7 @@ class OnlineAnalysisScheduler:
             tree, round_info.eligible_slots, pending
         )
         coalesce = self._plan_coalesce(
-            tree, round_info.eligible_slots, pending
+            tree, round_info.eligible_slots, pending, materialize
         )
         return LogStatePlan(
             tree_revision=tree.revision,
@@ -356,17 +380,32 @@ class OnlineAnalysisScheduler:
         tree          : LogRadixTree,
         eligible_slots: frozenset[int],
         pending       : tuple[_PendingProtection, ...],
+        materialize   : tuple[PageMaterialize, ...],
     ) -> tuple[CheckpointCoalesce, ...]:
+        projected = {
+            plan.log_slot: LogStateEntry(
+                slot=plan.log_slot,
+                kind=LogStateKind.CHECKPOINT,
+                begin=plan.begin,
+                end=plan.end,
+                merge_level=0,
+            )
+            for plan in materialize
+        }
         result = []
         used_slots: set[int] = set()
         for leaf in tree.leaves():
             entries = [
-                entry
+                projected.get(entry.slot, entry)
                 for entry in self._entries_for_node(tree, leaf)
                 if entry.slot in eligible_slots
-                and entry.kind is LogStateKind.CHECKPOINT
-                and entry.merge_level is not None
                 and entry.slot not in used_slots
+            ]
+            entries = [
+                entry
+                for entry in entries
+                if entry.kind is LogStateKind.CHECKPOINT
+                and entry.merge_level is not None
             ]
             entries.sort(key=lambda entry: (entry.begin, entry.end, entry.slot))
             index = 0
@@ -430,13 +469,7 @@ class OnlineAnalysisScheduler:
                 continue
             if value.trace.node.uuid not in path_ids:
                 continue
-            covering = self._covering_log(tree, value)
-            if (
-                covering is not None
-                and begin <= covering.begin
-                and covering.end <= end
-            ):
-                return True
+            return True
         return False
 
     def _covering_log(
@@ -502,10 +535,9 @@ class LogStateCacheManager(BaseCacheManager):
     """Own LogState cache allocation and request/tree ownership transitions.
 
     ``CacheResources`` owns the device buffers. This class owns their allocation
-    state, the Log-Radix-Tree, and the online maintenance policy. Kernel execution
-    is deliberately not implemented here yet; ``prepare_batch`` records the
-    plan, applies metadata-only branch protection, and leaves restore/maintenance
-    work for a later executor.
+    state, the Log-Radix-Tree, and the online maintenance policy. Branch recovery
+    writes request work states, while private Log chains are materialized in
+    place by the CUDA reconstruction kernel.
     """
 
     def __init__(
@@ -612,6 +644,7 @@ class LogStateCacheManager(BaseCacheManager):
             if req.cached_len == 0 and req.table_idx not in self.pending_recoveries:
                 work_slot = int(work_state_table[req.table_idx, 0])
                 self.logstate_pool.recurrent_state[work_slot].zero_()
+                self.logstate_pool.conv_state[work_slot].zero_()
 
         if needed == 0:
             return
@@ -637,11 +670,18 @@ class LogStateCacheManager(BaseCacheManager):
                         state_slot=state_slot,
                     )
                 )
+                mapped_end = min(
+                    logical_end,
+                    req.max_device_len,
+                    self.page_table.shape[1],
+                )
+                mapped_len = mapped_end - logical_begin
+                assert 0 < mapped_len <= self.page_size
                 self.page_table[
-                    req.table_idx, logical_begin:logical_end
-                ].copy_(kv_page + token_offsets)
+                    req.table_idx, logical_begin:mapped_end
+                ].copy_(kv_page + token_offsets[:mapped_len])
                 state_table[
-                    req.table_idx, logical_begin:logical_end
+                    req.table_idx, logical_begin:mapped_end
                 ].fill_(state_slot)
         assert offset == needed
 
@@ -659,31 +699,14 @@ class LogStateCacheManager(BaseCacheManager):
             if self.tree.has_slot(protection.log_slot):
                 self.tree.protect_entry(protection.log_slot)
 
-        materialize = plan.materialize[: len(self.free_states)]
-        self.last_plan = LogStatePlan(
-            tree_revision=plan.tree_revision,
-            protections=plan.protections,
-            restores=plan.restores,
-            materialize=materialize,
-            coalesce=plan.coalesce,
-        )
-        output_slots = self.free_states[: len(materialize)]
-        self.free_states = self.free_states[len(materialize) :]
-
+        self.last_plan = plan
         tasks = self._make_restore_tasks(batch)
-        tasks.extend(
-            self._make_materialize_tasks(materialize, output_slots)
-        )
-        try:
-            self._reconstruct(tasks)
-        except Exception:
-            if len(output_slots) > 0:
-                self.free_states = torch.cat([output_slots, self.free_states])
-            raise
+        self._reconstruct(tasks)
+        self._materialize_inplace(plan.materialize)
 
         for req in batch.reqs:
             self.pending_recoveries.pop(req.table_idx, None)
-        self._commit_materialize(materialize, output_slots)
+        self._commit_materialize(plan.materialize)
         self._commit_coalesce(plan.coalesce)
 
     def cache_req(self, req: Request, *, finished: bool) -> None:
@@ -696,6 +719,7 @@ class LogStateCacheManager(BaseCacheManager):
             if page.begin != insert_len:
                 break
             insert_len = page.end
+        assert (insert_len - old_handle.cached_len) % self.page_size == 0
 
         insert = self.tree.insert(
             req.input_ids[: req.cached_len],
@@ -705,8 +729,10 @@ class LogStateCacheManager(BaseCacheManager):
         adopted = [
             page
             for page in full_pages
-            if insert.previous_len <= page.begin and page.end <= insert.inserted_len
+            if old_handle.cached_len <= page.begin
+            and page.end <= insert.inserted_len
         ]
+        duplicate_kv_pages = []
         for page in adopted:
             self.tree.attach_entry(
                 insert.node,
@@ -717,14 +743,29 @@ class LogStateCacheManager(BaseCacheManager):
                     end=page.end,
                 ),
             )
-            self._retain_cached_kv(
-                self.page_table[req.table_idx, page.begin:page.end]
-            )
+            kv_begin = max(page.begin, insert.previous_len)
+            if kv_begin < page.end:
+                self._retain_cached_kv(
+                    self.page_table[req.table_idx, kv_begin:page.end]
+                )
+            else:
+                duplicate_kv_pages.append(page.kv_page)
 
         duplicates = [
-            page for page in full_pages if page.end <= insert.previous_len
+            page
+            for page in full_pages
+            if page not in adopted and page.end <= insert.previous_len
         ]
         self._release_live_pages(req.table_idx, duplicates)
+        if duplicate_kv_pages:
+            self._return_slots(
+                torch.tensor(
+                    duplicate_kv_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                torch.empty(0, dtype=torch.int32, device=self.device),
+            )
 
         new_handle = self.tree.make_handle(insert.node, insert.inserted_len)
         self.unlock(old_handle)
@@ -741,6 +782,19 @@ class LogStateCacheManager(BaseCacheManager):
         remaining = [
             page for page in pages if page.state_slot not in transferred
         ]
+        if (
+            not finished
+            and adopted
+            and req.cached_len == adopted[-1].end
+        ):
+            work_state_table = self.work_state_table
+            assert work_state_table is not None
+            work_slot = int(work_state_table[req.table_idx, 0])
+            self.logstate_pool.conv_state[work_slot, :, 0].copy_(
+                self.logstate_pool.conv_state[
+                    adopted[-1].state_slot, :, -1
+                ]
+            )
         if finished:
             self._release_live_pages(req.table_idx, remaining)
             self._live_pages.pop(req.table_idx, None)
@@ -889,38 +943,12 @@ class LogStateCacheManager(BaseCacheManager):
             )
         return tasks
 
-    def _make_materialize_tasks(
-        self,
-        materialize: Sequence[PageMaterialize],
-        output_slots: torch.Tensor,
-    ) -> list[_ReconstructionTask]:
-        tasks = []
-        output_granule = self.logstate_pool.num_granules - 1
-        for plan, output_slot in zip(materialize, output_slots.tolist()):
-            entries = self.tree.entries_for_slot(plan.log_slot)
-            assert len(entries) == 1
-            source = entries[0]
-            assert source.kind is LogStateKind.LOG
-            source_granule = (
-                plan.end - source.physical_begin
-            ) // self.granularity - 1
-            tasks.append(
-                _ReconstructionTask(
-                    output_slot=output_slot,
-                    base_slot=plan.base_checkpoint_slot,
-                    logs=plan.replay_logs,
-                    source_conv_slot=plan.log_slot,
-                    source_conv_granule=source_granule,
-                    output_conv_granule=output_granule,
-                )
-            )
-        return tasks
-
     def _reconstruct(self, tasks: Sequence[_ReconstructionTask]) -> None:
         if not tasks:
             return
         device = self.device
-        log_entries = [entry for task in tasks for entry in task.logs]
+        pool = self.logstate_pool
+        logs = [entry for task in tasks for entry in task.logs]
         offsets = [0]
         for task in tasks:
             offsets.append(offsets[-1] + len(task.logs))
@@ -928,7 +956,6 @@ class LogStateCacheManager(BaseCacheManager):
         def tensor(values: Sequence[int]) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.int32, device=device)
 
-        pool = self.logstate_pool
         reconstruct_log_states(
             key_log=pool.key_log,
             residual_value_log=pool.residual_value_log,
@@ -941,14 +968,12 @@ class LogStateCacheManager(BaseCacheManager):
                 for task in tasks
             ]),
             task_log_offsets=tensor(offsets),
-            log_slots=tensor([entry.slot for entry in log_entries]),
+            log_slots=tensor([entry.slot for entry in logs]),
             log_begins=tensor([
-                entry.begin - entry.physical_begin
-                for entry in log_entries
+                entry.begin - entry.physical_begin for entry in logs
             ]),
             log_ends=tensor([
-                entry.end - entry.physical_begin
-                for entry in log_entries
+                entry.end - entry.physical_begin for entry in logs
             ]),
             source_conv_slots=tensor([
                 task.source_conv_slot for task in tasks
@@ -961,13 +986,81 @@ class LogStateCacheManager(BaseCacheManager):
             ]),
         )
 
+    def _materialize_inplace(
+        self,
+        plans: Sequence[PageMaterialize],
+    ) -> None:
+        chains = self._make_materialize_chains(plans)
+        if not chains:
+            return
+
+        logs = [entry for chain in chains for entry in chain.logs]
+        offsets = [0]
+        for chain in chains:
+            offsets.append(offsets[-1] + len(chain.logs))
+
+        def tensor(values: Sequence[int]) -> torch.Tensor:
+            return torch.tensor(
+                values, dtype=torch.int32, device=self.device
+            )
+
+        pool = self.logstate_pool
+        materialize_log_states_inplace(
+            key_log=pool.key_log,
+            residual_value_log=pool.residual_value_log,
+            decay_log=pool.decay_log,
+            recurrent_state=pool.recurrent_state,
+            base_slots=tensor([
+                -1 if chain.base_slot is None else chain.base_slot
+                for chain in chains
+            ]),
+            chain_log_offsets=tensor(offsets),
+            log_slots=tensor([entry.slot for entry in logs]),
+            log_begins=tensor([
+                entry.begin - entry.physical_begin for entry in logs
+            ]),
+            log_ends=tensor([
+                entry.end - entry.physical_begin for entry in logs
+            ]),
+            checkpoint_flags=tensor([
+                int(entry.slot in chain.checkpoint_slots)
+                for chain in chains
+                for entry in chain.logs
+            ]),
+        )
+
+    @staticmethod
+    def _make_materialize_chains(
+        plans: Sequence[PageMaterialize],
+    ) -> tuple[_MaterializeChain, ...]:
+        remaining = {plan.log_slot: plan for plan in plans}
+        chains = []
+        for plan in sorted(plans, key=lambda value: value.end, reverse=True):
+            if plan.log_slot not in remaining:
+                continue
+            checkpoint_slots = frozenset(
+                entry.slot
+                for entry in plan.replay_logs
+                if entry.slot in remaining
+            )
+            assert plan.log_slot in checkpoint_slots
+            chains.append(
+                _MaterializeChain(
+                    base_slot=plan.base_checkpoint_slot,
+                    logs=plan.replay_logs,
+                    checkpoint_slots=checkpoint_slots,
+                )
+            )
+            for slot in checkpoint_slots:
+                del remaining[slot]
+        assert not remaining
+        return tuple(chains)
+
     def _commit_materialize(
         self,
-        plans       : Sequence[PageMaterialize],
-        output_slots: torch.Tensor,
+        plans: Sequence[PageMaterialize],
     ) -> None:
-        released = []
-        for plan, output_slot in zip(plans, output_slots.tolist()):
+        for plan in plans:
             entries = self.tree.entries_for_slot(plan.log_slot)
             assert len(entries) == 1
             old_entry = entries[0]
@@ -977,19 +1070,11 @@ class LogStateCacheManager(BaseCacheManager):
             self.tree.attach_entry(
                 owner,
                 LogStateEntry(
-                    slot=output_slot,
+                    slot=plan.log_slot,
                     kind=LogStateKind.CHECKPOINT,
                     begin=plan.begin,
                     end=plan.end,
                     merge_level=0,
-                ),
-            )
-            released.append(plan.log_slot)
-        if released:
-            self._return_slots(
-                torch.empty(0, dtype=torch.int32, device=self.device),
-                torch.tensor(
-                    released, dtype=torch.int32, device=self.device
                 ),
             )
 
@@ -1113,12 +1198,181 @@ class LogStateCacheManager(BaseCacheManager):
             )
 
 
+class LogStateCacheFactory(BaseCacheFactory):
+    """Allocate independent KV-page and LogState-slot budgets at a 3:1 ratio."""
+
+    def plan(
+        self,
+        config            : EngineConfig,
+        available_memory  : int,
+        speculator_reserve: SpeculatorReserve | None,
+    ) -> LogStateCachePlan:
+        from logssms.cache.config import LogStateCacheConfig
+        from logssms.distributed import try_get_tp_info
+        from logssms.utils import div_even
+
+        assert isinstance(config.cache_config, LogStateCacheConfig)
+        assert config.model_config.is_hybrid, (
+            "LogState cache is only defined for hybrid models."
+        )
+        assert config.page_size == 64, (
+            "LogState currently uses a fixed 64-token physical page."
+        )
+        assert speculator_reserve is None, (
+            "LogState speculative verify is not implemented yet."
+        )
+        tp_info = try_get_tp_info()
+        assert tp_info is not None
+
+        cache_per_page = (
+            2
+            * config.model_config.head_dim
+            * div_even(
+                config.model_config.num_kv_heads,
+                tp_info.size,
+                allow_replicate=True,
+            )
+            * config.page_size
+            * config.dtype.itemsize
+            * config.model_config.num_attention_layers
+        )
+        cache_per_log_slot = logstate_slot_bytes_for_config(
+            config.model_config,
+            config.page_size,
+            config.cache_config.granularity,
+            config.dtype,
+        )
+        num_work_states = config.max_running_req + 1
+        work_state_bytes = num_work_states * cache_per_log_slot
+        persistent_memory = available_memory - work_state_bytes
+        assert persistent_memory > 0, (
+            "Not enough memory for LogState request work states."
+        )
+
+        kv_budget = persistent_memory * 3 // 4
+        state_budget = persistent_memory - kv_budget
+        num_pages = (
+            kv_budget // cache_per_page
+            if config.num_page_override is None else config.num_page_override
+        )
+        num_states = state_budget // cache_per_log_slot
+        assert num_pages > 1 and num_states > 1, (
+            "Not enough memory for LogState cache allocation."
+        )
+
+        num_tokens = num_pages * config.page_size
+        max_seq_len = min(
+            config.max_seq_len,
+            num_tokens,
+            num_states * config.page_size,
+        )
+        return LogStateCachePlan(
+            num_pages=num_pages,
+            num_tokens=num_tokens,
+            max_seq_len=max_seq_len,
+            aligned_max_seq_len=align_ceil(max_seq_len, 32),
+            num_states=num_states,
+            num_work_states=num_work_states,
+            cache_per_page=cache_per_page,
+            cache_per_log_slot=cache_per_log_slot,
+        )
+
+    def allocate(
+        self,
+        config: EngineConfig,
+        plan  : CachePlan,
+        device: torch.device,
+        dtype : torch.dtype,
+    ) -> CacheResources:
+        from logssms.cache.config import LogStateCacheConfig
+
+        assert isinstance(plan, LogStateCachePlan)
+        assert isinstance(config.cache_config, LogStateCacheConfig)
+        kv_pool = make_kvcache_pool(
+            model_config=config.model_config,
+            num_pages=plan.num_pages + 1,
+            page_size=config.page_size,
+            device=device,
+            dtype=dtype,
+        )
+        page_table = torch.zeros(
+            (config.max_running_req + 1, plan.aligned_max_seq_len),
+            dtype=torch.int32,
+            device=device,
+        )
+        page_table[-1].fill_(plan.num_tokens)
+
+        linear_state = make_logstate_pool(
+            model_config=config.model_config,
+            num_slots=plan.num_states + plan.num_work_states,
+            page_size=config.page_size,
+            granularity=config.cache_config.granularity,
+            device=device,
+            dtype=dtype,
+        )
+        state_table = torch.full(
+            (config.max_running_req + 1, plan.aligned_max_seq_len),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        work_state_table = torch.arange(
+            plan.num_states,
+            plan.num_states + plan.num_work_states,
+            dtype=torch.int32,
+            device=device,
+        ).view(config.max_running_req + 1, 1)
+        dummy_work_slot = int(work_state_table[-1, 0])
+        state_table[-1].fill_(dummy_work_slot)
+        linear_state.recurrent_state[dummy_work_slot].zero_()
+        linear_state.conv_state[dummy_work_slot].zero_()
+
+        logger.info(
+            f"Allocating {plan.num_pages} KV pages = "
+            f"{plan.num_pages * plan.cache_per_page / (1 << 30):.2f} GiB, "
+            f"{plan.num_states} persistent LogState slots + "
+            f"{plan.num_work_states} work slots = "
+            f"{(plan.num_states + plan.num_work_states) * plan.cache_per_log_slot / (1 << 30):.2f} GiB"
+        )
+        return CacheResources(
+            kv_pool=kv_pool,
+            page_table=page_table,
+            linear_state=linear_state,
+            state_table=state_table,
+            work_state_table=work_state_table,
+        )
+
+    def make_manager(
+        self,
+        config   : EngineConfig,
+        plan     : CachePlan,
+        resources: CacheResources,
+    ) -> LogStateCacheManager:
+        from logssms.cache.config import LogStateCacheConfig
+
+        assert isinstance(plan, LogStateCachePlan)
+        assert isinstance(config.cache_config, LogStateCacheConfig)
+        return LogStateCacheManager(
+            num_pages=plan.num_pages,
+            num_states=plan.num_states,
+            num_work_states=plan.num_work_states,
+            page_size=config.page_size,
+            resources=resources,
+            granularity=config.cache_config.granularity,
+        )
+
+
+SUPPORTED_CACHE_FACTORIES.register("logstate")(LogStateCacheFactory())
+
+
 __all__ = [
     "BranchProtection",
     "CheckpointCoalesce",
     "LogStatePlan",
     "LogStateRound",
     "LogStateCacheManager",
+    "LogStateCacheFactory",
+    "LogStateCachePlan",
     "OnlineAnalysisScheduler",
     "PageMaterialize",
     "WorkStateRestore",

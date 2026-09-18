@@ -14,6 +14,8 @@ Examples:
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
       --dataset spec_bench --dataset-category coding,math_reasoning \
       --num-prompts 8 --output-len 256
+  python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
+      --dataset sharegpt --num-prompts 8 --num-turns 4 --output-len 128
 """
 import asyncio
 import os
@@ -23,16 +25,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from bench_common import (
     input_label,
     launch_server,
-    make_prompts,
     parse_full,
     parse_int_list,
     print_compare,
     print_stats,
     resolve_num_spec_tokens,
     resolve_port,
-    run_online_bench,
+    run_benchmark_point,
     save_json,
-    split_warmup_prompt,
     wait_server_ready,
     kill_server,
 )
@@ -73,28 +73,19 @@ def main() -> int:
         try:
             base = wait_server_ready(port)
             for point_idx, c in enumerate(parse_int_list(bench.num_prompts, 32)):
-                warmup = not bench.no_warmup
-                prompts, in_lens = make_prompts(
-                    server_args.model_path,
-                    bench.input_len,
-                    c + int(warmup),
-                    bench.seed + point_idx,
-                    dataset=bench.dataset,
-                    dataset_categories=bench.dataset_category,
-                )
-                warmup_prompt, prompts, in_lens = split_warmup_prompt(
-                    prompts, in_lens, warmup
-                )
-                out_lens = [bench.output_len] * c
-                stats = asyncio.run(
-                    run_online_bench(
+                stats, in_lens = asyncio.run(
+                    run_benchmark_point(
                         base,
                         server_args.model_path,
-                        prompts,
-                        in_lens,
-                        out_lens,
+                        bench.input_len,
+                        bench.output_len,
+                        c,
+                        bench.seed + point_idx,
+                        num_turns=bench.num_turns,
+                        dataset=bench.dataset,
+                        dataset_categories=bench.dataset_category,
                         mtp=enable_specualtive_decoding,
-                        warmup_prompt=warmup_prompt,
+                        warmup=not bench.no_warmup,
                         pbar=not bench.no_pbar,
                     )
                 )
@@ -103,10 +94,15 @@ def main() -> int:
                     f"avg_accept={stats['avg_accept']:.2f}"
                     if enable_specualtive_decoding else ""
                 )
+                input_desc = (
+                    f"multi(avg={stats['in_tokens'] / stats['n']:.0f})"
+                    if bench.num_turns > 1
+                    else input_label(bench.dataset, in_lens, bench.input_len)
+                )
                 print_stats(
                     f"bench_spec_decode {label} tp={server_args.tp_info.size} "
-                    f"in={input_label(bench.dataset, in_lens, bench.input_len)} "
-                    f"out={bench.output_len} conc={c}",
+                    f"in={input_desc} "
+                    f"out={bench.output_len} conc={c} turns={bench.num_turns}",
                     stats,
                     note=note,
                 )

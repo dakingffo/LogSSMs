@@ -1,13 +1,19 @@
+import asyncio
 import json
 
 import pytest
 
 from benchmarks.bench_common import (
+    BenchmarkConversation,
+    StreamResult,
+    _run_conversation,
     make_server_cmd,
     save_json,
     split_warmup_prompt,
+    stream_messages,
     summarize,
 )
+from datasets.parser import DatasetMessage
 
 
 def test_warmup_prompt_is_not_in_measured_batch():
@@ -53,3 +59,81 @@ def test_save_json_persists_each_completed_point(tmp_path):
         "mtp": {"1": {"output_tok_per_s": 10.0}}
     }
     assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_multiturn_session_appends_generated_assistant_output(monkeypatch):
+    requests = []
+
+    async def fake_stream(
+        client, base, model, messages, output_len, progress,
+    ):
+        requests.append(messages)
+        return StreamResult(
+            tics=[float(len(requests)), float(len(requests)) + 1],
+            output=f"generated-{len(requests)}",
+        )
+
+    monkeypatch.setattr("benchmarks.bench_common.stream_messages", fake_stream)
+    conversation = BenchmarkConversation(
+        uid="session",
+        initial_messages=(DatasetMessage(role="system", content="system"),),
+        user_turns=(
+            DatasetMessage(role="user", content="first"),
+            DatasetMessage(role="user", content="second"),
+        ),
+    )
+    asyncio.run(
+        _run_conversation(None, "base", "model", conversation, 8, None)
+    )
+
+    assert requests == [
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first"},
+        ],
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "generated-1"},
+            {"role": "user", "content": "second"},
+        ],
+    ]
+
+
+def test_stream_messages_collects_openai_delta_content():
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            for line in (
+                'data: {"choices":[{"delta":{"role":"assistant","content":"one"}}]}',
+                'data: {"choices":[{"delta":{"content":" two"}}]}',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ):
+                yield line
+
+    class Context:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            pass
+
+    class Client:
+        def stream(self, method, url, json):
+            assert json["messages"] == [{"role": "user", "content": "hello"}]
+            return Context()
+
+    result = asyncio.run(
+        stream_messages(
+            Client(),
+            "http://server",
+            "model",
+            [{"role": "user", "content": "hello"}],
+            2,
+        )
+    )
+    assert result.output == "one two"
+    assert len(result.tics) == 5

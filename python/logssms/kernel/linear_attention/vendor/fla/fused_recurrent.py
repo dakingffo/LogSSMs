@@ -31,6 +31,9 @@ def _fused_recurrent_gated_delta_kernel(
     initial_state,
     output,
     states,
+    prepared_key,
+    residual_value,
+    decay_log,
     scale,
     SEQ_LEN,
     NUM_K_HEADS: tl.constexpr,
@@ -39,6 +42,7 @@ def _fused_recurrent_gated_delta_kernel(
     HEAD_V_DIM : tl.constexpr,
     BLOCK_K    : tl.constexpr,
     BLOCK_V    : tl.constexpr,
+    STORE_LOG  : tl.constexpr,
 ):
     value_block = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -100,6 +104,29 @@ def _fused_recurrent_gated_delta_kernel(
         result = tl.sum(state * q[:, None], axis=0)
         tl.store(output_ptr, result, mask=v_mask)
 
+        if STORE_LOG:
+            prepared_key_ptr = (
+                prepared_key
+                + (batch_idx * SEQ_LEN * NUM_V_HEADS + value_head)
+                * HEAD_K_DIM
+                + k_offset
+            )
+            residual_value_ptr = (
+                residual_value
+                + (batch_idx * SEQ_LEN * NUM_V_HEADS + value_head)
+                * HEAD_V_DIM
+                + v_offset
+            )
+            decay_ptr = (
+                decay_log
+                + (batch_idx * SEQ_LEN + seq_idx) * NUM_V_HEADS
+                + value_head
+            )
+            tl.store(residual_value_ptr, delta, mask=v_mask)
+            if value_block == 0:
+                tl.store(prepared_key_ptr, k, mask=k_mask)
+                tl.store(decay_ptr, decay)
+
         snapshot_ptr = (
             states
             + (
@@ -130,6 +157,74 @@ def fused_recurrent_gated_delta_rule(
     dt_bias      : torch.Tensor,
     initial_state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    output, states, _, _, _ = _fused_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        A_log,
+        dt_bias,
+        initial_state,
+        store_log=False,
+    )
+    return output, states
+
+
+@torch.compiler.disable
+def fused_recurrent_gated_delta_rule_with_log(
+    query        : torch.Tensor,
+    key          : torch.Tensor,
+    value        : torch.Tensor,
+    gate         : torch.Tensor,
+    beta         : torch.Tensor,
+    A_log        : torch.Tensor,
+    dt_bias      : torch.Tensor,
+    initial_state: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run short GDN recurrence and expose its lossless update log."""
+    output, states, prepared_key, residual_value, decay = (
+        _fused_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            gate,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            store_log=True,
+        )
+    )
+    assert prepared_key is not None
+    assert residual_value is not None
+    assert decay is not None
+    return output, states, prepared_key, residual_value, decay
+
+
+def _fused_recurrent_gated_delta_rule(
+    query        : torch.Tensor,
+    key          : torch.Tensor,
+    value        : torch.Tensor,
+    gate         : torch.Tensor,
+    beta         : torch.Tensor,
+    A_log        : torch.Tensor,
+    dt_bias      : torch.Tensor,
+    initial_state: torch.Tensor,
+    store_log    : bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Run a short GDN recurrence and return every post-token state."""
     assert query.is_cuda and key.is_cuda and value.is_cuda
     assert query.ndim == key.ndim == value.ndim == 4
@@ -156,6 +251,9 @@ def fused_recurrent_gated_delta_rule(
         dtype=initial_state.dtype,
         device=initial_state.device,
     )
+    prepared_key = torch.empty_like(key) if store_log else None
+    residual_value = torch.empty_like(value) if store_log else None
+    decay = torch.empty_like(gate, dtype=torch.float32) if store_log else None
 
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = min(8, triton.next_power_of_2(head_v_dim))
@@ -171,6 +269,9 @@ def fused_recurrent_gated_delta_rule(
         initial_state,
         output,
         states,
+        prepared_key,
+        residual_value,
+        decay,
         head_k_dim ** -0.5,
         seq_len,
         NUM_K_HEADS=num_k_heads,
@@ -179,10 +280,14 @@ def fused_recurrent_gated_delta_rule(
         HEAD_V_DIM=head_v_dim,
         BLOCK_K=block_k,
         BLOCK_V=block_v,
+        STORE_LOG=store_log,
         num_warps=1,
         num_stages=3,
     )
-    return output, states
+    return output, states, prepared_key, residual_value, decay
 
 
-__all__ = ["fused_recurrent_gated_delta_rule"]
+__all__ = [
+    "fused_recurrent_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule_with_log",
+]
