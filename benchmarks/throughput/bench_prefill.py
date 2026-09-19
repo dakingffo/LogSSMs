@@ -7,11 +7,11 @@ throughput (input-tok/s), TTFT and req/s. Server flags are parsed by the library
 
 Examples:
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
-      --input-len 2048 --num-prompts 64
+      --input-len 2048 --num-concurrent-sessions 64
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
-      --dataset spec_bench --num-prompts 64 --output-len 8
+      --dataset spec_bench --num-concurrent-sessions 64 --output-len 8
   python benchmarks/throughput/bench_prefill.py --model-path <model> --tp-size 2 \
-      --dataset spec_bench --num-prompts 16 --num-turns 2 --output-len 8
+      --dataset spec_bench --num-concurrent-sessions 16 --num-turns 2 --output-len 8
 """
 import asyncio
 import os
@@ -48,7 +48,9 @@ def main() -> int:
     try:
         base = wait_server_ready(port)
         results: dict[str, dict] = {}
-        for point_idx, c in enumerate(parse_int_list(bench.num_prompts, 32)):
+        for point_idx, c in enumerate(
+            parse_int_list(bench.num_concurrent_sessions, 32)
+        ):
             stats, in_lens = asyncio.run(
                 run_benchmark_point(
                     base,

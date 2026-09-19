@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,12 +47,14 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: BaseCacheManager
     table_manager: TableManager
+    rejection_reason: str | None = field(default=None, init=False)
 
     def _try_allocate_one(
         self,
         req: PendingRequest,
     ) -> tuple[BaseCacheHandle, int, int] | None:
         if self.table_manager.available_size == 0:
+            self.rejection_reason = "no free request table slot"
             return None
 
         # TODO: consider host cache match case
@@ -63,12 +65,22 @@ class PrefillAdder:
             remain_len, self.token_budget
         )
         if chunk_size == 0:
+            self.rejection_reason = (
+                f"zero prefill chunk: remain={remain_len}, "
+                f"token_budget={self.token_budget}"
+            )
             return None
 
         # TODO: better estimate policy
         estimated_len = align_ceil(remain_len + req.output_len, self.cache_manager.page_size)
         total_len = estimated_len + self.reserved_size
         if not self.cache_manager.prefill_acquire(total_len, handle):
+            self.rejection_reason = (
+                f"cache admission rejected: request={estimated_len}, "
+                f"reserved={self.reserved_size}, total={total_len}, "
+                f"available={self.cache_manager.available_size}, "
+                f"matched={cached_len}"
+            )
             return None
 
         table_idx = self.table_manager.allocate()
@@ -111,6 +123,7 @@ class PrefillAdder:
 
     def try_add_one(self, pending_req: PendingRequest) -> Request | ChunkedRequest | None:
         if self.token_budget <= 0:
+            self.rejection_reason = "prefill token budget exhausted"
             return None
 
         if chunked_req := pending_req.chunked_req:

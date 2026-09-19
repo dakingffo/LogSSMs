@@ -55,8 +55,11 @@ from datasets.parser import (
 # --speculative-num-draft-tokens, ...) is parsed by the library's
 # logssms.server.args.parse_args.
 BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
-    "--num-prompts": {"type": str, "default": None,
-                      "help": "comma-separated concurrent request counts (default 32)"},
+    "--num-concurrent-sessions": {
+        "type": str,
+        "default": None,
+        "help": "comma-separated concurrent session counts (default 32)",
+    },
     "--input-len": {"type": int, "default": None, "help": "prompt length in tokens"},
     "--output-len": {"type": int, "default": None, "help": "generation length in tokens"},
     "--seed": {"type": int, "default": 0, "help": "RNG seed for prompt generation (A/B uses one batch)"},
@@ -88,6 +91,11 @@ BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
     },
     "--no-warmup": {"action": "store_true", "help": "skip the warmup request before the timed batch"},
     "--no-pbar": {"action": "store_true", "help": "disable the progress counter"},
+    "--request-timeout": {
+        "type": float,
+        "default": 300.0,
+        "help": "fail a request that does not complete within this many seconds",
+    },
 }
 
 
@@ -595,26 +603,36 @@ async def stream_one(
 
 
 async def _run_conversation(
-    client      : Any,
-    base        : str,
-    model       : str,
-    conversation: BenchmarkConversation,
-    output_len  : int,
-    progress    : _Progress | None,
+    client         : Any,
+    base           : str,
+    model          : str,
+    conversation   : BenchmarkConversation,
+    output_len     : int,
+    progress       : _Progress | None,
+    request_timeout: float | None = None,
 ) -> list[tuple[StreamResult, list[dict[str, Any]]]]:
     history = [_message_dict(message) for message in conversation.initial_messages]
     results = []
-    for user_turn in conversation.user_turns:
+    for turn_index, user_turn in enumerate(conversation.user_turns):
         history.append(_message_dict(user_turn))
         request_messages = [dict(message) for message in history]
-        result = await stream_messages(
-            client,
-            base,
-            model,
-            request_messages,
-            output_len,
-            progress,
-        )
+        try:
+            result = await asyncio.wait_for(
+                stream_messages(
+                    client,
+                    base,
+                    model,
+                    request_messages,
+                    output_len,
+                    progress,
+                ),
+                timeout=request_timeout,
+            )
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"Conversation {conversation.uid!r} turn {turn_index + 1} "
+                f"timed out after {request_timeout}s"
+            ) from error
         results.append((result, request_messages))
         history.append({"role": "assistant", "content": result.output})
     return results
@@ -626,16 +644,23 @@ async def run_multiturn_bench(
     conversations      : list[BenchmarkConversation],
     output_len         : int,
     *,
+    concurrency        : int | None = None,
     mtp                : bool = False,
     warmup_conversation: BenchmarkConversation | None = None,
     pbar               : bool = True,
+    request_timeout     : float | None = 300.0,
 ) -> dict:
-    """Run closed-loop sessions: turns serialize within a session, sessions overlap."""
+    """Run closed-loop sessions with a bounded number of concurrent sessions."""
     import httpx
     from transformers import AutoTokenizer
 
     if not conversations:
         raise ValueError("multi-turn benchmark requires at least one conversation")
+    if concurrency is None:
+        concurrency = len(conversations)
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be positive, got {concurrency}")
+    concurrency = min(concurrency, len(conversations))
     tokenizer = AutoTokenizer.from_pretrained(model)
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None),
@@ -650,6 +675,7 @@ async def run_multiturn_bench(
                 warmup_conversation,
                 min(8, output_len),
                 None,
+                request_timeout,
             )
         num_turns = len(conversations[0].user_turns) if conversations else 0
         assert all(
@@ -660,23 +686,37 @@ async def run_multiturn_bench(
             len(conversations) * num_turns,
             on=pbar and len(conversations) * num_turns > 1,
         )
-        session_results = await asyncio.gather(*[
-            _run_conversation(
-                client,
-                base,
-                model,
-                conversation,
-                output_len,
-                progress,
-            )
-            for conversation in conversations
-        ])
+        queue = asyncio.Queue()
+        for index, conversation in enumerate(conversations):
+            queue.put_nowait((index, conversation))
+        session_results: list[
+            list[tuple[StreamResult, list[dict[str, Any]]]] | None
+        ] = [None] * len(conversations)
+
+        async def worker() -> None:
+            while not queue.empty():
+                index, conversation = queue.get_nowait()
+                session_results[index] = await _run_conversation(
+                    client,
+                    base,
+                    model,
+                    conversation,
+                    output_len,
+                    progress,
+                    request_timeout,
+                )
+
+        await asyncio.gather(*[worker() for _ in range(concurrency)])
+        assert all(result is not None for result in session_results)
+        completed_results = [
+            result for result in session_results if result is not None
+        ]
     finally:
         await client.aclose()
     if progress.on:
         print(file=sys.stderr, flush=True)
 
-    flat = [request for session in session_results for request in session]
+    flat = [request for session in completed_results for request in session]
     tics_all = [result.tics for result, _messages in flat]
     input_lengths = [
         _chat_prompt_len(tokenizer, messages)
@@ -685,14 +725,21 @@ async def run_multiturn_bench(
     output_lengths = [output_len] * len(flat)
     summary = summarize(tics_all, input_lengths, output_lengths, mtp=mtp)
     summary["sessions"] = len(conversations)
+    summary["concurrency"] = concurrency
     summary["num_turns"] = num_turns
+    summary["workload_uids"] = [
+        conversation.uid for conversation in conversations
+    ]
+    summary["warmup_uid"] = (
+        warmup_conversation.uid if warmup_conversation is not None else None
+    )
     summary["session_per_s"] = (
         len(conversations) / summary["duration_s"]
         if summary["duration_s"] > 0 else 0.0
     )
     summary["turn_stats"] = []
     for turn in range(num_turns):
-        turn_requests = [session[turn] for session in session_results]
+        turn_requests = [session[turn] for session in completed_results]
         turn_tics = [result.tics for result, _messages in turn_requests]
         turn_input_lengths = [
             _chat_prompt_len(tokenizer, messages)
@@ -980,7 +1027,8 @@ def print_stats(title: str, s: dict, *, note: str = "") -> None:
         print(f"  verify rounds: {s['rounds']}  avg_accept: {s['avg_accept']:.2f} drafts/round")
     if "sessions" in s:
         print(
-            f"  sessions: {s['sessions']}  turns/session: {s['num_turns']}  "
+            f"  sessions: {s['sessions']}  concurrency: {s['concurrency']}  "
+            f"turns/session: {s['num_turns']}  "
             f"session/s: {s['session_per_s']:.2f}"
         )
         print(f"  {'turn':>6} {'input':>10} {'output':>10} {'TTFT p50':>10} {'E2E p50':>10}")

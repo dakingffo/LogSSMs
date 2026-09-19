@@ -58,7 +58,25 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
         parser.add_argument(
             "--enable-merge-adjustment",
             action="store_true",
-            help="Enable adaptive LogState merge adjustment (reserved for future use).",
+            help="Adapt LogState merge intensity from online branch-hit samples.",
+        )
+        parser.add_argument(
+            "--min-sampling-len",
+            type=int,
+            default=LogStateCacheConfig.min_sampling_len,
+            help="Minimum observed chain length before fitting hit density.",
+        )
+        parser.add_argument(
+            "--max-merge-intensity",
+            type=int,
+            default=LogStateCacheConfig.max_merge_intensity,
+            help="Maximum fitted LogState merge intensity.",
+        )
+        parser.add_argument(
+            "--base-intensity-increment",
+            type=int,
+            default=LogStateCacheConfig.base_intensity_increment,
+            help="Merge-intensity increment when hit density cannot be fitted.",
         )
 
     @staticmethod
@@ -66,6 +84,9 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
         return LogStateCacheConfig(
             granularity=kwargs.pop("granularity"),
             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
+            min_sampling_len=kwargs.pop("min_sampling_len"),
+            max_merge_intensity=kwargs.pop("max_merge_intensity"),
+            base_intensity_increment=kwargs.pop("base_intensity_increment"),
         )
 
 

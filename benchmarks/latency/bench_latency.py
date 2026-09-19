@@ -19,11 +19,11 @@ zipped (a length-1 list broadcasts), so the common sweeps are:
   # Natural prompts from Spec-Bench (the first turn of multi-turn records)
   python benchmarks/latency/bench_latency.py --model-path <model> \
       --dataset spec_bench --dataset-category coding,math_reasoning \
-      --num-prompts 8 --output-lens 64
+      --num-concurrent-sessions 8 --output-lens 64
 
   # Closed-loop multi-turn sessions; concurrency counts sessions, not requests
   python benchmarks/latency/bench_latency.py --model-path <model> \
-      --dataset sharegpt --num-prompts 8 --num-turns 4 --output-lens 64
+      --dataset sharegpt --num-concurrent-sessions 8 --num-turns 4 --output-lens 64
 
 Server flags are parsed by the library's ``logssms.server.args.parse_args`` --
 nothing is redefined here.
@@ -76,8 +76,11 @@ def main() -> int:
     server_args, bench, server_argv = parse_full(
         sys.argv[1:],
         extra={
-            "--num-prompts": {"type": str, "default": None,
-                              "help": "comma-separated concurrent request counts (default 8)"},
+            "--num-concurrent-sessions": {
+                "type": str,
+                "default": None,
+                "help": "comma-separated concurrent session counts (default 8)",
+            },
             "--input-lens": {"type": str, "default": None,
                              "help": "comma-separated prompt lengths (default 32)"},
             "--output-lens": {"type": str, "default": None,
@@ -88,7 +91,7 @@ def main() -> int:
         parse_int_list(bench.input_lens, 32),
         parse_int_list(bench.output_lens, 64),
     )
-    concs = parse_int_list(bench.num_prompts, 8)
+    concs = parse_int_list(bench.num_concurrent_sessions, 8)
     port = resolve_port(server_argv, server_args)
     proc = launch_server(
         server_argv, port=port,

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import heapq
 import time
-from dataclasses import dataclass, replace
+from collections import deque
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
 from typing import Any, Callable, NamedTuple, TypeAlias
@@ -27,6 +28,14 @@ def _get_key_fn(granularity: int) -> KEY_FN:
 class LogStateKind(Enum):
     LOG = "log"
     CHECKPOINT = "checkpoint"
+
+
+@dataclass
+class LogStateMergeStats:
+    origin       : int
+    tail         : int
+    intensity    : int = 2
+    hit_positions: deque[int] = field(default_factory=deque)
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,7 @@ class LogRadixTreeNode:
         self._key = torch.empty(0, dtype=torch.int32)
         self._kv = torch.empty(0, dtype=torch.int32)
         self._entries: list[LogStateEntry] = []
+        self.merge_stats: LogStateMergeStats | None = None
 
     def set(
         self,
@@ -178,10 +188,13 @@ class LogStateRecovery:
 
 @dataclass(frozen=True)
 class LogStateCacheHandle(BaseCacheHandle):
-    node        : LogRadixTreeNode
-    lock_node   : LogRadixTreeNode
-    kv_indices  : torch.Tensor
-    recovery    : LogStateRecovery
+    node              : LogRadixTreeNode
+    lock_node         : LogRadixTreeNode
+    kv_indices        : torch.Tensor
+    recovery          : LogStateRecovery
+    merge_stats       : LogStateMergeStats | None = None
+    source_merge_stats: LogStateMergeStats | None = None
+    match_position    : int = 0
 
     def get_matched_indices(self) -> torch.Tensor:
         return self.kv_indices
@@ -315,7 +328,9 @@ class LogRadixTree(BasePrefixCache):
                 "New LogState cache admission must consist of complete physical pages."
             )
 
-        if inserted_len < previous_len:
+        if inserted_len == 0:
+            node = self.root
+        elif inserted_len < previous_len:
             node = self._node_at_depth(node, inserted_len)
         elif previous_len < inserted_len:
             new_node = LogRadixTreeNode(self.key_fn, self.granularity)
@@ -341,15 +356,14 @@ class LogRadixTree(BasePrefixCache):
         assert entry.begin % self.granularity == 0
         assert entry.end % self.granularity == 0
         if entry.kind is LogStateKind.LOG:
-            assert entry.end - entry.begin == self.page_size, (
-                "One log slot must cover exactly one cache page."
+            assert (
+                entry.physical_begin <= entry.begin < entry.end
+                <= entry.physical_begin + self.page_size
+            ), (
+                "A logical log interval must stay inside its physical page."
             )
         elif entry.merge_level is not None:
-            expected_span = self.page_size << entry.merge_level
-            assert entry.end - entry.begin == expected_span, (
-                f"Level-{entry.merge_level} checkpoint must cover "
-                f"{expected_span} tokens."
-            )
+            assert (entry.end - entry.begin) % self.page_size == 0
         assert entry.slot not in self._slot_entries, (
             f"Linear cache slot {entry.slot} is already owned by node "
             f"{self.entry_owner(entry.slot).uuid}."
@@ -574,6 +588,12 @@ class LogRadixTree(BasePrefixCache):
                 stack.extend(node.children.values())
         return tuple(leaves)
 
+    def merge_owners(self) -> tuple[LogRadixTreeNode, ...]:
+        return tuple(
+            node for node in self._iter_nodes()
+            if node.merge_stats is not None
+        )
+
     def path(self, node: LogRadixTreeNode) -> tuple[LogRadixTreeNode, ...]:
         return tuple(self._path(node))
 
@@ -582,6 +602,20 @@ class LogRadixTree(BasePrefixCache):
             self.entry_owner(entry).is_protected
             for entry in self._slot_entries[slot]
         )
+
+    def is_lock_boundary(
+        self,
+        leaf    : LogRadixTreeNode,
+        position: int,
+    ) -> bool:
+        for node in self._path(leaf):
+            if node.depth != position:
+                continue
+            descendant_refs = sum(
+                child.ref_count for child in node.children.values()
+            )
+            return node.ref_count > descendant_refs
+        return False
 
     @property
     def size_info(self) -> SizeInfo:
@@ -858,5 +892,6 @@ __all__ = [
     "LogStateCacheHandle",
     "LogStateEntry",
     "LogStateKind",
+    "LogStateMergeStats",
     "LogStateRecovery",
 ]

@@ -128,3 +128,27 @@ def test_new_tail_smaller_than_one_physical_page_is_not_admitted():
     assert result.inserted_len == 2
     assert tree.trace(request).matched_len == 2
     tree.check_integrity()
+
+
+def test_zero_state_admission_returns_root_after_existing_kv_match():
+    tree = make_tree()
+    history = ids(8)
+    tree.insert(
+        history,
+        ids(8, 100),
+        (
+            LogStateEntry(0, LogStateKind.LOG, 0, 4),
+            LogStateEntry(1, LogStateKind.LOG, 4, 8),
+        ),
+    )
+
+    result = tree.insert(
+        history[:6],
+        ids(6, 200),
+        cache_len=0,
+    )
+
+    assert result.previous_len == 6
+    assert result.inserted_len == 0
+    assert result.node.is_root()
+    tree.check_integrity()

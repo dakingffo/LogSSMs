@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
+from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Sequence
 
@@ -23,7 +25,7 @@ from .pools import (
     make_kvcache_pool,
     make_logstate_pool,
 )
-from .prefix_cache.base import BaseCacheHandle
+from .prefix_cache.base import BaseCacheHandle, MatchResult
 from .prefix_cache.logstate import (
     LogStateCacheHandle,
     LogStateRecovery,
@@ -32,11 +34,13 @@ from .prefix_cache.logstate import (
     LogRadixTreeNode,
     LogStateEntry,
     LogStateKind,
+    LogStateMergeStats,
 )
 
 if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.engine import EngineConfig
+    from logssms.scheduler.prefill import PendingRequest
     from logssms.speculator import SpeculatorReserve
 
 
@@ -98,11 +102,19 @@ class PageMaterialize:
 
 @dataclass(frozen=True)
 class CheckpointCoalesce:
-    left_slot : int
-    right_slot: int
-    begin     : int
-    end       : int
-    next_level: int
+    slots        : tuple[int, ...]
+    source_levels: tuple[int, ...]
+    begin        : int
+    end          : int
+    next_level   : int
+
+    @property
+    def left_slot(self) -> int:
+        return self.slots[0]
+
+    @property
+    def right_slot(self) -> int:
+        return self.slots[-1]
 
 
 @dataclass(frozen=True)
@@ -157,27 +169,107 @@ class _MaterializeChain:
 
 
 class OnlineAnalysisScheduler:
-    """Generate deterministic LogState maintenance plans.
+    """Generate LogState protection, reconstruction, and merge plans.
 
-    This first policy has no online cost model. It detects branch endpoints at
-    the 16-token recovery granularity, protects the complete log page containing
-    each endpoint, and materializes complete unprotected log pages in the next
-    round. Newly materialized checkpoints immediately participate in one level
-    of adjacent equal-level coalescing in that same round. Branch restoration
-    writes directly to ``work_state_table`` and does not create a persistent
-    checkpoint. This class never allocates slots, launches kernels or mutates the
-    persistent tree.
+    With merge adjustment disabled, checkpoint coalescing remains binary. With
+    it enabled, each logical chain samples branch-hit endpoints over a moving
+    token window, fits their binned density in log-log space, and uses the
+    floored power-law exponent as the maximum same-level merge arity. This class
+    never allocates slots, launches kernels, or mutates persistent tree entries.
     """
 
     def __init__(
         self,
-        page_size  : int,
-        granularity: int = LOG_STATE_GRANULARITY,
+        page_size               : int,
+        granularity             : int  = LOG_STATE_GRANULARITY,
+        enable_merge_adjustment : bool = False,
+        min_sampling_len        : int  = 1024,
+        max_merge_intensity     : int  = 16,
+        base_intensity_increment: int  = 2,
     ) -> None:
         assert page_size > 0
         assert granularity > 0 and page_size % granularity == 0
+        assert min_sampling_len > 0
+        assert max_merge_intensity >= 2
+        assert base_intensity_increment > 0
         self.page_size = page_size
         self.granularity = granularity
+        self.enable_merge_adjustment = enable_merge_adjustment
+        self.min_sampling_len = min_sampling_len
+        self.max_merge_intensity = max_merge_intensity
+        self.base_intensity_increment = base_intensity_increment
+
+    def make_merge_stats(self, origin: int) -> LogStateMergeStats | None:
+        if not self.enable_merge_adjustment:
+            return None
+        return LogStateMergeStats(origin=origin, tail=origin)
+
+    def record_hit(self, stats: LogStateMergeStats, position: int) -> None:
+        if position < stats.origin or position > stats.tail:
+            return
+        stats.hit_positions.append(position)
+        self._update_merge_intensity(stats, increment_on_failure=False)
+
+    def advance_merge_stats(
+        self,
+        stats: LogStateMergeStats,
+        tail : int,
+    ) -> None:
+        if tail <= stats.tail:
+            return
+        stats.tail = tail
+        cutoff = tail - self.min_sampling_len
+        stats.hit_positions = deque(
+            position
+            for position in stats.hit_positions
+            if position >= cutoff
+        )
+        self._update_merge_intensity(stats, increment_on_failure=True)
+
+    def _update_merge_intensity(
+        self,
+        stats               : LogStateMergeStats,
+        increment_on_failure: bool,
+    ) -> None:
+        if stats.tail - stats.origin < self.min_sampling_len:
+            stats.intensity = 2
+            return
+        fitted = self._fit_merge_intensity(stats)
+        if fitted is not None:
+            stats.intensity = fitted
+        elif increment_on_failure:
+            stats.intensity = min(
+                self.max_merge_intensity,
+                stats.intensity + self.base_intensity_increment,
+            )
+
+    def _fit_merge_intensity(
+        self,
+        stats: LogStateMergeStats,
+    ) -> int | None:
+        bins: dict[int, int] = {}
+        for position in stats.hit_positions:
+            distance = max(self.granularity, stats.tail - position)
+            if distance > self.min_sampling_len:
+                continue
+            index = (distance - 1) // self.page_size
+            bins[index] = bins.get(index, 0) + 1
+        if len(bins) < 2:
+            return None
+
+        xs = [math.log((index + 0.5) * self.page_size) for index in bins]
+        ys = [math.log(count / self.page_size) for count in bins.values()]
+        x_mean = sum(xs) / len(xs)
+        y_mean = sum(ys) / len(ys)
+        denominator = sum((value - x_mean) ** 2 for value in xs)
+        if denominator == 0:
+            return None
+        slope = sum(
+            (x - x_mean) * (y - y_mean)
+            for x, y in zip(xs, ys, strict=True)
+        ) / denominator
+        fitted = math.floor(-slope)
+        return min(self.max_merge_intensity, max(2, fitted))
 
     def begin_round(self, tree: LogRadixTree) -> LogStateRound:
         return LogStateRound(
@@ -394,12 +486,23 @@ class OnlineAnalysisScheduler:
         }
         result = []
         used_slots: set[int] = set()
-        for leaf in tree.leaves():
+        owners = (
+            tree.merge_owners()
+            if self.enable_merge_adjustment else
+            tree.leaves()
+        )
+        for leaf in owners:
+            stats = leaf.merge_stats
             entries = [
                 projected.get(entry.slot, entry)
                 for entry in self._entries_for_node(tree, leaf)
                 if entry.slot in eligible_slots
                 and entry.slot not in used_slots
+                and (
+                    stats is None
+                    or stats.origin <= entry.begin
+                    and entry.end <= stats.tail
+                )
             ]
             entries = [
                 entry
@@ -408,44 +511,160 @@ class OnlineAnalysisScheduler:
                 and entry.merge_level is not None
             ]
             entries.sort(key=lambda entry: (entry.begin, entry.end, entry.slot))
-            index = 0
-            while index + 1 < len(entries):
-                left, right = entries[index : index + 2]
-                if not self._can_coalesce(tree, leaf, left, right, pending):
-                    index += 1
-                    continue
-                result.append(
-                    CheckpointCoalesce(
-                        left_slot=left.slot,
-                        right_slot=right.slot,
-                        begin=left.begin,
-                        end=right.end,
-                        next_level=left.merge_level + 1,
+            intensity = (
+                stats.intensity
+                if self.enable_merge_adjustment and stats is not None else
+                2
+            )
+            segments = self._merge_segments(tree, leaf, entries, pending)
+            groups = tuple(
+                group
+                for segment in segments
+                for group in (
+                    self._adaptive_merge_groups(segment, intensity)
+                    if self.enable_merge_adjustment else
+                    tuple(
+                        segment[index : index + 2]
+                        for index in range(len(segment) - 1)
                     )
                 )
+            )
+            for group in groups:
+                if any(entry.slot in used_slots for entry in group):
+                    continue
+                if not self._can_coalesce(
+                    tree, leaf, group, pending,
+                    require_equal_level=True,
+                ):
+                    continue
+                level = group[0].merge_level
+                assert level is not None
+                result.append(self._make_coalesce(group, level + 1))
+                used_slots.update(entry.slot for entry in group)
+
+            if not self.enable_merge_adjustment:
+                continue
+            remaining = [
+                entry for entry in entries if entry.slot not in used_slots
+            ]
+            for left, right in zip(remaining, remaining[1:]):
+                if left.slot in used_slots or right.slot in used_slots:
+                    continue
+                assert left.merge_level is not None
+                assert right.merge_level is not None
+                if left.merge_level >= right.merge_level:
+                    continue
+                group = (left, right)
+                if not self._can_coalesce(
+                    tree, leaf, group, pending,
+                    require_equal_level=False,
+                ):
+                    continue
+                result.append(self._make_coalesce(group, right.merge_level))
                 used_slots.update((left.slot, right.slot))
-                index += 2
         result.sort(key=lambda value: (value.begin, value.end, value.left_slot))
         return tuple(result)
+
+    def _merge_segments(
+        self,
+        tree   : LogRadixTree,
+        leaf   : LogRadixTreeNode,
+        entries: Sequence[LogStateEntry],
+        pending: tuple[_PendingProtection, ...],
+    ) -> tuple[tuple[LogStateEntry, ...], ...]:
+        result = []
+        current = []
+        for entry in entries:
+            entry_is_blocked = self._interval_is_protected(
+                tree, leaf, entry.begin, entry.end, pending
+            )
+            boundary_is_blocked = bool(current) and (
+                current[-1].end != entry.begin
+                or tree.is_lock_boundary(leaf, current[-1].end)
+                or self._interval_is_protected(
+                    tree, leaf, current[-1].begin, entry.end, pending
+                )
+            )
+            if entry_is_blocked or boundary_is_blocked:
+                if current:
+                    result.append(tuple(current))
+                current = []
+            if not entry_is_blocked:
+                current.append(entry)
+        if current:
+            result.append(tuple(current))
+        return tuple(result)
+
+    @staticmethod
+    def _adaptive_merge_groups(
+        entries  : Sequence[LogStateEntry],
+        intensity: int,
+    ) -> tuple[tuple[LogStateEntry, ...], ...]:
+        assert intensity >= 2
+        result = []
+        index = 0
+        while index < len(entries):
+            level = entries[index].merge_level
+            end = index + 1
+            while end < len(entries) and entries[end].merge_level == level:
+                end += 1
+            run = entries[index:end]
+            offset = 0
+            while len(run) - offset >= intensity:
+                result.append(tuple(run[offset : offset + intensity]))
+                offset += intensity
+            remaining = len(run) - offset
+            if remaining >= 3:
+                result.append(tuple(run[offset : len(run) - 1]))
+            index = end
+        return tuple(result)
+
+    @staticmethod
+    def _make_coalesce(
+        entries   : Sequence[LogStateEntry],
+        next_level: int,
+    ) -> CheckpointCoalesce:
+        return CheckpointCoalesce(
+            slots=tuple(entry.slot for entry in entries),
+            source_levels=tuple(
+                entry.merge_level for entry in entries  # type: ignore[arg-type]
+            ),
+            begin=entries[0].begin,
+            end=entries[-1].end,
+            next_level=next_level,
+        )
 
     def _can_coalesce(
         self,
         tree   : LogRadixTree,
         leaf   : LogRadixTreeNode,
-        left   : LogStateEntry,
-        right  : LogStateEntry,
+        entries: Sequence[LogStateEntry],
         pending: tuple[_PendingProtection, ...],
+        *,
+        require_equal_level: bool,
     ) -> bool:
-        assert left.merge_level is not None and right.merge_level is not None
-        expected_span = self.page_size << left.merge_level
-        return (
-            left.merge_level == right.merge_level
-            and left.end == right.begin
-            and left.end - left.begin == expected_span
-            and right.end - right.begin == expected_span
-            and not self._interval_is_protected(
-                tree, leaf, left.begin, right.end, pending
-            )
+        if len(entries) < 2:
+            return False
+        levels = [entry.merge_level for entry in entries]
+        assert all(level is not None for level in levels)
+        if require_equal_level and len(set(levels)) != 1:
+            return False
+        if not self.enable_merge_adjustment:
+            level = levels[0]
+            assert level is not None
+            expected_span = self.page_size << level
+            if any(
+                entry.end - entry.begin != expected_span
+                for entry in entries
+            ):
+                return False
+        for left, right in zip(entries, entries[1:]):
+            if left.end != right.begin:
+                return False
+            if tree.is_lock_boundary(leaf, left.end):
+                return False
+        return not self._interval_is_protected(
+            tree, leaf, entries[0].begin, entries[-1].end, pending
         )
 
     def _interval_is_protected(
@@ -548,6 +767,10 @@ class LogStateCacheManager(BaseCacheManager):
         page_size      : int,
         resources      : CacheResources,
         granularity    : int = LOG_STATE_GRANULARITY,
+        enable_merge_adjustment : bool = False,
+        min_sampling_len        : int  = 1024,
+        max_merge_intensity     : int  = 16,
+        base_intensity_increment: int  = 2,
     ) -> None:
         pool = resources.linear_state
         state_table = resources.state_table
@@ -571,7 +794,14 @@ class LogStateCacheManager(BaseCacheManager):
             resources=resources,
             prefix_cache=tree,
         )
-        self.analyzer = OnlineAnalysisScheduler(page_size, granularity)
+        self.analyzer = OnlineAnalysisScheduler(
+            page_size=page_size,
+            granularity=granularity,
+            enable_merge_adjustment=enable_merge_adjustment,
+            min_sampling_len=min_sampling_len,
+            max_merge_intensity=max_merge_intensity,
+            base_intensity_increment=base_intensity_increment,
+        )
         self.free_pages = torch.arange(
             num_pages, dtype=torch.int32, device=self.device
         ) * page_size
@@ -582,6 +812,7 @@ class LogStateCacheManager(BaseCacheManager):
         self.num_states = num_states
         self.num_work_states = num_work_states
         self.granularity = granularity
+        self.enable_merge_adjustment = enable_merge_adjustment
 
         self.pending_recoveries: dict[int, LogStateRecovery] = {}
         self.last_plan: LogStatePlan | None = None
@@ -600,6 +831,38 @@ class LogStateCacheManager(BaseCacheManager):
         pool = self.linear_pool
         assert isinstance(pool, LogStatePool)
         return pool
+
+    def match_req(self, req: PendingRequest) -> MatchResult:
+        if not self.enable_merge_adjustment:
+            return super().match_req(req)
+        values = req.input_ids[: req.input_len - 1]
+        usable_len = align_down(len(values), self.granularity)
+        trace = self.tree.trace(values[:usable_len])
+        result = super().match_req(req)
+        handle = result.cuda_handle
+        assert isinstance(handle, LogStateCacheHandle)
+        return MatchResult(replace(
+            handle,
+            merge_stats=self.analyzer.make_merge_stats(trace.matched_len),
+            source_merge_stats=trace.node.merge_stats,
+            match_position=trace.matched_len,
+        ))
+
+    def prefill_acquire(
+        self,
+        total_len: int,
+        handle   : BaseCacheHandle,
+    ) -> bool:
+        if not super().prefill_acquire(total_len, handle):
+            return False
+        if not self.enable_merge_adjustment:
+            return True
+        assert isinstance(handle, LogStateCacheHandle)
+        if handle.source_merge_stats is not None and handle.match_position > 0:
+            self.analyzer.record_hit(
+                handle.source_merge_stats, handle.match_position
+            )
+        return True
 
     @property
     def available_size(self) -> int:
@@ -732,24 +995,37 @@ class LogStateCacheManager(BaseCacheManager):
             if old_handle.cached_len <= page.begin
             and page.end <= insert.inserted_len
         ]
-        duplicate_kv_pages = []
+        existing = self.tree.match_prefix(
+            req.input_ids[: insert.inserted_len]
+        ).cuda_handle
+        assert isinstance(existing, LogStateCacheHandle)
+        covered_len = existing.cached_len
+        released_kv_pages = []
+        released_state_slots = []
         for page in adopted:
-            self.tree.attach_entry(
-                insert.node,
-                LogStateEntry(
-                    slot=page.state_slot,
-                    kind=LogStateKind.LOG,
-                    begin=page.begin,
-                    end=page.end,
-                ),
-            )
+            logical_begin = max(page.begin, covered_len)
+            if logical_begin < page.end:
+                self.tree.attach_entry(
+                    insert.node,
+                    LogStateEntry(
+                        slot=page.state_slot,
+                        kind=LogStateKind.LOG,
+                        begin=logical_begin,
+                        end=page.end,
+                        storage_begin=page.begin,
+                    ),
+                )
+                covered_len = page.end
+            else:
+                released_state_slots.append(page.state_slot)
+
             kv_begin = max(page.begin, insert.previous_len)
             if kv_begin < page.end:
                 self._retain_cached_kv(
                     self.page_table[req.table_idx, kv_begin:page.end]
                 )
             else:
-                duplicate_kv_pages.append(page.kv_page)
+                released_kv_pages.append(page.kv_page)
 
         duplicates = [
             page
@@ -757,17 +1033,32 @@ class LogStateCacheManager(BaseCacheManager):
             if page not in adopted and page.end <= insert.previous_len
         ]
         self._release_live_pages(req.table_idx, duplicates)
-        if duplicate_kv_pages:
+        if released_kv_pages or released_state_slots:
             self._return_slots(
                 torch.tensor(
-                    duplicate_kv_pages,
+                    released_kv_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
-                torch.empty(0, dtype=torch.int32, device=self.device),
+                torch.tensor(
+                    released_state_slots,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
             )
 
-        new_handle = self.tree.make_handle(insert.node, insert.inserted_len)
+        stats = old_handle.merge_stats
+        if stats is not None:
+            self.analyzer.advance_merge_stats(stats, insert.inserted_len)
+            if insert.previous_len < insert.inserted_len:
+                if old_handle.node.merge_stats is stats:
+                    old_handle.node.merge_stats = None
+                assert insert.node.merge_stats in (None, stats)
+                insert.node.merge_stats = stats
+        new_handle = replace(
+            self.tree.make_handle(insert.node, insert.inserted_len),
+            merge_stats=stats,
+        )
         self.unlock(old_handle)
         self.pending_recoveries.pop(req.table_idx, None)
 
@@ -1084,23 +1375,38 @@ class LogStateCacheManager(BaseCacheManager):
     ) -> None:
         released = []
         for plan in plans:
-            if (
-                not self.tree.has_slot(plan.left_slot)
-                or not self.tree.has_slot(plan.right_slot)
-                or self.tree.slot_is_fragmented(plan.left_slot)
-                or self.tree.slot_is_fragmented(plan.right_slot)
+            if any(
+                not self.tree.has_slot(slot)
+                or self.tree.slot_is_fragmented(slot)
+                for slot in plan.slots
             ):
                 continue
-            left = self.tree.entries_for_slot(plan.left_slot)[0]
-            right = self.tree.entries_for_slot(plan.right_slot)[0]
-            if (
-                left.kind is not LogStateKind.CHECKPOINT
-                or right.kind is not LogStateKind.CHECKPOINT
+            entries = [
+                self.tree.entries_for_slot(slot)[0]
+                for slot in plan.slots
+            ]
+            if any(
+                entry.kind is not LogStateKind.CHECKPOINT
+                or entry.slot != slot
+                or entry.merge_level != level
+                for entry, slot, level in zip(
+                    entries,
+                    plan.slots,
+                    plan.source_levels,
+                    strict=True,
+                )
             ):
                 continue
-            owner = self.tree.entry_owner(right)
-            self.tree.detach_entry(plan.left_slot)
-            self.tree.detach_entry(plan.right_slot)
+            if entries[0].begin != plan.begin or entries[-1].end != plan.end:
+                continue
+            if any(
+                left.end != right.begin
+                for left, right in zip(entries, entries[1:])
+            ):
+                continue
+            owner = self.tree.entry_owner(entries[-1])
+            for slot in plan.slots:
+                self.tree.detach_entry(slot)
             self.tree.attach_entry(
                 owner,
                 LogStateEntry(
@@ -1111,7 +1417,7 @@ class LogStateCacheManager(BaseCacheManager):
                     merge_level=plan.next_level,
                 ),
             )
-            released.append(plan.left_slot)
+            released.extend(plan.slots[:-1])
         if released:
             self._return_slots(
                 torch.empty(0, dtype=torch.int32, device=self.device),
@@ -1359,6 +1665,14 @@ class LogStateCacheFactory(BaseCacheFactory):
             page_size=config.page_size,
             resources=resources,
             granularity=config.cache_config.granularity,
+            enable_merge_adjustment=(
+                config.cache_config.enable_merge_adjustment
+            ),
+            min_sampling_len=config.cache_config.min_sampling_len,
+            max_merge_intensity=config.cache_config.max_merge_intensity,
+            base_intensity_increment=(
+                config.cache_config.base_intensity_increment
+            ),
         )
 
 

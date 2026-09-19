@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, NoReturn
 
 import torch
@@ -84,6 +85,7 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(self.token_pool, config.page_size)
         self.prefill_budget = config.max_prefill_tokens
         self.profiler = SchedulerProfiler(self.device)
+        self._last_stall_report = 0.0
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
@@ -99,7 +101,9 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch()
+        forward_input = self._schedule_next_batch(
+            has_inflight=last_data is not None
+        )
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -183,28 +187,68 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 
-    def _schedule_next_batch(self) -> ForwardInput | None:
+    def _schedule_next_batch(
+        self,
+        *,
+        has_inflight: bool = False,
+    ) -> ForwardInput | None:
+        adder = PrefillAdder(
+            token_budget=self.prefill_budget,
+            reserved_size=(
+                self.ar_manager.need_tokens
+                + self.prefill_manager.need_tokens
+            ),
+            cache_manager=self.cache_manager,
+            table_manager=self.table_manager,
+        )
         with self.profiler.record_schedule():
-            batch = (
-                self.prefill_manager.schedule_next_batch(
-                    PrefillAdder(
-                        token_budget=self.prefill_budget,
-                        reserved_size=self.ar_manager.need_tokens + self.prefill_manager.need_tokens,
-                        cache_manager=self.cache_manager,
-                        table_manager=self.table_manager,
-                    )
-                ) or
-                self.ar_manager.schedule_next_batch()
-            )
+            batch = self.prefill_manager.schedule_next_batch(adder)
+            if batch is not None:
+                self.ar_manager.on_prefill_scheduled()
+            else:
+                batch = self.ar_manager.schedule_next_batch()
         if batch is None:
             if self.ar_manager.runnable and not self.prefill_manager.runnable:
                 self.profiler.record_ar_no_batch()
+            if not has_inflight:
+                self._report_stall(adder)
             return None
 
         graph_used = batch.is_decode and self.engine.graph_runner.can_use_cuda_graph(batch)
         with self.profiler.record_prepare(batch, graph_used=graph_used):
             forward_input = self.engine.prepare_batch(batch, self.cache_manager)
         return forward_input
+
+    def _report_stall(self, adder: PrefillAdder) -> None:
+        if not self.prefill_manager.runnable and not self.ar_manager.runnable:
+            return
+        now = time.monotonic()
+        if now - self._last_stall_report < 10.0:
+            return
+        self._last_stall_report = now
+        pending = self.prefill_manager.pending_list
+        head = pending[0] if pending else None
+        running = tuple(
+            (req.uid, req.cached_len, req.device_len, req.max_device_len)
+            for req in self.ar_manager.running_reqs.values()
+        )
+        logger.warning_rank0(
+            "Scheduler made no progress: pending=%d, running=%s, "
+            "inflight=%s/%s, table_free=%d, cache_available=%d, "
+            "head=%s, reason=%s",
+            len(pending),
+            running,
+            sorted(self.ar_manager.inflight_uids[0]),
+            sorted(self.ar_manager.inflight_uids[1]),
+            self.table_manager.available_size,
+            self.cache_manager.available_size,
+            (
+                None
+                if head is None else
+                (head.uid, head.input_len, head.output_len)
+            ),
+            adder.rejection_reason,
+        )
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, _ = forward_input

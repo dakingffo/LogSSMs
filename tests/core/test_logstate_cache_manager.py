@@ -21,8 +21,9 @@ MAX_SEQ_LEN = 512
 
 
 def make_manager(
-    num_pages: int = 8,
-    num_states: int = 8,
+    num_pages             : int  = 8,
+    num_states            : int  = 8,
+    enable_merge_adjustment: bool = False,
 ) -> LogStateCacheManager:
     num_work_states = MAX_RUNNING_REQ
     pool = LogStatePool(
@@ -58,6 +59,7 @@ def make_manager(
         page_size=PAGE_SIZE,
         resources=resources,
         granularity=GRANULARITY,
+        enable_merge_adjustment=enable_merge_adjustment,
     )
 
 
@@ -112,6 +114,77 @@ def test_complete_pages_move_from_request_to_tree_and_tail_is_released():
     assert len(manager.free_pages) == 6
     assert len(manager.free_states) == 6
     assert torch.all(manager.state_table[req.table_idx] == -1)
+    manager.check_integrity()
+
+
+def test_adaptive_sampling_records_hit_only_after_successful_admission():
+    manager = make_manager(
+        num_pages=12,
+        num_states=12,
+        enable_merge_adjustment=True,
+    )
+    input_ids = torch.arange(130, dtype=torch.int32)
+    original = new_req(manager, input_ids)
+    manager.allocate([original])
+    original.cached_len = len(input_ids)
+    manager.cache_req(original, finished=True)
+    source = manager.tree.merge_owners()[0].merge_stats
+    assert source is not None
+
+    pending = PendingRequest(
+        uid=1,
+        input_ids=input_ids,
+        sampling_params=SamplingParams(max_tokens=16),
+    )
+    failed = manager.match_req(pending).cuda_handle
+    assert not manager.prefill_acquire(manager.available_size + 1, failed)
+    assert tuple(source.hit_positions) == ()
+
+    admitted = manager.match_req(pending).cuda_handle
+    assert manager.prefill_acquire(PAGE_SIZE, admitted)
+    assert tuple(source.hit_positions) == (128,)
+    manager.unlock(admitted)
+
+
+def test_adaptive_sampling_owner_moves_to_the_latest_chain_node():
+    manager = make_manager(enable_merge_adjustment=True)
+    req = new_req(manager, torch.arange(130, dtype=torch.int32))
+    stats = req.cache_handle.merge_stats
+    assert stats is not None
+    manager.allocate([req])
+
+    req.cached_len = PAGE_SIZE
+    manager.cache_req(req, finished=False)
+    first_node = req.cache_handle.node
+    assert first_node.merge_stats is stats
+
+    req.cached_len = 2 * PAGE_SIZE
+    manager.cache_req(req, finished=False)
+    assert first_node.merge_stats is None
+    assert req.cache_handle.node.merge_stats is stats
+
+    manager.unlock(req.cache_handle)
+
+
+def test_concurrent_same_prefix_discards_duplicate_log_pages():
+    manager = make_manager(num_pages=12, num_states=12)
+    input_ids = torch.arange(130, dtype=torch.int32)
+    first = new_req(manager, input_ids, table_idx=0)
+    second = new_req(manager, input_ids, table_idx=1)
+
+    manager.allocate([first, second])
+    first.cached_len = len(input_ids)
+    second.cached_len = len(input_ids)
+    manager.cache_req(first, finished=True)
+    manager.cache_req(second, finished=True)
+
+    entries = manager.tree.iter_entries()
+    assert [(entry.begin, entry.end) for entry in entries] == [
+        (0, PAGE_SIZE),
+        (PAGE_SIZE, 2 * PAGE_SIZE),
+    ]
+    assert len(manager.free_pages) == 10
+    assert len(manager.free_states) == 10
     manager.check_integrity()
 
 

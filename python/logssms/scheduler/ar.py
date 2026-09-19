@@ -76,6 +76,11 @@ class ARManagerBase:
         """Decode -> decode overlap hook. Verify can not advance for overlap."""
         return None
 
+    def on_prefill_scheduled(self) -> None:
+        """Close the AR overlap window when the next submitted batch is prefill."""
+        self.inflight_uids[0] = self.inflight_uids[1]
+        self.inflight_uids[1] = set()
+
     def process(
         self,
         ctx          : Context,

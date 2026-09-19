@@ -21,12 +21,18 @@ def test_logstate_arguments_build_algorithm_specific_config() -> None:
     kwargs = vars(parser.parser.parse_args([
         "--granularity", "8",
         "--enable-merge-adjustment",
+        "--min-sampling-len", "512",
+        "--max-merge-intensity", "12",
+        "--base-intensity-increment", "3",
     ]))
 
     config = parser.make_config(kwargs)
     assert config == LogStateCacheConfig(
         granularity=8,
         enable_merge_adjustment=True,
+        min_sampling_len=512,
+        max_merge_intensity=12,
+        base_intensity_increment=3,
     )
     assert config.page_size == 64
     assert kwargs == {}

@@ -1,3 +1,5 @@
+from collections import deque
+
 import torch
 
 from logssms.cache.logstate import (
@@ -7,8 +9,10 @@ from logssms.cache.logstate import (
 )
 from logssms.cache.prefix_cache.logstate import (
     LogRadixTree,
+    LogRadixTreeNode,
     LogStateEntry,
     LogStateKind,
+    LogStateMergeStats,
 )
 
 
@@ -136,6 +140,21 @@ def test_materialized_checkpoints_coalesce_in_the_same_round():
     } == {(0, 1, 1), (2, 3, 1)}
 
 
+def test_active_handle_boundary_blocks_checkpoint_coalesce():
+    tree, _history = make_history()
+    leaf = tree.leaves()[0]
+    handle = tree.make_handle(leaf, PAGE_SIZE)
+    tree.lock_handle(handle)
+
+    plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(tree, [])
+
+    assert not any(
+        task.left_slot == 0 and task.right_slot == 1
+        for task in plan.coalesce
+    )
+    assert all(task.begin >= PAGE_SIZE for task in plan.coalesce)
+
+
 def test_branch_between_checkpoints_blocks_coalesce_without_covering_log():
     tree = LogRadixTree(
         PAGE_SIZE, torch.device("cpu"), granularity=GRANULARITY
@@ -178,3 +197,160 @@ def test_new_log_pages_are_not_touched_in_their_birth_round():
     plan = scheduler.analyze(tree, [], round_info)
 
     assert {task.log_slot for task in plan.materialize} == {1, 2}
+
+
+def make_checkpoint_history(
+    count: int,
+) -> tuple[LogRadixTree, LogRadixTreeNode]:
+    tree = LogRadixTree(
+        PAGE_SIZE, torch.device("cpu"), granularity=GRANULARITY
+    )
+    length = count * PAGE_SIZE
+    tree.insert(
+        ids(length),
+        ids(length, 1000),
+        tuple(
+            LogStateEntry(
+                slot,
+                LogStateKind.CHECKPOINT,
+                slot * PAGE_SIZE,
+                (slot + 1) * PAGE_SIZE,
+                merge_level=0,
+            )
+            for slot in range(count)
+        ),
+    )
+    return tree, tree.leaves()[0]
+
+
+def test_adaptive_merge_uses_intensity_as_a_maximum_group_size():
+    expected = {
+        7: ((0, 1, 2, 3, 4, 5),),
+        15: (tuple(range(8)), tuple(range(8, 14))),
+        16: (tuple(range(8)), tuple(range(8, 16))),
+    }
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE,
+        GRANULARITY,
+        enable_merge_adjustment=True,
+    )
+
+    for count, groups in expected.items():
+        tree, leaf = make_checkpoint_history(count)
+        leaf.merge_stats = LogStateMergeStats(
+            origin=0,
+            tail=count * PAGE_SIZE,
+            intensity=8,
+        )
+
+        plan = scheduler.analyze(tree, [])
+
+        assert tuple(task.slots for task in plan.coalesce) == groups
+
+
+def test_adaptive_merge_only_changes_its_owned_chain_suffix():
+    tree, leaf = make_checkpoint_history(8)
+    leaf.merge_stats = LogStateMergeStats(
+        origin=4 * PAGE_SIZE,
+        tail=8 * PAGE_SIZE,
+        intensity=4,
+    )
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE,
+        GRANULARITY,
+        enable_merge_adjustment=True,
+    )
+
+    plan = scheduler.analyze(tree, [])
+
+    assert tuple(task.slots for task in plan.coalesce) == ((4, 5, 6, 7),)
+
+
+def test_adaptive_merge_absorbs_older_lower_level_checkpoint():
+    tree, leaf = make_checkpoint_history(3)
+    for slot in range(3):
+        tree.detach_entry(slot)
+    tree.attach_entry(
+        leaf,
+        LogStateEntry(3, LogStateKind.CHECKPOINT, 0, 64, merge_level=1),
+    )
+    tree.attach_entry(
+        leaf,
+        LogStateEntry(4, LogStateKind.CHECKPOINT, 64, 128, merge_level=2),
+    )
+    tree.attach_entry(
+        leaf,
+        LogStateEntry(5, LogStateKind.CHECKPOINT, 128, 192, merge_level=3),
+    )
+    leaf.merge_stats = LogStateMergeStats(0, 192, intensity=8)
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE,
+        GRANULARITY,
+        enable_merge_adjustment=True,
+    )
+
+    plan = scheduler.analyze(tree, [])
+
+    assert tuple(task.slots for task in plan.coalesce) == ((3, 4),)
+    assert plan.coalesce[0].next_level == 2
+
+
+def test_merge_sampling_evicts_old_hits_regardless_of_queue_order():
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE,
+        GRANULARITY,
+        enable_merge_adjustment=True,
+        min_sampling_len=1024,
+    )
+    stats = LogStateMergeStats(
+        origin=0,
+        tail=1024,
+        hit_positions=deque((900, 100, 700)),
+    )
+
+    scheduler.advance_merge_stats(stats, 1200)
+
+    assert tuple(stats.hit_positions) == (900, 700)
+
+
+def test_merge_sampling_fits_log_log_slope_and_floors_intensity():
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE,
+        GRANULARITY,
+        enable_merge_adjustment=True,
+        min_sampling_len=1024,
+    )
+    tail = 1024
+    hits = []
+    for index in range(8):
+        distance = int((index + 0.5) * PAGE_SIZE)
+        count = round(1e8 / distance ** 3.1)
+        hits.extend([tail - distance] * count)
+    stats = LogStateMergeStats(
+        origin=0,
+        tail=tail,
+        hit_positions=deque(hits),
+    )
+
+    scheduler.record_hit(stats, tail)
+
+    assert stats.intensity == 3
+
+
+def test_merge_sampling_increases_intensity_when_no_fit_is_available():
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE,
+        GRANULARITY,
+        enable_merge_adjustment=True,
+        min_sampling_len=128,
+        max_merge_intensity=5,
+        base_intensity_increment=2,
+    )
+    stats = LogStateMergeStats(origin=0, tail=0)
+
+    scheduler.advance_merge_stats(stats, 64)
+    assert stats.intensity == 2
+    scheduler.advance_merge_stats(stats, 128)
+    assert stats.intensity == 4
+    scheduler.advance_merge_stats(stats, 192)
+    assert stats.intensity == 5

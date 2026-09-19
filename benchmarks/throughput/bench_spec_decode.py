@@ -8,14 +8,15 @@ from ``--tp-size``. Server flags are parsed by the library's
 
 Examples:
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> --tp-size 2 \
-      --input-len 64 --output-len 256 --num-prompts 32 --speculative-num-draft-tokens 4
+      --input-len 64 --output-len 256 --num-concurrent-sessions 32 \
+      --speculative-num-draft-tokens 4
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
       --mode mtp --out /tmp/mtp.json   # single-mode run for longer data collection
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
       --dataset spec_bench --dataset-category coding,math_reasoning \
-      --num-prompts 8 --output-len 256
+      --num-concurrent-sessions 8 --output-len 256
   python benchmarks/throughput/bench_spec_decode.py --model-path <model> \
-      --dataset sharegpt --num-prompts 8 --num-turns 4 --output-len 128
+      --dataset sharegpt --num-concurrent-sessions 8 --num-turns 4 --output-len 128
 """
 import asyncio
 import os
@@ -72,7 +73,9 @@ def main() -> int:
         )
         try:
             base = wait_server_ready(port)
-            for point_idx, c in enumerate(parse_int_list(bench.num_prompts, 32)):
+            for point_idx, c in enumerate(
+                parse_int_list(bench.num_concurrent_sessions, 32)
+            ):
                 stats, in_lens = asyncio.run(
                     run_benchmark_point(
                         base,
@@ -112,7 +115,7 @@ def main() -> int:
             kill_server(proc)
 
     if bench.mode == "both":
-        for c in parse_int_list(bench.num_prompts, 32):
+        for c in parse_int_list(bench.num_concurrent_sessions, 32):
             print(f"  concurrency = {c}")
             print_compare(results["nonmtp"][str(c)], results["mtp"][str(c)])
     return 0
