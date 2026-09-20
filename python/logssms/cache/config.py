@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 LOG_STATE_PAGE_SIZE = 64
-LOG_STATE_GRANULARITIES = (1, 2, 4, 8, 16, 32, 64)
+LOG_STATE_GRANULARITIES = (16, 32, 64)
 
 
 class BaseCacheConfig:

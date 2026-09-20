@@ -19,8 +19,7 @@ def _jit_logstate_module(
         cuda_files=["logstate.cu"],
         cuda_wrappers=[
             ("store", f"LogStateKernel<{args}>::store"),
-            ("restore", f"LogStateKernel<{args}>::restore"),
-            ("materialize", f"LogStateKernel<{args}>::materialize"),
+            ("construct", f"LogStateKernel<{args}>::construct"),
         ],
     )
 
@@ -46,88 +45,6 @@ def _module_for(
 def _int32(values: torch.Tensor, device: torch.device) -> torch.Tensor:
     assert values.device == device
     return values.to(torch.int32).contiguous()
-
-
-def reconstruct_log_states(
-    key_log             : torch.Tensor,
-    residual_value_log  : torch.Tensor,
-    decay_log           : torch.Tensor,
-    recurrent_state     : torch.Tensor,
-    conv_state          : torch.Tensor,
-    output_slots        : torch.Tensor,
-    base_slots          : torch.Tensor,
-    task_log_offsets    : torch.Tensor,
-    log_slots           : torch.Tensor,
-    log_begins          : torch.Tensor,
-    log_ends            : torch.Tensor,
-    source_conv_slots   : torch.Tensor,
-    source_conv_granules: torch.Tensor,
-    output_conv_granules: torch.Tensor,
-) -> None:
-    """Restore independent request work states from LogState intervals."""
-    num_tasks = len(output_slots)
-    if num_tasks == 0:
-        return
-
-    reconstruct_recurrent_states(
-        key_log=key_log,
-        residual_value_log=residual_value_log,
-        decay_log=decay_log,
-        recurrent_state=recurrent_state,
-        output_slots=output_slots,
-        base_slots=base_slots,
-        task_log_offsets=task_log_offsets,
-        log_slots=log_slots,
-        log_begins=log_begins,
-        log_ends=log_ends,
-    )
-
-    device = key_log.device
-    layer_indices = torch.arange(
-        conv_state.shape[1], dtype=torch.int64, device=device
-    )
-    source = conv_state[
-        source_conv_slots.to(torch.int64)[:, None],
-        layer_indices[None, :],
-        source_conv_granules.to(torch.int64)[:, None],
-    ]
-    conv_state[
-        output_slots.to(torch.int64)[:, None],
-        layer_indices[None, :],
-        output_conv_granules.to(torch.int64)[:, None],
-    ] = source
-
-
-def reconstruct_recurrent_states(
-    key_log           : torch.Tensor,
-    residual_value_log: torch.Tensor,
-    decay_log         : torch.Tensor,
-    recurrent_state   : torch.Tensor,
-    output_slots      : torch.Tensor,
-    base_slots        : torch.Tensor,
-    task_log_offsets  : torch.Tensor,
-    log_slots         : torch.Tensor,
-    log_begins        : torch.Tensor,
-    log_ends          : torch.Tensor,
-) -> None:
-    """Replay LogState intervals without changing convolution snapshots."""
-    if len(output_slots) == 0:
-        return
-
-    module = _module_for(key_log, residual_value_log, recurrent_state)
-    device = key_log.device
-    module.restore(
-        key_log,
-        residual_value_log,
-        decay_log,
-        recurrent_state,
-        _int32(output_slots, device),
-        _int32(base_slots, device),
-        _int32(task_log_offsets, device),
-        _int32(log_slots, device),
-        _int32(log_begins, device),
-        _int32(log_ends, device),
-    )
 
 
 def store_log_states(
@@ -161,41 +78,62 @@ def store_log_states(
     )
 
 
-def materialize_log_states_inplace(
-    key_log           : torch.Tensor,
-    residual_value_log: torch.Tensor,
-    decay_log         : torch.Tensor,
-    recurrent_state   : torch.Tensor,
-    base_slots        : torch.Tensor,
-    chain_log_offsets : torch.Tensor,
-    log_slots         : torch.Tensor,
-    log_begins        : torch.Tensor,
-    log_ends          : torch.Tensor,
-    checkpoint_flags  : torch.Tensor,
+def construct_log_states(
+    key_log             : torch.Tensor,
+    residual_value_log  : torch.Tensor,
+    decay_log           : torch.Tensor,
+    recurrent_state     : torch.Tensor,
+    base_slots          : torch.Tensor,
+    task_segment_offsets: torch.Tensor,
+    log_slots           : torch.Tensor,
+    log_begins          : torch.Tensor,
+    log_ends            : torch.Tensor,
+    output_offsets      : torch.Tensor,
+    output_slots        : torch.Tensor,
 ) -> None:
-    """Materialize private LogState chains directly into their source slots."""
+    """Construct work states and checkpoints from one shared affine scan."""
     if len(base_slots) == 0:
         return
-
+    assert key_log.dtype in (torch.float16, torch.bfloat16)
+    assert key_log.shape[-1] % 16 == 0
+    assert residual_value_log.shape[-1] % 16 == 0
     module = _module_for(key_log, residual_value_log, recurrent_state)
     device = key_log.device
-    module.materialize(
+    num_segments = len(log_slots)
+    affine_gamma = torch.empty(
+        num_segments,
+        key_log.shape[1],
+        key_log.shape[3],
+        dtype=torch.float32,
+        device=device,
+    )
+    affine_bias = torch.empty(
+        num_segments,
+        key_log.shape[1],
+        key_log.shape[3],
+        key_log.shape[4],
+        residual_value_log.shape[4],
+        dtype=torch.float32,
+        device=device,
+    )
+    module.construct(
         key_log,
         residual_value_log,
         decay_log,
         recurrent_state,
         _int32(base_slots, device),
-        _int32(chain_log_offsets, device),
+        _int32(task_segment_offsets, device),
         _int32(log_slots, device),
         _int32(log_begins, device),
         _int32(log_ends, device),
-        _int32(checkpoint_flags, device),
+        _int32(output_offsets, device),
+        _int32(output_slots, device),
+        affine_gamma,
+        affine_bias,
     )
 
 
 __all__ = [
-    "materialize_log_states_inplace",
-    "reconstruct_log_states",
-    "reconstruct_recurrent_states",
+    "construct_log_states",
     "store_log_states",
 ]

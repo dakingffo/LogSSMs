@@ -366,12 +366,11 @@ def test_prepare_batch_applies_branch_protection_and_commits_plan():
         torch.arange(1000, 1032, dtype=torch.int32),
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
-    with (
-        patch("logssms.cache.logstate.reconstruct_log_states"),
-        patch("logssms.cache.logstate.materialize_log_states_inplace"),
-    ):
+    with patch("logssms.cache.logstate.construct_log_states") as construct:
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
+    assert construct.call_count == 1
+    assert construct.call_args.kwargs["task_segment_offsets"].tolist() == [0, 2]
     assert manager.last_plan is not None
     assert manager.tree.entry_is_protected(1)
     assert any(
@@ -394,10 +393,7 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
 
     request = new_req(manager, input_ids, table_idx=1)
     batch = Batch(reqs=[request], phase="prefill")
-    with (
-        patch("logssms.cache.logstate.reconstruct_log_states"),
-        patch("logssms.cache.logstate.materialize_log_states_inplace"),
-    ):
+    with patch("logssms.cache.logstate.construct_log_states"):
         manager.prepare_batch(batch)
 
     checkpoints = manager.tree.iter_entries()
@@ -491,7 +487,7 @@ def test_active_branch_recovery_anchor_survives_same_round_maintenance():
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
     assert branch.cached_len == 64
-    with patch("logssms.cache.logstate.reconstruct_log_states"):
+    with patch("logssms.cache.logstate.construct_log_states"):
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
     checkpoints = [

@@ -11,8 +11,7 @@ import torch
 
 from logssms.core import Request
 from logssms.kernel.linear_attention import (
-    materialize_log_states_inplace,
-    reconstruct_log_states,
+    construct_log_states,
 )
 from logssms.utils import align_ceil, align_down, div_ceil, init_logger
 
@@ -168,6 +167,13 @@ class _MaterializeChain:
     checkpoint_slots: frozenset[int]
 
 
+@dataclass(frozen=True)
+class _ConstructionChain:
+    base_slot: int | None
+    segments : tuple[LogStateEntry, ...]
+    outputs  : tuple[tuple[int, ...], ...]
+
+
 class OnlineAnalysisScheduler:
     """Generate LogState protection, reconstruction, and merge plans.
 
@@ -287,6 +293,7 @@ class OnlineAnalysisScheduler:
         if round_info is None:
             round_info = self.begin_round(tree)
 
+        analysis_nodes = self._analysis_nodes(tree, input_ids)
         pending = self._find_protections(tree, input_ids)
         protections = tuple(
             BranchProtection(
@@ -304,10 +311,14 @@ class OnlineAnalysisScheduler:
             if (restore := self._plan_work_state_restore(tree, value)) is not None
         )
         materialize = self._plan_materialize(
-            tree, round_info.eligible_slots, pending
+            tree, round_info.eligible_slots, pending, analysis_nodes
         )
         coalesce = self._plan_coalesce(
-            tree, round_info.eligible_slots, pending, materialize
+            tree,
+            round_info.eligible_slots,
+            pending,
+            materialize,
+            analysis_nodes,
         )
         return LogStatePlan(
             tree_revision=tree.revision,
@@ -316,6 +327,30 @@ class OnlineAnalysisScheduler:
             materialize=materialize,
             coalesce=coalesce,
         )
+
+    def _analysis_nodes(
+        self,
+        tree     : LogRadixTree,
+        input_ids: Sequence[torch.Tensor],
+    ) -> tuple[LogRadixTreeNode, ...]:
+        """Return cached nodes reached by this prefill batch.
+
+        Only the matched path is part of the current analysis.  Descendant and
+        sibling continuations are not maintained until a later prefill request
+        actually reaches them.  An entirely new request reaches only the root
+        and must not trigger unrelated cache work.
+        """
+        nodes: dict[int, LogRadixTreeNode] = {}
+        for values in input_ids:
+            usable_len = align_down(len(values), self.granularity)
+            trace = tree.trace(values[:usable_len])
+            if trace.matched_len == 0:
+                continue
+            for node in tree.path(trace.node):
+                if node.uuid in nodes:
+                    continue
+                nodes[node.uuid] = node
+        return tuple(nodes.values())
 
     def _find_protections(
         self,
@@ -431,12 +466,23 @@ class OnlineAnalysisScheduler:
         tree          : LogRadixTree,
         eligible_slots: frozenset[int],
         pending       : tuple[_PendingProtection, ...],
+        analysis_nodes: tuple[LogRadixTreeNode, ...],
     ) -> tuple[PageMaterialize, ...]:
         result = []
-        for entry in tree.iter_entries():
+        entries = {
+            entry.slot: entry
+            for node in analysis_nodes
+            for entry in node.entries
+        }
+        for entry in entries.values():
             if entry.slot not in eligible_slots or entry.kind is not LogStateKind.LOG:
                 continue
             if tree.slot_is_fragmented(entry.slot):
+                continue
+            if (entry.end - entry.begin) % self.page_size != 0:
+                # Prefix deduplication can leave a single logical suffix of a
+                # physical Log page.  It remains useful for replay, but the
+                # persistent Checkpoint representation is page-sized.
                 continue
             owner = tree.entry_owner(entry)
             if self._interval_is_protected(tree, owner, entry.begin, entry.end, pending):
@@ -473,6 +519,7 @@ class OnlineAnalysisScheduler:
         eligible_slots: frozenset[int],
         pending       : tuple[_PendingProtection, ...],
         materialize   : tuple[PageMaterialize, ...],
+        analysis_nodes: tuple[LogRadixTreeNode, ...],
     ) -> tuple[CheckpointCoalesce, ...]:
         projected = {
             plan.log_slot: LogStateEntry(
@@ -486,10 +533,14 @@ class OnlineAnalysisScheduler:
         }
         result = []
         used_slots: set[int] = set()
-        owners = (
-            tree.merge_owners()
-            if self.enable_merge_adjustment else
-            tree.leaves()
+        owners = tuple(
+            node
+            for node in analysis_nodes
+            if (
+                node.merge_stats is not None
+                if self.enable_merge_adjustment else
+                node.is_leaf()
+            )
         )
         for leaf in owners:
             stats = leaf.merge_stats
@@ -756,7 +807,7 @@ class LogStateCacheManager(BaseCacheManager):
     ``CacheResources`` owns the device buffers. This class owns their allocation
     state, the Log-Radix-Tree, and the online maintenance policy. Branch recovery
     writes request work states, while private Log chains are materialized in
-    place by the CUDA reconstruction kernel.
+    place by the CUDA construction kernel.
     """
 
     def __init__(
@@ -964,8 +1015,7 @@ class LogStateCacheManager(BaseCacheManager):
 
         self.last_plan = plan
         tasks = self._make_restore_tasks(batch)
-        self._reconstruct(tasks)
-        self._materialize_inplace(plan.materialize)
+        self._construct(tasks, plan.materialize)
 
         for req in batch.reqs:
             self.pending_recoveries.pop(req.table_idx, None)
@@ -1234,91 +1284,165 @@ class LogStateCacheManager(BaseCacheManager):
             )
         return tasks
 
-    def _reconstruct(self, tasks: Sequence[_ReconstructionTask]) -> None:
-        if not tasks:
-            return
+    def _construct(
+        self,
+        restores   : Sequence[_ReconstructionTask],
+        materialize: Sequence[PageMaterialize],
+    ) -> None:
+        conv_restores = list(restores)
+        direct = [task for task in restores if not task.logs]
+        if direct:
+            pool = self.logstate_pool
+            assert all(task.base_slot is not None for task in direct)
+            output_slots = torch.tensor(
+                [task.output_slot for task in direct],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            base_slots = torch.tensor(
+                [task.base_slot for task in direct],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            pool.recurrent_state[output_slots] = pool.recurrent_state[base_slots]
+        restores = [task for task in restores if task.logs]
+        chains = self._make_construction_chains(restores, materialize)
         device = self.device
         pool = self.logstate_pool
-        logs = [entry for task in tasks for entry in task.logs]
-        offsets = [0]
-        for task in tasks:
-            offsets.append(offsets[-1] + len(task.logs))
 
         def tensor(values: Sequence[int]) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.int32, device=device)
 
-        reconstruct_log_states(
-            key_log=pool.key_log,
-            residual_value_log=pool.residual_value_log,
-            decay_log=pool.decay_log,
-            recurrent_state=pool.recurrent_state,
-            conv_state=pool.conv_state,
-            output_slots=tensor([task.output_slot for task in tasks]),
-            base_slots=tensor([
-                -1 if task.base_slot is None else task.base_slot
-                for task in tasks
-            ]),
-            task_log_offsets=tensor(offsets),
-            log_slots=tensor([entry.slot for entry in logs]),
-            log_begins=tensor([
-                entry.begin - entry.physical_begin for entry in logs
-            ]),
-            log_ends=tensor([
-                entry.end - entry.physical_begin for entry in logs
-            ]),
-            source_conv_slots=tensor([
-                task.source_conv_slot for task in tasks
-            ]),
-            source_conv_granules=tensor([
-                task.source_conv_granule for task in tasks
-            ]),
-            output_conv_granules=tensor([
-                task.output_conv_granule for task in tasks
-            ]),
-        )
-
-    def _materialize_inplace(
-        self,
-        plans: Sequence[PageMaterialize],
-    ) -> None:
-        chains = self._make_materialize_chains(plans)
-        if not chains:
-            return
-
-        logs = [entry for chain in chains for entry in chain.logs]
-        offsets = [0]
-        for chain in chains:
-            offsets.append(offsets[-1] + len(chain.logs))
-
-        def tensor(values: Sequence[int]) -> torch.Tensor:
-            return torch.tensor(
-                values, dtype=torch.int32, device=self.device
+        if chains:
+            segments = [entry for chain in chains for entry in chain.segments]
+            outputs = [
+                slot
+                for chain in chains
+                for values in chain.outputs
+                for slot in values
+            ]
+            segment_offsets = [0]
+            output_offsets = [0]
+            for chain in chains:
+                segment_offsets.append(segment_offsets[-1] + len(chain.segments))
+                for values in chain.outputs:
+                    output_offsets.append(output_offsets[-1] + len(values))
+            construct_log_states(
+                key_log=pool.key_log,
+                residual_value_log=pool.residual_value_log,
+                decay_log=pool.decay_log,
+                recurrent_state=pool.recurrent_state,
+                base_slots=tensor([
+                    -1 if chain.base_slot is None else chain.base_slot
+                    for chain in chains
+                ]),
+                task_segment_offsets=tensor(segment_offsets),
+                log_slots=tensor([entry.slot for entry in segments]),
+                log_begins=tensor([
+                    entry.begin - entry.physical_begin for entry in segments
+                ]),
+                log_ends=tensor([
+                    entry.end - entry.physical_begin for entry in segments
+                ]),
+                output_offsets=tensor(output_offsets),
+                output_slots=tensor(outputs),
             )
 
-        pool = self.logstate_pool
-        materialize_log_states_inplace(
-            key_log=pool.key_log,
-            residual_value_log=pool.residual_value_log,
-            decay_log=pool.decay_log,
-            recurrent_state=pool.recurrent_state,
-            base_slots=tensor([
-                -1 if chain.base_slot is None else chain.base_slot
-                for chain in chains
-            ]),
-            chain_log_offsets=tensor(offsets),
-            log_slots=tensor([entry.slot for entry in logs]),
-            log_begins=tensor([
-                entry.begin - entry.physical_begin for entry in logs
-            ]),
-            log_ends=tensor([
-                entry.end - entry.physical_begin for entry in logs
-            ]),
-            checkpoint_flags=tensor([
-                int(entry.slot in chain.checkpoint_slots)
-                for chain in chains
-                for entry in chain.logs
-            ]),
-        )
+        if conv_restores:
+            layer_indices = torch.arange(
+                pool.conv_state.shape[1], dtype=torch.int64, device=device
+            )
+            source_slots = tensor([
+                task.source_conv_slot for task in conv_restores
+            ]).to(torch.int64)
+            source_granules = tensor([
+                task.source_conv_granule for task in conv_restores
+            ]).to(torch.int64)
+            output_slots = tensor([
+                task.output_slot for task in conv_restores
+            ]).to(torch.int64)
+            output_granules = tensor([
+                task.output_conv_granule for task in conv_restores
+            ]).to(torch.int64)
+            pool.conv_state[
+                output_slots[:, None],
+                layer_indices[None, :],
+                output_granules[:, None],
+            ] = pool.conv_state[
+                source_slots[:, None],
+                layer_indices[None, :],
+                source_granules[:, None],
+            ]
+
+    @staticmethod
+    def _make_construction_chains(
+        restores   : Sequence[_ReconstructionTask],
+        materialize: Sequence[PageMaterialize],
+    ) -> tuple[_ConstructionChain, ...]:
+        material_chains = LogStateCacheManager._make_materialize_chains(materialize)
+        unused = set(range(len(restores)))
+        result = []
+
+        for chain in material_chains:
+            source_logs = chain.logs
+            events: dict[int, list[int]] = {}
+            for entry in chain.logs:
+                if entry.slot in chain.checkpoint_slots:
+                    events.setdefault(entry.end, []).append(entry.slot)
+
+            for index, task in enumerate(restores):
+                if index not in unused or task.base_slot != chain.base_slot or not task.logs:
+                    continue
+                task_is_covered = all(any(
+                    source.slot == entry.slot
+                    and source.begin <= entry.begin
+                    and entry.end <= source.end
+                    for source in source_logs
+                ) for entry in task.logs)
+                source_is_covered = all(any(
+                    entry.slot == source.slot
+                    and entry.begin <= source.begin
+                    and source.end <= entry.end
+                    for entry in task.logs
+                ) for source in source_logs)
+                if not task_is_covered and not source_is_covered:
+                    continue
+                if source_is_covered:
+                    source_logs = task.logs
+                events.setdefault(task.logs[-1].end, []).append(task.output_slot)
+                unused.remove(index)
+
+            segments = []
+            outputs = []
+            for entry in source_logs:
+                boundaries = sorted(
+                    position for position in events
+                    if entry.begin < position <= entry.end
+                )
+                begin = entry.begin
+                for end in boundaries or [entry.end]:
+                    segments.append(entry if begin == entry.begin and end == entry.end
+                                    else entry.slice(begin, end))
+                    outputs.append(tuple(events.get(end, ())))
+                    begin = end
+                if begin < entry.end:
+                    segments.append(entry.slice(begin, entry.end))
+                    outputs.append(())
+            result.append(_ConstructionChain(
+                chain.base_slot, tuple(segments), tuple(outputs)
+            ))
+
+        for index in sorted(unused):
+            task = restores[index]
+            result.append(_ConstructionChain(
+                task.base_slot,
+                task.logs,
+                tuple(
+                    (task.output_slot,) if i == len(task.logs) - 1 else ()
+                    for i in range(len(task.logs))
+                ),
+            ))
+        return tuple(result)
 
     @staticmethod
     def _make_materialize_chains(
@@ -1505,7 +1629,7 @@ class LogStateCacheManager(BaseCacheManager):
 
 
 class LogStateCacheFactory(BaseCacheFactory):
-    """Allocate independent KV-page and LogState-slot budgets at a 3:1 ratio."""
+    """Allocate independent KV-page and LogState-slot budgets at a 1:4 ratio."""
 
     def plan(
         self,
@@ -1555,8 +1679,8 @@ class LogStateCacheFactory(BaseCacheFactory):
             "Not enough memory for LogState request work states."
         )
 
-        kv_budget = persistent_memory * 3 // 4
-        state_budget = persistent_memory - kv_budget
+        state_budget = persistent_memory * 4 // 5
+        kv_budget = persistent_memory - state_budget
         num_pages = (
             kv_budget // cache_per_page
             if config.num_page_override is None else config.num_page_override

@@ -5,10 +5,7 @@ from logssms.cache.linear_pool import LogStatePool
 from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import LogStateLinearAttentionBackend
-from logssms.kernel.linear_attention import (
-    materialize_log_states_inplace,
-    reconstruct_log_states,
-)
+from logssms.kernel.linear_attention import construct_log_states
 
 
 def _make_request(cached_len: int, device_len: int) -> Request:
@@ -270,45 +267,26 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
         first = run(resumed_ctx, 0, 64)
         pool = resumed_ctx.linear_state
         expected_state = pool.recurrent_state[2].clone()
-        if materialized:
-            materialize_log_states_inplace(
-                key_log=pool.key_log,
-                residual_value_log=pool.residual_value_log,
-                decay_log=pool.decay_log,
-                recurrent_state=pool.recurrent_state,
-                base_slots=torch.tensor([-1], dtype=torch.int32, device=device),
-                chain_log_offsets=torch.tensor([0, 1], dtype=torch.int32, device=device),
-                log_slots=torch.tensor([0], dtype=torch.int32, device=device),
-                log_begins=torch.tensor([0], dtype=torch.int32, device=device),
-                log_ends=torch.tensor([64], dtype=torch.int32, device=device),
-                checkpoint_flags=torch.tensor([1], dtype=torch.int32, device=device),
-            )
-        reconstruct_log_states(
+        construct_log_states(
             key_log=pool.key_log,
             residual_value_log=pool.residual_value_log,
             decay_log=pool.decay_log,
             recurrent_state=pool.recurrent_state,
-            conv_state=pool.conv_state,
-            output_slots=torch.tensor([2], dtype=torch.int32, device=device),
-            base_slots=torch.tensor(
-                [0 if materialized else -1], dtype=torch.int32, device=device
+            base_slots=torch.tensor([-1], dtype=torch.int32, device=device),
+            task_segment_offsets=torch.tensor(
+                [0, 1], dtype=torch.int32, device=device
             ),
-            task_log_offsets=torch.tensor(
-                [0, 0 if materialized else 1], dtype=torch.int32, device=device
+            log_slots=torch.tensor([0], dtype=torch.int32, device=device),
+            log_begins=torch.tensor([0], dtype=torch.int32, device=device),
+            log_ends=torch.tensor([64], dtype=torch.int32, device=device),
+            output_offsets=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            output_slots=torch.tensor(
+                [0 if materialized else 2], dtype=torch.int32, device=device
             ),
-            log_slots=torch.tensor(
-                [] if materialized else [0], dtype=torch.int32, device=device
-            ),
-            log_begins=torch.tensor(
-                [] if materialized else [0], dtype=torch.int32, device=device
-            ),
-            log_ends=torch.tensor(
-                [] if materialized else [64], dtype=torch.int32, device=device
-            ),
-            source_conv_slots=torch.tensor([0], dtype=torch.int32, device=device),
-            source_conv_granules=torch.tensor([3], dtype=torch.int32, device=device),
-            output_conv_granules=torch.tensor([0], dtype=torch.int32, device=device),
         )
+        if materialized:
+            pool.recurrent_state[2].copy_(pool.recurrent_state[0])
+        pool.conv_state[2, :, 0].copy_(pool.conv_state[0, :, 3])
         torch.testing.assert_close(
             pool.recurrent_state[2], expected_state, rtol=2e-2, atol=4e-2
         )

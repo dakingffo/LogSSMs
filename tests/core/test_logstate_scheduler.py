@@ -3,7 +3,6 @@ from collections import deque
 import torch
 
 from logssms.cache.logstate import (
-    LogStateCacheManager,
     OnlineAnalysisScheduler,
     WorkStateRestoreMode,
 )
@@ -57,12 +56,7 @@ def test_branch_inside_log_page_restores_work_state_and_protects_page():
     assert plan.restores[0].replay_end == 80
     assert plan.restores[0].base_checkpoint_slot == 0
     assert plan.restores[0].log_slots == (1,)
-    assert {task.log_slot for task in plan.materialize} == {2, 3}
-
-    chains = LogStateCacheManager._make_materialize_chains(plan.materialize)
-    assert len(chains) == 1
-    assert tuple(entry.slot for entry in chains[0].logs) == (1, 2, 3)
-    assert chains[0].checkpoint_slots == {2, 3}
+    assert plan.materialize == ()
 
 
 def test_branch_at_checkpoint_uses_checkpoint_and_blocks_crossing_coalesce():
@@ -92,7 +86,7 @@ def test_protected_log_page_is_not_materialized_but_later_pages_are():
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
     tree.protect(tree.entry_owner(1))
 
-    plan = scheduler.analyze(tree, [])
+    plan = scheduler.analyze(tree, [_history])
 
     assert {task.log_slot for task in plan.materialize} == {2, 3}
 
@@ -116,7 +110,7 @@ def test_adjacent_page_checkpoints_coalesce_one_level_per_round():
         ),
     )
 
-    plan = scheduler.analyze(tree, [])
+    plan = scheduler.analyze(tree, [_history])
 
     task = next(
         task
@@ -131,7 +125,7 @@ def test_materialized_checkpoints_coalesce_in_the_same_round():
     tree, _history = make_history()
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
 
-    plan = scheduler.analyze(tree, [])
+    plan = scheduler.analyze(tree, [_history])
 
     assert {task.log_slot for task in plan.materialize} == {1, 2, 3}
     assert {
@@ -140,13 +134,58 @@ def test_materialized_checkpoints_coalesce_in_the_same_round():
     } == {(0, 1, 1), (2, 3, 1)}
 
 
+def test_analysis_only_maintains_chains_touched_by_prefill_batch():
+    tree = LogRadixTree(
+        PAGE_SIZE, torch.device("cpu"), granularity=GRANULARITY
+    )
+    first = ids(128)
+    second = ids(128, 1000)
+    tree.insert(
+        first,
+        ids(128, 2000),
+        (
+            LogStateEntry(0, LogStateKind.LOG, 0, 64),
+            LogStateEntry(1, LogStateKind.LOG, 64, 128),
+        ),
+    )
+    tree.insert(
+        second,
+        ids(128, 3000),
+        (
+            LogStateEntry(2, LogStateKind.LOG, 0, 64),
+            LogStateEntry(3, LogStateKind.LOG, 64, 128),
+        ),
+    )
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+
+    plan = scheduler.analyze(tree, [first])
+
+    assert {task.log_slot for task in plan.materialize} == {0, 1}
+    assert all(
+        slot not in {2, 3}
+        for task in plan.coalesce
+        for slot in task.slots
+    )
+
+
+def test_empty_prefill_batch_does_not_trigger_tree_maintenance():
+    tree, _history = make_history()
+
+    plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(tree, [])
+
+    assert plan.materialize == ()
+    assert plan.coalesce == ()
+
+
 def test_active_handle_boundary_blocks_checkpoint_coalesce():
     tree, _history = make_history()
     leaf = tree.leaves()[0]
     handle = tree.make_handle(leaf, PAGE_SIZE)
     tree.lock_handle(handle)
 
-    plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(tree, [])
+    plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(
+        tree, [_history]
+    )
 
     assert not any(
         task.left_slot == 0 and task.right_slot == 1
@@ -194,9 +233,38 @@ def test_new_log_pages_are_not_touched_in_their_birth_round():
     tree.detach_entry(3)
     tree.attach_entry(leaf, LogStateEntry(6, LogStateKind.LOG, 192, 256))
 
-    plan = scheduler.analyze(tree, [], round_info)
+    plan = scheduler.analyze(tree, [_history], round_info)
 
     assert {task.log_slot for task in plan.materialize} == {1, 2}
+
+
+def test_partial_physical_log_page_is_replay_only():
+    tree = LogRadixTree(
+        PAGE_SIZE, torch.device("cpu"), granularity=GRANULARITY
+    )
+    tree.insert(
+        ids(80),
+        ids(80, 1000),
+        (
+            LogStateEntry(
+                0, LogStateKind.CHECKPOINT, 0, 64, merge_level=0
+            ),
+            LogStateEntry(
+                1,
+                LogStateKind.LOG,
+                64,
+                80,
+                storage_begin=64,
+            ),
+        ),
+        cache_len=80,
+    )
+
+    plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(
+        tree, [ids(80)]
+    )
+
+    assert plan.materialize == ()
 
 
 def make_checkpoint_history(
@@ -243,7 +311,7 @@ def test_adaptive_merge_uses_intensity_as_a_maximum_group_size():
             intensity=8,
         )
 
-        plan = scheduler.analyze(tree, [])
+        plan = scheduler.analyze(tree, [ids(count * PAGE_SIZE)])
 
         assert tuple(task.slots for task in plan.coalesce) == groups
 
@@ -261,7 +329,7 @@ def test_adaptive_merge_only_changes_its_owned_chain_suffix():
         enable_merge_adjustment=True,
     )
 
-    plan = scheduler.analyze(tree, [])
+    plan = scheduler.analyze(tree, [ids(8 * PAGE_SIZE)])
 
     assert tuple(task.slots for task in plan.coalesce) == ((4, 5, 6, 7),)
 
@@ -289,7 +357,7 @@ def test_adaptive_merge_absorbs_older_lower_level_checkpoint():
         enable_merge_adjustment=True,
     )
 
-    plan = scheduler.analyze(tree, [])
+    plan = scheduler.analyze(tree, [ids(3 * PAGE_SIZE)])
 
     assert tuple(task.slots for task in plan.coalesce) == ((3, 4),)
     assert plan.coalesce[0].next_level == 2
