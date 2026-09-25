@@ -205,7 +205,11 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         node, prefix_len = self._tree_walk(input_ids)
-        return MatchResult(RadixCacheHandle(prefix_len, node, self.empty_tensor))
+        return MatchResult(
+            RadixCacheHandle(prefix_len, node, self.empty_tensor),
+            tree_match_len=prefix_len,
+            recoverable_len=prefix_len,
+        )
 
     def insert_prefix(
         self,

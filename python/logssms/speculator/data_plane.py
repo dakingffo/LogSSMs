@@ -10,6 +10,7 @@ from logssms.distributed import (
     init_pynccl_drafter_target_separation,
     make_nccl_uid_bytes,
 )
+from logssms.tvm import call_cuda_ffi
 
 if TYPE_CHECKING:
     from logssms.scheduler.config import SchedulerConfig
@@ -133,21 +134,21 @@ class NCCLDataPlane(DataPlane):
         rows = hidden.shape[0]
         assert self._hidden_in is not None and rows <= self._hidden_in.shape[0]
         self._hidden_in[:rows].copy_(hidden)  # rest stale; receiver only reads [:rows]
-        self._nccld.all_gather(self._hidden_out, self._hidden_in)
+        call_cuda_ffi(self._nccld.all_gather, self._hidden_out, self._hidden_in)
 
     def recv_hidden(self, num_rows: int) -> torch.Tensor:
-        self._nccld.all_gather(self._hidden_out, self._hidden_in)
+        call_cuda_ffi(self._nccld.all_gather, self._hidden_out, self._hidden_in)
         return self._hidden_out[:num_rows].clone()
 
     def send_probs(self, probs: torch.Tensor) -> None:
         rows = probs.shape[0]
         assert self._probs_in is not None and rows <= self._probs_in.shape[0]
         self._probs_in[:rows].copy_(probs)
-        self._nccld.all_gather(self._probs_out, self._probs_in)
+        call_cuda_ffi(self._nccld.all_gather, self._probs_out, self._probs_in)
 
     def recv_probs(self, num_rows: int) -> torch.Tensor:
         S = self._probs_out.shape[0] // 2
-        self._nccld.all_gather(self._probs_out, self._probs_in)
+        call_cuda_ffi(self._nccld.all_gather, self._probs_out, self._probs_in)
         return self._probs_out[S : S + num_rows].clone()
 
     def destroy(self) -> None:

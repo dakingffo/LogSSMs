@@ -50,6 +50,27 @@ def test_prefill_overlap_carries_previous_batch_reservation_into_adder():
     assert adder.reserved_size == 28
 
 
+def test_cold_prefill_initializes_cache_handle() -> None:
+    calls = []
+    handle = SimpleNamespace(cached_len=0)
+    cache_manager = SimpleNamespace(
+        page_size=64,
+        match_req=lambda _req: SimpleNamespace(cuda_handle=handle),
+        plan_prefill_chunk=lambda remain, budget: min(remain, budget),
+        prefill_acquire=lambda *_args, **_kwargs: True,
+        record_match_profile=lambda *_args, **_kwargs: None,
+        init_with_handle=lambda index, value: calls.append((index, value)),
+    )
+    table_manager = SimpleNamespace(available_size=1, allocate=lambda: 3)
+    adder = PrefillAdder(64, 0, cache_manager, table_manager)
+    pending = PendingRequest(
+        7, torch.arange(16, dtype=torch.int32), SamplingParams(max_tokens=8)
+    )
+
+    assert adder._try_allocate_one(pending) == (handle, 3, 16)
+    assert calls == [(3, handle)]
+
+
 class FakeChunkAdder:
     def __init__(self):
         self.reserved_size = 0
@@ -122,6 +143,7 @@ def test_prefill_adder_continues_from_inflight_device_frontier():
     )
     cache_manager = SimpleNamespace(
         page_size=1,
+        record_prefill_wait=lambda _wait_ms: None,
         plan_prefill_chunk=lambda remain_len, token_budget: min(
             remain_len, token_budget
         ),
@@ -143,6 +165,7 @@ def test_hybrid_chunked_prefill_is_state_checkpoint_aligned():
     )
     cache_manager = SimpleNamespace(
         page_size=64,
+        record_prefill_wait=lambda _wait_ms: None,
         plan_prefill_chunk=lambda remain_len, token_budget: 64,
     )
     adder = PrefillAdder(100, 0, cache_manager, table_manager)

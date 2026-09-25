@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-from logssms.cache.linear_pool import LogStatePool
+from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.core import get_global_ctx
-from logssms.kernel.linear_attention import store_log_states
+from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
 
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
 from .native import _causal_conv1d_update, _prepare_gdn
@@ -74,8 +74,9 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         pool = ctx.linear_state
         state_table = ctx.state_table
         work_state_table = ctx.work_state_table
-        assert isinstance(pool, LogStatePool)
+        assert isinstance(pool, FramedMHALogStatePool)
         assert state_table is not None and work_state_table is not None
+        assert ctx.page_table is not None
         assert work_state_table.shape[1] == 1
 
         reqs = batch.padded_reqs if batch.is_decode else batch.reqs
@@ -97,31 +98,37 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         positions = batch.positions
         assert len(positions) == len(row_table_indices)
         log_slots = state_table[row_table_indices, positions]
-
-        previous_positions = torch.tensor(
-            [req.cached_len - 1 for req in reqs],
-            dtype=torch.int64,
-            device=state_table.device,
-        )
-        has_previous = previous_positions >= 0
-        previous_slots = state_table[
-            table_indices, previous_positions.clamp_min(0)
-        ]
-        conv_read_slots = torch.where(
-            has_previous, previous_slots, work_slots
-        )
-        conv_read_granules = torch.where(
-            has_previous,
-            previous_positions.remainder(pool.page_size)
-            // pool.layout.granularity,
-            0,
-        ).to(torch.int32)
+        token_offsets = batch.out_loc.remainder(pool.page_size).to(torch.int32)
+        if batch.is_decode:
+            conv_read_slots = work_slots
+            conv_read_granules = torch.zeros_like(work_slots)
+        else:
+            previous_positions = torch.tensor(
+                [req.cached_len - 1 for req in reqs],
+                dtype=torch.int64,
+                device=state_table.device,
+            )
+            previous_slots = state_table[
+                table_indices, previous_positions.clamp_min(0)
+            ]
+            previous_kv = ctx.page_table[
+                table_indices, previous_positions.clamp_min(0)
+            ]
+            mapped_previous = (previous_positions >= 0) & (previous_slots >= 0)
+            conv_read_slots = torch.where(
+                mapped_previous, previous_slots, work_slots
+            )
+            conv_read_granules = torch.where(
+                mapped_previous,
+                previous_kv.remainder(pool.page_size) // pool.layout.granularity,
+                0,
+            ).to(torch.int32)
 
         metadata = LogStateLinearAttentionMetadata(
             phase=batch.phase,
             work_slots=work_slots,
             log_slots=log_slots,
-            token_offsets=positions.remainder(pool.page_size).to(torch.int32),
+            token_offsets=token_offsets,
             conv_read_slots=conv_read_slots,
             conv_read_granules=conv_read_granules,
         )
@@ -131,12 +138,11 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             write_rows = []
             for req in reqs:
                 seq_len = req.extend_len
+                first_offset = int(token_offsets[offsets[-1]].item())
                 selected = [
                     index
                     for index in range(seq_len)
-                    if (
-                        req.cached_len + index + 1
-                    ) % pool.layout.granularity == 0
+                    if (first_offset + index + 1) % pool.layout.granularity == 0
                 ]
                 if not selected or selected[-1] != seq_len - 1:
                     selected.append(seq_len - 1)
@@ -164,7 +170,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         del max_seq_len
         assert self.capture is None, "Capture already initialized."
         pool = get_global_ctx().linear_state
-        assert isinstance(pool, LogStatePool)
+        assert isinstance(pool, FramedMHALogStatePool)
         self.capture = LogStateLinearAttentionCaptureData.make(
             max(bs_list), pool.device
         )
@@ -289,7 +295,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         )
 
         pool = get_global_ctx().linear_state
-        assert isinstance(pool, LogStatePool)
+        assert isinstance(pool, FramedMHALogStatePool)
         layer_idx = config.layer_idx
         qkv_segments = []
         conv_snapshots = []
@@ -302,11 +308,11 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             seq_len = req.extend_len
             end_offset = offset + seq_len
             req_qkv = mixed_qkv[offset:end_offset].transpose(0, 1).unsqueeze(0)
-            conv_state = pool.conv_state[
-                metadata.conv_read_slots[req_idx],
+            conv_state = pool.read_conv(
+                metadata.conv_read_slots[req_idx:req_idx + 1],
+                metadata.conv_read_granules[req_idx:req_idx + 1],
                 layer_idx,
-                metadata.conv_read_granules[req_idx],
-            ].unsqueeze(0)
+            )
             conv_input = torch.cat([conv_state, req_qkv], dim=-1)
             req_qkv = F.silu(
                 F.conv1d(conv_input, conv_weight, groups=config.conv_dim)
@@ -342,31 +348,33 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 value,
                 prepared_gate,
                 prepared_beta,
-                pool.recurrent_state[metadata.work_slots, layer_idx],
+                pool.read_states(metadata.work_slots, layer_idx),
                 metadata.cu_seqlens,
                 chunk_size=pool.layout.granularity,
             )
         )
-        store_log_states(
-            key_log=pool.key_log,
-            residual_value_log=pool.residual_value_log,
-            decay_log=pool.decay_log,
-            recurrent_state=pool.recurrent_state,
-            slots=metadata.log_slots,
-            token_offsets=metadata.token_offsets,
-            keys=key.squeeze(0),
-            residual_values=residual_value.squeeze(0),
-            decays=prepared_gate.exp().squeeze(0),
-            layer=layer_idx,
-        )
-        pool.recurrent_state[
-            metadata.work_slots, layer_idx
-        ] = final_state.to(pool.dtype)
-        pool.conv_state[
-            metadata.conv_write_slots,
+        store_framed_log_states(
+            pool,
+            metadata.log_slots,
+            metadata.token_offsets,
+            key.squeeze(0),
+            residual_value.squeeze(0),
+            prepared_gate.exp().squeeze(0),
             layer_idx,
+        )
+        pool.write_states(metadata.work_slots, layer_idx, final_state.to(pool.dtype))
+        pool.write_conv(
+            metadata.conv_write_slots,
             metadata.conv_write_granules,
-        ] = torch.cat(conv_snapshots)
+            layer_idx,
+            torch.cat(conv_snapshots),
+        )
+        pool.write_conv(
+            metadata.work_slots,
+            torch.zeros_like(metadata.work_slots),
+            layer_idx,
+            torch.stack([snapshot[-1] for snapshot in conv_snapshots]),
+        )
         return output.squeeze(0)
 
     def _forward_decode(
@@ -381,17 +389,17 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         metadata   : LogStateLinearAttentionMetadata,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
-            fused_recurrent_gated_delta_rule_with_log,
+            fused_recurrent_gated_delta_rule_to_framed_logstate,
         )
 
         pool = get_global_ctx().linear_state
-        assert isinstance(pool, LogStatePool)
+        assert isinstance(pool, FramedMHALogStatePool)
         layer_idx = config.layer_idx
-        conv_state = pool.conv_state[
+        conv_state = pool.read_conv(
             metadata.conv_read_slots,
-            layer_idx,
             metadata.conv_read_granules,
-        ]
+            layer_idx,
+        )
         mixed_qkv = mixed_qkv.unsqueeze(1).transpose(1, 2)
         mixed_qkv = _causal_conv1d_update(
             mixed_qkv, conv_state, conv_weight
@@ -399,40 +407,34 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         conv_write_granules = (
             metadata.token_offsets // pool.layout.granularity
         )
-        pool.conv_state[
+        pool.write_conv(
             metadata.log_slots,
-            layer_idx,
             conv_write_granules,
-        ] = conv_state
+            layer_idx,
+            conv_state,
+        )
+        pool.write_conv(
+            metadata.work_slots,
+            torch.zeros_like(metadata.work_slots),
+            layer_idx,
+            conv_state,
+        )
 
         query, key, value = self._split_qkv(mixed_qkv, config)
-        output, states, prepared_key, residual_value, decay = (
-            fused_recurrent_gated_delta_rule_with_log(
-                query,
-                key,
-                value,
-                gate.unsqueeze(1),
-                beta.unsqueeze(1),
-                A_log,
-                dt_bias,
-                pool.recurrent_state[metadata.work_slots, layer_idx],
-            )
+        output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query,
+            key,
+            value,
+            gate.unsqueeze(1),
+            beta.unsqueeze(1),
+            A_log,
+            dt_bias,
+            pool,
+            metadata.work_slots,
+            metadata.log_slots,
+            metadata.token_offsets,
+            layer_idx,
         )
-        store_log_states(
-            key_log=pool.key_log,
-            residual_value_log=pool.residual_value_log,
-            decay_log=pool.decay_log,
-            recurrent_state=pool.recurrent_state,
-            slots=metadata.log_slots,
-            token_offsets=metadata.token_offsets,
-            keys=prepared_key.squeeze(1),
-            residual_values=residual_value.squeeze(1),
-            decays=decay.squeeze(1),
-            layer=layer_idx,
-        )
-        pool.recurrent_state[
-            metadata.work_slots, layer_idx
-        ] = states.squeeze(1).to(pool.dtype)
         return output.squeeze(1)
 
 

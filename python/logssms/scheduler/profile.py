@@ -14,6 +14,7 @@ from logssms.distributed import get_tp_info
 from logssms.utils import init_logger, nvtx_annotate
 
 if TYPE_CHECKING:
+    from logssms.cache import BaseCacheManager
     from logssms.core import Batch
 
 
@@ -88,9 +89,14 @@ class SchedulerProfiler:
     asynchronously, so serving does not synchronize once per forward.
     """
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(
+        self,
+        device       : torch.device,
+        cache_manager: BaseCacheManager,
+    ) -> None:
         self.enabled = _env_bool("LOGSSMS_PROFILE_SCHEDULER")
         self.device = device
+        self.cache_manager = cache_manager
         self.path = os.getenv("LOGSSMS_PROFILE_SCHEDULER_PATH")
         self.flush_interval = _env_int("LOGSSMS_PROFILE_FLUSH_INTERVAL")
         self.ar_forward_count = 0
@@ -212,6 +218,7 @@ class SchedulerProfiler:
     def poll(self) -> None:
         if not self.enabled:
             return
+        self.cache_manager.poll_profile()
         remaining = []
         for phase, start, end in self.pending_gpu:
             if end.query():
@@ -230,7 +237,7 @@ class SchedulerProfiler:
 
     def _make_result(self) -> dict:
         tp_info = get_tp_info()
-        return {
+        result = {
             "tp_rank": tp_info.rank,
             "ar_forward_count": self.ar_forward_count,
             "ar_no_batch": self.ar_no_batch,
@@ -239,6 +246,10 @@ class SchedulerProfiler:
                 phase: profile.as_dict() for phase, profile in self.phases.items()
             },
         }
+        cache = self.cache_manager.profile_result()
+        if cache is not None:
+            result["cache"] = cache
+        return result
 
     def _write_result(self) -> None:
         assert self.path is not None

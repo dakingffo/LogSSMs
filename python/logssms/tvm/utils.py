@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, TypeAlias, Union
+from typing import TYPE_CHECKING, Callable, ParamSpec, TypeAlias, TypeVar, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -22,6 +22,16 @@ DEFAULT_CUDA_CFLAGS = DEFAULT_CFLAGS + ["--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
 
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def call_cuda_ffi(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    """Launch FFI CUDA work on the current PyTorch stream."""
+    from tvm_ffi import use_torch_stream
+
+    with use_torch_stream():
+        return func(*args, **kwargs)
 
 
 class CppArglist(list[str]):

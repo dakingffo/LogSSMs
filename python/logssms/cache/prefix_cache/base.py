@@ -31,6 +31,11 @@ class InsertResult(NamedTuple):
 
 class MatchResult(NamedTuple):
     cuda_handle: BaseCacheHandle
+    # Prefix tokens found in the index and the furthest position recoverable by
+    # the cache representation. These differ for LogState when the tree has logs
+    # that cannot be replayed from a retained checkpoint.
+    tree_match_len : int | None = None
+    recoverable_len: int | None = None
     # TODO: support HiCache
 
 

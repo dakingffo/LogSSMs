@@ -24,11 +24,11 @@ class StandardCacheConfig(BaseCacheConfig):
 
 @dataclass(frozen=True)
 class LogStateCacheConfig(BaseCacheConfig):
-    granularity             : int  = 16
-    enable_merge_adjustment : bool = False
-    min_sampling_len        : int  = 1024
-    max_merge_intensity     : int  = 16
-    base_intensity_increment: int  = 2
+    granularity              : int  = 16
+    enable_merge_adjustment  : bool = False
+    min_sampling_len         : int  = 1024
+    max_merge_intensity      : int  = 16
+    default_merge_growth_rate: int = 2
 
     def __post_init__(self) -> None:
         if self.granularity not in LOG_STATE_GRANULARITIES:
@@ -40,8 +40,8 @@ class LogStateCacheConfig(BaseCacheConfig):
             raise ValueError("Minimum sampling length must be positive.")
         if self.max_merge_intensity < 2:
             raise ValueError("Maximum merge intensity must be at least 2.")
-        if self.base_intensity_increment <= 0:
-            raise ValueError("Base intensity increment must be positive.")
+        if self.default_merge_growth_rate < 1:
+            raise ValueError("Default merge growth rate must be at least one.")
 
     @property
     def page_size(self) -> int:

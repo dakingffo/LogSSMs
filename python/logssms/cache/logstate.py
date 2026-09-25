@@ -1,29 +1,27 @@
 from __future__ import annotations
 
 import math
+import os
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, Sequence
 
 import torch
 
 from logssms.core import Request
-from logssms.kernel.linear_attention import (
-    construct_log_states,
+from logssms.kernel.linear_attention.framed_logstate import (
+    construct_framed_log_state_chains,
+    restore_framed_log_state_chains,
 )
 from logssms.utils import align_ceil, align_down, div_ceil, init_logger
 
 from .base import BaseCacheManager, CacheResources
 from .factory import BaseCacheFactory, CachePlan, SUPPORTED_CACHE_FACTORIES
-from .linear_pool.logstate_pool import LOG_STATE_GRANULARITY
-from .linear_pool.logstate_pool import LogStatePool
-from .pools import (
-    logstate_slot_bytes_for_config,
-    make_kvcache_pool,
-    make_logstate_pool,
-)
+from .logstate_pool.layout import LOG_STATE_GRANULARITY, LogStateSlotLayout
+from .logstate_pool.frame_pool import FramedMHALogStatePool
 from .prefix_cache.base import BaseCacheHandle, MatchResult
 from .prefix_cache.logstate import (
     LogStateCacheHandle,
@@ -46,12 +44,17 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class LogStateCapacityError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class LogStateCachePlan(CachePlan):
     num_states        : int
     num_work_states   : int
     cache_per_page    : int
     cache_per_log_slot: int
+    state_units       : int
 
 
 class WorkStateRestoreMode(Enum):
@@ -68,8 +71,8 @@ class LogStateRound:
 class BranchProtection:
     request_indices: tuple[int, ...]
     position       : int
-    log_slot       : int
-    owner_uuid     : int
+    log_slot       : int | None
+    node           : LogRadixTreeNode | None
 
 
 @dataclass(frozen=True)
@@ -102,10 +105,10 @@ class PageMaterialize:
 @dataclass(frozen=True)
 class CheckpointCoalesce:
     slots        : tuple[int, ...]
-    source_levels: tuple[int, ...]
+    source_spans : tuple[int, ...]
     begin        : int
     end          : int
-    next_level   : int
+    next_span    : int
 
     @property
     def left_slot(self) -> int:
@@ -118,11 +121,19 @@ class CheckpointCoalesce:
 
 @dataclass(frozen=True)
 class LogStatePlan:
-    tree_revision: int
-    protections  : tuple[BranchProtection, ...]
-    restores     : tuple[WorkStateRestore, ...]
-    materialize  : tuple[PageMaterialize, ...]
-    coalesce     : tuple[CheckpointCoalesce, ...]
+    tree_revision    : int
+    protections      : tuple[BranchProtection, ...]
+    restores         : tuple[WorkStateRestore, ...]
+    materialize      : tuple[PageMaterialize, ...]
+    coalesce         : tuple[CheckpointCoalesce, ...]
+    merge_diagnostics: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class _AnalysisEndpoint:
+    node       : LogRadixTreeNode
+    matched_len: int
+
 
 @dataclass
 class _BatchPrefixNode:
@@ -169,9 +180,10 @@ class _MaterializeChain:
 
 @dataclass(frozen=True)
 class _ConstructionChain:
-    base_slot: int | None
-    segments : tuple[LogStateEntry, ...]
-    outputs  : tuple[tuple[int, ...], ...]
+    base_slot  : int | None
+    segments   : tuple[LogStateEntry, ...]
+    outputs    : tuple[tuple[int, ...], ...]
+    materialize: bool
 
 
 class OnlineAnalysisScheduler:
@@ -186,35 +198,37 @@ class OnlineAnalysisScheduler:
 
     def __init__(
         self,
-        page_size               : int,
-        granularity             : int  = LOG_STATE_GRANULARITY,
-        enable_merge_adjustment : bool = False,
-        min_sampling_len        : int  = 1024,
-        max_merge_intensity     : int  = 16,
-        base_intensity_increment: int  = 2,
+        page_size                : int,
+        granularity              : int  = LOG_STATE_GRANULARITY,
+        enable_merge_adjustment  : bool = False,
+        min_sampling_len         : int  = 1024,
+        max_merge_intensity      : int  = 16,
+        default_merge_growth_rate: int = 2,
     ) -> None:
         assert page_size > 0
         assert granularity > 0 and page_size % granularity == 0
         assert min_sampling_len > 0
         assert max_merge_intensity >= 2
-        assert base_intensity_increment > 0
+        assert default_merge_growth_rate >= 1
         self.page_size = page_size
         self.granularity = granularity
         self.enable_merge_adjustment = enable_merge_adjustment
         self.min_sampling_len = min_sampling_len
         self.max_merge_intensity = max_merge_intensity
-        self.base_intensity_increment = base_intensity_increment
+        self.default_merge_growth_rate = default_merge_growth_rate
 
     def make_merge_stats(self, origin: int) -> LogStateMergeStats | None:
         if not self.enable_merge_adjustment:
             return None
-        return LogStateMergeStats(origin=origin, tail=origin)
+        return LogStateMergeStats(
+            origin=origin, tail=origin,
+            next_update_tail=origin + self.min_sampling_len,
+        )
 
     def record_hit(self, stats: LogStateMergeStats, position: int) -> None:
         if position < stats.origin or position > stats.tail:
             return
         stats.hit_positions.append(position)
-        self._update_merge_intensity(stats, increment_on_failure=False)
 
     def advance_merge_stats(
         self,
@@ -223,41 +237,36 @@ class OnlineAnalysisScheduler:
     ) -> None:
         if tail <= stats.tail:
             return
-        stats.tail = tail
-        cutoff = tail - self.min_sampling_len
-        stats.hit_positions = deque(
-            position
-            for position in stats.hit_positions
-            if position >= cutoff
-        )
-        self._update_merge_intensity(stats, increment_on_failure=True)
-
-    def _update_merge_intensity(
-        self,
-        stats               : LogStateMergeStats,
-        increment_on_failure: bool,
-    ) -> None:
-        if stats.tail - stats.origin < self.min_sampling_len:
-            stats.intensity = 2
-            return
-        fitted = self._fit_merge_intensity(stats)
-        if fitted is not None:
-            stats.intensity = fitted
-        elif increment_on_failure:
-            stats.intensity = min(
-                self.max_merge_intensity,
-                stats.intensity + self.base_intensity_increment,
+        boundary = stats.next_update_tail
+        if boundary is None:
+            boundary = stats.origin + self.min_sampling_len
+        while boundary <= tail:
+            fitted = self._fit_merge_intensity(stats, boundary)
+            stats.intensity = (
+                fitted if fitted is not None else
+                min(
+                    self.max_merge_intensity,
+                    stats.intensity * self.default_merge_growth_rate,
+                )
             )
+            stats.hit_positions = deque(
+                position for position in stats.hit_positions
+                if position >= boundary
+            )
+            boundary += self.min_sampling_len
+        stats.next_update_tail = boundary
+        stats.tail = tail
 
     def _fit_merge_intensity(
         self,
         stats: LogStateMergeStats,
+        boundary: int,
     ) -> int | None:
         bins: dict[int, int] = {}
         for position in stats.hit_positions:
-            distance = max(self.granularity, stats.tail - position)
-            if distance > self.min_sampling_len:
+            if not boundary - self.min_sampling_len <= position < boundary:
                 continue
+            distance = max(self.granularity, boundary - position)
             index = (distance - 1) // self.page_size
             bins[index] = bins.get(index, 0) + 1
         if len(bins) < 2:
@@ -287,24 +296,32 @@ class OnlineAnalysisScheduler:
         tree      : LogRadixTree,
         input_ids : Sequence[torch.Tensor],
         round_info: LogStateRound | None = None,
+        *,
+        collect_diagnostics: bool = False,
     ) -> LogStatePlan:
         assert tree.page_size == self.page_size
         assert tree.granularity == self.granularity
         if round_info is None:
             round_info = self.begin_round(tree)
 
-        analysis_nodes = self._analysis_nodes(tree, input_ids)
+        analysis_nodes, endpoints = self._analysis_paths(tree, input_ids)
         pending = self._find_protections(tree, input_ids)
-        protections = tuple(
-            BranchProtection(
-                request_indices=value.request_indices,
-                position=value.position,
-                log_slot=entry.slot,
-                owner_uuid=tree.entry_owner(entry).uuid,
+        protections = []
+        for value in pending:
+            entry = self._covering_log(tree, value)
+            node = (
+                value.trace.node
+                if value.trace.is_exact
+                and value.trace.matched_len == value.position
+                and not value.trace.node.is_root() else None
             )
-            for value in pending
-            if (entry := self._covering_log(tree, value)) is not None
-        )
+            if entry is not None or node is not None:
+                protections.append(BranchProtection(
+                    request_indices=value.request_indices,
+                    position=value.position,
+                    log_slot=None if entry is None else entry.slot,
+                    node=node,
+                ))
         restores = tuple(
             restore
             for value in pending
@@ -313,44 +330,65 @@ class OnlineAnalysisScheduler:
         materialize = self._plan_materialize(
             tree, round_info.eligible_slots, pending, analysis_nodes
         )
+        diagnostics = {} if collect_diagnostics else None
         coalesce = self._plan_coalesce(
             tree,
             round_info.eligible_slots,
             pending,
             materialize,
             analysis_nodes,
+            endpoints,
+            diagnostics,
         )
         return LogStatePlan(
             tree_revision=tree.revision,
-            protections=protections,
+            protections=tuple(protections),
             restores=restores,
             materialize=materialize,
             coalesce=coalesce,
+            merge_diagnostics=(
+                tuple(sorted(diagnostics.items()))
+                if diagnostics is not None else ()
+            ),
         )
 
-    def _analysis_nodes(
+    def _analysis_paths(
         self,
         tree     : LogRadixTree,
         input_ids: Sequence[torch.Tensor],
-    ) -> tuple[LogRadixTreeNode, ...]:
-        """Return cached nodes reached by this prefill batch.
+    ) -> tuple[
+        tuple[LogRadixTreeNode, ...],
+        tuple[_AnalysisEndpoint, ...],
+    ]:
+        """Return reached path nodes and the exact matched endpoints.
 
         Only the matched path is part of the current analysis.  Descendant and
         sibling continuations are not maintained until a later prefill request
         actually reaches them.  An entirely new request reaches only the root
-        and must not trigger unrelated cache work.
+        and must not trigger unrelated cache work.  Keep each endpoint's
+        matched length separately: a trace can end inside a compressed edge,
+        and maintenance must not inspect entries beyond that hit.
         """
         nodes: dict[int, LogRadixTreeNode] = {}
+        endpoints: dict[tuple[int, int], _AnalysisEndpoint] = {}
         for values in input_ids:
             usable_len = align_down(len(values), self.granularity)
             trace = tree.trace(values[:usable_len])
             if trace.matched_len == 0:
                 continue
+            endpoint = _AnalysisEndpoint(trace.node, trace.matched_len)
+            endpoints[(trace.node.uuid, trace.matched_len)] = endpoint
             for node in tree.path(trace.node):
                 if node.uuid in nodes:
                     continue
                 nodes[node.uuid] = node
-        return tuple(nodes.values())
+        return (
+            tuple(nodes.values()),
+            tuple(sorted(
+                endpoints.values(),
+                key=lambda value: (value.matched_len, value.node.uuid),
+            )),
+        )
 
     def _find_protections(
         self,
@@ -520,6 +558,8 @@ class OnlineAnalysisScheduler:
         pending       : tuple[_PendingProtection, ...],
         materialize   : tuple[PageMaterialize, ...],
         analysis_nodes: tuple[LogRadixTreeNode, ...],
+        endpoints     : tuple[_AnalysisEndpoint, ...],
+        diagnostics   : dict[str, int] | None,
     ) -> tuple[CheckpointCoalesce, ...]:
         projected = {
             plan.log_slot: LogStateEntry(
@@ -527,47 +567,133 @@ class OnlineAnalysisScheduler:
                 kind=LogStateKind.CHECKPOINT,
                 begin=plan.begin,
                 end=plan.end,
-                merge_level=0,
+                span_pages=1,
             )
             for plan in materialize
         }
         result = []
         used_slots: set[int] = set()
-        owners = tuple(
-            node
-            for node in analysis_nodes
-            if (
-                node.merge_stats is not None
-                if self.enable_merge_adjustment else
-                node.is_leaf()
-            )
-        )
-        for leaf in owners:
+        if diagnostics is not None:
+            diagnostics.update({
+                "matched_endpoints": len(endpoints),
+                "internal_endpoints": sum(
+                    not endpoint.node.is_leaf() for endpoint in endpoints
+                ),
+                "leaf_endpoints": sum(
+                    endpoint.node.is_leaf() for endpoint in endpoints
+                ),
+                "merge_anchors": 0,
+                "anchors_without_eligible_entries": 0,
+                "entries_beyond_match_endpoint": 0,
+                "entries_not_eligible_this_round": 0,
+                "entries_outside_adaptive_owner": 0,
+                "logs_not_materialized": 0,
+                "checkpoint_candidates": 0,
+                "protected_entries": 0,
+                "protected_boundaries": 0,
+                "gaps": 0,
+                "lock_boundaries": 0,
+                "segments": 0,
+                "segments_without_merge_pair": 0,
+                "candidate_groups": 0,
+                "groups_already_planned": 0,
+                "rejected_level_mismatch": 0,
+                "rejected_span_mismatch": 0,
+                "rejected_discontinuity": 0,
+                "rejected_lock_boundary": 0,
+                "rejected_protected_interval": 0,
+                "planned_groups": 0,
+                "planned_slot_releases": 0,
+            })
+        # Every matched endpoint is an anchor, including an internal node
+        # without an adaptive owner. Owner nodes on the matched path retain
+        # their own statistics; neither kind may inspect an unmatched suffix.
+        anchor_limits: dict[int, tuple[LogRadixTreeNode, int]] = {}
+        for endpoint in endpoints:
+            for node in tree.path(endpoint.node):
+                if node is not endpoint.node and (
+                    not self.enable_merge_adjustment
+                    or node.merge_stats is None
+                ):
+                    continue
+                limit = min(node.depth, endpoint.matched_len)
+                previous = anchor_limits.get(node.uuid)
+                if previous is None or limit > previous[1]:
+                    anchor_limits[node.uuid] = (node, limit)
+        anchors = tuple(anchor_limits.values())
+
+        for leaf, matched_len in anchors:
+            if diagnostics is not None:
+                diagnostics["merge_anchors"] += 1
             stats = leaf.merge_stats
+            path_entries = self._entries_for_node(tree, leaf)
+            if matched_len is not None:
+                in_match = [
+                    entry for entry in path_entries
+                    if entry.end <= matched_len
+                ]
+                if diagnostics is not None:
+                    diagnostics["entries_beyond_match_endpoint"] += (
+                        len(path_entries) - len(in_match)
+                    )
+                path_entries = in_match
+            if diagnostics is not None:
+                diagnostics["entries_not_eligible_this_round"] += sum(
+                    entry.slot not in eligible_slots for entry in path_entries
+                )
+            path_entries = [
+                entry for entry in path_entries
+                if entry.slot in eligible_slots
+            ]
+            if stats is not None:
+                if diagnostics is not None:
+                    diagnostics["entries_outside_adaptive_owner"] += sum(
+                        not (
+                            stats.origin <= entry.begin
+                            and entry.end <= stats.tail
+                        )
+                        for entry in path_entries
+                    )
             entries = [
                 projected.get(entry.slot, entry)
-                for entry in self._entries_for_node(tree, leaf)
-                if entry.slot in eligible_slots
-                and entry.slot not in used_slots
+                for entry in path_entries
+                if entry.slot not in used_slots
                 and (
                     stats is None
                     or stats.origin <= entry.begin
                     and entry.end <= stats.tail
                 )
             ]
+            if diagnostics is not None:
+                diagnostics["logs_not_materialized"] += sum(
+                    entry.kind is LogStateKind.LOG for entry in entries
+                )
             entries = [
                 entry
                 for entry in entries
                 if entry.kind is LogStateKind.CHECKPOINT
-                and entry.merge_level is not None
+                and entry.span_pages is not None
             ]
+            if diagnostics is not None:
+                diagnostics["checkpoint_candidates"] += len(entries)
+            if not entries:
+                if diagnostics is not None:
+                    diagnostics["anchors_without_eligible_entries"] += 1
+                continue
             entries.sort(key=lambda entry: (entry.begin, entry.end, entry.slot))
             intensity = (
                 stats.intensity
                 if self.enable_merge_adjustment and stats is not None else
                 2
             )
-            segments = self._merge_segments(tree, leaf, entries, pending)
+            segments = self._merge_segments(
+                tree, leaf, entries, pending, diagnostics
+            )
+            if diagnostics is not None:
+                diagnostics["segments"] += len(segments)
+                diagnostics["segments_without_merge_pair"] += sum(
+                    len(segment) < 2 for segment in segments
+                )
             groups = tuple(
                 group
                 for segment in segments
@@ -581,17 +707,25 @@ class OnlineAnalysisScheduler:
                 )
             )
             for group in groups:
+                if diagnostics is not None:
+                    diagnostics["candidate_groups"] += 1
                 if any(entry.slot in used_slots for entry in group):
+                    if diagnostics is not None:
+                        diagnostics["groups_already_planned"] += 1
                     continue
-                if not self._can_coalesce(
+                reason = self._coalesce_rejection_reason(
                     tree, leaf, group, pending,
                     require_equal_level=True,
-                ):
+                )
+                if reason is not None:
+                    if diagnostics is not None:
+                        diagnostics[f"rejected_{reason}"] += 1
                     continue
-                level = group[0].merge_level
-                assert level is not None
-                result.append(self._make_coalesce(group, level + 1))
+                result.append(self._make_coalesce(group))
                 used_slots.update(entry.slot for entry in group)
+                if diagnostics is not None:
+                    diagnostics["planned_groups"] += 1
+                    diagnostics["planned_slot_releases"] += len(group) - 1
 
             if not self.enable_merge_adjustment:
                 continue
@@ -601,18 +735,26 @@ class OnlineAnalysisScheduler:
             for left, right in zip(remaining, remaining[1:]):
                 if left.slot in used_slots or right.slot in used_slots:
                     continue
-                assert left.merge_level is not None
-                assert right.merge_level is not None
-                if left.merge_level >= right.merge_level:
+                assert left.span_pages is not None
+                assert right.span_pages is not None
+                if left.span_pages >= right.span_pages:
                     continue
                 group = (left, right)
-                if not self._can_coalesce(
+                if diagnostics is not None:
+                    diagnostics["candidate_groups"] += 1
+                reason = self._coalesce_rejection_reason(
                     tree, leaf, group, pending,
                     require_equal_level=False,
-                ):
+                )
+                if reason is not None:
+                    if diagnostics is not None:
+                        diagnostics[f"rejected_{reason}"] += 1
                     continue
-                result.append(self._make_coalesce(group, right.merge_level))
+                result.append(self._make_coalesce(group))
                 used_slots.update((left.slot, right.slot))
+                if diagnostics is not None:
+                    diagnostics["planned_groups"] += 1
+                    diagnostics["planned_slot_releases"] += 1
         result.sort(key=lambda value: (value.begin, value.end, value.left_slot))
         return tuple(result)
 
@@ -622,6 +764,7 @@ class OnlineAnalysisScheduler:
         leaf   : LogRadixTreeNode,
         entries: Sequence[LogStateEntry],
         pending: tuple[_PendingProtection, ...],
+        diagnostics: dict[str, int] | None,
     ) -> tuple[tuple[LogStateEntry, ...], ...]:
         result = []
         current = []
@@ -629,13 +772,27 @@ class OnlineAnalysisScheduler:
             entry_is_blocked = self._interval_is_protected(
                 tree, leaf, entry.begin, entry.end, pending
             )
-            boundary_is_blocked = bool(current) and (
-                current[-1].end != entry.begin
-                or tree.is_lock_boundary(leaf, current[-1].end)
-                or self._interval_is_protected(
+            if diagnostics is None:
+                boundary_is_blocked = bool(current) and (
+                    current[-1].end != entry.begin
+                    or tree.is_lock_boundary(leaf, current[-1].end)
+                    or self._interval_is_protected(
+                        tree, leaf, current[-1].begin, entry.end, pending
+                    )
+                )
+            else:
+                gap = bool(current) and current[-1].end != entry.begin
+                lock_boundary = bool(current) and tree.is_lock_boundary(
+                    leaf, current[-1].end
+                )
+                protected_boundary = bool(current) and self._interval_is_protected(
                     tree, leaf, current[-1].begin, entry.end, pending
                 )
-            )
+                diagnostics["protected_entries"] += int(entry_is_blocked)
+                diagnostics["gaps"] += int(gap)
+                diagnostics["lock_boundaries"] += int(lock_boundary)
+                diagnostics["protected_boundaries"] += int(protected_boundary)
+                boundary_is_blocked = gap or lock_boundary or protected_boundary
             if entry_is_blocked or boundary_is_blocked:
                 if current:
                     result.append(tuple(current))
@@ -655,9 +812,9 @@ class OnlineAnalysisScheduler:
         result = []
         index = 0
         while index < len(entries):
-            level = entries[index].merge_level
+            level = entries[index].span_pages
             end = index + 1
-            while end < len(entries) and entries[end].merge_level == level:
+            while end < len(entries) and entries[end].span_pages == level:
                 end += 1
             run = entries[index:end]
             offset = 0
@@ -673,16 +830,17 @@ class OnlineAnalysisScheduler:
     @staticmethod
     def _make_coalesce(
         entries   : Sequence[LogStateEntry],
-        next_level: int,
     ) -> CheckpointCoalesce:
         return CheckpointCoalesce(
             slots=tuple(entry.slot for entry in entries),
-            source_levels=tuple(
-                entry.merge_level for entry in entries  # type: ignore[arg-type]
+            source_spans=tuple(
+                entry.span_pages for entry in entries  # type: ignore[arg-type]
             ),
             begin=entries[0].begin,
             end=entries[-1].end,
-            next_level=next_level,
+            next_span=sum(
+                entry.span_pages for entry in entries  # type: ignore[arg-type]
+            ),
         )
 
     def _can_coalesce(
@@ -694,29 +852,44 @@ class OnlineAnalysisScheduler:
         *,
         require_equal_level: bool,
     ) -> bool:
+        return self._coalesce_rejection_reason(
+            tree,
+            leaf,
+            entries,
+            pending,
+            require_equal_level=require_equal_level,
+        ) is None
+
+    def _coalesce_rejection_reason(
+        self,
+        tree               : LogRadixTree,
+        leaf               : LogRadixTreeNode,
+        entries            : Sequence[LogStateEntry],
+        pending            : tuple[_PendingProtection, ...],
+        *,
+        require_equal_level: bool,
+    ) -> str | None:
         if len(entries) < 2:
-            return False
-        levels = [entry.merge_level for entry in entries]
+            return "too_few_entries"
+        levels = [entry.span_pages for entry in entries]
         assert all(level is not None for level in levels)
         if require_equal_level and len(set(levels)) != 1:
-            return False
-        if not self.enable_merge_adjustment:
-            level = levels[0]
-            assert level is not None
-            expected_span = self.page_size << level
-            if any(
-                entry.end - entry.begin != expected_span
-                for entry in entries
-            ):
-                return False
+            return "level_mismatch"
+        if any(
+            entry.end - entry.begin != self.page_size * span
+            for entry, span in zip(entries, levels, strict=True)
+        ):
+            return "span_mismatch"
         for left, right in zip(entries, entries[1:]):
             if left.end != right.begin:
-                return False
+                return "discontinuity"
             if tree.is_lock_boundary(leaf, left.end):
-                return False
-        return not self._interval_is_protected(
+                return "lock_boundary"
+        if self._interval_is_protected(
             tree, leaf, entries[0].begin, entries[-1].end, pending
-        )
+        ):
+            return "protected_interval"
+        return None
 
     def _interval_is_protected(
         self,
@@ -726,6 +899,11 @@ class OnlineAnalysisScheduler:
         end    : int,
         pending: tuple[_PendingProtection, ...],
     ) -> bool:
+        if any(
+            path_node.is_protected and begin < path_node.depth < end
+            for path_node in tree.path(node)
+        ):
+            return True
         entries = [
             entry
             for entry in self._entries_for_node(tree, node)
@@ -812,28 +990,28 @@ class LogStateCacheManager(BaseCacheManager):
 
     def __init__(
         self,
-        num_pages      : int,
-        num_states     : int,
-        num_work_states: int,
-        page_size      : int,
-        resources      : CacheResources,
-        granularity    : int = LOG_STATE_GRANULARITY,
-        enable_merge_adjustment : bool = False,
-        min_sampling_len        : int  = 1024,
-        max_merge_intensity     : int  = 16,
-        base_intensity_increment: int  = 2,
+        num_pages                : int,
+        num_states               : int,
+        num_work_states          : int,
+        page_size                : int,
+        resources                : CacheResources,
+        granularity              : int  = LOG_STATE_GRANULARITY,
+        enable_merge_adjustment  : bool = False,
+        min_sampling_len         : int  = 1024,
+        max_merge_intensity      : int  = 16,
+        default_merge_growth_rate: int = 2,
     ) -> None:
         pool = resources.linear_state
         state_table = resources.state_table
         work_state_table = resources.work_state_table
-        assert isinstance(pool, LogStatePool)
+        assert isinstance(pool, FramedMHALogStatePool)
         assert state_table is not None
         assert work_state_table is not None
         assert pool.page_size == page_size
         assert pool.layout.granularity == granularity
         assert num_pages > 0 and num_states > 0
         assert num_work_states == work_state_table.numel()
-        assert pool.num_slots >= num_states + num_work_states
+        assert pool.allocator.num_frames >= num_pages + 1
 
         tree = LogRadixTree(
             page_size=page_size,
@@ -851,17 +1029,31 @@ class LogStateCacheManager(BaseCacheManager):
             enable_merge_adjustment=enable_merge_adjustment,
             min_sampling_len=min_sampling_len,
             max_merge_intensity=max_merge_intensity,
-            base_intensity_increment=base_intensity_increment,
+            default_merge_growth_rate=default_merge_growth_rate,
         )
-        self.free_pages = torch.arange(
-            num_pages, dtype=torch.int32, device=self.device
-        ) * page_size
-        self.free_states = torch.arange(
-            num_states, dtype=torch.int32, device=self.device
+        self.state_units = (
+            pool.allocator.payload_frames
+            + pool.layout.num_granules * pool.allocator.conv_frames
+            + 1
         )
+        self.kv_units_per_page = 1
+        self._allocator = pool.allocator
         self.num_pages = num_pages
         self.num_states = num_states
         self.num_work_states = num_work_states
+        self._work_slots: dict[int, int] = {}
+        dummy_kv = pool.reserve(kv=1)
+        assert dummy_kv is not None
+        self._dummy_kv_frame = dummy_kv[0][0]
+        self.page_table[-1].fill_(self._dummy_kv_frame * page_size)
+        dummy = pool.reserve(logs=1, works=1)
+        assert dummy is not None
+        self._dummy_log_slot = dummy[1][0]
+        self._dummy_work_slot = dummy[2][0]
+        work_state_table[-1, 0] = self._dummy_work_slot
+        state_table[-1].fill_(self._dummy_log_slot)
+        pool.zero_state(self._dummy_work_slot)
+        pool.zero_work_conv(self._dummy_work_slot)
         self.granularity = granularity
         self.enable_merge_adjustment = enable_merge_adjustment
 
@@ -871,6 +1063,32 @@ class LogStateCacheManager(BaseCacheManager):
         self._cached_page_tokens: dict[int, int] = {}
         self._lazy_free_pages: list[torch.Tensor] | None = None
         self._lazy_free_states: list[torch.Tensor] | None = None
+        self._profile_enabled = os.getenv(
+            "LOGSSMS_PROFILE_SCHEDULER", "0"
+        ).lower() in ("1", "true", "yes")
+        self._profile_stats = {
+            "admission_attempts": 0,
+            "admission_rejections": 0,
+            "queue_observations": 0,
+            "max_pending_requests": 0,
+            "max_pending_wait_ms": 0.0,
+            "current_pending_requests": 0,
+            "current_oldest_wait_ms": 0.0,
+            "admitted_requests": 0,
+            "total_admission_wait_ms": 0.0,
+            "max_admission_wait_ms": 0.0,
+            "eviction_rounds": 0,
+            "evicted_kv_tokens": 0,
+            "released_state_slots_from_eviction": 0,
+            "released_state_slots_from_merge": 0,
+            "merge_plan_diagnostics": {},
+            "merge_commit_skips": {},
+        }
+        self._profile_samples: list[dict] = []
+        self._profile_active_requests: list[dict] = []
+        self._profile_cuda_events: list[
+            tuple[dict, torch.cuda.Event, torch.cuda.Event]
+        ] = []
 
     @property
     def tree(self) -> LogRadixTree:
@@ -878,10 +1096,22 @@ class LogStateCacheManager(BaseCacheManager):
         return self.prefix_cache
 
     @property
-    def logstate_pool(self) -> LogStatePool:
+    def logstate_pool(self) -> FramedMHALogStatePool:
         pool = self.linear_pool
-        assert isinstance(pool, LogStatePool)
+        assert isinstance(pool, FramedMHALogStatePool)
         return pool
+
+    @property
+    def free_pages(self) -> torch.Tensor:
+        return torch.tensor(
+            self._allocator._free, dtype=torch.int32, device=self.device
+        ) * self.page_size
+
+    @property
+    def free_states(self) -> torch.Tensor:
+        return torch.tensor(
+            self._allocator._free_slot_ids, dtype=torch.int32, device=self.device
+        )
 
     def match_req(self, req: PendingRequest) -> MatchResult:
         if not self.enable_merge_adjustment:
@@ -892,19 +1122,30 @@ class LogStateCacheManager(BaseCacheManager):
         result = super().match_req(req)
         handle = result.cuda_handle
         assert isinstance(handle, LogStateCacheHandle)
-        return MatchResult(replace(
-            handle,
-            merge_stats=self.analyzer.make_merge_stats(trace.matched_len),
-            source_merge_stats=trace.node.merge_stats,
-            match_position=trace.matched_len,
-        ))
+        return MatchResult(
+            replace(
+                handle,
+                merge_stats=self.analyzer.make_merge_stats(trace.matched_len),
+                source_merge_stats=trace.node.merge_stats,
+                match_position=trace.matched_len,
+            ),
+            tree_match_len=result.tree_match_len,
+            recoverable_len=result.recoverable_len,
+        )
 
     def prefill_acquire(
         self,
-        total_len: int,
-        handle   : BaseCacheHandle,
+        total_len  : int,
+        handle     : BaseCacheHandle,
+        request_len: int | None = None,
     ) -> bool:
-        if not super().prefill_acquire(total_len, handle):
+        del request_len
+        if self._profile_enabled:
+            self._profile_stats["admission_attempts"] += 1
+        admitted = super().prefill_acquire(total_len, handle)
+        if not admitted:
+            if self._profile_enabled:
+                self._profile_stats["admission_rejections"] += 1
             return False
         if not self.enable_merge_adjustment:
             return True
@@ -915,12 +1156,146 @@ class LogStateCacheManager(BaseCacheManager):
             )
         return True
 
+    def record_prefill_queue(
+        self,
+        pending_count : int,
+        oldest_wait_ms: float,
+    ) -> None:
+        if not self._profile_enabled:
+            return
+        stats = self._profile_stats
+        stats["queue_observations"] += 1
+        stats["current_pending_requests"] = pending_count
+        stats["current_oldest_wait_ms"] = oldest_wait_ms
+        stats["max_pending_requests"] = max(
+            stats["max_pending_requests"], pending_count
+        )
+        stats["max_pending_wait_ms"] = max(
+            stats["max_pending_wait_ms"], oldest_wait_ms
+        )
+
+    def record_prefill_wait(self, wait_ms: float) -> None:
+        if not self._profile_enabled:
+            return
+        stats = self._profile_stats
+        stats["admitted_requests"] += 1
+        stats["total_admission_wait_ms"] += wait_ms
+        stats["max_admission_wait_ms"] = max(
+            stats["max_admission_wait_ms"], wait_ms
+        )
+
+    def record_active_requests(self, reqs: Sequence[Request]) -> None:
+        if self._profile_enabled:
+            self._profile_active_requests = self._profile_request_paths(reqs)
+
+    def poll_profile(self) -> None:
+        if not self._profile_enabled:
+            return
+        pending = []
+        for construction, start, end in self._profile_cuda_events:
+            if end.query():
+                construction["cuda_ms"] = start.elapsed_time(end)
+            else:
+                pending.append((construction, start, end))
+        self._profile_cuda_events = pending
+
+    def profile_result(self) -> dict | None:
+        if not self._profile_enabled:
+            return None
+        self.poll_profile()
+        stats = dict(self._profile_stats)
+        admitted = stats["admitted_requests"]
+        stats["avg_admission_wait_ms"] = (
+            stats["total_admission_wait_ms"] / admitted
+            if admitted else 0.0
+        )
+        stats["pending_cuda_events"] = len(self._profile_cuda_events)
+        completed = [
+            sample["construction"]["cuda_ms"]
+            for sample in self._profile_samples
+            if sample["construction"]["cuda_ms"] is not None
+        ]
+        stats["construction_cuda_ms"] = sum(completed)
+        stats["avg_construction_cuda_ms"] = (
+            sum(completed) / len(completed) if completed else 0.0
+        )
+        stats["max_construction_cuda_ms"] = max(completed, default=0.0)
+        resources = [
+            sample[key]
+            for sample in self._profile_samples
+            for key in ("resources_before", "resources_after")
+        ]
+        constructions = [
+            sample["construction"] for sample in self._profile_samples
+        ]
+        stats["min_free_kv_pages"] = min(
+            (value["free_kv_pages"] for value in resources), default=self.num_pages
+        )
+        stats["min_free_state_slots"] = min(
+            (value["free_state_slots"] for value in resources),
+            default=self.num_states,
+        )
+        stats["max_construction_chains"] = max(
+            (value["chains"] for value in constructions), default=0
+        )
+        stats["max_construction_segments"] = max(
+            (value["segments"] for value in constructions), default=0
+        )
+        stats["max_construction_outputs"] = max(
+            (value["outputs"] for value in constructions), default=0
+        )
+        stats["max_construction_workspace_bytes"] = max(
+            (value["workspace_bytes"] for value in constructions), default=0
+        )
+        timing_fields = (
+            "analysis_and_tasks_cpu_ms",
+            "profile_before_cpu_ms",
+            "construction_submit_cpu_ms",
+            "construction_event_setup_cpu_ms",
+            "commit_cpu_ms",
+            "profile_after_cpu_ms",
+            "manager_total_cpu_ms",
+            "unaccounted_cpu_ms",
+        )
+        timing_totals = {
+            key: sum(
+                sample.get("timing_ms", {}).get(key, 0.0)
+                for sample in self._profile_samples
+            )
+            for key in timing_fields
+        }
+        timing_totals["production_cpu_ms"] = (
+            timing_totals["analysis_and_tasks_cpu_ms"]
+            + timing_totals["construction_submit_cpu_ms"]
+            - timing_totals["construction_event_setup_cpu_ms"]
+            + timing_totals["commit_cpu_ms"]
+        )
+        timing_totals["profile_diagnostics_cpu_ms"] = (
+            timing_totals["profile_before_cpu_ms"]
+            + timing_totals["profile_after_cpu_ms"]
+            + timing_totals["construction_event_setup_cpu_ms"]
+        )
+        timing_totals["avg_manager_total_cpu_ms"] = (
+            timing_totals["manager_total_cpu_ms"] / len(self._profile_samples)
+            if self._profile_samples else 0.0
+        )
+        stats["prepare_cpu_timing_ms"] = timing_totals
+        return {
+            "type": "logstate",
+            "aggregate": stats,
+            "match_samples": self._match_profile_samples,
+            "prefill_batches": self._profile_samples,
+        }
+
     @property
     def available_size(self) -> int:
-        evictable_entries = len(self.tree.evictable_slots())
-        kv_pages = len(self.free_pages) + self.tree.size_info.evictable_size // self.page_size
-        state_pages = len(self.free_states) + evictable_entries
-        return min(kv_pages, state_pages) * self.page_size
+        self.logstate_pool.poll_reclamation()
+        return self._allocator.admissible_pages(
+            evictable_kv_frames=self.tree.evictable_kv_frames(
+                self._cached_page_tokens
+            ),
+            evictable_slots=self.tree.evictable_slots(),
+        ) * self.page_size
 
     def plan_prefill_chunk(self, remain_len: int, token_budget: int) -> int:
         chunk_size = min(remain_len, token_budget)
@@ -930,6 +1305,12 @@ class LogStateCacheManager(BaseCacheManager):
 
     def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None:
         assert isinstance(handle, LogStateCacheHandle)
+        assert table_idx not in self._work_slots
+        work_slot = self._allocate_work()
+        self._work_slots[table_idx] = work_slot
+        work_state_table = self.work_state_table
+        assert work_state_table is not None
+        work_state_table[table_idx, 0] = work_slot
         if handle.cached_len > 0:
             self.page_table[table_idx, : handle.cached_len].copy_(
                 handle.kv_indices
@@ -955,15 +1336,18 @@ class LogStateCacheManager(BaseCacheManager):
                 allocation_info.append((req, begin, count))
                 needed += count
 
-            if req.cached_len == 0 and req.table_idx not in self.pending_recoveries:
+            recovery = self.pending_recoveries.get(req.table_idx)
+            if req.cached_len == 0 and (recovery is None or recovery.position == 0):
                 work_slot = int(work_state_table[req.table_idx, 0])
-                self.logstate_pool.recurrent_state[work_slot].zero_()
-                self.logstate_pool.conv_state[work_slot].zero_()
+                self.logstate_pool.zero_state(work_slot)
+                self.logstate_pool.zero_work_conv(work_slot)
 
         if needed == 0:
             return
 
-        kv_pages, state_slots = self._allocate(needed, needed)
+        pages, states, _works = self._allocate(needed, needed)
+        kv_pages = pages.tolist()
+        state_slots = states.tolist()
         offset = 0
         token_offsets = torch.arange(
             self.page_size, dtype=torch.int32, device=self.device
@@ -999,28 +1383,195 @@ class LogStateCacheManager(BaseCacheManager):
                 ].fill_(state_slot)
         assert offset == needed
 
+    def _profile_resource_snapshot(self) -> dict:
+        entries = self.tree.iter_entries()
+        log_slots = {
+            entry.slot for entry in entries
+            if entry.kind is LogStateKind.LOG
+        }
+        checkpoint_slots = {
+            entry.slot for entry in entries
+            if entry.kind is LogStateKind.CHECKPOINT
+        }
+        evictable_slots = self.tree.evictable_slots()
+        return {
+            "free_kv_pages": len(self.free_pages),
+            "free_state_slots": len(self.free_states),
+            "evictable_kv_tokens": self.tree.size_info.evictable_size,
+            "evictable_kv_pages": (
+                self.tree.size_info.evictable_size / self.page_size
+            ),
+            "evictable_state_slots": len(evictable_slots),
+            "tree_log_entries": sum(
+                entry.kind is LogStateKind.LOG for entry in entries
+            ),
+            "tree_checkpoint_entries": sum(
+                entry.kind is LogStateKind.CHECKPOINT for entry in entries
+            ),
+            "tree_log_slots": len(log_slots),
+            "tree_checkpoint_slots": len(checkpoint_slots),
+            "live_log_pages": sum(map(len, self._live_pages.values())),
+        }
+
+    def _profile_request_paths(
+        self,
+        reqs: Sequence[Request],
+    ) -> list[dict]:
+        result = []
+        for req in reqs:
+            recovery = self.pending_recoveries.get(req.table_idx)
+            live = self._live_pages.get(req.table_idx, ())
+            handle = req.cache_handle
+            cached_entries = ()
+            if isinstance(handle, LogStateCacheHandle):
+                cached_entries = tuple(
+                    entry
+                    for node in self.tree.path(handle.node)
+                    for entry in node.entries
+                    if entry.end <= handle.cached_len
+                )
+            result.append({
+                "uid": req.uid,
+                "cached_len": req.cached_len,
+                "device_len": req.device_len,
+                "recovery_log_slots": (
+                    0 if recovery is None else len(recovery.logs)
+                ),
+                "recovery_has_checkpoint": bool(
+                    recovery is not None
+                    and recovery.base_checkpoint_slot is not None
+                ),
+                "cached_log_slots": len({
+                    entry.slot for entry in cached_entries
+                    if entry.kind is LogStateKind.LOG
+                }),
+                "cached_checkpoint_slots": len({
+                    entry.slot for entry in cached_entries
+                    if entry.kind is LogStateKind.CHECKPOINT
+                }),
+                "live_log_pages": len(live),
+            })
+        return result
+
     def prepare_batch(self, batch: Batch) -> None:
         if not batch.is_prefill:
             self.last_plan = None
             return
+        profile_start = perf_counter_ns() if self._profile_enabled else 0
+        analysis_start = profile_start
         round_info = self.analyzer.begin_round(self.tree)
         plan = self.analyzer.analyze(
             self.tree,
             [req.input_ids for req in batch.reqs],
             round_info,
+            collect_diagnostics=self._profile_enabled,
         )
         for protection in plan.protections:
-            if self.tree.has_slot(protection.log_slot):
+            if protection.node is not None:
+                self.tree.protect(protection.node)
+            if (
+                protection.log_slot is not None
+                and self.tree.has_slot(protection.log_slot)
+            ):
                 self.tree.protect_entry(protection.log_slot)
 
         self.last_plan = plan
         tasks = self._make_restore_tasks(batch)
-        self._construct(tasks, plan.materialize)
+        analysis_and_tasks_cpu_ms = (
+            (perf_counter_ns() - analysis_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
+        sample = None
+        profile_before_cpu_ms = 0.0
+        if self._profile_enabled:
+            profile_before_start = perf_counter_ns()
+            sample = {
+                "batch_size": batch.size,
+                "input_tokens": sum(req.extend_len for req in batch.reqs),
+                "resources_before": self._profile_resource_snapshot(),
+                "requests": self._profile_request_paths(batch.reqs),
+                "active_requests": self._profile_active_requests,
+                "queue": {
+                    "pending_requests": self._profile_stats[
+                        "current_pending_requests"
+                    ],
+                    "oldest_wait_ms": self._profile_stats[
+                        "current_oldest_wait_ms"
+                    ],
+                },
+                "plan": {
+                    "protections": len(plan.protections),
+                    "restores": len(tasks),
+                    "materialize": len(plan.materialize),
+                    "coalesce": len(plan.coalesce),
+                    "planned_merge_releases": sum(
+                        len(item.slots) - 1 for item in plan.coalesce
+                    ),
+                    "merge_diagnostics": dict(plan.merge_diagnostics),
+                },
+            }
+            profile_before_cpu_ms = (
+                perf_counter_ns() - profile_before_start
+            ) / 1e6
+        construction_start = perf_counter_ns() if self._profile_enabled else 0
+        construction = self._construct(tasks, plan.materialize)
+        construction_submit_cpu_ms = (
+            (perf_counter_ns() - construction_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
 
+        commit_start = perf_counter_ns() if self._profile_enabled else 0
         for req in batch.reqs:
             self.pending_recoveries.pop(req.table_idx, None)
         self._commit_materialize(plan.materialize)
-        self._commit_coalesce(plan.coalesce)
+        released, commit_skips = self._commit_coalesce(plan.coalesce)
+        commit_cpu_ms = (
+            (perf_counter_ns() - commit_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
+        if self._profile_enabled:
+            self._profile_stats["released_state_slots_from_merge"] += released
+            for reason, count in commit_skips.items():
+                self._profile_stats["merge_commit_skips"][reason] = (
+                    self._profile_stats["merge_commit_skips"].get(reason, 0)
+                    + count
+                )
+            for reason, count in plan.merge_diagnostics:
+                self._profile_stats["merge_plan_diagnostics"][reason] = (
+                    self._profile_stats["merge_plan_diagnostics"].get(reason, 0)
+                    + count
+                )
+            assert sample is not None
+            profile_after_start = perf_counter_ns()
+            sample["construction"] = construction
+            sample["materialized_slots"] = len(plan.materialize)
+            sample["released_state_slots"] = released
+            sample["merge_commit_skips"] = commit_skips
+            sample["resources_after"] = self._profile_resource_snapshot()
+            profile_after_cpu_ms = (
+                perf_counter_ns() - profile_after_start
+            ) / 1e6
+            timing_ms = {
+                "analysis_and_tasks_cpu_ms": analysis_and_tasks_cpu_ms,
+                "profile_before_cpu_ms": profile_before_cpu_ms,
+                "construction_submit_cpu_ms": construction_submit_cpu_ms,
+                "construction_event_setup_cpu_ms": construction.get(
+                    "event_setup_cpu_ms", 0.0
+                ),
+                "commit_cpu_ms": commit_cpu_ms,
+                "profile_after_cpu_ms": profile_after_cpu_ms,
+            }
+            timing_ms["manager_total_cpu_ms"] = (
+                perf_counter_ns() - profile_start
+            ) / 1e6
+            accounted_ms = sum(timing_ms.values()) - timing_ms[
+                "manager_total_cpu_ms"
+            ]
+            timing_ms["unaccounted_cpu_ms"] = (
+                timing_ms["manager_total_cpu_ms"] - accounted_ms
+            )
+            sample["timing_ms"] = timing_ms
+            self._profile_samples.append(sample)
 
     def cache_req(self, req: Request, *, finished: bool) -> None:
         old_handle = req.cache_handle
@@ -1131,15 +1682,35 @@ class LogStateCacheManager(BaseCacheManager):
             work_state_table = self.work_state_table
             assert work_state_table is not None
             work_slot = int(work_state_table[req.table_idx, 0])
-            self.logstate_pool.conv_state[work_slot, :, 0].copy_(
-                self.logstate_pool.conv_state[
-                    adopted[-1].state_slot, :, -1
-                ]
+            source = torch.tensor(
+                [adopted[-1].state_slot], dtype=torch.int32, device=self.device
             )
+            destination = torch.tensor(
+                [work_slot], dtype=torch.int32, device=self.device
+            )
+            source_granule = torch.tensor(
+                [self.logstate_pool.layout.num_granules - 1],
+                dtype=torch.int32, device=self.device,
+            )
+            zero = torch.zeros(1, dtype=torch.int32, device=self.device)
+            for layer in range(self.logstate_pool.layout.num_linear_layers):
+                self.logstate_pool.write_conv(
+                    destination, zero, layer,
+                    self.logstate_pool.read_conv(source, source_granule, layer),
+                )
         if finished:
             self._release_live_pages(req.table_idx, remaining)
             self._live_pages.pop(req.table_idx, None)
             state_table[req.table_idx].fill_(-1)
+            work_slot = self._work_slots.pop(req.table_idx)
+            self._return_slots(
+                torch.empty(0, dtype=torch.int32, device=self.device),
+                torch.tensor([work_slot], dtype=torch.int32, device=self.device),
+            )
+            work_state_table = self.work_state_table
+            assert work_state_table is not None
+            work_state_table[req.table_idx, 0] = -1
+            self.record_cached_session(req, insert.inserted_len)
         else:
             req.cache_handle = new_handle
             self.lock(new_handle)
@@ -1166,35 +1737,38 @@ class LogStateCacheManager(BaseCacheManager):
                 f"LogState cache has {live_pages} request-owned pages while idle."
             )
 
-        if len(torch.unique(self.free_pages)) != len(self.free_pages):
-            raise RuntimeError("LogState free KV page list contains duplicates.")
-        if torch.any(self.free_pages % self.page_size != 0):
-            raise RuntimeError("LogState free KV page list is not page aligned.")
-        if len(self.free_pages) + len(self._cached_page_tokens) != self.num_pages:
-            raise RuntimeError(
-                "LogState KV page accounting mismatch:"
-                f" free={len(self.free_pages)},"
-                f" cached={len(self._cached_page_tokens)},"
-                f" total={self.num_pages}."
-            )
         if sum(self._cached_page_tokens.values()) != self.tree.size_info.total_size:
             raise RuntimeError("LogState cached KV token accounting mismatch.")
 
-        tree_slots = {entry.slot for entry in self.tree.iter_entries()}
-        free_slots = set(self.free_states.tolist())
+        tree_slots = {int(entry.slot) for entry in self.tree.iter_entries()}
         work_state_table = self.work_state_table
         assert work_state_table is not None
-        work_slots = set(work_state_table.flatten().tolist())
-        if not tree_slots.isdisjoint(free_slots | work_slots):
-            raise RuntimeError("LogState linear slots have multiple owners.")
-        if len(free_slots) + len(tree_slots) != self.num_states:
-            raise RuntimeError(
-                "LogState linear slot accounting mismatch:"
-                f" free={len(free_slots)}, tree={len(tree_slots)},"
-                f" total={self.num_states}."
-            )
-        if len(work_slots) != self.num_work_states:
+        work_slots = set(self._work_slots.values()) | {self._dummy_work_slot}
+        if len(work_slots) != len(self._work_slots) + 1:
             raise RuntimeError("LogState work-state table contains duplicate slots.")
+        for row, slot in self._work_slots.items():
+            if int(work_state_table[row, 0]) != slot:
+                raise RuntimeError("LogState work-state table disagrees with allocations.")
+        kv_pages = {page // self.page_size for page in self._cached_page_tokens}
+        kv_pages.update(
+            page.kv_page // self.page_size
+            for pages in self._live_pages.values() for page in pages
+        )
+        expected_kv = kv_pages | {self._dummy_kv_frame}
+        expected_state = tree_slots | {self._dummy_log_slot} | {
+            int(page.state_slot) for pages in self._live_pages.values() for page in pages
+        } | work_slots
+        self.logstate_pool.poll_reclamation()
+        self._allocator.check_integrity()
+        if (self._allocator.allocated_kv != expected_kv
+            or self._allocator.allocated_slots != expected_state):
+            raise RuntimeError(
+                "LogState allocator ownership accounting mismatch: "
+                f"KV extra={self._allocator.allocated_kv - expected_kv}, "
+                f"KV missing={expected_kv - self._allocator.allocated_kv}, "
+                f"State extra={self._allocator.allocated_slots - expected_state}, "
+                f"State missing={expected_state - self._allocator.allocated_slots}."
+            )
 
     @contextmanager
     def lazy_free_region(self):
@@ -1208,35 +1782,31 @@ class LogStateCacheManager(BaseCacheManager):
             lazy_states = self._lazy_free_states
             self._lazy_free_pages = None
             self._lazy_free_states = None
-            if lazy_pages:
-                self.free_pages = torch.cat([self.free_pages, *lazy_pages])
-            if lazy_states:
-                self.free_states = torch.cat([self.free_states, *lazy_states])
+            for pages in lazy_pages:
+                self._return_slots(pages, torch.empty(0, dtype=torch.int32))
+            for states in lazy_states:
+                self._return_slots(torch.empty(0, dtype=torch.int32), states)
 
     def _allocate(
         self,
         needed_pages : int,
         needed_states: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        while (
-            len(self.free_pages) < needed_pages
-            or len(self.free_states) < needed_states
-        ):
+        needed_works : int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        while (reserved := self.logstate_pool.reserve(
+            kv=needed_pages, logs=needed_states, works=needed_works
+        )) is None:
             evictable = self.tree.size_info.evictable_size
             if evictable == 0:
-                raise RuntimeError(
-                    "Insufficient evictable LogState cache capacity:"
-                    f" need_pages={needed_pages}, free_pages={len(self.free_pages)},"
-                    f" need_states={needed_states}, free_states={len(self.free_states)}."
+                raise LogStateCapacityError(
+                    "Insufficient evictable LogState cache capacity: "
+                    f"need_pages={needed_pages}, need_states={needed_states}, "
+                    f"free_frames={self._allocator.free_frames}."
                 )
-            missing_pages = max(0, needed_pages - len(self.free_pages))
-            missing_states = max(0, needed_states - len(self.free_states))
-            evict_size = max(
-                self.granularity,
-                missing_pages * self.page_size,
-                missing_states * self.granularity,
-            )
-            eviction = self.tree.evict(min(evict_size, evictable))
+            # A cached KV/Log page owns multiple frames.  A frame shortfall is
+            # not a page count: evict the smallest available tree unit, then
+            # retry the exact reservation against the frames it really freed.
+            eviction = self.tree.evict(min(self.page_size, evictable))
             self._release_cached_kv(eviction.kv_indices)
             released_states = sorted({
                 entry.slot
@@ -1251,12 +1821,29 @@ class LogStateCacheManager(BaseCacheManager):
                     device=self.device,
                 ),
             )
+            if self._profile_enabled:
+                self._profile_stats["eviction_rounds"] += 1
+                self._profile_stats["evicted_kv_tokens"] += len(
+                    eviction.kv_indices
+                )
+                self._profile_stats[
+                    "released_state_slots_from_eviction"
+                ] += len(released_states)
 
-        pages = self.free_pages[:needed_pages]
-        states = self.free_states[:needed_states]
-        self.free_pages = self.free_pages[needed_pages:]
-        self.free_states = self.free_states[needed_states:]
-        return pages, states
+        pages = torch.tensor(
+            reserved[0], dtype=torch.int32, device=self.device
+        ) * self.page_size
+        states = torch.tensor(
+            reserved[1], dtype=torch.int32, device=self.device
+        )
+        works = torch.tensor(
+            reserved[2], dtype=torch.int32, device=self.device
+        )
+        return pages, states, works
+
+    def _allocate_work(self) -> int:
+        _pages, _logs, works = self._allocate(0, 0, 1)
+        return int(works[0])
 
     def _make_restore_tasks(
         self,
@@ -1272,6 +1859,7 @@ class LogStateCacheManager(BaseCacheManager):
                 continue
             assert recovery.conv_slot is not None
             assert recovery.conv_granule is not None
+            assert not recovery.logs or recovery.logs[-1].end == recovery.position
             tasks.append(
                 _ReconstructionTask(
                     output_slot=int(work_state_table[req.table_idx, 0]),
@@ -1288,23 +1876,27 @@ class LogStateCacheManager(BaseCacheManager):
         self,
         restores   : Sequence[_ReconstructionTask],
         materialize: Sequence[PageMaterialize],
-    ) -> None:
+    ) -> dict:
+        events = None
+        event_setup_cpu_ms = 0.0
+        if self._profile_enabled and (restores or materialize):
+            event_setup_start = perf_counter_ns()
+            events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            events[0].record()
+            event_setup_cpu_ms = (
+                perf_counter_ns() - event_setup_start
+            ) / 1e6
         conv_restores = list(restores)
         direct = [task for task in restores if not task.logs]
         if direct:
             pool = self.logstate_pool
             assert all(task.base_slot is not None for task in direct)
-            output_slots = torch.tensor(
-                [task.output_slot for task in direct],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            base_slots = torch.tensor(
-                [task.base_slot for task in direct],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            pool.recurrent_state[output_slots] = pool.recurrent_state[base_slots]
+            for task in direct:
+                assert task.base_slot is not None
+                pool.copy_state(task.base_slot, task.output_slot)
         restores = [task for task in restores if task.logs]
         chains = self._make_construction_chains(restores, materialize)
         device = self.device
@@ -1314,6 +1906,8 @@ class LogStateCacheManager(BaseCacheManager):
             return torch.tensor(values, dtype=torch.int32, device=device)
 
         if chains:
+            material_chains = [chain for chain in chains if chain.materialize]
+            restore_chains = [chain for chain in chains if not chain.materialize]
             segments = [entry for chain in chains for entry in chain.segments]
             outputs = [
                 slot
@@ -1321,58 +1915,91 @@ class LogStateCacheManager(BaseCacheManager):
                 for values in chain.outputs
                 for slot in values
             ]
-            segment_offsets = [0]
-            output_offsets = [0]
-            for chain in chains:
-                segment_offsets.append(segment_offsets[-1] + len(chain.segments))
-                for values in chain.outputs:
-                    output_offsets.append(output_offsets[-1] + len(values))
-            construct_log_states(
-                key_log=pool.key_log,
-                residual_value_log=pool.residual_value_log,
-                decay_log=pool.decay_log,
-                recurrent_state=pool.recurrent_state,
-                base_slots=tensor([
-                    -1 if chain.base_slot is None else chain.base_slot
-                    for chain in chains
-                ]),
-                task_segment_offsets=tensor(segment_offsets),
-                log_slots=tensor([entry.slot for entry in segments]),
-                log_begins=tensor([
-                    entry.begin - entry.physical_begin for entry in segments
-                ]),
-                log_ends=tensor([
-                    entry.end - entry.physical_begin for entry in segments
-                ]),
-                output_offsets=tensor(output_offsets),
-                output_slots=tensor(outputs),
-            )
+            construction = {
+                "chains": len(chains),
+                "segments": len(segments),
+                "outputs": len(outputs),
+                "direct_checkpoint_copies": len(direct),
+                "workspace_bytes": 0,
+                "cuda_ms": None,
+            }
+            if restore_chains:
+                restore_framed_log_state_chains(
+                    pool,
+                    [
+                        (
+                            chain.base_slot,
+                            [
+                                (
+                                    entry.slot,
+                                    entry.begin - entry.physical_begin,
+                                    entry.end - entry.physical_begin,
+                                )
+                                for entry in chain.segments
+                            ],
+                            chain.outputs[-1][0],
+                        )
+                        for chain in restore_chains
+                    ],
+                )
+            if material_chains:
+                construction["workspace_bytes"] = construct_framed_log_state_chains(
+                    pool,
+                    [
+                        (
+                            chain.base_slot,
+                            [
+                                (
+                                    entry.slot,
+                                    entry.begin - entry.physical_begin,
+                                    entry.end - entry.physical_begin,
+                                )
+                                for entry in chain.segments
+                            ],
+                            chain.outputs,
+                        )
+                        for chain in material_chains
+                    ],
+                )
+        else:
+            construction = {
+                "chains": 0,
+                "segments": 0,
+                "outputs": 0,
+                "direct_checkpoint_copies": len(direct),
+                "workspace_bytes": 0,
+                "cuda_ms": 0.0,
+            }
 
         if conv_restores:
-            layer_indices = torch.arange(
-                pool.conv_state.shape[1], dtype=torch.int64, device=device
-            )
             source_slots = tensor([
                 task.source_conv_slot for task in conv_restores
-            ]).to(torch.int64)
+            ])
             source_granules = tensor([
                 task.source_conv_granule for task in conv_restores
-            ]).to(torch.int64)
+            ])
             output_slots = tensor([
                 task.output_slot for task in conv_restores
-            ]).to(torch.int64)
+            ])
             output_granules = tensor([
                 task.output_conv_granule for task in conv_restores
-            ]).to(torch.int64)
-            pool.conv_state[
-                output_slots[:, None],
-                layer_indices[None, :],
-                output_granules[:, None],
-            ] = pool.conv_state[
-                source_slots[:, None],
-                layer_indices[None, :],
-                source_granules[:, None],
-            ]
+            ])
+            for layer in range(pool.layout.num_linear_layers):
+                pool.write_conv(
+                    output_slots, output_granules, layer,
+                    pool.read_conv(source_slots, source_granules, layer),
+                )
+        if events is not None:
+            event_end_setup_start = perf_counter_ns()
+            events[1].record()
+            self._profile_cuda_events.append(
+                (construction, events[0], events[1])
+            )
+            event_setup_cpu_ms += (
+                perf_counter_ns() - event_end_setup_start
+            ) / 1e6
+        construction["event_setup_cpu_ms"] = event_setup_cpu_ms
+        return construction
 
     @staticmethod
     def _make_construction_chains(
@@ -1429,7 +2056,7 @@ class LogStateCacheManager(BaseCacheManager):
                     segments.append(entry.slice(begin, entry.end))
                     outputs.append(())
             result.append(_ConstructionChain(
-                chain.base_slot, tuple(segments), tuple(outputs)
+                chain.base_slot, tuple(segments), tuple(outputs), True
             ))
 
         for index in sorted(unused):
@@ -1441,6 +2068,7 @@ class LogStateCacheManager(BaseCacheManager):
                     (task.output_slot,) if i == len(task.logs) - 1 else ()
                     for i in range(len(task.logs))
                 ),
+                False,
             ))
         return tuple(result)
 
@@ -1489,21 +2117,26 @@ class LogStateCacheManager(BaseCacheManager):
                     kind=LogStateKind.CHECKPOINT,
                     begin=plan.begin,
                     end=plan.end,
-                    merge_level=0,
+                    span_pages=1,
                 ),
             )
+            self.logstate_pool.materialize(plan.log_slot)
 
     def _commit_coalesce(
         self,
         plans: Sequence[CheckpointCoalesce],
-    ) -> None:
+    ) -> tuple[int, dict[str, int]]:
         released = []
+        skips: dict[str, int] = {}
         for plan in plans:
             if any(
                 not self.tree.has_slot(slot)
                 or self.tree.slot_is_fragmented(slot)
                 for slot in plan.slots
             ):
+                skips["missing_or_fragmented_slot"] = (
+                    skips.get("missing_or_fragmented_slot", 0) + 1
+                )
                 continue
             entries = [
                 self.tree.entries_for_slot(slot)[0]
@@ -1512,21 +2145,28 @@ class LogStateCacheManager(BaseCacheManager):
             if any(
                 entry.kind is not LogStateKind.CHECKPOINT
                 or entry.slot != slot
-                or entry.merge_level != level
+                or entry.span_pages != level
                 for entry, slot, level in zip(
                     entries,
                     plan.slots,
-                    plan.source_levels,
+                    plan.source_spans,
                     strict=True,
                 )
             ):
+                skips["checkpoint_metadata_mismatch"] = (
+                    skips.get("checkpoint_metadata_mismatch", 0) + 1
+                )
                 continue
             if entries[0].begin != plan.begin or entries[-1].end != plan.end:
+                skips["range_mismatch"] = skips.get("range_mismatch", 0) + 1
                 continue
             if any(
                 left.end != right.begin
                 for left, right in zip(entries, entries[1:])
             ):
+                skips["noncontiguous_at_commit"] = (
+                    skips.get("noncontiguous_at_commit", 0) + 1
+                )
                 continue
             owner = self.tree.entry_owner(entries[-1])
             for slot in plan.slots:
@@ -1538,7 +2178,7 @@ class LogStateCacheManager(BaseCacheManager):
                     kind=LogStateKind.CHECKPOINT,
                     begin=plan.begin,
                     end=plan.end,
-                    merge_level=plan.next_level,
+                    span_pages=plan.next_span,
                 ),
             )
             released.extend(plan.slots[:-1])
@@ -1549,6 +2189,7 @@ class LogStateCacheManager(BaseCacheManager):
                     released, dtype=torch.int32, device=self.device
                 ),
             )
+        return len(released), skips
 
     def _release_live_pages(
         self,
@@ -1580,10 +2221,10 @@ class LogStateCacheManager(BaseCacheManager):
         states: torch.Tensor,
     ) -> None:
         if self._lazy_free_pages is None:
-            if len(pages) > 0:
-                self.free_pages = torch.cat([self.free_pages, pages])
-            if len(states) > 0:
-                self.free_states = torch.cat([self.free_states, states])
+            page_frames = [page // self.page_size for page in pages.tolist()]
+            self.logstate_pool.release_kv(page_frames)
+            for slot in states.tolist():
+                self.logstate_pool.release_slot(slot)
         else:
             assert self._lazy_free_states is not None
             if len(pages) > 0:
@@ -1629,7 +2270,7 @@ class LogStateCacheManager(BaseCacheManager):
 
 
 class LogStateCacheFactory(BaseCacheFactory):
-    """Allocate independent KV-page and LogState-slot budgets at a 1:4 ratio."""
+    """Allocate one arena of KV granules shared by KV, log and checkpoints."""
 
     def plan(
         self,
@@ -1666,27 +2307,51 @@ class LogStateCacheFactory(BaseCacheFactory):
             * config.dtype.itemsize
             * config.model_config.num_attention_layers
         )
-        cache_per_log_slot = logstate_slot_bytes_for_config(
-            config.model_config,
-            config.page_size,
-            config.cache_config.granularity,
-            config.dtype,
+        model = config.model_config
+        from .pools import local_linear_head_counts
+        num_k_heads, num_v_heads = local_linear_head_counts(model)
+        conv_dim = (
+            num_k_heads * model.linear_key_head_dim * 2
+            + num_v_heads * model.linear_value_head_dim
+        )
+        layout = LogStateSlotLayout(
+            page_size=config.page_size,
+            granularity=config.cache_config.granularity,
+            num_linear_layers=model.num_linear_layers,
+            num_key_heads=num_k_heads,
+            num_value_heads=num_v_heads,
+            head_k_dim=model.linear_key_head_dim,
+            head_v_dim=model.linear_value_head_dim,
+            conv_dim=conv_dim,
+            state_len=model.linear_conv_kernel_dim - 1,
+            dtype=config.dtype,
         )
         num_work_states = config.max_running_req + 1
-        work_state_bytes = num_work_states * cache_per_log_slot
-        persistent_memory = available_memory - work_state_bytes
-        assert persistent_memory > 0, (
-            "Not enough memory for LogState request work states."
+        head_bytes = max(
+            layout.head_log_key_bytes + layout.head_log_value_bytes,
+            layout.head_recurrent_state_bytes,
         )
-
-        state_budget = persistent_memory * 4 // 5
-        kv_budget = persistent_memory - state_budget
-        num_pages = (
-            kv_budget // cache_per_page
-            if config.num_page_override is None else config.num_page_override
+        payload_frames = div_ceil(
+            model.num_linear_layers * num_v_heads * head_bytes,
+            cache_per_page,
         )
-        num_states = state_budget // cache_per_log_slot
-        assert num_pages > 1 and num_states > 1, (
+        conv_frames = div_ceil(
+            layout.conv_state_bytes // layout.num_granules, cache_per_page
+        )
+        assert layout.log_decay_bytes <= cache_per_page
+        state_units = payload_frames + layout.num_granules * conv_frames + 1
+        cache_per_log_slot = (
+            payload_frames + layout.num_granules * conv_frames
+        ) * cache_per_page + layout.log_decay_bytes
+        work_units = payload_frames + conv_frames
+        # The manager also allocates one dummy KV frame, log slot and work slot.
+        num_pages = available_memory // cache_per_page - 1
+        if config.num_page_override is not None:
+            num_pages = min(num_pages, config.num_page_override)
+        num_states = max(0, (
+            num_pages - num_work_states * work_units - state_units
+        ) // state_units)
+        assert num_pages > 1 and num_states > 1 and layout.log_decay_bytes <= cache_per_page, (
             "Not enough memory for LogState cache allocation."
         )
 
@@ -1694,7 +2359,8 @@ class LogStateCacheFactory(BaseCacheFactory):
         max_seq_len = min(
             config.max_seq_len,
             num_tokens,
-            num_states * config.page_size,
+            max(0, num_pages - num_work_states * work_units - state_units)
+            // (1 + state_units) * config.page_size,
         )
         return LogStateCachePlan(
             num_pages=num_pages,
@@ -1705,6 +2371,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             num_work_states=num_work_states,
             cache_per_page=cache_per_page,
             cache_per_log_slot=cache_per_log_slot,
+            state_units=state_units,
         )
 
     def allocate(
@@ -1718,13 +2385,40 @@ class LogStateCacheFactory(BaseCacheFactory):
 
         assert isinstance(plan, LogStateCachePlan)
         assert isinstance(config.cache_config, LogStateCacheConfig)
-        kv_pool = make_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=plan.num_pages + 1,
+        from .pools import local_linear_head_counts
+        from logssms.distributed import try_get_tp_info
+        from logssms.utils import div_even
+
+        model = config.model_config
+        num_k_heads, num_v_heads = local_linear_head_counts(model)
+        conv_dim = (
+            num_k_heads * model.linear_key_head_dim * 2
+            + num_v_heads * model.linear_value_head_dim
+        )
+        tp_info = try_get_tp_info()
+        assert tp_info is not None
+        shared_pool = FramedMHALogStatePool(
+            num_frames=plan.num_pages + 1,
             page_size=config.page_size,
+            num_attention_layers=model.num_attention_layers,
+            num_kv_heads=div_even(model.num_kv_heads, tp_info.size, allow_replicate=True),
+            head_dim=model.head_dim,
+            num_linear_layers=model.num_linear_layers,
+            num_key_heads=num_k_heads,
+            num_value_heads=num_v_heads,
+            head_k_dim=model.linear_key_head_dim,
+            head_v_dim=model.linear_value_head_dim,
+            conv_dim=conv_dim,
+            state_len=model.linear_conv_kernel_dim - 1,
             device=device,
             dtype=dtype,
+            granularity=config.cache_config.granularity,
         )
+        assert (
+            shared_pool.allocator.payload_frames
+            + shared_pool.layout.num_granules * shared_pool.allocator.conv_frames
+            + 1
+        ) == plan.state_units
         page_table = torch.zeros(
             (config.max_running_req + 1, plan.aligned_max_seq_len),
             dtype=torch.int32,
@@ -1732,40 +2426,25 @@ class LogStateCacheFactory(BaseCacheFactory):
         )
         page_table[-1].fill_(plan.num_tokens)
 
-        linear_state = make_logstate_pool(
-            model_config=config.model_config,
-            num_slots=plan.num_states + plan.num_work_states,
-            page_size=config.page_size,
-            granularity=config.cache_config.granularity,
-            device=device,
-            dtype=dtype,
-        )
+        linear_state = shared_pool
         state_table = torch.full(
             (config.max_running_req + 1, plan.aligned_max_seq_len),
             -1,
             dtype=torch.int32,
             device=device,
         )
-        work_state_table = torch.arange(
-            plan.num_states,
-            plan.num_states + plan.num_work_states,
-            dtype=torch.int32,
-            device=device,
-        ).view(config.max_running_req + 1, 1)
-        dummy_work_slot = int(work_state_table[-1, 0])
-        state_table[-1].fill_(dummy_work_slot)
-        linear_state.recurrent_state[dummy_work_slot].zero_()
-        linear_state.conv_state[dummy_work_slot].zero_()
+        work_state_table = torch.full(
+            (config.max_running_req + 1, 1), -1,
+            dtype=torch.int32, device=device,
+        )
 
         logger.info(
-            f"Allocating {plan.num_pages} KV pages = "
-            f"{plan.num_pages * plan.cache_per_page / (1 << 30):.2f} GiB, "
-            f"{plan.num_states} persistent LogState slots + "
-            f"{plan.num_work_states} work slots = "
-            f"{(plan.num_states + plan.num_work_states) * plan.cache_per_log_slot / (1 << 30):.2f} GiB"
+            f"Allocating {plan.num_pages + 1} shared cache frames, "
+            f"up to {plan.num_work_states} work states allocated on demand = "
+            f"{shared_pool.storage.numel() / (1 << 30):.2f} GiB"
         )
         return CacheResources(
-            kv_pool=kv_pool,
+            kv_pool=shared_pool,
             page_table=page_table,
             linear_state=linear_state,
             state_table=state_table,
@@ -1794,8 +2473,8 @@ class LogStateCacheFactory(BaseCacheFactory):
             ),
             min_sampling_len=config.cache_config.min_sampling_len,
             max_merge_intensity=config.cache_config.max_merge_intensity,
-            base_intensity_increment=(
-                config.cache_config.base_intensity_increment
+            default_merge_growth_rate=(
+                config.cache_config.default_merge_growth_rate
             ),
         )
 

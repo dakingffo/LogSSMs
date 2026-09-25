@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
-from logssms.tvm import load_jit, make_cpp_args
+from logssms.tvm import call_cuda_ffi, load_jit, make_cpp_args
 
 from .utils import KernelConfig
 
@@ -63,7 +63,7 @@ def store_cache(
     v = v.view(v.shape[0], -1)
     element_size = k_cache.shape[1] * k_cache.element_size()
     module = _jit_store_module(element_size)
-    module.launch(k_cache, v_cache, indices, k, v)
+    call_cuda_ffi(module.launch, k_cache, v_cache, indices, k, v)
 
 
 def store_state(
@@ -80,4 +80,4 @@ def store_state(
     element_size = pool.shape[1] * pool.element_size()
     assert element_size % 128 == 0
     module = _jit_state_store_module(element_size)
-    module.launch(pool, indices, states)
+    call_cuda_ffi(module.launch, pool, indices, states)

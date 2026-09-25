@@ -1,5 +1,5 @@
 from .kv_pool.base import BaseKVCachePool
-from .linear_pool.logstate_pool import LogStatePool
+from .logstate_pool.frame_pool import FramedMHALogStatePool
 from .linear_pool.state_pool import LinearStatePool
 from .prefix_cache import make_prefix_cache
 from .prefix_cache.base import (
@@ -43,10 +43,8 @@ from .logstate import (
 )
 from .pools import (
     linear_state_slot_bytes_for_config,
-    logstate_slot_bytes_for_config,
     make_kvcache_pool,
     make_linear_state_pool,
-    make_logstate_pool,
 )
 from .standard import StandardCacheFactory, StandardCacheManager, StandardCachePlan
 
@@ -65,11 +63,9 @@ __all__ = [
     "get_cache_factory",
     "make_kvcache_pool",
     "make_linear_state_pool",
-    "make_logstate_pool",
     "make_prefix_cache",
     "linear_state_slot_bytes_for_config",
-    "logstate_slot_bytes_for_config",
-    "LogStatePool",
+    "FramedMHALogStatePool",
     "BaseKVCachePool",
     "BaseCacheHandle",
     "BasePrefixCache",

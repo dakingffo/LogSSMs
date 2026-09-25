@@ -46,6 +46,7 @@ class Request:
     sampling_params: SamplingParams
     cache_handle   : BaseCacheHandle
     max_device_len : int
+    profile_tag    : str | None = None
     device_len     : int  = field(init=False)
     aborted        : bool = field(default=False, init=False)
 

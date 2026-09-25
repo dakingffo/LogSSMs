@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter_ns
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,7 +31,10 @@ class PendingRequest:
     uid            : int
     input_ids      : torch.Tensor
     sampling_params: SamplingParams
+    profile_tag    : str | None = None
     chunked_req    : ChunkedRequest | None = None
+    queued_at_ns   : int = field(default_factory=perf_counter_ns)
+    admitted       : bool = False
 
     @property
     def input_len(self) -> int:
@@ -58,7 +62,8 @@ class PrefillAdder:
             return None
 
         # TODO: consider host cache match case
-        handle = self.cache_manager.match_req(req).cuda_handle
+        match = self.cache_manager.match_req(req)
+        handle = match.cuda_handle
         cached_len = handle.cached_len
         remain_len = req.input_len - cached_len
         chunk_size = self.cache_manager.plan_prefill_chunk(
@@ -74,7 +79,9 @@ class PrefillAdder:
         # TODO: better estimate policy
         estimated_len = align_ceil(remain_len + req.output_len, self.cache_manager.page_size)
         total_len = estimated_len + self.reserved_size
-        if not self.cache_manager.prefill_acquire(total_len, handle):
+        if not self.cache_manager.prefill_acquire(
+            total_len, handle, request_len=estimated_len
+        ):
             self.rejection_reason = (
                 f"cache admission rejected: request={estimated_len}, "
                 f"reserved={self.reserved_size}, total={total_len}, "
@@ -83,11 +90,15 @@ class PrefillAdder:
             )
             return None
 
+        self.cache_manager.record_match_profile(
+            req, match, input_len=req.input_len
+        )
+
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            self.cache_manager.init_with_handle(table_idx, handle)
+        self.cache_manager.init_with_handle(table_idx, handle)
 
         return handle, table_idx, chunk_size
 
@@ -99,6 +110,11 @@ class PrefillAdder:
         cached_len  : int,
         chunk_size  : int,
     ) -> Request | ChunkedRequest:
+        if not pending_req.admitted:
+            self.cache_manager.record_prefill_wait(
+                (perf_counter_ns() - pending_req.queued_at_ns) / 1e6
+            )
+            pending_req.admitted = True
         remain_len = pending_req.input_len - cached_len
         is_chunked = chunk_size < remain_len
         CLS = ChunkedRequest if is_chunked else Request
@@ -118,6 +134,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            profile_tag=pending_req.profile_tag,
             max_device_len=len(pending_req.input_ids) + pending_req.output_len,
         )
 
@@ -166,7 +183,12 @@ class PrefillManager:
         self.page_size = page_size
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingRequest(req.uid, req.input_ids, req.sampling_params))
+        self.pending_list.append(PendingRequest(
+            req.uid,
+            req.input_ids,
+            req.sampling_params,
+            profile_tag=req.profile_tag,
+        ))
 
     @property
     def need_tokens(self) -> int:

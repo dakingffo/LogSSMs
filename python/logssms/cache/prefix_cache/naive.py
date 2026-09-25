@@ -36,7 +36,11 @@ class NaivePrefixCache(StandardPrefixCacheBase):
         pass
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
-        return MatchResult(NaiveCacheHandle(0, self.empty_tensor, self.with_state))
+        return MatchResult(
+            NaiveCacheHandle(0, self.empty_tensor, self.with_state),
+            tree_match_len=0,
+            recoverable_len=0,
+        )
 
     def insert_prefix(
         self,

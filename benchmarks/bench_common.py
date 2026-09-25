@@ -87,7 +87,18 @@ BENCH_ONLY_FLAGS: dict[str, dict[str, Any]] = {
     "--out": {
         "type": str,
         "default": None,
-        "help": "incrementally write completed benchmark points to this JSON file",
+        "help": (
+            "incrementally write completed points to this file; relative paths "
+            "are under benchmark-results/"
+        ),
+    },
+    "--history": {
+        "type": str,
+        "default": None,
+        "help": (
+            "save every measured request's full context and response to this file; "
+            "relative paths are under benchmark-results/"
+        ),
     },
     "--no-warmup": {"action": "store_true", "help": "skip the warmup request before the timed batch"},
     "--no-pbar": {"action": "store_true", "help": "disable the progress counter"},
@@ -114,6 +125,8 @@ def parse_full(argv: list[str], extra: dict[str, dict[str, Any]] | None = None):
     bench_ns, server_argv = p.parse_known_args(argv)
     if bench_ns.num_turns < 1:
         p.error("--num-turns must be positive")
+    bench_ns.out = resolve_result_path(bench_ns.out)
+    bench_ns.history = resolve_result_path(bench_ns.history)
 
     from logssms.server.args import parse_args
 
@@ -364,15 +377,47 @@ def split_warmup_conversation(
     return conversations[-1], conversations[:-1]
 
 
+def resolve_result_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    if not path.endswith(".json"):
+        raise ValueError("--out and --history require an explicit .json file path")
+    return path if os.path.isabs(path) else os.path.join(_REPO, "benchmark-results", path)
+
+
 def save_json(path: str | None, data: Any) -> None:
     """Atomically persist every completed point so an interrupted matrix is useful."""
-    if path is None:
+    resolved = resolve_result_path(path)
+    if resolved is None:
         return
-    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(resolved), exist_ok=True)
+    tmp_path = resolved + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    os.replace(tmp_path, path)
-    print(f"  wrote {path}", flush=True)
+    os.replace(tmp_path, resolved)
+    print(f"  wrote {resolved}", flush=True)
+
+
+def prepare_history(
+    benchmark  : str,
+    server_args: Any,
+    bench      : Any,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if bench.history is None:
+        return None, None
+    path = resolve_result_path(bench.history)
+    return path, {
+        "benchmark": benchmark,
+        "model": server_args.model_path,
+        "cache_type": server_args.cache_type,
+        "cache_config": repr(server_args.cache_config),
+        "dataset": bench.dataset,
+        "dataset_category": bench.dataset_category,
+        "seed": bench.seed,
+        "num_turns": bench.num_turns,
+        "output_len": bench.output_len,
+        "points": {},
+    }
 
 
 # -------------------------------------------------------------------------------------
@@ -486,7 +531,7 @@ def wait_server_ready(port: int, timeout: float = 900.0) -> str:
     last_report = 0.0
     while time.time() < deadline:
         try:
-            with httpx.Client(timeout=5) as c:
+            with httpx.Client(timeout=5, trust_env=False) as c:
                 if c.get(f"{base}/v1/models").status_code == 200:
                     return base
         except Exception:  # noqa: BLE001 -- server not up yet
@@ -532,8 +577,9 @@ class _Progress:
 
 @dataclass(frozen=True)
 class StreamResult:
-    tics  : list[float]
-    output: str
+    tics                   : list[float]
+    output                 : str
+    nonempty_content_chunks: int = 0
 
 
 async def stream_messages(
@@ -543,6 +589,7 @@ async def stream_messages(
     messages  : list[dict[str, Any]],
     output_len: int,
     progress  : _Progress | None = None,
+    profile_tag: str | None = None,
 ) -> StreamResult:
     """Stream one chat-completions request and retain its assistant text.
 
@@ -562,9 +609,16 @@ async def stream_messages(
         "stream": True,
         "ignore_eos": True,
     }
+    headers = (
+        {"X-LogSSMs-Profile-Tag": profile_tag}
+        if profile_tag is not None else None
+    )
     tics = [time.perf_counter()]
     output = []
-    async with client.stream("POST", f"{base}/v1/chat/completions", json=payload) as resp:
+    nonempty_content_chunks = 0
+    async with client.stream(
+        "POST", f"{base}/v1/chat/completions", json=payload, headers=headers
+    ) as resp:
         resp.raise_for_status()
         async for line in resp.aiter_lines():
             if not line.startswith("data: "):
@@ -577,10 +631,15 @@ async def stream_messages(
             delta = chunk["choices"][0]["delta"]
             if content := delta.get("content"):
                 output.append(content)
+                nonempty_content_chunks += 1
             tics.append(time.perf_counter())
     if progress is not None:
         progress.tick()
-    return StreamResult(tics=tics, output="".join(output))
+    return StreamResult(
+        tics=tics,
+        output="".join(output),
+        nonempty_content_chunks=nonempty_content_chunks,
+    )
 
 
 async def stream_one(
@@ -625,6 +684,7 @@ async def _run_conversation(
                     request_messages,
                     output_len,
                     progress,
+                    profile_tag=f"{conversation.uid}/turn-{turn_index + 1}",
                 ),
                 timeout=request_timeout,
             )
@@ -649,6 +709,7 @@ async def run_multiturn_bench(
     warmup_conversation: BenchmarkConversation | None = None,
     pbar               : bool = True,
     request_timeout     : float | None = 300.0,
+    history_records     : list[dict[str, Any]] | None = None,
 ) -> dict:
     """Run closed-loop sessions with a bounded number of concurrent sessions."""
     import httpx
@@ -665,6 +726,7 @@ async def run_multiturn_bench(
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None),
         limits=httpx.Limits(max_connections=1024, max_keepalive_connections=128),
+        trust_env=False,
     )
     try:
         if warmup_conversation is not None:
@@ -752,6 +814,26 @@ async def run_multiturn_bench(
             mtp=mtp,
         )
         summary["turn_stats"].append({"turn": turn + 1, **turn_stats})
+    if history_records is not None:
+        for conversation, session in zip(conversations, completed_results, strict=True):
+            history_records.append({
+                "uid": conversation.uid,
+                "turns": [
+                    {
+                        "turn": turn + 1,
+                        "input_tokens": _chat_prompt_len(tokenizer, messages),
+                        "messages": messages,
+                        "response": result.output,
+                        "response_chars": len(result.output),
+                        "response_tokens": len(tokenizer.encode(
+                            result.output, add_special_tokens=False
+                        )),
+                        "content_chunks": max(len(result.tics) - 3, 0),
+                        "nonempty_content_chunks": result.nonempty_content_chunks,
+                    }
+                    for turn, (result, messages) in enumerate(session)
+                ],
+            })
     return summary
 
 
@@ -769,6 +851,7 @@ async def run_benchmark_point(
     mtp                : bool = False,
     warmup             : bool = True,
     pbar               : bool = True,
+    history_records    : list[dict[str, Any]] | None = None,
 ) -> tuple[dict, list[int]]:
     """Construct and execute one single- or multi-turn benchmark point."""
     if num_turns < 1:
@@ -796,6 +879,7 @@ async def run_benchmark_point(
             mtp=mtp,
             warmup_conversation=warmup_conversation,
             pbar=pbar,
+            history_records=history_records,
         )
         return stats, [round(stats["in_tokens"] / max(stats["n"], 1))]
 
@@ -819,6 +903,7 @@ async def run_benchmark_point(
         mtp=mtp,
         warmup_prompt=warmup_prompt,
         pbar=pbar,
+        history_records=history_records,
     )
     return stats, input_lengths
 
@@ -833,6 +918,7 @@ async def run_online_bench_tics(
     mtp: bool = False,
     warmup_prompt: str | None = None,
     pbar: bool = True,
+    history_records: list[dict[str, Any]] | None = None,
 ) -> tuple[dict, list[list[float]]]:
     """Drive the workload, returning (summary, per-request tics) for split reporting."""
     import httpx
@@ -841,6 +927,7 @@ async def run_online_bench_tics(
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None),
         limits=httpx.Limits(max_connections=1024, max_keepalive_connections=128),
+        trust_env=False,
     )
     try:
         if warmup_prompt is not None:
@@ -849,10 +936,41 @@ async def run_online_bench_tics(
                 client, base, model, warmup_prompt, min(8, output_lengths[0])
             )
         progress = _Progress(len(prompts), on=pbar and len(prompts) > 1)
-        tics_all = await asyncio.gather(*[
-            stream_one(client, base, model, p, o, progress)
-            for p, o in zip(prompts, output_lengths, strict=True)
-        ])
+        if history_records is None:
+            tics_all = await asyncio.gather(*[
+                stream_one(client, base, model, p, o, progress)
+                for p, o in zip(prompts, output_lengths, strict=True)
+            ])
+        else:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(model)
+            responses = await asyncio.gather(*[
+                stream_messages(
+                    client, base, model, [{"role": "user", "content": prompt}],
+                    output_len, progress,
+                )
+                for prompt, output_len in zip(prompts, output_lengths, strict=True)
+            ])
+            tics_all = [response.tics for response in responses]
+            for index, (prompt, response) in enumerate(zip(prompts, responses, strict=True)):
+                history_records.append({
+                    "uid": f"request-{index}",
+                    "turns": [{
+                        "turn": 1,
+                        "input_tokens": _chat_prompt_len(
+                            tokenizer, [{"role": "user", "content": prompt}]
+                        ),
+                        "messages": [{"role": "user", "content": prompt}],
+                        "response": response.output,
+                        "response_chars": len(response.output),
+                        "response_tokens": len(tokenizer.encode(
+                            response.output, add_special_tokens=False
+                        )),
+                        "content_chunks": max(len(response.tics) - 3, 0),
+                        "nonempty_content_chunks": response.nonempty_content_chunks,
+                    }],
+                })
     finally:
         await client.aclose()
     if progress.on:
@@ -870,10 +988,12 @@ async def run_online_bench(
     mtp: bool = False,
     warmup_prompt: str | None = None,
     pbar: bool = True,
+    history_records: list[dict[str, Any]] | None = None,
 ) -> dict:
     summary, _ = await run_online_bench_tics(
         base, model, prompts, input_lengths, output_lengths,
         mtp=mtp, warmup_prompt=warmup_prompt, pbar=pbar,
+        history_records=history_records,
     )
     return summary
 

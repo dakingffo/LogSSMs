@@ -25,7 +25,7 @@ def test_insert_match_and_collect_path_values():
     entries = (
         LogStateEntry(0, LogStateKind.LOG, 0, 4),
         LogStateEntry(1, LogStateKind.LOG, 4, 8),
-        LogStateEntry(2, LogStateKind.CHECKPOINT, 0, 12),
+        LogStateEntry(2, LogStateKind.CHECKPOINT, 0, 12, span_pages=3),
     )
 
     result = tree.insert(token_ids, kv, entries)
@@ -46,7 +46,7 @@ def test_split_uses_entry_end_as_ownership_boundary():
     entries = (
         LogStateEntry(0, LogStateKind.LOG, 0, 4),
         LogStateEntry(1, LogStateKind.LOG, 4, 8),
-        LogStateEntry(2, LogStateKind.CHECKPOINT, 0, 12),
+        LogStateEntry(2, LogStateKind.CHECKPOINT, 0, 12, span_pages=3),
     )
     leaf = tree.insert(token_ids, ids(12, 100), entries).node
 
@@ -98,7 +98,7 @@ def test_evict_returns_kv_and_linear_slots_without_freeing_them():
     tree.insert(
         right,
         ids(8, 200),
-        (LogStateEntry(4, LogStateKind.CHECKPOINT, 0, 8),),
+        (LogStateEntry(4, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),),
     )
 
     evicted = tree.evict(4)
@@ -130,6 +130,22 @@ def test_new_tail_smaller_than_one_physical_page_is_not_admitted():
     tree.check_integrity()
 
 
+def test_kv_reclamation_requires_the_entire_physical_frame_to_be_evictable():
+    tree = make_tree()
+    token_ids = ids(8)
+    kv = ids(8, 100)
+    leaf = tree.insert(token_ids, kv).node
+    cached_page_tokens = {100: 4, 104: 4}
+    assert tree.evictable_kv_frames(cached_page_tokens) == 2
+
+    branch = tree.split_at(leaf, 2)
+    tree.lock(branch)
+    assert tree.evictable_kv_frames(cached_page_tokens) == 1
+    tree.lock(branch, unlock=True)
+    assert tree.evictable_kv_frames(cached_page_tokens) == 2
+    tree.check_integrity()
+
+
 def test_zero_state_admission_returns_root_after_existing_kv_match():
     tree = make_tree()
     history = ids(8)
@@ -151,4 +167,30 @@ def test_zero_state_admission_returns_root_after_existing_kv_match():
     assert result.previous_len == 6
     assert result.inserted_len == 0
     assert result.node.is_root()
+    tree.check_integrity()
+
+
+def test_recovery_inside_log_page_stops_at_matched_granule():
+    tree = LogRadixTree(64, torch.device("cpu"), granularity=16)
+    history = ids(64)
+    tree.insert(
+        history,
+        ids(64, 100),
+        (LogStateEntry(7, LogStateKind.LOG, 0, 64),),
+    )
+
+    for matched_len in (16, 32, 48, 64):
+        request = torch.cat([history[:matched_len], ids(16, 1000)])
+        handle = tree.match_prefix(request).cuda_handle
+
+        assert handle.cached_len == matched_len
+        assert handle.recovery.position == matched_len
+        assert handle.recovery.logs[0].begin == 0
+        assert handle.recovery.logs[-1].end == matched_len
+        assert all(entry.slot == 7 and entry.physical_begin == 0
+                   for entry in handle.recovery.logs)
+        assert all(left.end == right.begin for left, right in zip(
+            handle.recovery.logs, handle.recovery.logs[1:]
+        ))
+        assert handle.recovery.conv_granule == matched_len // 16 - 1
     tree.check_integrity()

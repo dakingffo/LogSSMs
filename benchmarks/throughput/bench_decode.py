@@ -29,6 +29,7 @@ from bench_common import (
     make_conversations,
     parse_full,
     parse_int_list,
+    prepare_history,
     print_conc_summary,
     print_stats,
     resolve_port,
@@ -61,6 +62,7 @@ def main() -> int:
     if any(concurrency < 1 for concurrency in concurrencies):
         raise ValueError("all concurrency values must be positive")
     port = resolve_port(server_argv, server_args)
+    history_path, history = prepare_history("bench_decode", server_args, bench)
     rows = []
     results: dict[str, dict] = {}
 
@@ -90,6 +92,7 @@ def main() -> int:
         )
 
         for c in concurrencies:
+            history_records = [] if history is not None else None
             proc = launch_server(
                 server_argv,
                 port=port,
@@ -108,6 +111,7 @@ def main() -> int:
                         warmup_conversation=warmup_conversation,
                         pbar=not bench.no_pbar,
                         request_timeout=bench.request_timeout,
+                        history_records=history_records,
                     )
                 )
             finally:
@@ -125,6 +129,12 @@ def main() -> int:
             rows.append((c, stats))
             results[str(c)] = stats
             save_json(bench.out, results)
+            if history is not None:
+                history["points"][str(c)] = {
+                    "concurrency": c,
+                    "sessions": history_records,
+                }
+                save_json(history_path, history)
     else:
         if bench.num_sessions is not None:
             raise ValueError("--num-sessions requires --num-turns greater than one")
@@ -135,6 +145,7 @@ def main() -> int:
         try:
             base = wait_server_ready(port)
             for point_idx, c in enumerate(concurrencies):
+                history_records = [] if history is not None else None
                 stats, in_lens = asyncio.run(
                     run_benchmark_point(
                         base,
@@ -148,6 +159,7 @@ def main() -> int:
                         dataset_categories=bench.dataset_category,
                         warmup=not bench.no_warmup,
                         pbar=not bench.no_pbar,
+                        history_records=history_records,
                     )
                 )
                 assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
@@ -161,6 +173,12 @@ def main() -> int:
                 rows.append((c, stats))
                 results[str(c)] = stats
                 save_json(bench.out, results)
+                if history is not None:
+                    history["points"][str(c)] = {
+                        "concurrency": c,
+                        "sessions": history_records,
+                    }
+                    save_json(history_path, history)
         finally:
             kill_server(proc)
 

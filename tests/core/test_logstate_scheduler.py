@@ -30,7 +30,7 @@ def make_history() -> tuple[LogRadixTree, torch.Tensor]:
     input_ids = ids(256)
     entries = (
         LogStateEntry(
-            0, LogStateKind.CHECKPOINT, 0, 64, merge_level=0
+            0, LogStateKind.CHECKPOINT, 0, 64, span_pages=1
         ),
         LogStateEntry(1, LogStateKind.LOG, 64, 128),
         LogStateEntry(2, LogStateKind.LOG, 128, 192),
@@ -74,7 +74,9 @@ def test_branch_at_checkpoint_uses_checkpoint_and_blocks_crossing_coalesce():
     plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(
         tree, [request]
     )
-    assert plan.protections == ()
+    assert len(plan.protections) == 1
+    assert plan.protections[0].node is not None
+    assert plan.protections[0].node.depth == 64
     assert plan.restores == ()
     assert not any(
         task.begin < 64 < task.end for task in plan.coalesce
@@ -100,13 +102,13 @@ def test_adjacent_page_checkpoints_coalesce_one_level_per_round():
     tree.attach_entry(
         leaf,
         LogStateEntry(
-            4, LogStateKind.CHECKPOINT, 128, 192, merge_level=0
+            4, LogStateKind.CHECKPOINT, 128, 192, span_pages=1
         ),
     )
     tree.attach_entry(
         leaf,
         LogStateEntry(
-            5, LogStateKind.CHECKPOINT, 192, 256, merge_level=0
+            5, LogStateKind.CHECKPOINT, 192, 256, span_pages=1
         ),
     )
 
@@ -118,7 +120,7 @@ def test_adjacent_page_checkpoints_coalesce_one_level_per_round():
         if (task.left_slot, task.right_slot) == (4, 5)
     )
     assert (task.left_slot, task.right_slot) == (4, 5)
-    assert (task.begin, task.end, task.next_level) == (128, 256, 1)
+    assert (task.begin, task.end, task.next_span) == (128, 256, 2)
 
 
 def test_materialized_checkpoints_coalesce_in_the_same_round():
@@ -129,9 +131,83 @@ def test_materialized_checkpoints_coalesce_in_the_same_round():
 
     assert {task.log_slot for task in plan.materialize} == {1, 2, 3}
     assert {
-        (task.left_slot, task.right_slot, task.next_level)
+        (task.left_slot, task.right_slot, task.next_span)
         for task in plan.coalesce
-    } == {(0, 1, 1), (2, 3, 1)}
+    } == {(0, 1, 2), (2, 3, 2)}
+
+
+def test_internal_match_endpoint_plans_merges_only_on_the_hit_path():
+    tree = LogRadixTree(
+        PAGE_SIZE, torch.device("cpu"), granularity=GRANULARITY
+    )
+    shared = ids(4 * PAGE_SIZE)
+    first = torch.cat([shared, ids(PAGE_SIZE, 10_000)])
+    second = torch.cat([shared, ids(PAGE_SIZE, 20_000)])
+    entries = tuple(
+        LogStateEntry(
+            slot,
+            LogStateKind.CHECKPOINT,
+            slot * PAGE_SIZE,
+            (slot + 1) * PAGE_SIZE,
+            span_pages=1,
+        )
+        for slot in range(5)
+    )
+    tree.insert(first, ids(len(first), 1000), entries)
+    tree.insert(second, ids(len(second), 2000))
+    endpoint = tree.trace(shared)
+    assert endpoint.matched_len == len(shared)
+    assert not endpoint.node.is_leaf()
+
+    plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(
+        tree, [shared], collect_diagnostics=True
+    )
+
+    assert tuple(task.slots for task in plan.coalesce) == ((0, 1), (2, 3))
+    diagnostics = dict(plan.merge_diagnostics)
+    assert diagnostics["internal_endpoints"] == 1
+    assert diagnostics["merge_anchors"] == 1
+    assert diagnostics["planned_groups"] == 2
+    assert diagnostics["planned_slot_releases"] == 2
+    assert diagnostics["entries_beyond_match_endpoint"] == 0
+    assert 4 not in {
+        slot for task in plan.coalesce for slot in task.slots
+    }
+
+
+def test_adaptive_internal_endpoint_merges_without_an_owner():
+    tree, leaf = make_checkpoint_history(4)
+    leaf.merge_stats = LogStateMergeStats(origin=0, tail=256, intensity=4)
+    shared = ids(128)
+    branch = torch.cat([shared, ids(128, 10_000)])
+    tree.insert(branch, ids(256, 20_000))
+    endpoint = tree.trace(shared)
+    assert not endpoint.node.is_leaf()
+    assert endpoint.node.merge_stats is None
+
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY, enable_merge_adjustment=True
+    )
+    plan = scheduler.analyze(tree, [shared])
+
+    assert tuple(task.slots for task in plan.coalesce) == ((0, 1),)
+
+
+def test_checkpoint_branch_remains_protected_in_later_batch():
+    tree, _leaf = make_checkpoint_history(2)
+    history = ids(2 * PAGE_SIZE)
+    branch = torch.cat([history[:PAGE_SIZE], ids(PAGE_SIZE, 10_000)])
+    tree.match_prefix(branch)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    first = scheduler.analyze(tree, [branch])
+    assert len(first.protections) == 1
+    assert first.protections[0].node is not None
+    tree.protect(first.protections[0].node)
+    tree.insert(branch, ids(2 * PAGE_SIZE, 20_000))
+
+    later = scheduler.analyze(tree, [history])
+
+    assert not any(task.begin < PAGE_SIZE < task.end for task in later.coalesce)
 
 
 def test_analysis_only_maintains_chains_touched_by_prefill_batch():
@@ -204,17 +280,17 @@ def test_branch_between_checkpoints_blocks_coalesce_without_covering_log():
         ids(128, 1000),
         (
             LogStateEntry(
-                0, LogStateKind.CHECKPOINT, 0, 64, merge_level=0
+                0, LogStateKind.CHECKPOINT, 0, 64, span_pages=1
             ),
             LogStateEntry(
-                1, LogStateKind.CHECKPOINT, 64, 128, merge_level=0
+                1, LogStateKind.CHECKPOINT, 64, 128, span_pages=1
             ),
         ),
     )
     request = torch.cat([history[:96], ids(32, 1000)])
 
     plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(
-        tree, [request]
+        tree, [request], collect_diagnostics=True
     )
 
     assert len(plan.protections) == 0
@@ -223,6 +299,10 @@ def test_branch_between_checkpoints_blocks_coalesce_without_covering_log():
     assert plan.restores[0].replay_end == 64
     assert plan.restores[0].mode is WorkStateRestoreMode.PREFILL
     assert len(plan.coalesce) == 0
+    diagnostics = dict(plan.merge_diagnostics)
+    assert diagnostics["entries_beyond_match_endpoint"] == 1
+    assert diagnostics["segments_without_merge_pair"] == 1
+    assert diagnostics["planned_groups"] == 0
 
 
 def test_new_log_pages_are_not_touched_in_their_birth_round():
@@ -247,7 +327,7 @@ def test_partial_physical_log_page_is_replay_only():
         ids(80, 1000),
         (
             LogStateEntry(
-                0, LogStateKind.CHECKPOINT, 0, 64, merge_level=0
+                0, LogStateKind.CHECKPOINT, 0, 64, span_pages=1
             ),
             LogStateEntry(
                 1,
@@ -283,7 +363,7 @@ def make_checkpoint_history(
                 LogStateKind.CHECKPOINT,
                 slot * PAGE_SIZE,
                 (slot + 1) * PAGE_SIZE,
-                merge_level=0,
+                span_pages=1,
             )
             for slot in range(count)
         ),
@@ -316,6 +396,29 @@ def test_adaptive_merge_uses_intensity_as_a_maximum_group_size():
         assert tuple(task.slots for task in plan.coalesce) == groups
 
 
+def test_adaptive_merge_keeps_different_physical_spans_distinct():
+    tree, leaf = make_checkpoint_history(10)
+    for slot in range(10):
+        tree.detach_entry(slot)
+    tree.attach_entry(
+        leaf, LogStateEntry(
+            10, LogStateKind.CHECKPOINT, 0, 8 * PAGE_SIZE, span_pages=8
+        )
+    )
+    tree.attach_entry(
+        leaf, LogStateEntry(
+            11, LogStateKind.CHECKPOINT,
+            8 * PAGE_SIZE, 10 * PAGE_SIZE, span_pages=2,
+        )
+    )
+    leaf.merge_stats = LogStateMergeStats(0, 10 * PAGE_SIZE, intensity=8)
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY, enable_merge_adjustment=True
+    )
+
+    assert scheduler.analyze(tree, [ids(10 * PAGE_SIZE)]).coalesce == ()
+
+
 def test_adaptive_merge_only_changes_its_owned_chain_suffix():
     tree, leaf = make_checkpoint_history(8)
     leaf.merge_stats = LogStateMergeStats(
@@ -335,35 +438,35 @@ def test_adaptive_merge_only_changes_its_owned_chain_suffix():
 
 
 def test_adaptive_merge_absorbs_older_lower_level_checkpoint():
-    tree, leaf = make_checkpoint_history(3)
-    for slot in range(3):
+    tree, leaf = make_checkpoint_history(6)
+    for slot in range(6):
         tree.detach_entry(slot)
     tree.attach_entry(
         leaf,
-        LogStateEntry(3, LogStateKind.CHECKPOINT, 0, 64, merge_level=1),
+        LogStateEntry(6, LogStateKind.CHECKPOINT, 0, 64, span_pages=1),
     )
     tree.attach_entry(
         leaf,
-        LogStateEntry(4, LogStateKind.CHECKPOINT, 64, 128, merge_level=2),
+        LogStateEntry(7, LogStateKind.CHECKPOINT, 64, 192, span_pages=2),
     )
     tree.attach_entry(
         leaf,
-        LogStateEntry(5, LogStateKind.CHECKPOINT, 128, 192, merge_level=3),
+        LogStateEntry(8, LogStateKind.CHECKPOINT, 192, 384, span_pages=3),
     )
-    leaf.merge_stats = LogStateMergeStats(0, 192, intensity=8)
+    leaf.merge_stats = LogStateMergeStats(0, 384, intensity=8)
     scheduler = OnlineAnalysisScheduler(
         PAGE_SIZE,
         GRANULARITY,
         enable_merge_adjustment=True,
     )
 
-    plan = scheduler.analyze(tree, [ids(3 * PAGE_SIZE)])
+    plan = scheduler.analyze(tree, [ids(6 * PAGE_SIZE)])
 
-    assert tuple(task.slots for task in plan.coalesce) == ((3, 4),)
-    assert plan.coalesce[0].next_level == 2
+    assert tuple(task.slots for task in plan.coalesce) == ((6, 7),)
+    assert plan.coalesce[0].next_span == 3
 
 
-def test_merge_sampling_evicts_old_hits_regardless_of_queue_order():
+def test_merge_sampling_retires_completed_interval_hits():
     scheduler = OnlineAnalysisScheduler(
         PAGE_SIZE,
         GRANULARITY,
@@ -372,13 +475,13 @@ def test_merge_sampling_evicts_old_hits_regardless_of_queue_order():
     )
     stats = LogStateMergeStats(
         origin=0,
-        tail=1024,
+        tail=1023,
         hit_positions=deque((900, 100, 700)),
     )
 
-    scheduler.advance_merge_stats(stats, 1200)
+    scheduler.advance_merge_stats(stats, 1024)
 
-    assert tuple(stats.hit_positions) == (900, 700)
+    assert tuple(stats.hit_positions) == ()
 
 
 def test_merge_sampling_fits_log_log_slope_and_floors_intensity():
@@ -396,23 +499,23 @@ def test_merge_sampling_fits_log_log_slope_and_floors_intensity():
         hits.extend([tail - distance] * count)
     stats = LogStateMergeStats(
         origin=0,
-        tail=tail,
+        tail=tail - 1,
         hit_positions=deque(hits),
     )
 
-    scheduler.record_hit(stats, tail)
+    scheduler.advance_merge_stats(stats, tail)
 
     assert stats.intensity == 3
 
 
-def test_merge_sampling_increases_intensity_when_no_fit_is_available():
+def test_merge_sampling_multiplies_once_per_completed_interval():
     scheduler = OnlineAnalysisScheduler(
         PAGE_SIZE,
         GRANULARITY,
         enable_merge_adjustment=True,
         min_sampling_len=128,
         max_merge_intensity=5,
-        base_intensity_increment=2,
+        default_merge_growth_rate=2,
     )
     stats = LogStateMergeStats(origin=0, tail=0)
 
@@ -421,4 +524,25 @@ def test_merge_sampling_increases_intensity_when_no_fit_is_available():
     scheduler.advance_merge_stats(stats, 128)
     assert stats.intensity == 4
     scheduler.advance_merge_stats(stats, 192)
+    assert stats.intensity == 4
+    scheduler.advance_merge_stats(stats, 256)
     assert stats.intensity == 5
+
+
+def test_merge_sampling_uses_complete_nonoverlapping_token_intervals():
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY,
+        enable_merge_adjustment=True,
+        min_sampling_len=1024,
+        default_merge_growth_rate=2,
+    )
+    stats = scheduler.make_merge_stats(0)
+    assert stats is not None
+    scheduler.advance_merge_stats(stats, 1023)
+    assert stats.intensity == 2
+    scheduler.advance_merge_stats(stats, 1024)
+    assert stats.intensity == 4
+    scheduler.advance_merge_stats(stats, 1536)
+    assert stats.intensity == 4
+    scheduler.advance_merge_stats(stats, 2048)
+    assert stats.intensity == 8

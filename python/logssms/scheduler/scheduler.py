@@ -84,8 +84,9 @@ class Scheduler(SchedulerIOMixin):
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool, config.page_size)
         self.prefill_budget = config.max_prefill_tokens
-        self.profiler = SchedulerProfiler(self.device)
+        self.profiler = SchedulerProfiler(self.device, self.cache_manager)
         self._last_stall_report = 0.0
+        self._deferred_req_frees: list[tuple[ForwardOutput, Request, bool]] = []
 
     def run_when_idle(self) -> None:
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
@@ -99,7 +100,7 @@ class Scheduler(SchedulerIOMixin):
             or self.ar_manager.runnable
         )
         for msg in self.receive_msg(blocking=blocking):
-            self._process_one_msg(msg)
+            self._process_one_msg(msg, last_data)
 
         forward_input = self._schedule_next_batch(
             has_inflight=last_data is not None
@@ -114,7 +115,7 @@ class Scheduler(SchedulerIOMixin):
                     if not batch.is_prefill:
                         self.ar_manager.advance_for_overlap(batch)
 
-        self._process_last_data(last_data)
+        self._process_last_data(last_data, ongoing_data)
         return ongoing_data
 
     @torch.inference_mode()
@@ -132,7 +133,11 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
-    def _process_last_data(self, last_data: ForwardData | None) -> None:
+    def _process_last_data(
+        self,
+        last_data   : ForwardData | None,
+        ongoing_data: ForwardData | None = None,
+    ) -> None:
         if last_data is None:
             return
         last_input, last_output = last_data
@@ -145,12 +150,31 @@ class Scheduler(SchedulerIOMixin):
             )
             self.send_result(reply)
             for req in finished_reqs:
-                self._free_req_resources(req)
+                if ongoing_data is not None and any(
+                    candidate is req for candidate in ongoing_data[0].batch.reqs
+                ):
+                    # The next forward was submitted before this result was
+                    # processed. Its graph can still access this request's frames.
+                    self._deferred_req_frees.append((ongoing_data[1], req, False))
+                else:
+                    self._free_req_resources(req)
 
-    def _process_one_msg(self, msg: BaseBackendMsg) -> None:
+            remaining = []
+            for output, req, inflight in self._deferred_req_frees:
+                if output is last_output:
+                    self._free_req_resources(req, inflight)
+                else:
+                    remaining.append((output, req, inflight))
+            self._deferred_req_frees = remaining
+
+    def _process_one_msg(
+        self,
+        msg      : BaseBackendMsg,
+        last_data: ForwardData | None = None,
+    ) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
-                self._process_one_msg(msg)
+                self._process_one_msg(msg, last_data)
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
@@ -172,11 +196,30 @@ class Scheduler(SchedulerIOMixin):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req: Request
             inflight: bool
+            submitted_req = None
+            if last_data is not None:
+                submitted_req = next(
+                    (
+                        candidate for candidate in last_data[0].batch.reqs
+                        if candidate.uid == msg.uid and not candidate.aborted
+                    ),
+                    None,
+                )
             req, inflight = self.prefill_manager.abort_req(msg.uid)
             if req is None:
                 req, inflight = self.ar_manager.abort_req(msg.uid)
+            if req is None and submitted_req is not None:
+                req, inflight = submitted_req, True
             if req is not None:
-                self._free_req_resources(req, inflight)
+                if submitted_req is not None:
+                    assert last_data is not None
+                    assert submitted_req.table_idx == req.table_idx
+                    submitted_req.aborted = True
+                    # The result is discarded, but the submitted forward can
+                    # still read or write these slots until its event completes.
+                    self._deferred_req_frees.append((last_data[1], req, True))
+                else:
+                    self._free_req_resources(req, inflight)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -192,6 +235,19 @@ class Scheduler(SchedulerIOMixin):
         *,
         has_inflight: bool = False,
     ) -> ForwardInput | None:
+        if self.profiler.enabled:
+            pending = self.prefill_manager.pending_list
+            now_ns = time.perf_counter_ns()
+            self.cache_manager.record_prefill_queue(
+                len(pending),
+                max(
+                    ((now_ns - req.queued_at_ns) / 1e6 for req in pending),
+                    default=0.0,
+                ),
+            )
+            self.cache_manager.record_active_requests(
+                tuple(self.ar_manager.running_reqs.values())
+            )
         adder = PrefillAdder(
             token_budget=self.prefill_budget,
             reserved_size=(

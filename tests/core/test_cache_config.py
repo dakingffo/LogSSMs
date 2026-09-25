@@ -23,7 +23,7 @@ def test_logstate_arguments_build_algorithm_specific_config() -> None:
         "--enable-merge-adjustment",
         "--min-sampling-len", "512",
         "--max-merge-intensity", "12",
-        "--base-intensity-increment", "3",
+        "--default-merge-growth-rate", "3",
     ]))
 
     config = parser.make_config(kwargs)
@@ -32,7 +32,7 @@ def test_logstate_arguments_build_algorithm_specific_config() -> None:
         enable_merge_adjustment=True,
         min_sampling_len=512,
         max_merge_intensity=12,
-        base_intensity_increment=3,
+        default_merge_growth_rate=3,
     )
     assert config.page_size == 64
     assert kwargs == {}

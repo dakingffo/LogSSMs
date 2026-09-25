@@ -35,6 +35,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     uid            : int
     text           : str | list[dict[str, str]]
     sampling_params: SamplingParams
+    profile_tag    : str | None = None
 
 
 @dataclass

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from logssms.tvm import call_cuda_ffi
+
 if TYPE_CHECKING:
     from logssms.distributed import DistributedInfo
 
@@ -40,7 +42,7 @@ class PyNCCLDistributedImpl(DistributedImpl):
     comm: NCCLWrapper
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        self.comm.all_reduce(x, "sum")
+        call_cuda_ffi(self.comm.all_reduce, x, "sum")
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
@@ -50,7 +52,7 @@ class PyNCCLDistributedImpl(DistributedImpl):
         output_shape = list(x.shape)
         output_shape[0] *= world_size
         result = x.new_empty(output_shape)
-        self.comm.all_gather(result, x)
+        call_cuda_ffi(self.comm.all_gather, result, x)
         return result
 
 

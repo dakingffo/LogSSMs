@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
-from logssms.tvm import load_jit, make_cpp_args
+from logssms.tvm import call_cuda_ffi, load_jit, make_cpp_args
 
 from .utils import KernelConfig
 
@@ -55,5 +55,5 @@ def indexing(
             1
         )
     )
-    module.launch(weights, indices, output, vocab_range)
+    call_cuda_ffi(module.launch, weights, indices, output, vocab_range)
     return output

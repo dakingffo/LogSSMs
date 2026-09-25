@@ -3,13 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Dict, List, Literal
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from logssms.core import Batch, get_global_ctx
 from logssms.distributed import get_tp_info
 from logssms.env import ENV
-from logssms.utils import div_even, init_logger, nvtx_annotate
+from logssms.utils import div_ceil, div_even, init_logger, nvtx_annotate
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -54,7 +54,7 @@ class FIMetadata(BaseAttnMetadata):
     num_qo_heads:       int
     num_kv_heads:       int
     head_dim:           int
-    page_size:          Literal[1] # currently only support page_size=1
+    page_size:          int
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
@@ -63,7 +63,7 @@ class FIMetadata(BaseAttnMetadata):
     # fmt: on
 
     def __post_init__(self) -> None:
-        assert self.page_size == 1, "Currently only page_size=1 is supported."
+        assert self.page_size > 0
         assert (
             self.cu_seqlens_k_cpu.is_cpu
             and self.cu_seqlens_q_cpu.is_cpu
@@ -177,15 +177,16 @@ class FlashInferBackend(BaseAttnBackend):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
-        def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
-            return cache.view(-1, 1, cache.shape[2], cache.shape[3])
-
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
-        kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
+        if metadata.page_size == 1:
+            kv_cache = tuple(
+                cache.view(-1, 1, cache.shape[2], cache.shape[3])
+                for cache in kv_cache
+            )
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     @nvtx_annotate("FlashInfer::metadata")
@@ -210,16 +211,35 @@ class FlashInferBackend(BaseAttnBackend):
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
         page_table = get_global_ctx().page_table
+        page_size = getattr(self.kvcache, "kv_page_size", 1)
+        if page_size == 1:
+            indices = torch.cat([
+                page_table[req.table_idx, :req.device_len] for req in reqs
+            ])
+            last_page_len = self._get_ones_cpu(padded_size)
+        else:
+            kv_lengths = [div_ceil(length, page_size) for length in seqlens_k]
+            cu_seqlens_k_cpu = torch.tensor(
+                [0] + kv_lengths, **CPU_KWARGS
+            ).cumsum_(dim=0)
+            indices = torch.cat([
+                page_table[req.table_idx, :req.device_len:page_size] // page_size
+                for req in reqs
+            ])
+            last_page_len = torch.tensor(
+                [(length - 1) % page_size + 1 for length in seqlens_k],
+                **CPU_KWARGS,
+            )
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
-            last_page_len_cpu=self._get_ones_cpu(padded_size),
+            indices=indices,
+            last_page_len_cpu=last_page_len,
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
             head_dim=self.config.head_dim,
-            page_size=1,
+            page_size=page_size,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,

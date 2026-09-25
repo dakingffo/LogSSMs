@@ -271,7 +271,6 @@ class Engine:
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
-
         if batch.is_verify:
             next_tokens_gpu = self.sampler.reject_sample(logits, batch).to(torch.int32)
         else: # prefill / decode
@@ -338,7 +337,12 @@ class Engine:
             assert isinstance(config.cache_config, StandardCacheConfig)
             override("cache_config", replace(config.cache_config, page_size=value))
 
-        if config.attention_backend == "auto":
+        if config.cache_type == "logstate":
+            assert config.attention_backend in ("auto", "fi"), (
+                "LogState shared KV storage currently requires FlashInfer attention."
+            )
+            override("attention_backend", "fi")
+        elif config.attention_backend == "auto":
             backend = "trtllm" if is_sm100_supported() else "fa,fi" if is_sm90_supported() else "fi"
             override("attention_backend", backend)
             logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")

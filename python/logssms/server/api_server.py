@@ -270,6 +270,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
                 top_k=req.top_k,
                 top_p=req.top_p,
             ),
+            profile_tag=request.headers.get("x-logssms-profile-tag"),
         )
     )
 

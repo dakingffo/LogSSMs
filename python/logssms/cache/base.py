@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+import os
+from time import perf_counter_ns
+from typing import TYPE_CHECKING, Sequence, TypeAlias
 
 import torch
 
 from logssms.core import Request
 
 from .kv_pool.base import BaseKVCachePool
-from .linear_pool.logstate_pool import LogStatePool
+from .logstate_pool.frame_pool import FramedMHALogStatePool
 from .linear_pool.state_pool import LinearStatePool
 from .prefix_cache.base import BaseCacheHandle, BasePrefixCache, MatchResult
 
@@ -18,12 +20,12 @@ if TYPE_CHECKING:
     from logssms.scheduler.prefill import PendingRequest
 
 
-LinearCachePool: TypeAlias = LinearStatePool | LogStatePool
+LinearCachePool: TypeAlias = LinearStatePool | FramedMHALogStatePool
 
 
 @dataclass
 class CacheResources:
-    kv_pool         : BaseKVCachePool
+    kv_pool         : BaseKVCachePool | FramedMHALogStatePool
     page_table      : torch.Tensor
     linear_state    : LinearCachePool | None
     state_table     : torch.Tensor | None
@@ -52,6 +54,11 @@ class BaseCacheManager(ABC):
                 device=self.device, type=prefix_cache_type
             )
         self.prefix_cache = prefix_cache
+        self._match_profile_enabled = os.getenv(
+            "LOGSSMS_PROFILE_SCHEDULER", "0"
+        ).lower() in ("1", "true", "yes")
+        self._match_profile_samples: list[dict] = []
+        self._profile_session_tokens: dict[str, torch.Tensor] = {}
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -85,7 +92,12 @@ class BaseCacheManager(ABC):
     def unlock(self, handle: BaseCacheHandle) -> None:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
-    def prefill_acquire(self, total_len: int, handle: BaseCacheHandle) -> bool:
+    def prefill_acquire(
+        self,
+        total_len  : int,
+        handle     : BaseCacheHandle,
+        request_len: int | None = None,
+    ) -> bool:
         if total_len > self.available_size:
             return False
         self.lock(handle)
@@ -97,6 +109,101 @@ class BaseCacheManager(ABC):
     def prepare_batch(self, batch: Batch) -> None:
         """Prepare cache-specific work after allocation and before model metadata."""
         return None
+
+    def record_prefill_queue(
+        self,
+        pending_count : int,
+        oldest_wait_ms: float,
+    ) -> None:
+        return None
+
+    def record_prefill_wait(self, wait_ms: float) -> None:
+        return None
+
+    def record_match_profile(
+        self,
+        req: PendingRequest,
+        match: MatchResult,
+        *,
+        input_len: int,
+    ) -> None:
+        if not self._match_profile_enabled:
+            return
+        handle = match.cuda_handle
+        tree_match_len = (
+            handle.cached_len
+            if match.tree_match_len is None else match.tree_match_len
+        )
+        recoverable_len = (
+            handle.cached_len
+            if match.recoverable_len is None else match.recoverable_len
+        )
+        tag = req.profile_tag or f"uid:{req.uid}"
+        session_key = tag.partition("/turn-")[0] if "/turn-" in tag else None
+        previous_tokens = (
+            self._profile_session_tokens.get(session_key)
+            if session_key is not None else None
+        )
+        session_lcp_len = 0
+        if previous_tokens is not None:
+            compare_len = min(len(previous_tokens), req.input_len)
+            different = torch.nonzero(
+                previous_tokens[:compare_len] != req.input_ids[:compare_len]
+            )
+            session_lcp_len = (
+                compare_len if len(different) == 0 else int(different[0, 0])
+            )
+        session_expected_hit = min(session_lcp_len, max(0, input_len - 1))
+        match_granularity = getattr(self, "granularity", self.page_size)
+        session_aligned_expected_hit = (
+            session_expected_hit // match_granularity * match_granularity
+        )
+        self._match_profile_samples.append({
+            "tag": tag,
+            "input_len": input_len,
+            # match_req intentionally excludes the final prompt token.
+            "matchable_len": max(0, input_len - 1),
+            "tree_match_len": tree_match_len,
+            "recoverable_len": recoverable_len,
+            "admitted_cached_len": handle.cached_len,
+            "state_recovery_gap": max(0, tree_match_len - recoverable_len),
+            "unmatched_suffix_len": max(0, input_len - 1 - tree_match_len),
+            "session_previous_cached_len": (
+                len(previous_tokens) if previous_tokens is not None else 0
+            ),
+            "session_prefix_lcp_len": session_lcp_len,
+            "session_expected_hit_len": session_expected_hit,
+            "session_aligned_expected_hit_len": session_aligned_expected_hit,
+            "session_cache_miss_len": max(
+                0, session_aligned_expected_hit - tree_match_len
+            ),
+            "admission_wait_ms": (
+                perf_counter_ns() - req.queued_at_ns
+            ) / 1e6,
+        })
+
+    def record_cached_session(self, req: Request, cached_len: int) -> None:
+        if not self._match_profile_enabled or not req.profile_tag:
+            return
+        session_key, separator, _turn = req.profile_tag.partition("/turn-")
+        if separator:
+            self._profile_session_tokens[session_key] = (
+                req.input_ids[:cached_len].clone()
+            )
+
+    def record_active_requests(self, reqs: Sequence[Request]) -> None:
+        return None
+
+    def poll_profile(self) -> None:
+        return None
+
+    def profile_result(self) -> dict | None:
+        if not self._match_profile_enabled:
+            return None
+        return {
+            "type": type(self).__name__,
+            "match_samples": self._match_profile_samples,
+        }
 
     @property
     @abstractmethod

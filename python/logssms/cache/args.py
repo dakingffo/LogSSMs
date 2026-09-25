@@ -73,10 +73,10 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             help="Maximum fitted LogState merge intensity.",
         )
         parser.add_argument(
-            "--base-intensity-increment",
+            "--default-merge-growth-rate",
             type=int,
-            default=LogStateCacheConfig.base_intensity_increment,
-            help="Merge-intensity increment when hit density cannot be fitted.",
+            default=LogStateCacheConfig.default_merge_growth_rate,
+            help="Merge-intensity multiplier when hit density cannot be fitted.",
         )
 
     @staticmethod
@@ -86,7 +86,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
             min_sampling_len=kwargs.pop("min_sampling_len"),
             max_merge_intensity=kwargs.pop("max_merge_intensity"),
-            base_intensity_increment=kwargs.pop("base_intensity_increment"),
+            default_merge_growth_rate=kwargs.pop("default_merge_growth_rate"),
         )
 
 

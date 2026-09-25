@@ -23,6 +23,7 @@ from bench_common import (
     launch_server,
     parse_full,
     parse_int_list,
+    prepare_history,
     print_stats,
     resolve_port,
     run_benchmark_point,
@@ -41,6 +42,7 @@ def main() -> int:
         },
     )
     port = resolve_port(server_argv, server_args)
+    history_path, history = prepare_history("bench_prefill", server_args, bench)
     proc = launch_server(
         server_argv, port=port,
         enable_specualtive_decoding=False, num_spec_tokens=0,
@@ -51,6 +53,7 @@ def main() -> int:
         for point_idx, c in enumerate(
             parse_int_list(bench.num_concurrent_sessions, 32)
         ):
+            history_records = [] if history is not None else None
             stats, in_lens = asyncio.run(
                 run_benchmark_point(
                     base,
@@ -64,6 +67,7 @@ def main() -> int:
                     dataset_categories=bench.dataset_category,
                     warmup=not bench.no_warmup,
                     pbar=not bench.no_pbar,
+                    history_records=history_records,
                 )
             )
             assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
@@ -80,6 +84,12 @@ def main() -> int:
             )
             results[str(c)] = stats
             save_json(bench.out, results)
+            if history is not None:
+                history["points"][str(c)] = {
+                    "concurrency": c,
+                    "sessions": history_records,
+                }
+                save_json(history_path, history)
         return 0
     finally:
         kill_server(proc)

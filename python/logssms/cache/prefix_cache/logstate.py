@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import heapq
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
@@ -12,7 +12,7 @@ import torch
 
 from logssms.utils import align_down
 
-from ..linear_pool.logstate_pool import LOG_STATE_GRANULARITY
+from ..logstate_pool.layout import LOG_STATE_GRANULARITY
 from .base import BaseCacheHandle, BasePrefixCache, MatchResult, SizeInfo
 
 
@@ -32,10 +32,11 @@ class LogStateKind(Enum):
 
 @dataclass
 class LogStateMergeStats:
-    origin       : int
-    tail         : int
-    intensity    : int = 2
-    hit_positions: deque[int] = field(default_factory=deque)
+    origin          : int
+    tail            : int
+    intensity       : int = 2
+    hit_positions   : deque[int] = field(default_factory=deque)
+    next_update_tail: int | None = None
 
 
 @dataclass(frozen=True)
@@ -44,17 +45,19 @@ class LogStateEntry:
     kind         : LogStateKind
     begin        : int
     end          : int
-    merge_level  : int | None = None
+    span_pages   : int | None = None
     storage_begin: int | None = None
 
     def __post_init__(self) -> None:
         assert self.slot >= 0
         assert 0 <= self.begin < self.end
-        assert self.merge_level is None or self.merge_level >= 0
+        assert self.span_pages is None or self.span_pages > 0
         if self.kind is LogStateKind.LOG:
-            assert self.merge_level is None, "A log page has no checkpoint merge level."
+            assert self.span_pages is None, "A log page has no checkpoint span."
             storage_begin = self.physical_begin
             assert storage_begin <= self.begin < self.end
+        else:
+            assert self.span_pages is not None, "A checkpoint needs an exact page span."
 
     @property
     def physical_begin(self) -> int:
@@ -90,6 +93,8 @@ class LogRadixTreeNode:
         self.timestamp = time.monotonic_ns() if tic is None else tic
         self._key = torch.empty(0, dtype=torch.int32)
         self._kv = torch.empty(0, dtype=torch.int32)
+        self._kv_pages = torch.empty(0, dtype=torch.int32)
+        self._kv_page_counts: dict[int, int] = {}
         self._entries: list[LogStateEntry] = []
         self.merge_stats: LogStateMergeStats | None = None
 
@@ -99,10 +104,21 @@ class LogRadixTreeNode:
         end       : int,
         input_ids : torch.Tensor,
         kv_indices: torch.Tensor,
+        page_size : int,
+        kv_pages  : torch.Tensor | None = None,
     ) -> None:
         assert len(input_ids) == len(kv_indices)
         self._key = input_ids[begin:end]
         self._kv = kv_indices[begin:end].clone()
+        self._kv_pages = (
+            torch.div(
+                kv_indices[begin:end].to(device="cpu", dtype=torch.int32),
+                page_size,
+                rounding_mode="floor",
+            )
+            if kv_pages is None else kv_pages[begin:end].clone()
+        )
+        self._kv_page_counts = dict(Counter(self._kv_pages.tolist()))
 
     def set_parent(self, parent: LogRadixTreeNode) -> None:
         self._parent = parent
@@ -263,7 +279,9 @@ class LogRadixTree(BasePrefixCache):
                 lock_node=lock_node,
                 kv_indices=self.matched_kv(node),
                 recovery=recovery,
-            )
+            ),
+            tree_match_len=trace.matched_len,
+            recoverable_len=recovery.position,
         )
 
     def lock_handle(
@@ -335,7 +353,8 @@ class LogRadixTree(BasePrefixCache):
         elif previous_len < inserted_len:
             new_node = LogRadixTreeNode(self.key_fn, self.granularity)
             new_node.set(
-                previous_len, inserted_len, input_ids, kv_indices
+                previous_len, inserted_len, input_ids, kv_indices,
+                self.page_size,
             )
             new_node.set_parent(node)
             self.evictable_size += new_node.length
@@ -362,8 +381,9 @@ class LogRadixTree(BasePrefixCache):
             ), (
                 "A logical log interval must stay inside its physical page."
             )
-        elif entry.merge_level is not None:
-            assert (entry.end - entry.begin) % self.page_size == 0
+        else:
+            assert entry.span_pages is not None
+            assert entry.end - entry.begin == entry.span_pages * self.page_size
         assert entry.slot not in self._slot_entries, (
             f"Linear cache slot {entry.slot} is already owned by node "
             f"{self.entry_owner(entry.slot).uuid}."
@@ -401,7 +421,8 @@ class LogRadixTree(BasePrefixCache):
         prefix = LogRadixTreeNode(
             self.key_fn, self.granularity, node.timestamp
         )
-        prefix.set(0, pos, node.key, node.kv)
+        kv_pages = node._kv_pages
+        prefix.set(0, pos, node.key, node.kv, self.page_size, kv_pages)
         prefix.set_parent(parent)
         prefix.ref_count = node.ref_count
 
@@ -424,7 +445,7 @@ class LogRadixTree(BasePrefixCache):
             else:
                 self._register_entry(node, entry)
 
-        node.set(pos, node.length, node.key, node.kv)
+        node.set(pos, node.length, node.key, node.kv, self.page_size, kv_pages)
         node.set_parent(prefix)
         self.revision += 1
         return prefix
@@ -564,6 +585,19 @@ class LogRadixTree(BasePrefixCache):
             if all(not self.entry_owner(entry).is_locked for entry in entries)
         )
 
+    def evictable_kv_frames(
+        self, cached_page_tokens: dict[int, int]
+    ) -> int:
+        """Count physical KV frames whose entire cached contents can be evicted."""
+        evictable_tokens: Counter[int] = Counter()
+        for node in self._iter_nodes():
+            if not node.is_locked:
+                evictable_tokens.update(node._kv_page_counts)
+        return sum(
+            count == cached_page_tokens.get(frame * self.page_size, 0)
+            for frame, count in evictable_tokens.items()
+        )
+
     def iter_entries(self) -> tuple[LogStateEntry, ...]:
         return tuple(
             sorted(
@@ -655,6 +689,10 @@ class LogRadixTree(BasePrefixCache):
                 if len(node.kv) != node.length:
                     raise RuntimeError(
                         f"Node {node.uuid} has mismatched key/KV lengths."
+                    )
+                if len(node._kv_pages) != node.length:
+                    raise RuntimeError(
+                        f"Node {node.uuid} has mismatched KV frame metadata."
                     )
                 if node.ref_count < 0:
                     raise RuntimeError(
@@ -760,13 +798,18 @@ class LogRadixTree(BasePrefixCache):
         base = max(checkpoints, key=lambda entry: entry.end, default=None)
         cursor = 0 if base is None else base.end
         logs = []
+        last_log_owner = None
         for entry in entries:
+            if cursor == matched_len:
+                break
             if entry.kind is not LogStateKind.LOG:
                 continue
             if entry.end <= cursor or entry.begin > cursor:
                 continue
-            logs.append(entry)
-            cursor = min(matched_len, entry.end)
+            end = min(matched_len, entry.end)
+            logs.append(entry.slice(cursor, end))
+            last_log_owner = self.entry_owner(entry)
+            cursor = end
             cursor = align_down(cursor, self.granularity)
             if cursor == matched_len or cursor < entry.end:
                 break
@@ -777,7 +820,8 @@ class LogRadixTree(BasePrefixCache):
             conv_granule = (
                 cursor - last.physical_begin
             ) // self.granularity - 1
-            lock_node = self.entry_owner(last)
+            assert last_log_owner is not None
+            lock_node = last_log_owner
         elif base is not None:
             conv_slot = base.slot
             conv_granule = self.page_size // self.granularity - 1

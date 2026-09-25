@@ -158,6 +158,9 @@ class StandardCacheManager(BaseCacheManager):
             else:
                 self.page_table[req.table_idx, :insert_len].copy_(matched)
 
+        if finished:
+            self.record_cached_session(req, insert_len)
+
     def _free(
         self,
         page_indices : torch.Tensor,

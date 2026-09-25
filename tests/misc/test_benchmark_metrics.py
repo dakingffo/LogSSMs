@@ -66,6 +66,7 @@ def test_multiturn_session_appends_generated_assistant_output(monkeypatch):
 
     async def fake_stream(
         client, base, model, messages, output_len, progress,
+        profile_tag=None,
     ):
         requests.append(messages)
         return StreamResult(
@@ -122,7 +123,7 @@ def test_stream_messages_collects_openai_delta_content():
             pass
 
     class Client:
-        def stream(self, method, url, json):
+        def stream(self, method, url, json, headers=None):
             assert json["messages"] == [{"role": "user", "content": "hello"}]
             return Context()
 
@@ -136,4 +137,5 @@ def test_stream_messages_collects_openai_delta_content():
         )
     )
     assert result.output == "one two"
+    assert result.nonempty_content_chunks == 2
     assert len(result.tics) == 5
