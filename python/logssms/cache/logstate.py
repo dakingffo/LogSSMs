@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -37,6 +37,7 @@ from .prefix_cache.logstate import (
 if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.engine import EngineConfig
+    from logssms.message import UserMsg
     from logssms.scheduler.prefill import PendingRequest
     from logssms.speculator import SpeculatorReserve
 
@@ -1081,10 +1082,13 @@ class LogStateCacheManager(BaseCacheManager):
             "evicted_kv_tokens": 0,
             "released_state_slots_from_eviction": 0,
             "released_state_slots_from_merge": 0,
+            "scheduled_payload_conv_frames_from_merge": 0,
+            "merge_batch_outcomes": {},
             "merge_plan_diagnostics": {},
             "merge_commit_skips": {},
         }
         self._profile_samples: list[dict] = []
+        self._profile_allocation_samples: list[dict] = []
         self._profile_active_requests: list[dict] = []
         self._profile_cuda_events: list[
             tuple[dict, torch.cuda.Event, torch.cuda.Event]
@@ -1184,6 +1188,18 @@ class LogStateCacheManager(BaseCacheManager):
             stats["max_admission_wait_ms"], wait_ms
         )
 
+    def record_arrival_profile(self, req: UserMsg) -> None:
+        if not self._profile_enabled:
+            return
+        matchable_len = max(0, len(req.input_ids) - 1)
+        usable_len = align_down(matchable_len, self.granularity)
+        trace = self.tree.trace(req.input_ids[:usable_len])
+        recovery, _ = self.tree._recovery_for_trace(trace)
+        self._record_arrival_snapshot(
+            req, trace.matched_len, recovery.position,
+            [node.uuid for node in self.tree.path(trace.node)],
+        )
+
     def record_active_requests(self, reqs: Sequence[Request]) -> None:
         if self._profile_enabled:
             self._profile_active_requests = self._profile_request_paths(reqs)
@@ -1280,11 +1296,31 @@ class LogStateCacheManager(BaseCacheManager):
             if self._profile_samples else 0.0
         )
         stats["prepare_cpu_timing_ms"] = timing_totals
+        allocation_phases: dict[str, dict] = {}
+        for sample in self._profile_allocation_samples:
+            phase = allocation_phases.setdefault(sample["phase"], {
+                "calls": 0, "eviction_calls": 0, "evicted_nodes": 0,
+                "timing_ms": {}, "counts": {},
+            })
+            phase["calls"] += 1
+            phase["eviction_calls"] += int(sample["evicted_nodes"] > 0)
+            phase["evicted_nodes"] += sample["evicted_nodes"]
+            for name, value in sample["timing_ms"].items():
+                phase["timing_ms"][name] = (
+                    phase["timing_ms"].get(name, 0.0) + value
+                )
+            for name, value in sample.get("counts", {}).items():
+                phase["counts"][name] = phase["counts"].get(name, 0) + value
         return {
             "type": "logstate",
             "aggregate": stats,
             "match_samples": self._match_profile_samples,
             "prefill_batches": self._profile_samples,
+            "allocation_profile": {
+                "phases": allocation_phases,
+                "samples": self._profile_allocation_samples,
+            },
+            "lifecycle_events": self._profile_lifecycle_events,
         }
 
     @property
@@ -1321,13 +1357,21 @@ class LogStateCacheManager(BaseCacheManager):
         self.pending_recoveries[table_idx] = handle.recovery
         self._live_pages[table_idx] = []
 
-    def allocate(self, reqs: list[Request]) -> None:
+    def allocate(self, reqs: list[Request], *, phase: str | None = None) -> None:
         state_table = self.state_table
         work_state_table = self.work_state_table
         assert state_table is not None and work_state_table is not None
+        start = perf_counter_ns() if self._profile_enabled else 0
+        profile = (
+            {"phase": phase or "direct", "batch_size": len(reqs),
+             "needed_pages": 0, "needed_states": 0, "needed_works": 0,
+             "evicted_nodes": 0, "timing_ms": {}}
+            if self._profile_enabled else None
+        )
 
         allocation_info: list[tuple[Request, int, int]] = []
         needed = 0
+        fresh_work_slots: list[int] = []
         for req in reqs:
             pages = self._live_pages.setdefault(req.table_idx, [])
             begin = pages[-1].end if pages else req.cached_len
@@ -1338,29 +1382,59 @@ class LogStateCacheManager(BaseCacheManager):
 
             recovery = self.pending_recoveries.get(req.table_idx)
             if req.cached_len == 0 and (recovery is None or recovery.position == 0):
-                work_slot = int(work_state_table[req.table_idx, 0])
-                self.logstate_pool.zero_state(work_slot)
-                self.logstate_pool.zero_work_conv(work_slot)
+                fresh_work_slots.append(self._work_slots[req.table_idx])
 
+        zero_start = perf_counter_ns() if profile is not None else 0
+        self.logstate_pool.zero_work_slots(fresh_work_slots)
+        zero_work_ms = (
+            (perf_counter_ns() - zero_start) / 1e6 if profile is not None else 0.0
+        )
+
+        if profile is not None:
+            now = perf_counter_ns()
+            profile["needed_pages"] = needed
+            profile["needed_states"] = needed
+            profile["timing_ms"]["scan_and_zero_ms"] = (now - start) / 1e6
+            profile["timing_ms"]["zero_work_ms"] = zero_work_ms
+            profile["timing_ms"]["scan_ms"] = (
+                profile["timing_ms"]["scan_and_zero_ms"] - zero_work_ms
+            )
+            stage = now
         if needed == 0:
+            if profile is not None:
+                profile["timing_ms"]["total_ms"] = (
+                    perf_counter_ns() - start
+                ) / 1e6
+                self._profile_allocation_samples.append(profile)
             return
 
-        pages, states, _works = self._allocate(needed, needed)
+        pages, states, _works = self._allocate(
+            needed, needed, profile=profile
+        )
+        if profile is not None:
+            now = perf_counter_ns()
+            profile["timing_ms"]["core_allocate_ms"] = (now - stage) / 1e6
+            stage = now
         kv_pages = pages.tolist()
         state_slots = states.tolist()
+        if profile is not None:
+            now = perf_counter_ns()
+            profile["timing_ms"]["ids_to_host_ms"] = (now - stage) / 1e6
+            stage = now
         offset = 0
         token_offsets = torch.arange(
             self.page_size, dtype=torch.int32, device=self.device
         )
         for req, begin, count in allocation_info:
-            pages = self._live_pages[req.table_idx]
+            live_pages = self._live_pages[req.table_idx]
+            req_offset = offset
             for index in range(count):
                 logical_begin = begin + index * self.page_size
                 logical_end = logical_begin + self.page_size
                 kv_page = int(kv_pages[offset])
                 state_slot = int(state_slots[offset])
                 offset += 1
-                pages.append(
+                live_pages.append(
                     _LivePage(
                         begin=logical_begin,
                         end=logical_end,
@@ -1368,20 +1442,31 @@ class LogStateCacheManager(BaseCacheManager):
                         state_slot=state_slot,
                     )
                 )
-                mapped_end = min(
-                    logical_end,
-                    req.max_device_len,
-                    self.page_table.shape[1],
-                )
-                mapped_len = mapped_end - logical_begin
-                assert 0 < mapped_len <= self.page_size
-                self.page_table[
-                    req.table_idx, logical_begin:mapped_end
-                ].copy_(kv_page + token_offsets[:mapped_len])
-                state_table[
-                    req.table_idx, logical_begin:mapped_end
-                ].fill_(state_slot)
+            mapped_end = min(
+                begin + count * self.page_size,
+                req.max_device_len,
+                self.page_table.shape[1],
+            )
+            mapped_len = mapped_end - begin
+            assert (count - 1) * self.page_size < mapped_len <= count * self.page_size
+            kv_mapping = (
+                pages[req_offset:offset, None] + token_offsets[None, :]
+            ).reshape(-1)[:mapped_len]
+            state_mapping = states[req_offset:offset].repeat_interleave(
+                self.page_size
+            )[:mapped_len]
+            self.page_table[req.table_idx, begin:mapped_end].copy_(kv_mapping)
+            state_table[req.table_idx, begin:mapped_end].copy_(state_mapping)
         assert offset == needed
+        if profile is not None:
+            now = perf_counter_ns()
+            profile["timing_ms"]["mapping_write_ms"] = (now - stage) / 1e6
+            profile["timing_ms"]["mapping_ms"] = (
+                profile["timing_ms"]["ids_to_host_ms"]
+                + profile["timing_ms"]["mapping_write_ms"]
+            )
+            profile["timing_ms"]["total_ms"] = (now - start) / 1e6
+            self._profile_allocation_samples.append(profile)
 
     def _profile_resource_snapshot(self) -> dict:
         entries = self.tree.iter_entries()
@@ -1395,6 +1480,7 @@ class LogStateCacheManager(BaseCacheManager):
         }
         evictable_slots = self.tree.evictable_slots()
         return {
+            "free_frames": self._allocator.free_frames,
             "free_kv_pages": len(self.free_pages),
             "free_state_slots": len(self.free_states),
             "evictable_kv_tokens": self.tree.size_info.evictable_size,
@@ -1524,13 +1610,16 @@ class LogStateCacheManager(BaseCacheManager):
         for req in batch.reqs:
             self.pending_recoveries.pop(req.table_idx, None)
         self._commit_materialize(plan.materialize)
-        released, commit_skips = self._commit_coalesce(plan.coalesce)
+        released, released_frames, commit_skips = self._commit_coalesce(plan.coalesce)
         commit_cpu_ms = (
             (perf_counter_ns() - commit_start) / 1e6
             if self._profile_enabled else 0.0
         )
         if self._profile_enabled:
             self._profile_stats["released_state_slots_from_merge"] += released
+            self._profile_stats["scheduled_payload_conv_frames_from_merge"] += (
+                released_frames
+            )
             for reason, count in commit_skips.items():
                 self._profile_stats["merge_commit_skips"][reason] = (
                     self._profile_stats["merge_commit_skips"].get(reason, 0)
@@ -1546,6 +1635,11 @@ class LogStateCacheManager(BaseCacheManager):
             sample["construction"] = construction
             sample["materialized_slots"] = len(plan.materialize)
             sample["released_state_slots"] = released
+            sample["scheduled_payload_conv_frames"] = released_frames
+            outcome = self._merge_batch_outcome(plan, released)
+            sample["merge_outcome"] = outcome
+            outcomes = self._profile_stats["merge_batch_outcomes"]
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
             sample["merge_commit_skips"] = commit_skips
             sample["resources_after"] = self._profile_resource_snapshot()
             profile_after_cpu_ms = (
@@ -1711,6 +1805,12 @@ class LogStateCacheManager(BaseCacheManager):
             assert work_state_table is not None
             work_state_table[req.table_idx, 0] = -1
             self.record_cached_session(req, insert.inserted_len)
+            if self._profile_enabled:
+                node = self.tree.trace(req.input_ids[:insert.inserted_len]).node
+                self._record_complete_profile(
+                    req, insert.inserted_len,
+                    [value.uuid for value in self.tree.path(node)],
+                )
         else:
             req.cache_handle = new_handle
             self.lock(new_handle)
@@ -1782,54 +1882,145 @@ class LogStateCacheManager(BaseCacheManager):
             lazy_states = self._lazy_free_states
             self._lazy_free_pages = None
             self._lazy_free_states = None
-            for pages in lazy_pages:
-                self._return_slots(pages, torch.empty(0, dtype=torch.int32))
-            for states in lazy_states:
-                self._return_slots(torch.empty(0, dtype=torch.int32), states)
+            if lazy_pages:
+                self._return_slots(
+                    torch.cat(lazy_pages), torch.empty(0, dtype=torch.int32)
+                )
+            if lazy_states:
+                self._return_slots(
+                    torch.empty(0, dtype=torch.int32), torch.cat(lazy_states)
+                )
 
     def _allocate(
         self,
         needed_pages : int,
         needed_states: int,
         needed_works : int = 0,
+        profile     : dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        while (reserved := self.logstate_pool.reserve(
-            kv=needed_pages, logs=needed_states, works=needed_works
-        )) is None:
-            evictable = self.tree.size_info.evictable_size
-            if evictable == 0:
+        own_profile = profile is None and self._profile_enabled
+        if own_profile:
+            profile = {
+                "phase": "work" if needed_works else "direct",
+                "batch_size": 0, "needed_pages": needed_pages,
+                "needed_states": needed_states, "needed_works": needed_works,
+                "evicted_nodes": 0, "timing_ms": {}, "counts": {},
+            }
+        start = perf_counter_ns() if profile is not None else 0
+        initial_pool_timings = {} if profile is not None else None
+        reserved = self.logstate_pool.reserve(
+            kv=needed_pages, logs=needed_states, works=needed_works,
+            timings=initial_pool_timings,
+        )
+        if profile is not None:
+            now = perf_counter_ns()
+            profile["timing_ms"]["initial_reserve_ms"] = (now - start) / 1e6
+            self._record_pool_timings(
+                profile, "initial", initial_pool_timings
+            )
+            stage = now
+        if reserved is None:
+            selected: list[LogRadixTreeNode] = []
+            page_counts: Counter[int] = Counter()
+            slot_counts: Counter[int] = Counter()
+            released_slots: set[int] = set()
+            releasable_kv = 0
+            for node in self.tree.iter_evict_candidates():
+                selected.append(node)
+                for frame, count in node._kv_page_counts.items():
+                    page_counts[frame] += count
+                    cached = self._cached_page_tokens[frame * self.page_size]
+                    assert page_counts[frame] <= cached
+                    if page_counts[frame] == cached:
+                        releasable_kv += 1
+                for entry in node.entries:
+                    slot_counts[entry.slot] += 1
+                    if slot_counts[entry.slot] == self.tree.slot_entry_count(entry.slot):
+                        released_slots.add(entry.slot)
+                projected_frames, projected_decay = (
+                    self._allocator.projected_free_capacity(released_slots)
+                )
+                if self._allocator.required_frames(
+                    needed_pages, needed_states, needed_works, projected_decay
+                ) <= projected_frames + releasable_kv:
+                    break
+            else:
                 raise LogStateCapacityError(
                     "Insufficient evictable LogState cache capacity: "
                     f"need_pages={needed_pages}, need_states={needed_states}, "
                     f"free_frames={self._allocator.free_frames}."
                 )
-            # A cached KV/Log page owns multiple frames.  A frame shortfall is
-            # not a page count: evict the smallest available tree unit, then
-            # retry the exact reservation against the frames it really freed.
-            eviction = self.tree.evict(min(self.page_size, evictable))
-            self._release_cached_kv(eviction.kv_indices)
-            released_states = sorted({
-                entry.slot
-                for entry in eviction.entries
-                if not self.tree.has_slot(entry.slot)
-            })
-            self._return_slots(
-                torch.empty(0, dtype=torch.int32, device=self.device),
-                torch.tensor(
-                    released_states,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
+            if profile is not None:
+                now = perf_counter_ns()
+                profile["timing_ms"]["eviction_plan_ms"] = (now - stage) / 1e6
+                profile["evicted_nodes"] = len(selected)
+                stage = now
+
+            evicted_nodes = [] if self._profile_enabled else None
+            free_frames_before = self._allocator.free_frames if self._profile_enabled else 0
+            eviction = self.tree.evict_nodes(selected, evicted_nodes)
+            if profile is not None:
+                now = perf_counter_ns()
+                profile["timing_ms"]["tree_evict_ms"] = (now - stage) / 1e6
+                stage = now
+            self._release_cached_kv(page_counts)
+            if profile is not None:
+                now = perf_counter_ns()
+                profile["timing_ms"]["release_kv_ms"] = (now - stage) / 1e6
+                stage = now
+            release_pool_timings = {} if profile is not None else None
+            for slot in released_slots:
+                assert not self.tree.has_slot(slot)
+            self.logstate_pool.release_slots(
+                sorted(released_slots), timings=release_pool_timings
             )
+            if profile is not None:
+                now = perf_counter_ns()
+                profile["timing_ms"]["release_states_ms"] = (now - stage) / 1e6
+                self._record_pool_timings(
+                    profile, "release_pool", release_pool_timings
+                )
+                stage = now
+            free_frames_after_evict = (
+                self._allocator.free_frames if self._profile_enabled else 0
+            )
+            retry_pool_timings = {} if profile is not None else None
+            reserved = self.logstate_pool.reserve(
+                kv=needed_pages, logs=needed_states, works=needed_works,
+                timings=retry_pool_timings,
+            )
+            if profile is not None:
+                now = perf_counter_ns()
+                profile["timing_ms"]["retry_reserve_ms"] = (now - stage) / 1e6
+                self._record_pool_timings(
+                    profile, "retry", retry_pool_timings
+                )
+                stage = now
+            assert reserved is not None, "Eviction plan did not free the projected frames"
             if self._profile_enabled:
+                self._record_lifecycle_event({
+                    "event": "eviction",
+                    "nodes": [
+                        {"uuid": uuid, "begin": begin, "end": end}
+                        for uuid, begin, end in evicted_nodes
+                    ],
+                    "kv_tokens": len(eviction.kv_indices),
+                    "state_slots": len(released_slots),
+                    "free_frames_before": free_frames_before,
+                    "free_frames_after": free_frames_after_evict,
+                    "need_kv_pages": needed_pages,
+                    "need_log_slots": needed_states,
+                    "need_work_slots": needed_works,
+                })
                 self._profile_stats["eviction_rounds"] += 1
                 self._profile_stats["evicted_kv_tokens"] += len(
                     eviction.kv_indices
                 )
                 self._profile_stats[
                     "released_state_slots_from_eviction"
-                ] += len(released_states)
+                ] += len(released_slots)
 
+        tensor_start = perf_counter_ns() if profile is not None else 0
         pages = torch.tensor(
             reserved[0], dtype=torch.int32, device=self.device
         ) * self.page_size
@@ -1839,7 +2030,27 @@ class LogStateCacheManager(BaseCacheManager):
         works = torch.tensor(
             reserved[2], dtype=torch.int32, device=self.device
         )
+        if profile is not None:
+            now = perf_counter_ns()
+            profile["timing_ms"]["tensor_build_ms"] = (
+                now - tensor_start
+            ) / 1e6
+            profile["timing_ms"]["core_total_ms"] = (now - start) / 1e6
+            if own_profile:
+                self._profile_allocation_samples.append(profile)
         return pages, states, works
+
+    @staticmethod
+    def _record_pool_timings(
+        profile: dict, prefix: str, timings: dict | None,
+    ) -> None:
+        assert timings is not None
+        for name, value in timings.items():
+            bucket = "counts" if name in (
+                "waited_materializations", "descriptor_count",
+                "reclamation_count", "failed",
+            ) else "timing_ms"
+            profile.setdefault(bucket, {})[f"{prefix}_{name}"] = value
 
     def _allocate_work(self) -> int:
         _pages, _logs, works = self._allocate(0, 0, 1)
@@ -2122,11 +2333,27 @@ class LogStateCacheManager(BaseCacheManager):
             )
             self.logstate_pool.materialize(plan.log_slot)
 
+    @staticmethod
+    def _merge_batch_outcome(plan: LogStatePlan, released: int) -> str:
+        if released:
+            return "merged"
+        if plan.coalesce:
+            return "commit_skipped"
+        diagnostics = dict(plan.merge_diagnostics)
+        if not diagnostics.get("merge_anchors", 0):
+            return "no_match_anchor"
+        if not diagnostics.get("checkpoint_candidates", 0):
+            return "no_checkpoint_candidate"
+        if not diagnostics.get("candidate_groups", 0):
+            return "no_adjacent_candidate"
+        return "candidates_rejected"
+
     def _commit_coalesce(
         self,
         plans: Sequence[CheckpointCoalesce],
-    ) -> tuple[int, dict[str, int]]:
+    ) -> tuple[int, int, dict[str, int]]:
         released = []
+        released_frames = 0
         skips: dict[str, int] = {}
         for plan in plans:
             if any(
@@ -2169,6 +2396,12 @@ class LogStateCacheManager(BaseCacheManager):
                 )
                 continue
             owner = self.tree.entry_owner(entries[-1])
+            if self._profile_enabled:
+                for slot in plan.slots[:-1]:
+                    record = self._allocator.slot(slot)
+                    # Materialization may still be pending on CUDA. Count the
+                    # eventual checkpoint layout, not Log-only conv frames.
+                    released_frames += len(record.payload) + len(record.conv[-1])
             for slot in plan.slots:
                 self.tree.detach_entry(slot)
             self.tree.attach_entry(
@@ -2189,7 +2422,7 @@ class LogStateCacheManager(BaseCacheManager):
                     released, dtype=torch.int32, device=self.device
                 ),
             )
-        return len(released), skips
+        return len(released), released_frames, skips
 
     def _release_live_pages(
         self,
@@ -2223,8 +2456,7 @@ class LogStateCacheManager(BaseCacheManager):
         if self._lazy_free_pages is None:
             page_frames = [page // self.page_size for page in pages.tolist()]
             self.logstate_pool.release_kv(page_frames)
-            for slot in states.tolist():
-                self.logstate_pool.release_slot(slot)
+            self.logstate_pool.release_slots(states.tolist())
         else:
             assert self._lazy_free_states is not None
             if len(pages) > 0:
@@ -2243,30 +2475,19 @@ class LogStateCacheManager(BaseCacheManager):
                 self._cached_page_tokens.get(page, 0) + count
             )
 
-    def _release_cached_kv(self, indices: torch.Tensor) -> None:
-        if len(indices) == 0:
-            return
-        pages = torch.div(
-            indices.to(torch.int64), self.page_size,
-            rounding_mode="floor",
-        ) * self.page_size
-        unique, counts = torch.unique(pages, return_counts=True)
+    def _release_cached_kv(self, page_counts: Counter[int]) -> None:
         released = []
-        for page, count in zip(unique.tolist(), counts.tolist()):
+        for frame, count in page_counts.items():
+            page = frame * self.page_size
             remaining = self._cached_page_tokens[page] - count
             assert remaining >= 0
             if remaining == 0:
                 del self._cached_page_tokens[page]
-                released.append(page)
+                released.append(frame)
             else:
                 self._cached_page_tokens[page] = remaining
         if released:
-            self._return_slots(
-                torch.tensor(
-                    released, dtype=torch.int32, device=self.device
-                ),
-                torch.empty(0, dtype=torch.int32, device=self.device),
-            )
+            self.logstate_pool.release_kv(released)
 
 
 class LogStateCacheFactory(BaseCacheFactory):

@@ -17,6 +17,9 @@ class BaseLinearAttentionMetadata(ABC):
 
 
 class BaseLinearAttentionBackend(ABC):
+    def profile_result(self) -> dict | None:
+        return None
+
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
 

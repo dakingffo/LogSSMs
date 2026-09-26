@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from time import perf_counter_ns
 from typing import TYPE_CHECKING
 
 import torch
@@ -63,8 +65,32 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
     def __init__(self) -> None:
         self.capture: LogStateLinearAttentionCaptureData | None = None
         self.capture_bs: list[int] = []
+        self._profile_enabled = os.getenv(
+            "LOGSSMS_PROFILE_SCHEDULER", "0"
+        ).lower() in ("1", "true", "yes")
+        self._profile_prefill_samples: list[dict] = []
+
+    def profile_result(self) -> dict | None:
+        if not self._profile_enabled:
+            return None
+        samples = self._profile_prefill_samples
+        fields = (
+            "metadata_cpu_ms", "repeat_interleave_cpu_ms", "item_cpu_ms",
+        )
+        totals = {key: sum(sample[key] for sample in samples) for key in fields}
+        return {
+            "type": "logstate",
+            "aggregate": {
+                "prefill_batches": len(samples),
+                "item_calls": sum(sample["item_calls"] for sample in samples),
+                **totals,
+            },
+            "prefill_batches": samples,
+        }
 
     def prepare_metadata(self, batch: Batch) -> None:
+        profile = self._profile_enabled and batch.is_prefill
+        metadata_start = perf_counter_ns() if profile else 0
         if batch.is_verify:
             raise NotImplementedError(
                 "LogState speculative verify is not implemented yet."
@@ -87,6 +113,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         )
         work_slots = work_state_table[table_indices, 0]
 
+        repeat_start = perf_counter_ns() if profile else 0
         row_table_indices = torch.repeat_interleave(
             table_indices,
             torch.tensor(
@@ -94,6 +121,9 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 dtype=torch.int64,
                 device=state_table.device,
             ),
+        )
+        repeat_cpu_ms = (
+            (perf_counter_ns() - repeat_start) / 1e6 if profile else 0.0
         )
         positions = batch.positions
         assert len(positions) == len(row_table_indices)
@@ -136,9 +166,13 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             offsets = [0]
             snapshot_rows = []
             write_rows = []
+            item_cpu_ns = 0
             for req in reqs:
                 seq_len = req.extend_len
+                item_start = perf_counter_ns() if profile else 0
                 first_offset = int(token_offsets[offsets[-1]].item())
+                if profile:
+                    item_cpu_ns += perf_counter_ns() - item_start
                 selected = [
                     index
                     for index in range(seq_len)
@@ -165,6 +199,14 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 // pool.layout.granularity
             )
         batch.linear_attn_metadata = metadata
+        if profile:
+            self._profile_prefill_samples.append({
+                "batch_size": batch.size,
+                "metadata_cpu_ms": (perf_counter_ns() - metadata_start) / 1e6,
+                "repeat_interleave_cpu_ms": repeat_cpu_ms,
+                "item_calls": len(reqs),
+                "item_cpu_ms": item_cpu_ns / 1e6,
+            })
 
     def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
         del max_seq_len

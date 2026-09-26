@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from time import perf_counter_ns
+from collections.abc import Sequence
+
 import torch
 
 from .frame_allocator import LinearFrameSlot, LogStateFrameAllocator
@@ -303,6 +306,50 @@ class FramedMHALogStatePool:
         for layer in range(self.layout.num_linear_layers):
             self.write_conv(slots, granules, layer, values)
 
+    def zero_work_slots(self, slots: Sequence[int]) -> None:
+        """Clear exclusive work frames in one operation; never touch shared decay frames."""
+        frames: list[int] = []
+        for slot in slots:
+            record = self.allocator.slot(slot)
+            assert record.kind == "work" and record.decay is None
+            frames.extend(record.payload)
+            for conv in record.conv:
+                frames.extend(conv)
+        if frames:
+            indices = torch.tensor(frames, dtype=torch.int64, device=self.device)
+            self.storage.index_fill_(0, indices, 0)
+
+    def _write_descriptors(self, slots: Sequence[int]) -> None:
+        if not slots:
+            return
+        payload = torch.full(
+            (len(slots), self.allocator.payload_frames), -1, dtype=torch.int32
+        )
+        conv = torch.full(
+            (len(slots), self.layout.num_granules, self.allocator.conv_frames),
+            -1, dtype=torch.int32,
+        )
+        decay = torch.full((len(slots), 2), -1, dtype=torch.int32)
+        for row, slot in enumerate(slots):
+            record = self.allocator.slot(slot)
+            payload[row] = torch.tensor(record.payload, dtype=torch.int32)
+            if record.kind == "log":
+                granules = range(self.layout.num_granules)
+            elif record.kind == "work":
+                granules = (0,)
+            else:
+                granules = (self.layout.num_granules - 1,)
+            for granule, frames in zip(granules, record.conv, strict=True):
+                conv[row, granule] = torch.tensor(frames, dtype=torch.int32)
+            if record.decay is not None:
+                decay[row] = torch.tensor(
+                    (record.decay.frame, record.decay.index), dtype=torch.int32
+                )
+        indices = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        self.payload_frame_table.index_copy_(0, indices, payload.to(self.device))
+        self.conv_frame_table.index_copy_(0, indices, conv.to(self.device))
+        self.decay_frame_table.index_copy_(0, indices, decay.to(self.device))
+
     def _write_descriptor(self, slot: int, record: LinearFrameSlot) -> None:
         self.payload_frame_table[slot].copy_(
             torch.tensor(record.payload, dtype=torch.int32, device=self.device)
@@ -327,19 +374,49 @@ class FramedMHALogStatePool:
             )
 
     def reserve(
-        self, *, kv: int = 0, logs: int = 0, works: int = 0
+        self, *, kv: int = 0, logs: int = 0, works: int = 0,
+        timings: dict[str, float] | None = None,
     ) -> tuple[list[int], list[int], list[int]] | None:
-        self.poll_reclamation()
+        stage = perf_counter_ns() if timings is not None else 0
+        self.poll_reclamation(timings)
+        if timings is not None:
+            now = perf_counter_ns()
+            timings["poll_reclamation_ms"] = (now - stage) / 1e6
+            stage = now
         allocated = self.allocator.reserve(kv=kv, logs=logs, states=works)
+        if timings is not None:
+            now = perf_counter_ns()
+            timings["allocator_reserve_ms"] = (now - stage) / 1e6
+            stage = now
         if allocated is None and self._retired_materializations:
+            if timings is not None:
+                timings["waited_materializations"] = len(self._retired_materializations)
             for event, _slot in self._retired_materializations:
                 event.synchronize()
-            self.poll_reclamation()
+            if timings is not None:
+                now = perf_counter_ns()
+                timings["wait_materialization_ms"] = (now - stage) / 1e6
+                stage = now
+            self.poll_reclamation(timings)
+            if timings is not None:
+                now = perf_counter_ns()
+                timings["retry_poll_reclamation_ms"] = (now - stage) / 1e6
+                stage = now
             allocated = self.allocator.reserve(kv=kv, logs=logs, states=works)
+            if timings is not None:
+                now = perf_counter_ns()
+                timings["retry_allocator_reserve_ms"] = (now - stage) / 1e6
+                stage = now
         if allocated is None:
+            if timings is not None:
+                timings["failed"] = 1
             return None
-        for slot in allocated[1] + allocated[2]:
-            self._write_descriptor(slot, self.allocator.slot(slot))
+        self._write_descriptors(allocated[1] + allocated[2])
+        if timings is not None:
+            timings["descriptor_write_ms"] = (
+                perf_counter_ns() - stage
+            ) / 1e6
+            timings["descriptor_count"] = len(allocated[1]) + len(allocated[2])
         return allocated
 
     def materialize(self, slot: int) -> None:
@@ -352,25 +429,91 @@ class FramedMHALogStatePool:
             self.allocator.materialize(slot)
             self._write_descriptor(slot, self.allocator.slot(slot))
 
-    def poll_reclamation(self) -> None:
+    def poll_reclamation(self, timings: dict[str, float] | None = None) -> None:
         remaining = []
         for event, slot in self._retired_materializations:
+            start = perf_counter_ns() if timings is not None else 0
             if event.query():
+                if timings is not None:
+                    timings["reclamation_query_ms"] = (
+                        timings.get("reclamation_query_ms", 0.0)
+                        + (perf_counter_ns() - start) / 1e6
+                    )
+                    start = perf_counter_ns()
                 self.allocator.materialize(slot)
+                if timings is not None:
+                    timings["reclamation_materialize_ms"] = (
+                        timings.get("reclamation_materialize_ms", 0.0)
+                        + (perf_counter_ns() - start) / 1e6
+                    )
+                    start = perf_counter_ns()
                 self._write_descriptor(slot, self.allocator.slot(slot))
+                if timings is not None:
+                    timings["reclamation_descriptor_ms"] = (
+                        timings.get("reclamation_descriptor_ms", 0.0)
+                        + (perf_counter_ns() - start) / 1e6
+                    )
+                    timings["reclamation_count"] = (
+                        timings.get("reclamation_count", 0) + 1
+                    )
             else:
+                if timings is not None:
+                    timings["reclamation_query_ms"] = (
+                        timings.get("reclamation_query_ms", 0.0)
+                        + (perf_counter_ns() - start) / 1e6
+                    )
                 remaining.append((event, slot))
         self._retired_materializations = remaining
 
     def release_kv(self, frames: list[int] | tuple[int, ...]) -> None:
         self.allocator.release_kv(frames)
 
-    def release_slot(self, slot: int) -> None:
+    def release_slot(
+        self, slot: int, timings: dict[str, float] | None = None,
+    ) -> None:
+        self.release_slots((slot,), timings=timings)
+
+    def release_slots(
+        self, slots: Sequence[int], timings: dict[str, float] | None = None,
+    ) -> None:
+        if not slots:
+            return
+        assert len(slots) == len(set(slots))
+        stage = perf_counter_ns() if timings is not None else 0
+        selected = set(slots)
         for event, pending_slot in self._retired_materializations:
-            if pending_slot == slot:
+            if pending_slot in selected:
                 event.synchronize()
-        self.poll_reclamation()
-        self.allocator.release_slot(slot)
-        self.payload_frame_table[slot].fill_(-1)
-        self.conv_frame_table[slot].fill_(-1)
-        self.decay_frame_table[slot].fill_(-1)
+        if timings is not None:
+            now = perf_counter_ns()
+            timings["wait_materialization_ms"] = (
+                timings.get("wait_materialization_ms", 0.0)
+                + (now - stage) / 1e6
+            )
+            stage = now
+        self.poll_reclamation(timings)
+        if timings is not None:
+            now = perf_counter_ns()
+            timings["poll_reclamation_ms"] = (
+                timings.get("poll_reclamation_ms", 0.0)
+                + (now - stage) / 1e6
+            )
+            stage = now
+        for slot in slots:
+            self.allocator.release_slot(slot)
+        if timings is not None:
+            now = perf_counter_ns()
+            timings["allocator_release_ms"] = (
+                timings.get("allocator_release_ms", 0.0)
+                + (now - stage) / 1e6
+            )
+            stage = now
+        indices = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        self.payload_frame_table.index_fill_(0, indices, -1)
+        self.conv_frame_table.index_fill_(0, indices, -1)
+        self.decay_frame_table.index_fill_(0, indices, -1)
+        if timings is not None:
+            timings["descriptor_clear_ms"] = (
+                timings.get("descriptor_clear_ms", 0.0)
+                + (perf_counter_ns() - stage) / 1e6
+            )

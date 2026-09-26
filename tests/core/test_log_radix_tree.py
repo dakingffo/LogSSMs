@@ -101,7 +101,10 @@ def test_evict_returns_kv_and_linear_slots_without_freeing_them():
         (LogStateEntry(4, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),),
     )
 
-    evicted = tree.evict(4)
+    evicted_nodes = []
+    evicted = tree.evict(4, evicted_nodes)
+    assert evicted_nodes
+    assert all(begin < end for _uuid, begin, end in evicted_nodes)
 
     assert len(evicted.kv_indices) >= 4
     assert len(evicted.entries) >= 1

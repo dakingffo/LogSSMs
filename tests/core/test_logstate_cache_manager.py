@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from logssms.cache import CacheResources
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.cache.logstate import LogStateCacheManager, PageMaterialize
+from logssms.cache.logstate import (
+    LogStateCacheManager, LogStateCapacityError, PageMaterialize,
+)
 from logssms.cache.prefix_cache.logstate import LogStateCacheHandle
 from logssms.cache.prefix_cache.logstate import LogStateEntry
 from logssms.cache.prefix_cache.logstate import LogStateKind
 from logssms.core import Batch, Request, SamplingParams
+from logssms.message import UserMsg
 from logssms.scheduler.prefill import PendingRequest
 
 
@@ -120,6 +125,71 @@ def new_req(
     )
     manager.init_with_handle(table_idx, handle)
     return req
+
+
+def test_profile_tracks_complete_arrival_and_admission_without_mutating_tree():
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = make_manager()
+    tokens = torch.arange(128, dtype=torch.int32)
+    req = new_req(manager, tokens)
+    req.profile_tag = "session/turn-1"
+    manager.allocate([req])
+    req.cached_len = 128
+    manager.cache_req(req, finished=True)
+
+    next_tokens = torch.cat([tokens, torch.tensor([999], dtype=torch.int32)])
+    arrival = UserMsg(
+        uid=1,
+        input_ids=next_tokens,
+        sampling_params=SamplingParams(max_tokens=16),
+        profile_tag="session/turn-2",
+    )
+    revision = manager.tree.revision
+    manager.record_arrival_profile(arrival)
+    assert manager.tree.revision == revision
+    pending = PendingRequest(
+        uid=arrival.uid,
+        input_ids=next_tokens,
+        sampling_params=arrival.sampling_params,
+        profile_tag=arrival.profile_tag,
+    )
+    match = manager.match_req(pending)
+    manager.record_match_profile(pending, match, input_len=len(next_tokens))
+
+    profile = manager.profile_result()
+    assert profile is not None
+    events = profile["lifecycle_events"]
+    assert [event["event"] for event in events] == [
+        "complete", "arrival", "admission",
+    ]
+    assert events[0]["inserted_len"] == 128
+    assert events[1]["previous_inserted_len"] == 128
+    assert events[1]["tree_match_len"] == 128
+    sample = profile["match_samples"][-1]
+    assert sample["arrival_tree_match_len"] == 128
+    assert sample["tree_match_len"] == 128
+    assert sample["arrival_seq"] < sample["admission_seq"]
+
+
+def test_allocation_profile_separates_work_prefill_and_pool_reserve():
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = make_manager()
+    req = new_req(manager, torch.arange(130, dtype=torch.int32))
+    manager.allocate([req], phase="prefill")
+
+    allocation = manager.profile_result()["allocation_profile"]
+    phases = allocation["phases"]
+    assert phases["work"]["calls"] == 1
+    assert phases["prefill"]["calls"] == 1
+    sample = next(
+        value for value in allocation["samples"]
+        if value["phase"] == "prefill"
+    )
+    assert sample["needed_pages"] > 0
+    assert sample["timing_ms"]["initial_descriptor_write_ms"] >= 0
+    assert sample["timing_ms"]["mapping_ms"] >= 0
+    assert sample["counts"]["initial_descriptor_count"] == sample["needed_states"]
+    assert phases["prefill"]["timing_ms"]["total_ms"] == sample["timing_ms"]["total_ms"]
 
 
 def test_partial_log_hit_restores_only_matched_granule():
@@ -280,6 +350,27 @@ def test_allocate_maps_only_valid_suffix_of_last_physical_page():
     manager._live_pages[req.table_idx] = []
     manager.unlock(req.cache_handle)
     manager.check_integrity()
+
+
+def test_allocate_maps_multiple_requests_and_partial_pages():
+    manager = make_manager(num_pages=12, num_states=12)
+    first = new_req(manager, torch.arange(130, dtype=torch.int32), table_idx=0)
+    second = new_req(manager, torch.arange(99, dtype=torch.int32), table_idx=1)
+    first.max_device_len = 130
+    second.max_device_len = 99
+    manager.allocate([first, second])
+    for req in (first, second):
+        pages = manager._live_pages[req.table_idx]
+        assert len(pages) == (len(req.input_ids) + PAGE_SIZE - 1) // PAGE_SIZE
+        for page in pages:
+            end = min(page.end, req.max_device_len)
+            expected = page.kv_page + torch.arange(end - page.begin, dtype=torch.int32)
+            torch.testing.assert_close(
+                manager.page_table[req.table_idx, page.begin:end], expected
+            )
+            assert torch.all(
+                manager.state_table[req.table_idx, page.begin:end] == page.state_slot
+            )
 
 
 def test_cache_boundary_carries_conv_state_into_request_work_slot():
@@ -474,7 +565,8 @@ def test_logical_admission_does_not_evict_cached_prefix():
 
 
 def test_allocation_evicts_only_as_many_cached_leaves_as_needed():
-    manager = make_manager(num_pages=4, num_states=4)
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = make_manager(num_pages=4, num_states=4)
 
     def ids_for(index: int) -> torch.Tensor:
         return torch.cat([
@@ -508,13 +600,25 @@ def test_allocation_evicts_only_as_many_cached_leaves_as_needed():
         cache_handle=handle,
         max_device_len=len(input_ids) + 16,
     )
-    manager.allocate([req])
+    with patch.object(
+        manager.tree, "evict_nodes", wraps=manager.tree.evict_nodes
+    ) as evict:
+        manager.allocate([req])
+    assert evict.call_count == 1
     req.cached_len = len(input_ids)
     manager.cache_req(req, finished=True)
 
     # One 64-token leaf was enough to satisfy the reservation.  The former
     # missing_frames * page_size estimate evicted four leaves here.
     assert manager.tree.size_info.total_size == 8 * PAGE_SIZE
+    profile = manager.profile_result()
+    assert profile is not None
+    evictions = [
+        event for event in profile["lifecycle_events"]
+        if event["event"] == "eviction"
+    ]
+    assert evictions
+    assert all(event["nodes"] for event in evictions)
     manager.check_integrity()
 
 
@@ -647,6 +751,23 @@ def test_fragmented_log_slot_is_returned_only_after_all_routes_are_evicted():
     assert not manager.tree.has_slot(1)
 
     manager._return_slots(pages, states)
+    manager.check_integrity()
+
+
+def test_unfulfillable_eviction_plan_preserves_cached_prefix():
+    manager = make_manager()
+    original_ids = torch.arange(130, dtype=torch.int32)
+    req = new_req(manager, original_ids)
+    manager.allocate([req])
+    req.cached_len = len(original_ids)
+    manager.cache_req(req, finished=True)
+    revision = manager.tree.revision
+    free_frames = manager._allocator.free_frames
+
+    with pytest.raises(LogStateCapacityError):
+        manager._allocate(1000, 1000)
+    assert manager.tree.revision == revision
+    assert manager._allocator.free_frames == free_frames
     manager.check_integrity()
 
 

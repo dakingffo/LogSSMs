@@ -17,6 +17,7 @@ from .prefix_cache.base import BaseCacheHandle, BasePrefixCache, MatchResult
 
 if TYPE_CHECKING:
     from logssms.core import Batch
+    from logssms.message import UserMsg
     from logssms.scheduler.prefill import PendingRequest
 
 
@@ -59,6 +60,9 @@ class BaseCacheManager(ABC):
         ).lower() in ("1", "true", "yes")
         self._match_profile_samples: list[dict] = []
         self._profile_session_tokens: dict[str, torch.Tensor] = {}
+        self._profile_lifecycle_events: list[dict] = []
+        self._profile_arrivals: dict[int, dict] = {}
+        self._profile_completed_sessions: dict[str, dict] = {}
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -120,6 +124,60 @@ class BaseCacheManager(ABC):
     def record_prefill_wait(self, wait_ms: float) -> None:
         return None
 
+    def record_arrival_profile(self, req: UserMsg) -> None:
+        return None
+
+    def _record_lifecycle_event(self, event: dict) -> None:
+        event["seq"] = len(self._profile_lifecycle_events)
+        event["time_ns"] = perf_counter_ns()
+        self._profile_lifecycle_events.append(event)
+
+    def _record_arrival_snapshot(
+        self,
+        req            : UserMsg,
+        tree_match_len : int,
+        recoverable_len: int,
+        node_path      : list[int],
+    ) -> None:
+        tag = req.profile_tag or f"uid:{req.uid}"
+        session_key = tag.partition("/turn-")[0] if "/turn-" in tag else None
+        previous = self._profile_completed_sessions.get(session_key)
+        event = {
+            "event": "arrival",
+            "tag": tag,
+            "uid": req.uid,
+            "matchable_len": max(0, len(req.input_ids) - 1),
+            "tree_match_len": tree_match_len,
+            "recoverable_len": recoverable_len,
+            "node_path": node_path,
+            "previous_inserted_len": (
+                previous["inserted_len"] if previous is not None else None
+            ),
+        }
+        self._record_lifecycle_event(event)
+        self._profile_arrivals[req.uid] = event
+
+    def _record_complete_profile(
+        self,
+        req         : Request,
+        inserted_len: int,
+        node_path   : list[int],
+    ) -> None:
+        if not self._match_profile_enabled:
+            return
+        tag = req.profile_tag or f"uid:{req.uid}"
+        event = {
+            "event": "complete",
+            "tag": tag,
+            "uid": req.uid,
+            "request_cached_len": req.cached_len,
+            "inserted_len": inserted_len,
+            "node_path": node_path,
+        }
+        self._record_lifecycle_event(event)
+        if "/turn-" in tag:
+            self._profile_completed_sessions[tag.partition("/turn-")[0]] = event
+
     def record_match_profile(
         self,
         req: PendingRequest,
@@ -158,7 +216,7 @@ class BaseCacheManager(ABC):
         session_aligned_expected_hit = (
             session_expected_hit // match_granularity * match_granularity
         )
-        self._match_profile_samples.append({
+        sample = {
             "tag": tag,
             "input_len": input_len,
             # match_req intentionally excludes the final prompt token.
@@ -180,7 +238,29 @@ class BaseCacheManager(ABC):
             "admission_wait_ms": (
                 perf_counter_ns() - req.queued_at_ns
             ) / 1e6,
-        })
+        }
+        arrival = self._profile_arrivals.pop(req.uid, None)
+        sample["arrival_tree_match_len"] = (
+            arrival["tree_match_len"] if arrival is not None else None
+        )
+        sample["arrival_recoverable_len"] = (
+            arrival["recoverable_len"] if arrival is not None else None
+        )
+        sample["arrival_seq"] = arrival["seq"] if arrival is not None else None
+        sample["previous_inserted_len"] = (
+            arrival["previous_inserted_len"] if arrival is not None else None
+        )
+        event = {
+            "event": "admission",
+            "tag": tag,
+            "uid": req.uid,
+            "tree_match_len": tree_match_len,
+            "recoverable_len": recoverable_len,
+            "arrival_seq": sample["arrival_seq"],
+        }
+        self._record_lifecycle_event(event)
+        sample["admission_seq"] = event["seq"]
+        self._match_profile_samples.append(sample)
 
     def record_cached_session(self, req: Request, cached_len: int) -> None:
         if not self._match_profile_enabled or not req.profile_tag:
@@ -203,6 +283,7 @@ class BaseCacheManager(ABC):
         return {
             "type": type(self).__name__,
             "match_samples": self._match_profile_samples,
+            "lifecycle_events": self._profile_lifecycle_events,
         }
 
     @property
@@ -216,7 +297,7 @@ class BaseCacheManager(ABC):
     def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None: ...
 
     @abstractmethod
-    def allocate(self, reqs: list[Request]) -> None: ...
+    def allocate(self, reqs: list[Request], *, phase: str | None = None) -> None: ...
 
     @abstractmethod
     def cache_req(self, req: Request, *, finished: bool) -> None: ...

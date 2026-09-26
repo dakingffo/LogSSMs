@@ -5,6 +5,7 @@ from logssms.cache import (
     StandardCacheConfig,
     make_cache_argument_parser,
 )
+from logssms.cache.logstate_pool.layout import LOG_STATE_GRANULARITY
 from logssms.server.args import parse_args
 
 
@@ -60,6 +61,7 @@ def test_server_uses_logstate_defaults(tmp_path) -> None:
     ])
 
     assert args.cache_config == LogStateCacheConfig()
+    assert args.cache_config.granularity == LOG_STATE_GRANULARITY == 32
     assert args.page_size == 64
 
 

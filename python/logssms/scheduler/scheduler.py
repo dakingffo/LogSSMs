@@ -84,7 +84,11 @@ class Scheduler(SchedulerIOMixin):
         self.verify_manager = self.ar_manager
         self.prefill_manager = PrefillManager(self.token_pool, config.page_size)
         self.prefill_budget = config.max_prefill_tokens
-        self.profiler = SchedulerProfiler(self.device, self.cache_manager)
+        self.profiler = SchedulerProfiler(
+            self.device, self.cache_manager,
+            getattr(self.engine, "linear_attn_backend", None),
+            self.engine,
+        )
         self._last_stall_report = 0.0
         self._deferred_req_frees: list[tuple[ForwardOutput, Request, bool]] = []
 
@@ -191,6 +195,7 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            self.cache_manager.record_arrival_profile(msg)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

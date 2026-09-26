@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+from unittest.mock import patch
+import os
 
 import logssms.core as core
 from logssms.cache import (
@@ -13,6 +15,9 @@ from logssms.cache import (
     StandardCacheManager,
     StandardPrefixValue,
 )
+from logssms.core import Request, SamplingParams
+from logssms.message import UserMsg
+from logssms.scheduler.prefill import PendingRequest
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +75,66 @@ def _assert_no_overlap(pages: torch.Tensor, page_size: int):
         overlap = expanded & token_range
         assert len(overlap) == 0, f"Overlapping tokens: {overlap}"
         expanded.update(token_range)
+
+
+def test_radix_lifecycle_profile_tracks_arrival_admission_and_eviction():
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = _make_cache_manager(num_pages=4, page_size=4)
+    manager.resources.page_table = torch.full((2, 32), -1, dtype=torch.int32)
+    tokens = torch.arange(9, dtype=torch.int32)
+    allocated, _ = manager._allocate(2)
+    assert allocated is not None
+    manager.page_table[0, :8] = manager._page_to_token(allocated)
+
+    pending = PendingRequest(
+        uid=0, input_ids=tokens, sampling_params=SamplingParams(max_tokens=4),
+        profile_tag="session/turn-1",
+    )
+    handle = manager.match_req(pending).cuda_handle
+    manager.lock(handle)
+    req = Request(
+        input_ids=tokens, table_idx=0, cached_len=8, output_len=4,
+        uid=0, sampling_params=pending.sampling_params, cache_handle=handle,
+        max_device_len=12, profile_tag=pending.profile_tag,
+    )
+    manager.cache_req(req, finished=True)
+
+    next_tokens = torch.cat([tokens[:4], torch.tensor([99], dtype=torch.int32)])
+    arrival = UserMsg(
+        uid=1, input_ids=next_tokens,
+        sampling_params=SamplingParams(max_tokens=4),
+        profile_tag="session/turn-2",
+    )
+    original = manager.prefix_cache.root_node.children.copy()
+    child = next(iter(original.values()))
+    timestamp = child.timestamp
+    manager.record_arrival_profile(arrival)
+    assert manager.prefix_cache.root_node.children == original
+    assert child.timestamp == timestamp
+    assert child.length == 8
+
+    pending = PendingRequest(
+        uid=arrival.uid, input_ids=arrival.input_ids,
+        sampling_params=arrival.sampling_params, profile_tag=arrival.profile_tag,
+    )
+    match = manager.match_req(pending)
+    manager.record_match_profile(pending, match, input_len=len(next_tokens))
+    profile = manager.profile_result()
+    assert [event["event"] for event in profile["lifecycle_events"]] == [
+        "complete", "arrival", "admission",
+    ]
+    assert profile["lifecycle_events"][1]["tree_match_len"] == 4
+    assert profile["lifecycle_events"][1]["previous_inserted_len"] == 8
+    assert profile["match_samples"][0]["arrival_tree_match_len"] == 4
+
+    # Admission split the compressed edge. An unrelated allocation evicts
+    # the unlocked suffix; its original node must appear in the event.
+    manager._allocate(2)
+    manager._allocate(1)
+    events = manager.profile_result()["lifecycle_events"]
+    assert events[-1]["event"] == "eviction"
+    assert events[-1]["nodes"][0]["uuid"] == child.uuid
+    assert events[-1]["kv_tokens"] == 4
 
 
 class TestAllocateEvictPageAlignment:

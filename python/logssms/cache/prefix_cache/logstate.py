@@ -6,7 +6,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
-from typing import Any, Callable, NamedTuple, TypeAlias
+from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias
 
 import torch
 
@@ -475,26 +475,57 @@ class LogRadixTree(BasePrefixCache):
         for entry in self._slot_entries[slot]:
             self.protect(self.entry_owner(entry), protected)
 
-    def evict(self, size: int) -> LogRadixEviction:
+    def evict(
+        self,
+        size         : int,
+        evicted_nodes: list[tuple[int, int, int]] | None = None,
+    ) -> LogRadixEviction:
         if size == 0:
             return LogRadixEviction(self.empty_tensor, ())
         assert size <= self.evictable_size, (
             f"Can't evict {size}, only {self.evictable_size}."
         )
+        selected = []
+        evicted_size = 0
+        for node in self.iter_evict_candidates():
+            selected.append(node)
+            evicted_size += node.length
+            if evicted_size >= size:
+                break
+        assert evicted_size >= size
+        return self.evict_nodes(selected, evicted_nodes)
 
+    def iter_evict_candidates(self) -> Iterator[LogRadixTreeNode]:
+        """Yield LRU nodes in the order they can be removed, without mutating the tree."""
         leaves = self._collect_leaves_for_evict()
         heapq.heapify(leaves)
-        evicted_size = 0
+        remaining_children: dict[LogRadixTreeNode, int] = {}
+        while leaves:
+            node = heapq.heappop(leaves)
+            yield node
+            parent = node.parent
+            if not parent.is_root() and not parent.is_locked:
+                remaining = remaining_children.setdefault(
+                    parent, len(parent.children)
+                ) - 1
+                remaining_children[parent] = remaining
+                if remaining == 0:
+                    heapq.heappush(leaves, parent)
+
+    def slot_entry_count(self, slot: int) -> int:
+        return len(self._slot_entries[slot])
+
+    def evict_nodes(
+        self,
+        nodes        : Iterable[LogRadixTreeNode],
+        evicted_nodes: list[tuple[int, int, int]] | None = None,
+    ) -> LogRadixEviction:
         evicted_kv: list[torch.Tensor] = []
         evicted_entries: list[LogStateEntry] = []
-        while evicted_size < size:
-            assert leaves, (
-                f"Can't evict enough cache, need {size}, "
-                f"only {evicted_size} evicted."
-            )
-            node = heapq.heappop(leaves)
+        for node in nodes:
             assert node.is_leaf() and not node.is_locked and not node.is_root()
-            evicted_size += node.length
+            if evicted_nodes is not None:
+                evicted_nodes.append((node.uuid, node.begin, node.depth))
             self.evictable_size -= node.length
             evicted_kv.append(node.kv)
             evicted_entries.extend(node.entries)
@@ -503,9 +534,8 @@ class LogRadixTree(BasePrefixCache):
 
             parent = node.parent
             del parent.children[self.key_fn(node.key)]
-            if parent.is_leaf() and not parent.is_locked and not parent.is_root():
-                heapq.heappush(leaves, parent)
-
+        if not evicted_kv:
+            return LogRadixEviction(self.empty_tensor, ())
         self.revision += 1
         return LogRadixEviction(
             torch.cat(evicted_kv), tuple(evicted_entries)

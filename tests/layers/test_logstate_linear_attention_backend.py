@@ -154,6 +154,32 @@ def test_logstate_uses_physical_offsets_after_unaligned_prefix_hit() -> None:
         clear_global_ctx()
 
 
+def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", "1")
+    clear_global_ctx()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ctx = _make_context(device)
+    backend = LogStateLinearAttentionBackend()
+    req = _make_request(cached_len=16, device_len=32)
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.positions = torch.arange(16, 32, dtype=torch.int32, device=device)
+    batch.out_loc = ctx.page_table[0, 16:32]
+
+    set_global_ctx(ctx)
+    try:
+        backend.prepare_metadata(batch)
+        profile = backend.profile_result()
+    finally:
+        clear_global_ctx()
+
+    assert profile is not None
+    assert profile["aggregate"]["prefill_batches"] == 1
+    assert profile["aggregate"]["item_calls"] == 1
+    assert profile["aggregate"]["metadata_cpu_ms"] >= 0
+    assert profile["aggregate"]["repeat_interleave_cpu_ms"] >= 0
+    assert profile["aggregate"]["item_cpu_ms"] >= 0
+
+
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 def test_logstate_unmapped_cached_prefix_reads_work_conv(phase: str) -> None:
     clear_global_ctx()

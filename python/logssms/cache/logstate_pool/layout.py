@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 
-LOG_STATE_GRANULARITY = 16
+LOG_STATE_GRANULARITY = 32
 DEFAULT_LOG_STATE_PAGE_SIZE = 64
 
 

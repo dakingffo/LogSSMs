@@ -24,6 +24,20 @@ def make_pool(device: torch.device | None = None) -> FramedMHALogStatePool:
     )
 
 
+def test_reserve_profile_separates_allocator_and_descriptor_work():
+    pool = make_pool()
+    timings = {}
+    assert pool.reserve(logs=1, works=1, timings=timings) is not None
+    assert timings["descriptor_count"] == 2
+    assert timings["poll_reclamation_ms"] >= 0
+    assert timings["allocator_reserve_ms"] >= 0
+    assert timings["descriptor_write_ms"] >= 0
+
+    failed = {}
+    assert pool.reserve(kv=1000, timings=failed) is None
+    assert failed["failed"] == 1
+
+
 def test_framed_kv_preserves_sixteen_token_page_view():
     pool = make_pool()
     allocated = pool.reserve(kv=2)
@@ -55,6 +69,42 @@ def test_framed_work_state_and_conv_roundtrip():
     pool.write_conv(slots, granules, 1, conv)
     torch.testing.assert_close(pool.read_states(slots, 1), state)
     torch.testing.assert_close(pool.read_conv(slots, granules, 1), conv)
+
+
+def test_batch_zero_work_slots_does_not_clear_log_or_descriptors():
+    pool = make_pool()
+    allocated = pool.reserve(logs=1, works=2)
+    assert allocated is not None
+    log = allocated[1][0]
+    works = allocated[2]
+    pool.storage.fill_(7)
+    payload_before = pool.payload_frame_table[works].clone()
+    pool.zero_work_slots(works)
+    for slot in works:
+        record = pool.allocator.slot(slot)
+        for frame in (*record.payload, *(f for group in record.conv for f in group)):
+            assert torch.all(pool.storage[frame] == 0)
+    assert torch.all(pool.storage[pool.allocator.slot(log).payload[0]] == 7)
+    torch.testing.assert_close(pool.payload_frame_table[works], payload_before)
+
+
+def test_batch_release_clears_only_selected_descriptors():
+    pool = make_pool()
+    allocated = pool.reserve(logs=2, works=2)
+    assert allocated is not None
+    selected = [allocated[1][0], allocated[2][0], allocated[2][1]]
+    survivor = allocated[1][1]
+    payload = pool.payload_frame_table[survivor].clone()
+    conv = pool.conv_frame_table[survivor].clone()
+    decay = pool.decay_frame_table[survivor].clone()
+    pool.release_slots(selected)
+    for table in (pool.payload_frame_table, pool.conv_frame_table, pool.decay_frame_table):
+        assert torch.all(table[selected] == -1)
+    torch.testing.assert_close(pool.payload_frame_table[survivor], payload)
+    torch.testing.assert_close(pool.conv_frame_table[survivor], conv)
+    torch.testing.assert_close(pool.decay_frame_table[survivor], decay)
+    pool.allocator.check_integrity()
+    assert pool.reserve(logs=1, works=1) is not None
 
 
 def test_framed_kv_store_uses_physical_token_offsets():

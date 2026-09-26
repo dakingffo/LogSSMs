@@ -20,10 +20,12 @@ from .pools import (
     make_linear_state_pool,
 )
 from .prefix_cache.base import BaseCacheHandle
+from .prefix_cache.radix import RadixPrefixCache, RadixTreeNode
 from .prefix_cache.standard import StandardPrefixValue
 
 if TYPE_CHECKING:
     from logssms.engine import EngineConfig
+    from logssms.message import UserMsg
     from logssms.speculator import SpeculatorReserve
 
 
@@ -64,6 +66,27 @@ class StandardCacheManager(BaseCacheManager):
         self.num_states = num_states
         self.num_draft_states = num_draft_states
 
+    @staticmethod
+    def _node_path(node: RadixTreeNode) -> list[int]:
+        path = []
+        while not node.is_root():
+            path.append(node.uuid)
+            node = node.parent
+        return list(reversed(path))
+
+    def record_arrival_profile(self, req: UserMsg) -> None:
+        if not self._match_profile_enabled or not isinstance(
+            self.prefix_cache, RadixPrefixCache
+        ):
+            return
+        usable_len = align_down(max(0, len(req.input_ids) - 1), self.page_size)
+        node, matched_len = self.prefix_cache.trace_prefix(
+            req.input_ids[:usable_len]
+        )
+        self._record_arrival_snapshot(
+            req, matched_len, matched_len, self._node_path(node)
+        )
+
     @property
     def available_size(self) -> int:
         return self.prefix_cache.size_info.evictable_size + len(self.free_pages) * self.page_size
@@ -85,7 +108,8 @@ class StandardCacheManager(BaseCacheManager):
         else:
             page_entry.copy_(matched)
 
-    def allocate(self, reqs: list[Request]) -> None:
+    def allocate(self, reqs: list[Request], *, phase: str | None = None) -> None:
+        del phase
         needed_pages = 0
         allocation_info: list[tuple[int, int, int]] = []
         for req in reqs:
@@ -160,6 +184,13 @@ class StandardCacheManager(BaseCacheManager):
 
         if finished:
             self.record_cached_session(req, insert_len)
+            if self._match_profile_enabled and isinstance(
+                self.prefix_cache, RadixPrefixCache
+            ):
+                self._record_complete_profile(
+                    req, new_handle.cached_len,
+                    self._node_path(new_handle.node),
+                )
 
     def _free(
         self,
@@ -299,10 +330,37 @@ class StandardCacheManager(BaseCacheManager):
                     f" evictable_tokens={evictable},"
                     f" protected_tokens={self.prefix_cache.size_info.protected_size}."
                 )
-            evicted_pages, evicted_states = self.prefix_cache.evict(needed_evict)
+            trace_eviction = self._match_profile_enabled and isinstance(
+                self.prefix_cache, RadixPrefixCache
+            )
+            evicted_nodes = [] if trace_eviction else None
+            if trace_eviction:
+                evicted_pages, evicted_states = self.prefix_cache.evict(
+                    needed_evict, evicted_nodes=evicted_nodes
+                )
+            else:
+                evicted_pages, evicted_states = self.prefix_cache.evict(needed_evict)
             self.free_pages = torch.cat([self.free_pages, evicted_pages[:: self.page_size]])
             if self.state_pool is not None and evicted_states is not None:
                 self.free_states = torch.cat([self.free_states, evicted_states])
+            if trace_eviction:
+                self._record_lifecycle_event({
+                    "event": "eviction",
+                    "nodes": [
+                        {"uuid": uuid, "begin": begin, "end": end}
+                        for uuid, begin, end in evicted_nodes
+                    ],
+                    "kv_tokens": len(evicted_pages),
+                    "state_slots": (
+                        len(evicted_states) if evicted_states is not None else 0
+                    ),
+                    "free_kv_pages_before": free_pages,
+                    "free_kv_pages_after": len(self.free_pages),
+                    "free_state_slots_before": free_states,
+                    "free_state_slots_after": len(self.free_states),
+                    "need_kv_pages": needed_pages,
+                    "need_state_slots": needed_states,
+                })
             assert needed_pages == 0 or len(self.free_pages) >= needed_pages, "Eviction did not free enough pages."
             assert needed_states == 0 or len(self.free_states) >= needed_states, "Eviction did not free enough states."
 

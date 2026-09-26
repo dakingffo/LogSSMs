@@ -211,6 +211,25 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
             recoverable_len=prefix_len,
         )
 
+    def trace_prefix(self, input_ids: torch.Tensor) -> tuple[NodeT, int]:
+        """Read-only match for profiling; unlike match_prefix, never splits nodes."""
+        node = self.root_node
+        prefix_len = 0
+        while prefix_len < len(input_ids):
+            child = node.children.get(self.key_fn(input_ids[prefix_len:]))
+            if child is None:
+                break
+            match_len = align_down(
+                child.get_match_len(input_ids[prefix_len:]), self.page_size
+            )
+            if match_len == 0:
+                break
+            node = child
+            prefix_len += match_len
+            if match_len != child.length:
+                break
+        return node, prefix_len
+
     def insert_prefix(
         self,
         input_ids: torch.Tensor,
@@ -234,7 +253,11 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node, self.empty_tensor))
 
-    def evict(self, size: int) -> StandardPrefixValue:
+    def evict(
+        self,
+        size         : int,
+        evicted_nodes: list[tuple[int, int, int]] | None = None,
+    ) -> StandardPrefixValue:
         """Evict prefixes. Returns (evicted KV page indices, evicted state slots).
 
         For the non-hybrid radix cache the state slots are None.
@@ -253,6 +276,13 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
             assert leave_nodes, f"Can't evict enough cache, need {size}, only {evicted_size} evicted"
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            if evicted_nodes is not None:
+                end = 0
+                ancestor = node
+                while not ancestor.is_root():
+                    end += ancestor.length
+                    ancestor = ancestor.parent
+                evicted_nodes.append((node.uuid, end - node.length, end))
             evicted_size += node.length
             values = node.value
             evicted_indices.append(values[0])

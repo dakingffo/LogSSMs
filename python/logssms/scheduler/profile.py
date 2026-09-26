@@ -16,6 +16,8 @@ from logssms.utils import init_logger, nvtx_annotate
 if TYPE_CHECKING:
     from logssms.cache import BaseCacheManager
     from logssms.core import Batch
+    from logssms.engine import Engine
+    from logssms.layers.linear_attention_backend import BaseLinearAttentionBackend
 
 
 logger = init_logger(__name__)
@@ -93,10 +95,14 @@ class SchedulerProfiler:
         self,
         device       : torch.device,
         cache_manager: BaseCacheManager,
+        linear_backend: BaseLinearAttentionBackend | None = None,
+        engine       : Engine | None = None,
     ) -> None:
         self.enabled = _env_bool("LOGSSMS_PROFILE_SCHEDULER")
         self.device = device
         self.cache_manager = cache_manager
+        self.linear_backend = linear_backend
+        self.engine = engine
         self.path = os.getenv("LOGSSMS_PROFILE_SCHEDULER_PATH")
         self.flush_interval = _env_int("LOGSSMS_PROFILE_FLUSH_INTERVAL")
         self.ar_forward_count = 0
@@ -249,6 +255,14 @@ class SchedulerProfiler:
         cache = self.cache_manager.profile_result()
         if cache is not None:
             result["cache"] = cache
+        if self.linear_backend is not None:
+            linear = self.linear_backend.profile_result()
+            if linear is not None:
+                result["linear_attention_backend"] = linear
+        if self.engine is not None:
+            prepare = self.engine.prepare_profile_result()
+            if prepare is not None:
+                result["engine_prepare"] = prepare
         return result
 
     def _write_result(self) -> None:
