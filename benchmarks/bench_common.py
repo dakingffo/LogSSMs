@@ -44,6 +44,7 @@ from datasets.parser import (
     resolve_dataset_path as _resolve_dataset_path,
     sample_dataset,
 )
+from logssms.utils.platform import configure_chat_tokenizer, render_chat_prompt
 
 
 # -------------------------------------------------------------------------------------
@@ -169,21 +170,23 @@ def _take_dataset_prompts(
     ]
 
 
+def _load_benchmark_tokenizer(model_path: str) -> Any:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    return configure_chat_tokenizer(tokenizer, model_path)
+
+
 def _dataset_prompt_len(tokenizer: Any, prompt: str) -> int:
     """Match the chat-template tokenization performed by ``TokenizeManager``."""
-    text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    text = render_chat_prompt(tokenizer, [{"role": "user", "content": prompt}])
     return len(tokenizer.encode(text))
 
 
-def _chat_prompt_len(tokenizer: Any, messages: list[dict[str, Any]]) -> int:
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
+def _chat_prompt_len(tokenizer: Any, messages: list[dict[str, Any]] | str) -> int:
+    text = (
+        messages if isinstance(messages, str) else
+        render_chat_prompt(tokenizer, messages)
     )
     return len(tokenizer.encode(text))
 
@@ -245,9 +248,7 @@ def make_conversations(
             for record in records
         ]
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = _load_benchmark_tokenizer(model_path)
     random.seed(seed)
     return [
         BenchmarkConversation(
@@ -288,9 +289,7 @@ def make_prompts(
     dataset_categories: str | None = None,
 ):
     """One seeded batch of prompts + their exact token lengths. Reused across A/B runs."""
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = _load_benchmark_tokenizer(model_path)
     if dataset is not None:
         prompts = _take_dataset_prompts(
             dataset, dataset_categories, num_prompts, seed
@@ -315,9 +314,7 @@ def make_mixed_prompts(
 ):
     """One seeded mixed-length batch. ``segments`` is [(input_len, count), ...]; returns
     (prompts, lens) in segment order so group indices are just running offsets."""
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = _load_benchmark_tokenizer(model_path)
     if dataset is not None:
         count = sum(count for _, count in segments)
         dataset_prompts = load_dataset_prompts(dataset, dataset_categories)
@@ -416,6 +413,9 @@ def prepare_history(
         "seed": bench.seed,
         "num_turns": bench.num_turns,
         "output_len": bench.output_len,
+        "ignore_eos": getattr(bench, "ignore_eos", True),
+        "history_mode": getattr(bench, "history_mode", "generated"),
+        "fixed_history_tokens": getattr(bench, "fixed_history_tokens", None),
         "points": {},
     }
 
@@ -548,17 +548,26 @@ def kill_server(proc: subprocess.Popen) -> None:
         return
     pgid = os.getpgid(proc.pid)
     try:
-        os.killpg(pgid, signal.SIGTERM)
+        # The scheduler writes its opt-in profile in shutdown().  SIGTERM skips
+        # that path; SIGINT is handled cooperatively by every TP rank.
+        os.killpg(pgid, signal.SIGINT)
     except ProcessLookupError:
         return
     try:
-        proc.wait(timeout=30)
+        proc.wait(timeout=60)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=10)
 
 
 # -------------------------------------------------------------------------------------
@@ -586,28 +595,28 @@ async def stream_messages(
     client    : Any,
     base      : str,
     model     : str,
-    messages  : list[dict[str, Any]],
+    messages  : list[dict[str, Any]] | str,
     output_len: int,
     progress  : _Progress | None = None,
     profile_tag: str | None = None,
+    ignore_eos: bool = True,
 ) -> StreamResult:
     """Stream one chat-completions request and retain its assistant text.
 
     Every ``data: {json}`` line is exactly one detokenizer ack (one token per ack on the
     non-MTP path, one verify round per ack on the MTP path). ``data: [DONE]`` is the
-    terminator. Its arrival timestamp is retained as the request completion boundary,
-    matching SGLang's serving benchmark. ``ignore_eos + top_k=1 + temperature=0`` makes
-    every request greedy and deterministic, and the server delivers the full
-    ``max_tokens`` budget -- see ``summarize``.
+    terminator. Its arrival timestamp is retained as the request completion boundary.
+    ``top_k=1 + temperature=0`` makes requests greedy; ``ignore_eos`` controls whether
+    they must consume the full ``max_tokens`` budget.
     """
     payload = {
         "model": model,
-        "messages": messages,
+        ("prompt" if isinstance(messages, str) else "messages"): messages,
         "max_tokens": output_len,
         "temperature": 0.0,
         "top_k": 1,
         "stream": True,
-        "ignore_eos": True,
+        "ignore_eos": ignore_eos,
     }
     headers = (
         {"X-LogSSMs-Profile-Tag": profile_tag}
@@ -649,6 +658,7 @@ async def stream_one(
     prompt    : str,
     output_len: int,
     progress  : _Progress | None = None,
+    ignore_eos: bool = True,
 ) -> list[float]:
     result = await stream_messages(
         client,
@@ -657,6 +667,7 @@ async def stream_one(
         [{"role": "user", "content": prompt}],
         output_len,
         progress,
+        ignore_eos=ignore_eos,
     )
     return result.tics
 
@@ -669,12 +680,23 @@ async def _run_conversation(
     output_len     : int,
     progress       : _Progress | None,
     request_timeout: float | None = None,
-) -> list[tuple[StreamResult, list[dict[str, Any]]]]:
+    fixed_assistant: str | None = None,
+    prefix_tokenizer: Any | None = None,
+    ignore_eos: bool = True,
+) -> list[tuple[StreamResult, list[dict[str, Any]] | str]]:
     history = [_message_dict(message) for message in conversation.initial_messages]
     results = []
+    next_prefix_prompt = None
     for turn_index, user_turn in enumerate(conversation.user_turns):
-        history.append(_message_dict(user_turn))
-        request_messages = [dict(message) for message in history]
+        if prefix_tokenizer is None:
+            history.append(_message_dict(user_turn))
+            request_messages = [dict(message) for message in history]
+        else:
+            request_messages = next_prefix_prompt
+            if request_messages is None:
+                request_messages = render_chat_prompt(
+                    prefix_tokenizer, history + [_message_dict(user_turn)]
+                )
         try:
             result = await asyncio.wait_for(
                 stream_messages(
@@ -685,6 +707,7 @@ async def _run_conversation(
                     output_len,
                     progress,
                     profile_tag=f"{conversation.uid}/turn-{turn_index + 1}",
+                    ignore_eos=ignore_eos,
                 ),
                 timeout=request_timeout,
             )
@@ -694,8 +717,32 @@ async def _run_conversation(
                 f"timed out after {request_timeout}s"
             ) from error
         results.append((result, request_messages))
-        history.append({"role": "assistant", "content": result.output})
+        assistant = result.output if fixed_assistant is None else fixed_assistant
+        if prefix_tokenizer is None:
+            history.append({"role": "assistant", "content": assistant})
+        elif turn_index + 1 < len(conversation.user_turns):
+            next_user = _message_dict(conversation.user_turns[turn_index + 1])
+            next_prefix_prompt = (
+                request_messages + assistant + prefix_tokenizer.eos_token + "\n"
+                + render_chat_prompt(prefix_tokenizer, [next_user])
+            )
+            old_ids = prefix_tokenizer.encode(request_messages)
+            new_ids = prefix_tokenizer.encode(next_prefix_prompt)
+            if new_ids[:len(old_ids)] != old_ids:
+                raise AssertionError(
+                    f"Raw prefix is not token-stable for {conversation.uid} "
+                    f"at turn {turn_index + 1}"
+                )
     return results
+
+
+def _fixed_assistant_reply(tokenizer: Any, output_len: int) -> str:
+    """A deterministic prior reply for an identical-input cache-policy A/B trace."""
+    sentence = "The assistant summarizes this turn in a stable and reproducible way. "
+    tokens = tokenizer.encode(sentence, add_special_tokens=False)
+    assert tokens
+    repeated = (tokens * ((output_len + len(tokens) - 1) // len(tokens)))[:output_len]
+    return tokenizer.decode(repeated, skip_special_tokens=False)
 
 
 async def run_multiturn_bench(
@@ -710,11 +757,12 @@ async def run_multiturn_bench(
     pbar               : bool = True,
     request_timeout     : float | None = 300.0,
     history_records     : list[dict[str, Any]] | None = None,
+    history_mode        : str = "generated",
+    fixed_history_tokens: int | None = None,
+    ignore_eos          : bool = True,
 ) -> dict:
     """Run closed-loop sessions with a bounded number of concurrent sessions."""
     import httpx
-    from transformers import AutoTokenizer
-
     if not conversations:
         raise ValueError("multi-turn benchmark requires at least one conversation")
     if concurrency is None:
@@ -722,7 +770,20 @@ async def run_multiturn_bench(
     if concurrency < 1:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
     concurrency = min(concurrency, len(conversations))
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    tokenizer = _load_benchmark_tokenizer(model)
+    if history_mode not in ("generated", "fixed", "prefix_generated", "prefix_fixed"):
+        raise ValueError(f"Unsupported history mode: {history_mode}")
+    if fixed_history_tokens is not None and (
+        history_mode not in ("fixed", "prefix_fixed") or fixed_history_tokens < 1
+    ):
+        raise ValueError("fixed_history_tokens requires fixed mode and a positive length")
+    fixed_assistant = (
+        _fixed_assistant_reply(tokenizer, fixed_history_tokens or output_len)
+        if history_mode in ("fixed", "prefix_fixed") else None
+    )
+    prefix_tokenizer = tokenizer if history_mode.startswith("prefix_") else None
+    if prefix_tokenizer is not None and tokenizer.eos_token != "<|im_end|>":
+        raise ValueError("prefix history mode currently requires a ChatML tokenizer")
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None),
         limits=httpx.Limits(max_connections=1024, max_keepalive_connections=128),
@@ -738,6 +799,9 @@ async def run_multiturn_bench(
                 min(8, output_len),
                 None,
                 request_timeout,
+                fixed_assistant,
+                prefix_tokenizer,
+                ignore_eos,
             )
         num_turns = len(conversations[0].user_turns) if conversations else 0
         assert all(
@@ -752,7 +816,7 @@ async def run_multiturn_bench(
         for index, conversation in enumerate(conversations):
             queue.put_nowait((index, conversation))
         session_results: list[
-            list[tuple[StreamResult, list[dict[str, Any]]]] | None
+            list[tuple[StreamResult, list[dict[str, Any]] | str]] | None
         ] = [None] * len(conversations)
 
         async def worker() -> None:
@@ -766,6 +830,9 @@ async def run_multiturn_bench(
                     output_len,
                     progress,
                     request_timeout,
+                    fixed_assistant,
+                    prefix_tokenizer,
+                    ignore_eos,
                 )
 
         await asyncio.gather(*[worker() for _ in range(concurrency)])
@@ -785,10 +852,12 @@ async def run_multiturn_bench(
         for _result, messages in flat
     ]
     output_lengths = [output_len] * len(flat)
-    summary = summarize(tics_all, input_lengths, output_lengths, mtp=mtp)
+    summary = summarize(tics_all, input_lengths, output_lengths, mtp=mtp, ignore_eos=ignore_eos)
     summary["sessions"] = len(conversations)
     summary["concurrency"] = concurrency
     summary["num_turns"] = num_turns
+    summary["history_mode"] = history_mode
+    summary["fixed_history_tokens"] = fixed_history_tokens
     summary["workload_uids"] = [
         conversation.uid for conversation in conversations
     ]
@@ -812,6 +881,7 @@ async def run_multiturn_bench(
             turn_input_lengths,
             [output_len] * len(turn_requests),
             mtp=mtp,
+            ignore_eos=ignore_eos,
         )
         summary["turn_stats"].append({"turn": turn + 1, **turn_stats})
     if history_records is not None:
@@ -852,6 +922,7 @@ async def run_benchmark_point(
     warmup             : bool = True,
     pbar               : bool = True,
     history_records    : list[dict[str, Any]] | None = None,
+    ignore_eos         : bool = True,
 ) -> tuple[dict, list[int]]:
     """Construct and execute one single- or multi-turn benchmark point."""
     if num_turns < 1:
@@ -880,6 +951,7 @@ async def run_benchmark_point(
             warmup_conversation=warmup_conversation,
             pbar=pbar,
             history_records=history_records,
+            ignore_eos=ignore_eos,
         )
         return stats, [round(stats["in_tokens"] / max(stats["n"], 1))]
 
@@ -904,6 +976,7 @@ async def run_benchmark_point(
         warmup_prompt=warmup_prompt,
         pbar=pbar,
         history_records=history_records,
+        ignore_eos=ignore_eos,
     )
     return stats, input_lengths
 
@@ -919,6 +992,7 @@ async def run_online_bench_tics(
     warmup_prompt: str | None = None,
     pbar: bool = True,
     history_records: list[dict[str, Any]] | None = None,
+    ignore_eos: bool = True,
 ) -> tuple[dict, list[list[float]]]:
     """Drive the workload, returning (summary, per-request tics) for split reporting."""
     import httpx
@@ -933,22 +1007,21 @@ async def run_online_bench_tics(
         if warmup_prompt is not None:
             # flush Triton autotune / CUDA graph capture / lazy detokenizer init
             await stream_one(
-                client, base, model, warmup_prompt, min(8, output_lengths[0])
+                client, base, model, warmup_prompt, min(8, output_lengths[0]),
+                ignore_eos=ignore_eos,
             )
         progress = _Progress(len(prompts), on=pbar and len(prompts) > 1)
         if history_records is None:
             tics_all = await asyncio.gather(*[
-                stream_one(client, base, model, p, o, progress)
+                stream_one(client, base, model, p, o, progress, ignore_eos=ignore_eos)
                 for p, o in zip(prompts, output_lengths, strict=True)
             ])
         else:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(model)
+            tokenizer = _load_benchmark_tokenizer(model)
             responses = await asyncio.gather(*[
                 stream_messages(
                     client, base, model, [{"role": "user", "content": prompt}],
-                    output_len, progress,
+                    output_len, progress, ignore_eos=ignore_eos,
                 )
                 for prompt, output_len in zip(prompts, output_lengths, strict=True)
             ])
@@ -975,7 +1048,7 @@ async def run_online_bench_tics(
         await client.aclose()
     if progress.on:
         print(file=sys.stderr, flush=True)
-    return summarize(tics_all, input_lengths, output_lengths, mtp=mtp), tics_all
+    return summarize(tics_all, input_lengths, output_lengths, mtp=mtp, ignore_eos=ignore_eos), tics_all
 
 
 async def run_online_bench(
@@ -989,11 +1062,12 @@ async def run_online_bench(
     warmup_prompt: str | None = None,
     pbar: bool = True,
     history_records: list[dict[str, Any]] | None = None,
+    ignore_eos: bool = True,
 ) -> dict:
     summary, _ = await run_online_bench_tics(
         base, model, prompts, input_lengths, output_lengths,
         mtp=mtp, warmup_prompt=warmup_prompt, pbar=pbar,
-        history_records=history_records,
+        history_records=history_records, ignore_eos=ignore_eos,
     )
     return summary
 
@@ -1042,6 +1116,7 @@ def summarize(
     output_lengths: list[int],
     *,
     mtp: bool = False,
+    ignore_eos: bool = True,
 ) -> dict:
     n = len(tics_all)
     in_tokens = sum(input_lengths)
@@ -1074,7 +1149,10 @@ def summarize(
         verify_rounds = 0
         out_tokens = sum(content_chunks)
         avg_accept = 0.0  # one chunk == one token; avg_accept is MTP-only
-        chunks_ok = out_tokens == requested  # full budget delivered
+        chunks_ok = (
+            out_tokens == requested if ignore_eos else
+            all(1 <= chunks <= length for chunks, length in zip(content_chunks, output_lengths, strict=True))
+        )
 
     start = min(t[0] for t in tics_all)
     end = max(t[-1] for t in tics_all)
@@ -1086,8 +1164,8 @@ def summarize(
     # ends when [DONE] arrives. This remains well-defined when one MTP chunk delivers
     # several committed tokens at once.
     tpot_times = [
-        (t[-1] - t[1]) / (output_len - 1) if output_len > 1 else 0.0
-        for t, output_len in zip(tics_all, output_lengths, strict=True)
+        (t[-1] - t[1]) / (tokens - 1) if tokens > 1 else 0.0
+        for t, tokens in zip(tics_all, content_chunks if not mtp else output_lengths, strict=True)
     ]
     tpot_ms = _stats(tpot_times)
     # HTTP timestamps cannot isolate a pure decode phase under continuous batching.
@@ -1095,8 +1173,13 @@ def summarize(
     output_tok_per_s = out_tokens / dur if dur > 0 else 0.0
     return {
         "n": n,
+        "ignore_eos": ignore_eos,
         "in_tokens": in_tokens,
         "requested_out": requested,
+        "early_stops": (
+            sum(chunks < length for chunks, length in zip(content_chunks, output_lengths, strict=True))
+            if not mtp else 0
+        ),
         "out_tokens": out_tokens,
         "duration_s": dur,
         "prefill_tok_per_s": in_tokens / max(first_times) if first_times else 0.0,

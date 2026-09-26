@@ -70,6 +70,27 @@ class LogStateFrameAllocator:
     def slot(self, slot: int) -> LinearFrameSlot:
         return self._slots[slot]
 
+    def profile_usage(self) -> dict[str, int]:
+        """Physical ownership accounting; only called by the opt-in profiler."""
+        kinds = {"log": 0, "checkpoint": 0, "work": 0}
+        payload_frames = conv_frames = 0
+        for record in self._slots.values():
+            kinds[record.kind] += 1
+            payload_frames += len(record.payload)
+            conv_frames += sum(map(len, record.conv))
+        return {
+            "total_frames": self.num_frames,
+            "free_frames": self.free_frames,
+            "kv_frames": len(self._kv),
+            "payload_frames": payload_frames,
+            "conv_frames": conv_frames,
+            "decay_frames": len(self._decay_masks),
+            "free_decay_records": self._free_decay_records,
+            "log_slots": kinds["log"],
+            "checkpoint_slots": kinds["checkpoint"],
+            "work_slots": kinds["work"],
+        }
+
     def _take_decay(self) -> DecayRecord:
         full_mask = (1 << self.decay_records_per_frame) - 1
         if self._open_decay_frames:

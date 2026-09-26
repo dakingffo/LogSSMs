@@ -16,6 +16,26 @@ class FakeTokenizer:
     def encode(self, text, *, add_special_tokens=True):
         return text.split()
 
+    def decode(self, tokens, *, skip_special_tokens=False):
+        return " ".join(tokens)
+
+
+class PrefixTokenizer:
+    eos_token = "<|im_end|>"
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert not tokenize and add_generation_prompt
+        return "".join(
+            f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+            for message in messages
+        ) + "<|im_start|>assistant\n"
+
+    def encode(self, text, *, add_special_tokens=True):
+        return list(text)
+
+    def decode(self, tokens, *, skip_special_tokens=False):
+        return "".join(tokens)
+
 
 def test_multiturn_sessions_advance_on_their_own_completion(monkeypatch):
     from transformers import AutoTokenizer
@@ -40,7 +60,7 @@ def test_multiturn_sessions_advance_on_their_own_completion(monkeypatch):
 
         async def fake_stream(
             _client, _base, _model, messages, _output_len, progress,
-            profile_tag=None,
+            profile_tag=None, ignore_eos=True,
         ):
             current = messages[-1]["content"]
             sent.append((current, [dict(message) for message in messages]))
@@ -90,7 +110,7 @@ def test_multiturn_history_records_full_context_and_actual_reply(monkeypatch, tm
 
     async def fake_stream(
         _client, _base, _model, messages, _output_len, _progress,
-        profile_tag=None,
+        profile_tag=None, ignore_eos=True,
     ):
         current = messages[-1]["content"]
         return bench_common.StreamResult(
@@ -142,6 +162,89 @@ def test_multiturn_history_records_full_context_and_actual_reply(monkeypatch, tm
     assert json.loads(open(path).read())["sessions"] == records
 
 
+def test_fixed_history_keeps_request_inputs_independent_of_generated_reply(monkeypatch):
+    from transformers import AutoTokenizer
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda _model: FakeTokenizer())
+    conversation = bench_common.BenchmarkConversation(
+        uid="sample",
+        initial_messages=(),
+        user_turns=(
+            DatasetMessage(role="user", content="first"),
+            DatasetMessage(role="user", content="second"),
+        ),
+    )
+
+    async def run_with_first_reply(reply):
+        seen = []
+
+        async def fake_stream(
+            _client, _base, _model, messages, _output_len, _progress,
+            profile_tag=None, ignore_eos=True,
+        ):
+            seen.append([dict(message) for message in messages])
+            return bench_common.StreamResult(
+                tics=[0.0, 0.1, 0.2, 0.3, 0.4],
+                output=reply if len(seen) == 1 else "final",
+            )
+
+        monkeypatch.setattr(bench_common, "stream_messages", fake_stream)
+        stats = await bench_common.run_multiturn_bench(
+            "http://unused", "unused-model", [conversation], 8,
+            pbar=False, history_mode="fixed",
+        )
+        assert stats["history_mode"] == "fixed"
+        return seen
+
+    first = asyncio.run(run_with_first_reply("one reply"))
+    second = asyncio.run(run_with_first_reply("a different reply"))
+    assert first == second
+    assert first[1][1]["role"] == "assistant"
+    assert first[1][1]["content"] != "one reply"
+
+
+@pytest.mark.parametrize("history_mode", ["prefix_generated", "prefix_fixed"])
+def test_raw_prefix_history_preserves_every_previous_prompt(monkeypatch, history_mode):
+    from transformers import AutoTokenizer
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda _model: PrefixTokenizer())
+    conversation = bench_common.BenchmarkConversation(
+        uid="sample",
+        initial_messages=(),
+        user_turns=tuple(
+            DatasetMessage(role="user", content=f"turn {index}")
+            for index in range(3)
+        ),
+    )
+    seen = []
+
+    async def fake_stream(
+        _client, _base, _model, messages, _output_len, _progress,
+        profile_tag=None, ignore_eos=True,
+    ):
+        assert isinstance(messages, str)
+        seen.append(messages)
+        return bench_common.StreamResult(
+            tics=[0.0, 0.1, 0.2, 0.3, 0.4],
+            output=f"generated {len(seen)}",
+        )
+
+    monkeypatch.setattr(bench_common, "stream_messages", fake_stream)
+    records = []
+    stats = asyncio.run(bench_common.run_multiturn_bench(
+        "http://unused", "unused-model", [conversation], 2,
+        pbar=False, history_mode=history_mode, history_records=records,
+    ))
+    assert stats["n"] == 3
+    assert all(new.startswith(old) for old, new in zip(seen, seen[1:]))
+    assert records[0]["turns"][1]["messages"] == seen[1]
+    assert records[0]["turns"][1]["input_tokens"] == len(seen[1])
+    if history_mode == "prefix_generated":
+        assert "generated 1" in seen[1]
+    else:
+        assert "generated 1" not in seen[1]
+
+
 def test_history_requires_an_explicit_path():
     with pytest.raises(SystemExit):
         bench_common.parse_full(["--history"])
@@ -164,7 +267,7 @@ def test_single_turn_history_collects_actual_response(monkeypatch):
 
     async def fake_stream(
         _client, _base, _model, messages, _output_len, _progress,
-        profile_tag=None,
+        profile_tag=None, ignore_eos=True,
     ):
         return bench_common.StreamResult(
             tics=[0.0, 0.1, 0.2, 0.3, 0.4],

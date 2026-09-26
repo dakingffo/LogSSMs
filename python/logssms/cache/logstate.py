@@ -1313,6 +1313,14 @@ class LogStateCacheManager(BaseCacheManager):
                 phase["counts"][name] = phase["counts"].get(name, 0) + value
         return {
             "type": "logstate",
+            "capacity": {
+                "total_frames": self._allocator.num_frames,
+                "frame_bytes": self._allocator.frame_bytes,
+                "payload_frames_per_slot": self._allocator.payload_frames,
+                "conv_frames_per_snapshot": self._allocator.conv_frames,
+                "granules_per_log": self._allocator.num_granules,
+                "decay_records_per_frame": self._allocator.decay_records_per_frame,
+            },
             "aggregate": stats,
             "match_samples": self._match_profile_samples,
             "prefill_batches": self._profile_samples,
@@ -1364,6 +1372,7 @@ class LogStateCacheManager(BaseCacheManager):
         start = perf_counter_ns() if self._profile_enabled else 0
         profile = (
             {"phase": phase or "direct", "batch_size": len(reqs),
+             "request_tags": [req.profile_tag for req in reqs],
              "needed_pages": 0, "needed_states": 0, "needed_works": 0,
              "evicted_nodes": 0, "timing_ms": {}}
             if self._profile_enabled else None
@@ -1470,6 +1479,10 @@ class LogStateCacheManager(BaseCacheManager):
 
     def _profile_resource_snapshot(self) -> dict:
         entries = self.tree.iter_entries()
+        checkpoint_spans = Counter(
+            entry.span_pages for entry in entries
+            if entry.kind is LogStateKind.CHECKPOINT
+        )
         log_slots = {
             entry.slot for entry in entries
             if entry.kind is LogStateKind.LOG
@@ -1480,10 +1493,12 @@ class LogStateCacheManager(BaseCacheManager):
         }
         evictable_slots = self.tree.evictable_slots()
         return {
+            "frame_usage": self._allocator.profile_usage(),
             "free_frames": self._allocator.free_frames,
             "free_kv_pages": len(self.free_pages),
             "free_state_slots": len(self.free_states),
             "evictable_kv_tokens": self.tree.size_info.evictable_size,
+            "cached_kv_tokens": self.tree.size_info.total_size,
             "evictable_kv_pages": (
                 self.tree.size_info.evictable_size / self.page_size
             ),
@@ -1496,6 +1511,10 @@ class LogStateCacheManager(BaseCacheManager):
             ),
             "tree_log_slots": len(log_slots),
             "tree_checkpoint_slots": len(checkpoint_slots),
+            "checkpoint_span_pages": dict(sorted(checkpoint_spans.items())),
+            "checkpoint_covered_pages": sum(
+                span * count for span, count in checkpoint_spans.items()
+            ),
             "live_log_pages": sum(map(len, self._live_pages.values())),
         }
 
@@ -1535,6 +1554,10 @@ class LogStateCacheManager(BaseCacheManager):
                     entry.slot for entry in cached_entries
                     if entry.kind is LogStateKind.CHECKPOINT
                 }),
+                "cached_checkpoint_span_pages": dict(sorted(Counter(
+                    entry.span_pages for entry in cached_entries
+                    if entry.kind is LogStateKind.CHECKPOINT
+                ).items())),
                 "live_log_pages": len(live),
             })
         return result
@@ -1574,6 +1597,7 @@ class LogStateCacheManager(BaseCacheManager):
             sample = {
                 "batch_size": batch.size,
                 "input_tokens": sum(req.extend_len for req in batch.reqs),
+                "request_tags": [req.profile_tag for req in batch.reqs],
                 "resources_before": self._profile_resource_snapshot(),
                 "requests": self._profile_request_paths(batch.reqs),
                 "active_requests": self._profile_active_requests,
@@ -1956,6 +1980,19 @@ class LogStateCacheManager(BaseCacheManager):
                 profile["evicted_nodes"] = len(selected)
                 stage = now
 
+            evicted_entry_spans = (
+                [
+                    {
+                        "node_uuid": node.uuid,
+                        "kind": entry.kind.value,
+                        "begin": entry.begin,
+                        "end": entry.end,
+                        "slot": entry.slot,
+                    }
+                    for node in selected for entry in node.entries
+                ]
+                if self._profile_enabled else None
+            )
             evicted_nodes = [] if self._profile_enabled else None
             free_frames_before = self._allocator.free_frames if self._profile_enabled else 0
             eviction = self.tree.evict_nodes(selected, evicted_nodes)
@@ -2000,10 +2037,13 @@ class LogStateCacheManager(BaseCacheManager):
             if self._profile_enabled:
                 self._record_lifecycle_event({
                     "event": "eviction",
+                    "phase": profile["phase"] if profile is not None else None,
+                    "request_tags": profile.get("request_tags") if profile is not None else None,
                     "nodes": [
                         {"uuid": uuid, "begin": begin, "end": end}
                         for uuid, begin, end in evicted_nodes
                     ],
+                    "entries": evicted_entry_spans,
                     "kv_tokens": len(eviction.kv_indices),
                     "state_slots": len(released_slots),
                     "free_frames_before": free_frames_before,

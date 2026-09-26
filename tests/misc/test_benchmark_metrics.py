@@ -33,6 +33,15 @@ def test_ar_online_metrics_match_sglang_tpot():
     assert stats["output_tok_per_s"] == pytest.approx(3 / 4.2)
 
 
+def test_eos_enabled_uses_delivered_length_for_tpot():
+    stats = summarize([[0.0, 2.0, 3.0, 3.1, 3.2]], [8], [256], mtp=False, ignore_eos=False)
+    assert stats["requested_out"] == 256
+    assert stats["out_tokens"] == 2
+    assert stats["early_stops"] == 1
+    assert stats["tpot_ms"][0] == pytest.approx(1200.0)
+    assert stats["chunks_ok"]
+
+
 def test_mtp_acceptance_excludes_mandatory_target_token():
     # One prefill token plus two 2-token verify rounds => one accepted draft/round.
     stats = summarize([[0.0, 2.0, 3.0, 4.0, 4.1, 4.2]], [8], [5], mtp=True)
@@ -66,7 +75,7 @@ def test_multiturn_session_appends_generated_assistant_output(monkeypatch):
 
     async def fake_stream(
         client, base, model, messages, output_len, progress,
-        profile_tag=None,
+        profile_tag=None, ignore_eos=True,
     ):
         requests.append(messages)
         return StreamResult(
@@ -125,6 +134,7 @@ def test_stream_messages_collects_openai_delta_content():
     class Client:
         def stream(self, method, url, json, headers=None):
             assert json["messages"] == [{"role": "user", "content": "hello"}]
+            assert json["ignore_eos"] is False
             return Context()
 
     result = asyncio.run(
@@ -134,6 +144,7 @@ def test_stream_messages_collects_openai_delta_content():
             "model",
             [{"role": "user", "content": "hello"}],
             2,
+            ignore_eos=False,
         )
     )
     assert result.output == "one two"

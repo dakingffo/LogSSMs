@@ -65,6 +65,36 @@ class StandardCacheManager(BaseCacheManager):
         self.num_pages = num_pages
         self.num_states = num_states
         self.num_draft_states = num_draft_states
+        self._profile_resource_samples: list[dict] = []
+
+    def _resource_snapshot(self) -> dict:
+        size = self.prefix_cache.size_info
+        return {
+            "free_kv_pages": len(self.free_pages),
+            "free_state_slots": len(self.free_states),
+            "evictable_kv_tokens": size.evictable_size,
+            "protected_kv_tokens": size.protected_size,
+            "cached_kv_tokens": size.total_size,
+        }
+
+    def prepare_batch(self, batch: Batch) -> None:
+        if self._match_profile_enabled and batch.is_prefill:
+            self._profile_resource_samples.append({
+                "batch_size": batch.size,
+                "input_tokens": sum(req.extend_len for req in batch.reqs),
+                "resources": self._resource_snapshot(),
+            })
+
+    def profile_result(self) -> dict | None:
+        result = super().profile_result()
+        if result is not None:
+            result["capacity"] = {
+                "num_kv_pages": self.num_pages,
+                "num_state_slots": self.num_states,
+                "page_size": self.page_size,
+            }
+            result["prefill_batches"] = self._profile_resource_samples
+        return result
 
     @staticmethod
     def _node_path(node: RadixTreeNode) -> list[int]:
@@ -109,7 +139,6 @@ class StandardCacheManager(BaseCacheManager):
             page_entry.copy_(matched)
 
     def allocate(self, reqs: list[Request], *, phase: str | None = None) -> None:
-        del phase
         needed_pages = 0
         allocation_info: list[tuple[int, int, int]] = []
         for req in reqs:
@@ -123,6 +152,11 @@ class StandardCacheManager(BaseCacheManager):
             allocated = self._allocate(
                 needed_pages=needed_pages,
                 needed_states=needed_pages if self.state_pool is not None else 0,
+                phase=phase,
+                request_tags=(
+                    [req.profile_tag for req in reqs]
+                    if self._match_profile_enabled else None
+                ),
             )
             if allocated[0] is not None:
                 self._write_page_table(
@@ -311,7 +345,14 @@ class StandardCacheManager(BaseCacheManager):
             if lazy_free_states:
                 self.free_states = torch.cat([self.free_states] + lazy_free_states)
 
-    def _allocate(self, needed_pages: int = 0, needed_states: int = 0) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def _allocate(
+        self,
+        needed_pages: int = 0,
+        needed_states: int = 0,
+        *,
+        phase: str | None = None,
+        request_tags: list[str | None] | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         free_pages = len(self.free_pages)
         free_states = len(self.free_states)
         if needed_pages > free_pages or needed_states > free_states:
@@ -346,6 +387,8 @@ class StandardCacheManager(BaseCacheManager):
             if trace_eviction:
                 self._record_lifecycle_event({
                     "event": "eviction",
+                    "phase": phase,
+                    "request_tags": request_tags,
                     "nodes": [
                         {"uuid": uuid, "begin": begin, "end": end}
                         for uuid, begin, end in evicted_nodes

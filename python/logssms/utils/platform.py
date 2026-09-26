@@ -9,6 +9,12 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 ModelSource = Literal["huggingface", "modelscope"]
 
+_QWEN35_HISTORY_BRANCH = "{%- if loop.index0 > ns.last_query_index %}"
+_QWEN35_PRESERVED_BRANCH = (
+    "{%- if (preserve_thinking is defined and preserve_thinking is true) "
+    "or (loop.index0 > ns.last_query_index) %}"
+)
+
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
@@ -22,7 +28,42 @@ def load_tokenizer(
     source    : ModelSource = "huggingface",
 ) -> PreTrainedTokenizerBase:
     model_path = resolve_model_path(model_path, source, download_weights=False)
-    return AutoTokenizer.from_pretrained(model_path)
+    return configure_chat_tokenizer(AutoTokenizer.from_pretrained(model_path), model_path)
+
+
+def configure_chat_tokenizer(
+    tokenizer : PreTrainedTokenizerBase,
+    model_path: str,
+) -> PreTrainedTokenizerBase:
+    """Keep Qwen3.5's non-thinking assistant prefix stable across turns."""
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return tokenizer
+    if _load_config_json(model_path).get("model_type") != "qwen3_5":
+        return tokenizer
+
+    template = tokenizer.chat_template
+    if not isinstance(template, str) or _QWEN35_HISTORY_BRANCH not in template:
+        # Qwen3.6 already has preserve_thinking; leave its defaults unchanged.
+        return tokenizer
+    tokenizer.chat_template = template.replace(
+        _QWEN35_HISTORY_BRANCH, _QWEN35_PRESERVED_BRANCH, 1
+    )
+    tokenizer._logssms_preserve_thinking = True
+    return tokenizer
+
+
+def render_chat_prompt(
+    tokenizer: PreTrainedTokenizerBase,
+    messages : list[dict[str, Any]],
+) -> str:
+    kwargs = (
+        {"preserve_thinking": True, "enable_thinking": False}
+        if getattr(tokenizer, "_logssms_preserve_thinking", False) else {}
+    )
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, **kwargs
+    )
 
 
 @functools.cache

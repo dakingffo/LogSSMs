@@ -24,6 +24,13 @@ def test_one_frame_pool_with_independent_log_frames():
     assert len(allocator.slot(logs[0]).conv) == 4
     assert allocator.slot(states[0]).decay is None
     assert allocator.slot(logs[0]).decay.frame == allocator.slot(logs[1]).decay.frame
+    usage = allocator.profile_usage()
+    assert usage["log_slots"] == 2
+    assert usage["work_slots"] == 1
+    assert usage["kv_frames"] == 2
+    assert sum(usage[key] for key in (
+        "free_frames", "kv_frames", "payload_frames", "conv_frames", "decay_frames"
+    )) == usage["total_frames"]
     allocator.check_integrity()
 
 

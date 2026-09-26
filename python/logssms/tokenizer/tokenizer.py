@@ -4,6 +4,7 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from logssms.message import TokenizeMsg, DetokenizeMsg
+from logssms.utils.platform import render_chat_prompt
 
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
@@ -13,11 +14,10 @@ class TokenizeManager:
         results: list[torch.Tensor] = []
         # TODO: batch tokenization
         for msg in msgs:
-            prompt = self.tokenizer.apply_chat_template(
-                msg.text,
-                tokenize=False,
-                add_generation_prompt=True,
-            ) if isinstance(msg.text, list) else msg.text
+            prompt = (
+                render_chat_prompt(self.tokenizer, msg.text)
+                if isinstance(msg.text, list) else msg.text
+            )
             input_ids: torch.Tensor = (
                 self.tokenizer.encode(prompt, return_tensors="pt")
             )

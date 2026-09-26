@@ -1,7 +1,7 @@
 """Decode-throughput benchmark: short prompts, long generations.
 
 Launches a LogSSMs HTTP server (tp-size from --tp-size), streams a batch of
-``--output-len``-token generations through ``/v1/chat/completions`` and reports decode
+generations of up to ``--output-len`` tokens through ``/v1/chat/completions`` and reports decode
 throughput (output-tok/s), total throughput, TPOT and TTFT. Server flags are parsed by
 the library's ``logssms.server.args.parse_args`` -- nothing is redefined here.
 
@@ -48,12 +48,35 @@ def main() -> int:
         extra={
             "--input-len": {"type": int, "default": 32, "help": "prompt length in tokens"},
             "--output-len": {"type": int, "default": 256, "help": "generation length in tokens"},
+            "--ignore-eos": {
+                "action": "store_true",
+                "help": "continue generation to --output-len despite EOS (default: stop at EOS)",
+            },
             "--num-sessions": {
                 "type": int,
                 "default": None,
                 "help": (
                     "fixed number of measured multi-turn sessions; defaults to the "
                     "largest --num-concurrent-sessions value"
+                ),
+            },
+            "--history-mode": {
+                "choices": ("generated", "fixed", "prefix_generated", "prefix_fixed"),
+                "default": "generated",
+                "help": (
+                    "generated: use each actual assistant reply in the next request; "
+                    "fixed: use the same deterministic assistant text in every run "
+                    "for an identical-input cache-policy A/B trace; "
+                    "prefix_*: send a raw, token-stable prompt that extends the "
+                    "previous turn (ChatML models only)"
+                ),
+            },
+            "--fixed-history-tokens": {
+                "type": int,
+                "default": None,
+                "help": (
+                    "length of deterministic prior assistant text in fixed mode; "
+                    "defaults to --output-len"
                 ),
             },
         },
@@ -112,12 +135,15 @@ def main() -> int:
                         pbar=not bench.no_pbar,
                         request_timeout=bench.request_timeout,
                         history_records=history_records,
+                        history_mode=bench.history_mode,
+                        fixed_history_tokens=bench.fixed_history_tokens,
+                        ignore_eos=bench.ignore_eos,
                     )
                 )
             finally:
                 kill_server(proc)
             assert stats["chunks_ok"], (
-                "chunk count != requested output tokens (SSE parse broken?)"
+                "SSE stream has an invalid output-token count"
             )
             input_desc = f"multi(avg={stats['in_tokens'] / stats['n']:.0f})"
             print_stats(
@@ -160,9 +186,10 @@ def main() -> int:
                         warmup=not bench.no_warmup,
                         pbar=not bench.no_pbar,
                         history_records=history_records,
+                        ignore_eos=bench.ignore_eos,
                     )
                 )
-                assert stats["chunks_ok"], "chunk count != requested output tokens (SSE parse broken?)"
+                assert stats["chunks_ok"], "SSE stream has an invalid output-token count"
                 input_desc = input_label(bench.dataset, in_lens, bench.input_len)
                 print_stats(
                     f"bench_decode tp={server_args.tp_info.size} "
