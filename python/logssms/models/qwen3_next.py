@@ -14,7 +14,7 @@ from logssms.layers import (
     GatedRotaryAttention,
     OPList,
     ParallelLMHead,
-    RMSNorm,
+    RMSNormFused,
     VocabParallelEmbedding,
 )
 from logssms.speculator.hidden_captor import HiddenCapturePoint, with_speculator
@@ -205,10 +205,10 @@ class Qwen3NextDecoderLayer(BaseOP):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
             )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = RMSNormFused(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = RMSNormFused(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
         )
 
@@ -217,19 +217,19 @@ class Qwen3NextDecoderLayer(BaseOP):
         HiddenCapturePoint.DECODER_INPUT,
         layer_id_field="_layer_id",
     )
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        residual = x
-        h = self.input_layernorm.forward(x)
+    def forward(
+        self,
+        x        : torch.Tensor,
+        residual : torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h, residual = self.input_layernorm.forward(x, residual)
         if self.block_type == "linear_attention":
             h = self.linear_attn.forward(h)
         else:
             h = self.self_attn.forward(h, positions)
-        h = residual + h
-
-        residual = h
-        h = self.post_attention_layernorm.forward(h)
-        h = self.mlp.forward(h)
-        return residual + h
+        h, residual = self.post_attention_layernorm.forward(h, residual)
+        return self.mlp.forward(h), residual
 
 
 class Qwen3NextModel(BaseOP):
@@ -250,7 +250,7 @@ class Qwen3NextModel(BaseOP):
                 )
                 linear_idx += 1
         self.layers = OPList(layers)
-        self.norm = RMSNorm(
+        self.norm = RMSNormFused(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
         )
 
@@ -258,9 +258,10 @@ class Qwen3NextModel(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         positions = get_global_ctx().batch.positions
+        residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
-            x = layer.forward(x, positions)
-        return self.norm.forward(x)
+            x, residual = layer.forward(x, residual, positions)
+        return self.norm.forward(x, residual)[0]
 
 
 class Qwen3NextForCausalLM(BaseLLMModel):

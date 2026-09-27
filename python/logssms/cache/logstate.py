@@ -1043,6 +1043,7 @@ class LogStateCacheManager(BaseCacheManager):
         self.num_states = num_states
         self.num_work_states = num_work_states
         self._work_slots: dict[int, int] = {}
+        self._work_committed_pos: dict[int, int] = {}
         dummy_kv = pool.reserve(kv=1)
         assert dummy_kv is not None
         self._dummy_kv_frame = dummy_kv[0][0]
@@ -1352,6 +1353,7 @@ class LogStateCacheManager(BaseCacheManager):
         assert table_idx not in self._work_slots
         work_slot = self._allocate_work()
         self._work_slots[table_idx] = work_slot
+        self._work_committed_pos[table_idx] = handle.cached_len
         work_state_table = self.work_state_table
         assert work_state_table is not None
         work_state_table[table_idx, 0] = work_slot
@@ -1565,9 +1567,52 @@ class LogStateCacheManager(BaseCacheManager):
     def prepare_batch(self, batch: Batch) -> None:
         if not batch.is_prefill:
             self.last_plan = None
+            if batch.is_decode:
+                replay_counts = []
+                for req in batch.reqs:
+                    offset = next(
+                        (req.cached_len - page.begin
+                         for page in self._live_pages[req.table_idx]
+                         if page.begin <= req.cached_len < page.end),
+                        None,
+                    )
+                    assert offset is not None, "Decode token has no LogState page"
+                    committed_pos = self._work_committed_pos[req.table_idx]
+                    count = req.cached_len - committed_pos
+                    assert 0 <= count < self.granularity
+                    assert count <= offset % self.granularity
+                    replay_counts.append(count)
+                    if (offset + 1) % self.granularity == 0:
+                        self._work_committed_pos[req.table_idx] = req.cached_len + 1
+                batch.logstate_replay_counts = replay_counts + [
+                    0 for _ in range(batch.padded_size - batch.size)
+                ]
             return
         profile_start = perf_counter_ns() if self._profile_enabled else 0
-        analysis_start = profile_start
+        # The first physical offset is known from allocation. Pass it to the
+        # linear backend instead of synchronizing out_loc from GPU per request.
+        first_offsets = []
+        for req in batch.reqs:
+            page = next(
+                (page for page in self._live_pages.get(req.table_idx, ())
+                 if page.begin <= req.cached_len < page.end),
+                None,
+            )
+            if page is None:
+                # Planning-only callers may invoke prepare_batch before allocate.
+                # The backend retains its physical-offset fallback for these.
+                break
+            first_offsets.append(req.cached_len - page.begin)
+        batch.logstate_first_offsets = (
+            first_offsets if len(first_offsets) == len(batch.reqs) else None
+        )
+        for req in batch.reqs:
+            self._work_committed_pos[req.table_idx] = req.device_len
+        first_offsets_cpu_ms = (
+            (perf_counter_ns() - profile_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
+        analysis_start = perf_counter_ns() if self._profile_enabled else 0
         round_info = self.analyzer.begin_round(self.tree)
         plan = self.analyzer.analyze(
             self.tree,
@@ -1670,6 +1715,7 @@ class LogStateCacheManager(BaseCacheManager):
                 perf_counter_ns() - profile_after_start
             ) / 1e6
             timing_ms = {
+                "first_offsets_cpu_ms": first_offsets_cpu_ms,
                 "analysis_and_tasks_cpu_ms": analysis_and_tasks_cpu_ms,
                 "profile_before_cpu_ms": profile_before_cpu_ms,
                 "construction_submit_cpu_ms": construction_submit_cpu_ms,
@@ -1821,6 +1867,7 @@ class LogStateCacheManager(BaseCacheManager):
             self._live_pages.pop(req.table_idx, None)
             state_table[req.table_idx].fill_(-1)
             work_slot = self._work_slots.pop(req.table_idx)
+            self._work_committed_pos.pop(req.table_idx)
             self._return_slots(
                 torch.empty(0, dtype=torch.int32, device=self.device),
                 torch.tensor([work_slot], dtype=torch.int32, device=self.device),
@@ -1868,6 +1915,8 @@ class LogStateCacheManager(BaseCacheManager):
         work_state_table = self.work_state_table
         assert work_state_table is not None
         work_slots = set(self._work_slots.values()) | {self._dummy_work_slot}
+        if self._work_committed_pos.keys() != self._work_slots.keys():
+            raise RuntimeError("LogState work cursor ownership disagrees with work slots.")
         if len(work_slots) != len(self._work_slots) + 1:
             raise RuntimeError("LogState work-state table contains duplicate slots.")
         for row, slot in self._work_slots.items():

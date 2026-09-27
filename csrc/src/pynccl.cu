@@ -104,7 +104,10 @@ public:
     const auto reduce_op = kNCCLReduceOPMap.at(op);
     const auto stream = LaunchKernel::resolve_device(t.device());
 
-    if (size_bytes <= max_bytes_) { // use internal buffer
+    // Copying through registered symmetric memory pays off for large messages,
+    // but the two device copies dominate small decode collectives.
+    constexpr size_t kDirectAllReduceMaxBytes = 256 * 1024;
+    if (size_bytes > kDirectAllReduceMaxBytes && size_bytes <= max_bytes_) {
       const auto buf_ptr = sym_mem_.get();
       const auto need_memcpy = (buf_ptr != data_ptr);
       if (need_memcpy) {

@@ -4,6 +4,7 @@ from .gated_delta import chunk_gated_delta_rule, chunk_gated_delta_rule_with_log
 from .fused_recurrent import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_to_framed_logstate,
+    fused_recurrent_gated_delta_rule_to_slots,
     fused_recurrent_gated_delta_rule_with_log,
 )
 
@@ -12,5 +13,6 @@ __all__ = [
     "chunk_gated_delta_rule_with_log",
     "fused_recurrent_gated_delta_rule",
     "fused_recurrent_gated_delta_rule_to_framed_logstate",
+    "fused_recurrent_gated_delta_rule_to_slots",
     "fused_recurrent_gated_delta_rule_with_log",
 ]

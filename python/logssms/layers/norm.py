@@ -54,13 +54,25 @@ class RMSNormGated(BaseOP):
 
 
 class RMSNormFused(BaseOP):
-    def __init__(self, size: int, eps: float) -> None:
-        from flashinfer import fused_add_rmsnorm, rmsnorm
+    def __init__(
+        self,
+        size         : int,
+        eps          : float,
+        zero_centered: bool = False,
+    ) -> None:
+        from flashinfer import (
+            fused_add_rmsnorm,
+            gemma_fused_add_rmsnorm,
+            gemma_rmsnorm,
+            rmsnorm,
+        )
 
         self.eps = eps
-        self.weight = torch.empty(size)
-        self.rmsnorm = rmsnorm
-        self.fused_add_rmsnorm = fused_add_rmsnorm
+        self.weight = torch.zeros(size) if zero_centered else torch.empty(size)
+        self.rmsnorm = gemma_rmsnorm if zero_centered else rmsnorm
+        self.fused_add_rmsnorm = (
+            gemma_fused_add_rmsnorm if zero_centered else fused_add_rmsnorm
+        )
 
     @nvtx_annotate("RMSNormFused")
     def forward(

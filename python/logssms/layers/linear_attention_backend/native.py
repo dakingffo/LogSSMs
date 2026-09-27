@@ -18,23 +18,89 @@ if TYPE_CHECKING:
 
 @dataclass
 class LinearAttentionMetadata(BaseLinearAttentionMetadata):
+    slots        : torch.Tensor | None = None
     read_slots   : torch.Tensor | None = None
     write_slots  : torch.Tensor | None = None
     verify_groups: dict[
         int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ] | None = None
+    prefill_indices : PackedLinearIndices | None = None
+    baseline_slots  : torch.Tensor | None = None
+    checkpoint_slots: torch.Tensor | None = None
+    checkpoint_chunks: torch.Tensor | None = None
+    snapshot_rows   : torch.Tensor | None = None
+    snapshot_reqs   : torch.Tensor | None = None
+
+
+@dataclass
+class PackedLinearIndices:
+    cu_seqlens      : torch.Tensor
+    chunk_indices   : torch.Tensor
+    chunk_offsets   : torch.Tensor
+    continuing      : torch.Tensor
+    endings         : torch.Tensor
+    ending_sequences: torch.Tensor
+    conv_chunks     : torch.Tensor
+
+    @classmethod
+    def from_lengths(
+        cls, lengths: list[int], device: torch.device, chunk_size: int
+    ) -> PackedLinearIndices:
+        offsets = [0]
+        chunk_offsets = [0]
+        chunks: list[tuple[int, int]] = []
+        conv_chunks: list[tuple[int, int]] = []
+        continuing = []
+        endings = []
+        for req_idx, length in enumerate(lengths):
+            assert length > 0
+            offsets.append(offsets[-1] + length)
+            n_chunks = (length + chunk_size - 1) // chunk_size
+            chunk_offsets.append(chunk_offsets[-1] + n_chunks)
+            chunks.extend((req_idx, chunk) for chunk in range(n_chunks))
+            conv_chunks.extend((req_idx, chunk) for chunk in range((length + 63) // 64))
+            continuing.extend(range(chunk_offsets[-2], chunk_offsets[-1] - 1))
+            endings.append(chunk_offsets[-1] - 1)
+
+        def tensor(values) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int64, device=device)
+
+        return cls(
+            cu_seqlens=tensor(offsets),
+            chunk_indices=tensor(chunks),
+            chunk_offsets=tensor(chunk_offsets),
+            continuing=tensor(continuing),
+            endings=tensor(endings),
+            ending_sequences=tensor(list(range(len(lengths)))),
+            conv_chunks=tensor(conv_chunks),
+        )
+
+    def fla_kwargs(self) -> dict[str, torch.Tensor]:
+        return {
+            "chunk_indices": self.chunk_indices,
+            "chunk_offsets": self.chunk_offsets,
+            "continuing": self.continuing,
+            "endings": self.endings,
+            "ending_sequences": self.ending_sequences,
+        }
 
 
 @dataclass
 class LinearAttentionCaptureData:
-    read_slots : torch.Tensor
-    write_slots: torch.Tensor
+    slots: torch.Tensor
+
+    @property
+    def read_slots(self) -> torch.Tensor:
+        return self.slots[:, 0]
+
+    @property
+    def write_slots(self) -> torch.Tensor:
+        return self.slots[:, 1]
 
     @classmethod
     def make(cls, max_bs: int, device: torch.device) -> LinearAttentionCaptureData:
         return cls(
-            read_slots=torch.zeros(max_bs, dtype=torch.int64, device=device),
-            write_slots=torch.zeros(max_bs, dtype=torch.int64, device=device),
+            slots=torch.zeros(max_bs, 2, dtype=torch.int64, device=device),
         )
 
 
@@ -97,23 +163,73 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
 
         if batch.is_decode:
             reqs = batch.padded_reqs
+            descriptors = torch.tensor(
+                [[req.table_idx, req.cached_len - 1, req.cached_len] for req in reqs],
+                dtype=torch.int64,
+                pin_memory=state_table.is_cuda,
+            ).to(state_table.device, non_blocking=state_table.is_cuda)
+            metadata.slots = state_table[
+                descriptors[:, :1], descriptors[:, 1:]
+            ].to(torch.int64)
+            metadata.read_slots = metadata.slots[:, 0]
+            metadata.write_slots = metadata.slots[:, 1]
+        elif batch.is_prefill:
+            ctx_page_size = ctx.page_size
+            assert ctx_page_size % 64 == 0
+            lengths = [req.extend_len for req in batch.reqs]
+            metadata.prefill_indices = PackedLinearIndices.from_lengths(
+                lengths, state_table.device, 64
+            )
             table_indices = torch.tensor(
-                [req.table_idx for req in reqs],
-                dtype=torch.int64,
-                device=state_table.device,
+                [req.table_idx for req in batch.reqs],
+                dtype=torch.int64, device=state_table.device,
             )
-            read_positions = torch.tensor(
-                [req.cached_len - 1 for req in reqs],
-                dtype=torch.int64,
-                device=state_table.device,
+            previous = torch.tensor(
+                [req.cached_len - 1 for req in batch.reqs],
+                dtype=torch.int64, device=state_table.device,
             )
-            write_positions = torch.tensor(
-                [req.cached_len for req in reqs],
-                dtype=torch.int64,
-                device=state_table.device,
+            baseline = state_table[table_indices, previous.clamp_min(0)]
+            metadata.baseline_slots = torch.where(
+                previous >= 0, baseline, -1
+            ).to(torch.int64)
+
+            checkpoint_tables = []
+            checkpoint_positions = []
+            checkpoint_chunks = []
+            snapshot_rows = []
+            snapshot_reqs = []
+            chunk_offset = 0
+            token_offset = 0
+            for req_idx, req in enumerate(batch.reqs):
+                assert req.cached_len % 64 == 0
+                ends = list(range(ctx_page_size, req.extend_len, ctx_page_size))
+                ends.append(req.extend_len)
+                for end in ends:
+                    checkpoint_tables.append(req.table_idx)
+                    checkpoint_positions.append(req.cached_len + end - 1)
+                    checkpoint_chunks.append(chunk_offset + (end - 1) // 64)
+                    snapshot_rows.append(token_offset + end - 1)
+                    snapshot_reqs.append(req_idx)
+                chunk_offset += (req.extend_len + 63) // 64
+                token_offset += req.extend_len
+            checkpoint_tables_tensor = torch.tensor(
+                checkpoint_tables, dtype=torch.int64, device=state_table.device
             )
-            metadata.read_slots = state_table[table_indices, read_positions].to(torch.int64)
-            metadata.write_slots = state_table[table_indices, write_positions].to(torch.int64)
+            checkpoint_positions_tensor = torch.tensor(
+                checkpoint_positions, dtype=torch.int64, device=state_table.device
+            )
+            metadata.checkpoint_slots = state_table[
+                checkpoint_tables_tensor, checkpoint_positions_tensor
+            ].to(torch.int64)
+            metadata.checkpoint_chunks = torch.tensor(
+                checkpoint_chunks, dtype=torch.int64, device=state_table.device
+            )
+            metadata.snapshot_rows = torch.tensor(
+                snapshot_rows, dtype=torch.int64, device=state_table.device
+            )
+            metadata.snapshot_reqs = torch.tensor(
+                snapshot_reqs, dtype=torch.int64, device=state_table.device
+            )
         elif batch.is_verify:
             work_state_table = ctx.work_state_table
             assert work_state_table is not None
@@ -171,11 +287,11 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         assert self.capture is not None and bs in self.capture_bs
         self.prepare_metadata(batch)
         metadata = batch.linear_attn_metadata
-        assert metadata.read_slots is not None and metadata.write_slots is not None
-        self.capture.read_slots[:bs].copy_(metadata.read_slots)
-        self.capture.write_slots[:bs].copy_(metadata.write_slots)
+        assert metadata.slots is not None
+        self.capture.slots[:bs].copy_(metadata.slots)
         batch.linear_attn_metadata = LinearAttentionMetadata(
             phase="decode",
+            slots=self.capture.slots[:bs],
             read_slots=self.capture.read_slots[:bs],
             write_slots=self.capture.write_slots[:bs],
         )
@@ -184,9 +300,8 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         metadata = batch.linear_attn_metadata
         bs = batch.padded_size
         assert self.capture is not None and bs in self.capture_bs
-        assert metadata.read_slots is not None and metadata.write_slots is not None
-        self.capture.read_slots[:bs].copy_(metadata.read_slots)
-        self.capture.write_slots[:bs].copy_(metadata.write_slots)
+        assert metadata.slots is not None
+        self.capture.slots[:bs].copy_(metadata.slots)
 
     def forward(
         self,
@@ -249,89 +364,44 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         batch      : Batch,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
+        from logssms.kernel.linear_attention.packed_conv import (
+            packed_causal_conv1d, packed_conv_snapshots,
+        )
 
         ctx = get_global_ctx()
         pool = ctx.linear_state
-        state_table = ctx.state_table
-        page_size = ctx.page_size
         layer_idx = config.layer_idx
-        assert state_table is not None
-        assert page_size % 64 == 0
-        lengths = []
-        initial_states = []
-        qkv_segments = []
-        checkpoint_slots = []
-        checkpoint_chunks = []
-        conv_snapshots = []
-        offset = 0
-        chunk_offset = 0
-        for req in batch.reqs:
-            seq_len = req.extend_len
-            end_offset = offset + seq_len
-            use_state = req.cached_len > 0
-            cached_len = req.cached_len
-            # Chunked prefill boundaries are aligned to the GDN chunk. Prefix
-            # cache hits are page-aligned, which is a stronger guarantee.
-            assert cached_len % 64 == 0
-            if use_state:
-                baseline_slot = int(
-                    state_table[req.table_idx, cached_len - 1]
-                )
-
-            req_qkv = mixed_qkv[offset:end_offset].transpose(0, 1).unsqueeze(0)
-            conv_input = req_qkv
-            if use_state:
-                conv_input = torch.cat(
-                    [pool.conv_state[baseline_slot, layer_idx].unsqueeze(0), conv_input],
-                    dim=-1,
-                )
-            total_len = conv_input.shape[-1]
-            conv_output = F.silu(
-                F.conv1d(
-                    conv_input,
-                    conv_weight,
-                    padding=config.state_len,
-                    groups=config.conv_dim,
-                )
-            )
-            req_qkv = conv_output[:, :, :total_len][:, :, -seq_len:].transpose(1, 2)
-            qkv_segments.append(req_qkv.squeeze(0))
-            lengths.append(seq_len)
-            initial_states.append(
-                pool.recurrent_state[baseline_slot, layer_idx]
-                if use_state else torch.zeros_like(pool.recurrent_state[0, layer_idx])
-            )
-
-            history_prefix = config.state_len if use_state else 0
-            first_page_end = page_size - cached_len % page_size
-            for end in range(first_page_end, seq_len, page_size):
-                position = cached_len + end - 1
-                checkpoint_slots.append(state_table[req.table_idx, position])
-                checkpoint_chunks.append(chunk_offset + (end - 1) // 64)
-                history = conv_input[0, :, : history_prefix + end]
-                if history.shape[-1] < config.state_len:
-                    history = F.pad(history, (config.state_len - history.shape[-1], 0))
-                conv_snapshots.append(history[:, -config.state_len:])
-
-            end = seq_len
-            position = cached_len + end - 1
-            checkpoint_slots.append(state_table[req.table_idx, position])
-            checkpoint_chunks.append(chunk_offset + (end - 1) // 64)
-            history = conv_input[0, :, : history_prefix + end]
-            if history.shape[-1] < config.state_len:
-                history = F.pad(history, (config.state_len - history.shape[-1], 0))
-            conv_snapshots.append(history[:, -config.state_len:])
-
-            chunk_offset += (seq_len + 63) // 64
-            offset = end_offset
-
-        mixed_qkv = torch.cat(qkv_segments).unsqueeze(0)
-        query, key, value = self._split_qkv(mixed_qkv, config)
-        cu_seqlens = torch.tensor(
-            [0, *torch.tensor(lengths).cumsum(0).tolist()],
-            dtype=torch.int64,
-            device=mixed_qkv.device,
+        metadata = batch.linear_attn_metadata
+        assert isinstance(metadata, LinearAttentionMetadata)
+        indices = metadata.prefill_indices
+        slots = metadata.baseline_slots
+        assert indices is not None and slots is not None
+        assert metadata.checkpoint_slots is not None
+        assert metadata.checkpoint_chunks is not None
+        assert metadata.snapshot_rows is not None
+        assert metadata.snapshot_reqs is not None
+        live = slots >= 0
+        conv_history = pool.conv_state[:, layer_idx].index_select(
+            0, slots.clamp_min(0)
         )
+        conv_history = torch.where(
+            live[:, None, None], conv_history, 0
+        )
+        initial_states = pool.recurrent_state[:, layer_idx].index_select(
+            0, slots.clamp_min(0)
+        )
+        initial_states = torch.where(
+            live[:, None, None, None], initial_states, 0
+        )
+        conv_snapshots = packed_conv_snapshots(
+            mixed_qkv, conv_history, indices.cu_seqlens,
+            metadata.snapshot_rows, metadata.snapshot_reqs,
+        )
+        mixed_qkv = packed_causal_conv1d(
+            mixed_qkv, conv_weight, conv_history,
+            indices.cu_seqlens, indices.conv_chunks,
+        ).unsqueeze(0)
+        query, key, value = self._split_qkv(mixed_qkv, config)
         query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
             query,
             key,
@@ -347,21 +417,20 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             value,
             prepared_gate,
             prepared_beta,
-            torch.stack(initial_states),
-            cu_seqlens,
+            initial_states,
+            indices.cu_seqlens,
+            **indices.fla_kwargs(),
         )
 
-        slots = torch.stack(checkpoint_slots).to(torch.int64)
-        chunks = torch.tensor(checkpoint_chunks, dtype=torch.int64, device=slots.device)
         store_state(
             pool.conv_state[:, layer_idx],
-            slots,
-            torch.stack(conv_snapshots),
+            metadata.checkpoint_slots,
+            conv_snapshots,
         )
         store_state(
             pool.recurrent_state[:, layer_idx],
-            slots,
-            chunk_states.index_select(0, chunks).to(pool.recurrent_state.dtype),
+            metadata.checkpoint_slots,
+            chunk_states.index_select(0, metadata.checkpoint_chunks).to(pool.recurrent_state.dtype),
         )
         return output.squeeze(0)
 
@@ -448,8 +517,9 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         metadata   : LinearAttentionMetadata,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
-            fused_recurrent_gated_delta_rule,
+            fused_recurrent_gated_delta_rule_to_slots,
         )
+        from logssms.kernel.linear_attention.conv_decode import conv_decode_qkv
 
         ctx = get_global_ctx()
         pool = ctx.linear_state
@@ -457,15 +527,13 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
         read_slots = metadata.read_slots
         write_slots = metadata.write_slots
         assert read_slots is not None and write_slots is not None
-        conv_state = pool.conv_state[:, layer_idx].index_select(0, read_slots)
-        recurrent_state = pool.recurrent_state[:, layer_idx].index_select(0, read_slots)
-
-        mixed_qkv = mixed_qkv.unsqueeze(1).transpose(1, 2)
-        mixed_qkv = _causal_conv1d_update(mixed_qkv, conv_state, conv_weight)
-        pool.conv_state[:, layer_idx].index_copy_(0, write_slots, conv_state)
-
-        query, key, value = self._split_qkv(mixed_qkv.transpose(1, 2), config)
-        output, states = fused_recurrent_gated_delta_rule(
+        query, key, value = conv_decode_qkv(
+            mixed_qkv, conv_weight, config,
+            read_slots=read_slots,
+            write_slots=write_slots,
+            standard_state=pool.conv_state,
+        )
+        output = fused_recurrent_gated_delta_rule_to_slots(
             query,
             key,
             value,
@@ -473,12 +541,10 @@ class LinearAttentionBackend(BaseLinearAttentionBackend):
             beta.unsqueeze(1),
             A_log,
             dt_bias,
-            recurrent_state,
-        )
-        store_state(
-            pool.recurrent_state[:, layer_idx],
+            pool.recurrent_state,
+            read_slots,
             write_slots,
-            states.squeeze(1),
+            layer_idx,
         )
         return output.squeeze(1)
 

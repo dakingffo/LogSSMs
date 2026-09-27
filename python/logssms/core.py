@@ -121,6 +121,8 @@ class Batch:
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
     linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
+    logstate_first_offsets: list[int] | None = field(init=False, default=None)
+    logstate_replay_counts: list[int] | None = field(init=False, default=None)
 
     @property
     def is_prefill(self) -> bool:

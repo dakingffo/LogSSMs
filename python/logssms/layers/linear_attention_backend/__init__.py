@@ -11,9 +11,11 @@ from .logstate import (
 )
 
 
-def make_linear_attention_backend(cache_type: str) -> BaseLinearAttentionBackend:
+def make_linear_attention_backend(
+    cache_type: str, *, enable_eager_state: bool = False
+) -> BaseLinearAttentionBackend:
     if cache_type == "logstate":
-        return LogStateLinearAttentionBackend()
+        return LogStateLinearAttentionBackend(enable_eager_state=enable_eager_state)
     return LinearAttentionBackend()
 
 __all__ = [

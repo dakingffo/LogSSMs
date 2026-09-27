@@ -13,7 +13,7 @@ from logssms.core import get_global_ctx
 from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
 
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
-from .native import _causal_conv1d_update, _prepare_gdn
+from .native import PackedLinearIndices, _causal_conv1d_update, _prepare_gdn
 
 if TYPE_CHECKING:
     from logssms.core import Batch
@@ -27,8 +27,12 @@ class LogStateLinearAttentionMetadata(BaseLinearAttentionMetadata):
     token_offsets      : torch.Tensor
     conv_read_slots    : torch.Tensor
     conv_read_granules : torch.Tensor
+    replay_counts      : torch.Tensor
     cu_seqlens         : torch.Tensor | None = None
-    conv_snapshot_rows : tuple[torch.Tensor, ...] | None = None
+    prefill_indices    : PackedLinearIndices | None = None
+    conv_snapshot_rows : torch.Tensor | None = None
+    conv_snapshot_reqs : torch.Tensor | None = None
+    conv_final_rows    : torch.Tensor | None = None
     conv_write_slots   : torch.Tensor | None = None
     conv_write_granules: torch.Tensor | None = None
 
@@ -40,6 +44,7 @@ class LogStateLinearAttentionCaptureData:
     token_offsets     : torch.Tensor
     conv_read_slots   : torch.Tensor
     conv_read_granules: torch.Tensor
+    replay_counts     : torch.Tensor
 
     @classmethod
     def make(
@@ -56,15 +61,17 @@ class LogStateLinearAttentionCaptureData:
             token_offsets=tensor(),
             conv_read_slots=tensor(),
             conv_read_granules=tensor(),
+            replay_counts=tensor(),
         )
 
 
 class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
     """Gated DeltaNet backend backed by lossless per-token update logs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, enable_eager_state: bool = False) -> None:
         self.capture: LogStateLinearAttentionCaptureData | None = None
         self.capture_bs: list[int] = []
+        self.enable_eager_state = enable_eager_state
         self._profile_enabled = os.getenv(
             "LOGSSMS_PROFILE_SCHEDULER", "0"
         ).lower() in ("1", "true", "yes")
@@ -106,38 +113,46 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         assert work_state_table.shape[1] == 1
 
         reqs = batch.padded_reqs if batch.is_decode else batch.reqs
-        table_indices = torch.tensor(
-            [req.table_idx for req in reqs],
-            dtype=torch.int64,
-            device=state_table.device,
-        )
-        work_slots = work_state_table[table_indices, 0]
-
+        table_ids = [req.table_idx for req in reqs]
         repeat_start = perf_counter_ns() if profile else 0
-        row_table_indices = torch.repeat_interleave(
-            table_indices,
-            torch.tensor(
-                [req.extend_len for req in reqs],
-                dtype=torch.int64,
-                device=state_table.device,
-            ),
-        )
+        if batch.is_decode:
+            row_ids = table_ids
+        else:
+            row_ids = [req.table_idx for req in reqs for _ in range(req.extend_len)]
         repeat_cpu_ms = (
             (perf_counter_ns() - repeat_start) / 1e6 if profile else 0.0
         )
+        previous_ids = (
+            [] if batch.is_decode else [req.cached_len - 1 for req in reqs]
+        )
+        all_ids = torch.tensor(
+            table_ids + ([] if batch.is_decode else row_ids + previous_ids),
+            dtype=torch.int64,
+            pin_memory=state_table.is_cuda,
+        ).to(state_table.device, non_blocking=state_table.is_cuda)
+        table_indices = all_ids[:len(reqs)]
+        row_table_indices = (
+            table_indices
+            if batch.is_decode else all_ids[len(reqs):len(reqs) + len(row_ids)]
+        )
+        work_slots = work_state_table[table_indices, 0]
         positions = batch.positions
         assert len(positions) == len(row_table_indices)
         log_slots = state_table[row_table_indices, positions]
         token_offsets = batch.out_loc.remainder(pool.page_size).to(torch.int32)
         if batch.is_decode:
+            counts = batch.logstate_replay_counts
+            if counts is None:
+                counts = [0] * len(reqs)  # direct/capture callers
+            assert len(counts) == len(reqs)
+            replay_counts = torch.tensor(
+                counts, dtype=torch.int32, pin_memory=pool.device.type == "cuda"
+            ).to(pool.device, non_blocking=pool.device.type == "cuda")
             conv_read_slots = work_slots
             conv_read_granules = torch.zeros_like(work_slots)
         else:
-            previous_positions = torch.tensor(
-                [req.cached_len - 1 for req in reqs],
-                dtype=torch.int64,
-                device=state_table.device,
-            )
+            replay_counts = torch.empty(0, dtype=torch.int32, device=pool.device)
+            previous_positions = all_ids[len(reqs) + len(row_ids):]
             previous_slots = state_table[
                 table_indices, previous_positions.clamp_min(0)
             ]
@@ -161,18 +176,29 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             token_offsets=token_offsets,
             conv_read_slots=conv_read_slots,
             conv_read_granules=conv_read_granules,
+            replay_counts=replay_counts,
         )
         if batch.is_prefill:
             offsets = [0]
             snapshot_rows = []
+            snapshot_reqs = []
+            final_rows = []
             write_rows = []
             item_cpu_ns = 0
-            for req in reqs:
+            item_calls = 0
+            first_offsets = batch.logstate_first_offsets
+            for req_idx, req in enumerate(reqs):
                 seq_len = req.extend_len
-                item_start = perf_counter_ns() if profile else 0
-                first_offset = int(token_offsets[offsets[-1]].item())
-                if profile:
-                    item_cpu_ns += perf_counter_ns() - item_start
+                if first_offsets is None:
+                    # Direct backend callers (e.g. isolated tests) may not
+                    # have gone through CacheManager.prepare_batch.
+                    item_start = perf_counter_ns() if profile else 0
+                    first_offset = int(token_offsets[offsets[-1]].item())
+                    item_calls += 1
+                    if profile:
+                        item_cpu_ns += perf_counter_ns() - item_start
+                else:
+                    first_offset = first_offsets[req_idx]
                 selected = [
                     index
                     for index in range(seq_len)
@@ -180,17 +206,27 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 ]
                 if not selected or selected[-1] != seq_len - 1:
                     selected.append(seq_len - 1)
-                local_rows = torch.tensor(
-                    selected, dtype=torch.int64, device=pool.device
-                )
-                snapshot_rows.append(local_rows)
-                write_rows.append(local_rows + offsets[-1])
+                snapshot_rows.extend(row + offsets[-1] for row in selected)
+                snapshot_reqs.extend([len(offsets) - 1] * len(selected))
+                write_rows.extend(row + offsets[-1] for row in selected)
+                final_rows.append(len(snapshot_rows) - 1)
                 offsets.append(offsets[-1] + seq_len)
-            write_rows_tensor = torch.cat(write_rows)
-            metadata.cu_seqlens = torch.tensor(
-                offsets, dtype=torch.int64, device=pool.device
+            metadata.prefill_indices = PackedLinearIndices.from_lengths(
+                [req.extend_len for req in reqs], pool.device, pool.layout.granularity
             )
-            metadata.conv_snapshot_rows = tuple(snapshot_rows)
+            metadata.cu_seqlens = metadata.prefill_indices.cu_seqlens
+            metadata.conv_snapshot_rows = torch.tensor(
+                snapshot_rows, dtype=torch.int64, device=pool.device
+            )
+            metadata.conv_snapshot_reqs = torch.tensor(
+                snapshot_reqs, dtype=torch.int64, device=pool.device
+            )
+            metadata.conv_final_rows = torch.tensor(
+                final_rows, dtype=torch.int64, device=pool.device
+            )
+            write_rows_tensor = torch.tensor(
+                write_rows, dtype=torch.int64, device=pool.device
+            )
             metadata.conv_write_slots = log_slots.index_select(
                 0, write_rows_tensor
             )
@@ -204,7 +240,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 "batch_size": batch.size,
                 "metadata_cpu_ms": (perf_counter_ns() - metadata_start) / 1e6,
                 "repeat_interleave_cpu_ms": repeat_cpu_ms,
-                "item_calls": len(reqs),
+                "item_calls": item_calls,
                 "item_cpu_ms": item_cpu_ns / 1e6,
             })
 
@@ -245,6 +281,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             "token_offsets",
             "conv_read_slots",
             "conv_read_granules",
+            "replay_counts",
         ):
             getattr(self.capture, name)[:bs].copy_(getattr(metadata, name))
         return LogStateLinearAttentionMetadata(
@@ -254,6 +291,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             token_offsets=self.capture.token_offsets[:bs],
             conv_read_slots=self.capture.conv_read_slots[:bs],
             conv_read_granules=self.capture.conv_read_granules[:bs],
+            replay_counts=self.capture.replay_counts[:bs],
         )
 
     def forward(
@@ -335,44 +373,31 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         from logssms.kernel.linear_attention.vendor.fla import (
             chunk_gated_delta_rule_with_log,
         )
+        from logssms.kernel.linear_attention.packed_conv import (
+            packed_causal_conv1d, packed_conv_snapshots,
+        )
 
         pool = get_global_ctx().linear_state
         assert isinstance(pool, FramedMHALogStatePool)
         layer_idx = config.layer_idx
-        qkv_segments = []
-        conv_snapshots = []
         assert metadata.cu_seqlens is not None
+        assert metadata.prefill_indices is not None
         assert metadata.conv_snapshot_rows is not None
+        assert metadata.conv_snapshot_reqs is not None
+        assert metadata.conv_final_rows is not None
         assert metadata.conv_write_slots is not None
         assert metadata.conv_write_granules is not None
-        offset = 0
-        for req_idx, req in enumerate(batch.reqs):
-            seq_len = req.extend_len
-            end_offset = offset + seq_len
-            req_qkv = mixed_qkv[offset:end_offset].transpose(0, 1).unsqueeze(0)
-            conv_state = pool.read_conv(
-                metadata.conv_read_slots[req_idx:req_idx + 1],
-                metadata.conv_read_granules[req_idx:req_idx + 1],
-                layer_idx,
-            )
-            conv_input = torch.cat([conv_state, req_qkv], dim=-1)
-            req_qkv = F.silu(
-                F.conv1d(conv_input, conv_weight, groups=config.conv_dim)
-            ).transpose(1, 2)
-            qkv_segments.append(req_qkv.squeeze(0))
-            snapshots = (
-                conv_input.unfold(-1, config.state_len, 1)[:, :, 1:]
-                .permute(0, 2, 1, 3)
-                .squeeze(0)
-            )
-            conv_snapshots.append(
-                snapshots.index_select(
-                    0, metadata.conv_snapshot_rows[req_idx]
-                )
-            )
-            offset = end_offset
-
-        mixed_qkv = torch.cat(qkv_segments).unsqueeze(0)
+        conv_history = pool.read_conv(
+            metadata.conv_read_slots, metadata.conv_read_granules, layer_idx
+        )
+        conv_snapshots = packed_conv_snapshots(
+            mixed_qkv, conv_history, metadata.cu_seqlens,
+            metadata.conv_snapshot_rows, metadata.conv_snapshot_reqs,
+        )
+        mixed_qkv = packed_causal_conv1d(
+            mixed_qkv, conv_weight, conv_history,
+            metadata.cu_seqlens, metadata.prefill_indices.conv_chunks,
+        ).unsqueeze(0)
         query, key, value = self._split_qkv(mixed_qkv, config)
         query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
             query,
@@ -393,6 +418,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 pool.read_states(metadata.work_slots, layer_idx),
                 metadata.cu_seqlens,
                 chunk_size=pool.layout.granularity,
+                **metadata.prefill_indices.fla_kwargs(),
             )
         )
         store_framed_log_states(
@@ -409,13 +435,13 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             metadata.conv_write_slots,
             metadata.conv_write_granules,
             layer_idx,
-            torch.cat(conv_snapshots),
+            conv_snapshots,
         )
         pool.write_conv(
             metadata.work_slots,
             torch.zeros_like(metadata.work_slots),
             layer_idx,
-            torch.stack([snapshot[-1] for snapshot in conv_snapshots]),
+            conv_snapshots.index_select(0, metadata.conv_final_rows),
         )
         return output.squeeze(0)
 
@@ -433,36 +459,20 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         from logssms.kernel.linear_attention.vendor.fla import (
             fused_recurrent_gated_delta_rule_to_framed_logstate,
         )
+        from logssms.kernel.linear_attention.conv_decode import conv_decode_qkv
 
         pool = get_global_ctx().linear_state
         assert isinstance(pool, FramedMHALogStatePool)
         layer_idx = config.layer_idx
-        conv_state = pool.read_conv(
-            metadata.conv_read_slots,
-            metadata.conv_read_granules,
-            layer_idx,
+        query, key, value = conv_decode_qkv(
+            mixed_qkv, conv_weight, config,
+            read_slots=metadata.conv_read_slots,
+            read_granules=metadata.conv_read_granules,
+            write_slots=metadata.log_slots,
+            write_granules=metadata.token_offsets // pool.layout.granularity,
+            work_slots=metadata.work_slots,
+            pool=pool,
         )
-        mixed_qkv = mixed_qkv.unsqueeze(1).transpose(1, 2)
-        mixed_qkv = _causal_conv1d_update(
-            mixed_qkv, conv_state, conv_weight
-        ).transpose(1, 2)
-        conv_write_granules = (
-            metadata.token_offsets // pool.layout.granularity
-        )
-        pool.write_conv(
-            metadata.log_slots,
-            conv_write_granules,
-            layer_idx,
-            conv_state,
-        )
-        pool.write_conv(
-            metadata.work_slots,
-            torch.zeros_like(metadata.work_slots),
-            layer_idx,
-            conv_state,
-        )
-
-        query, key, value = self._split_qkv(mixed_qkv, config)
         output = fused_recurrent_gated_delta_rule_to_framed_logstate(
             query,
             key,
@@ -476,6 +486,8 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             metadata.log_slots,
             metadata.token_offsets,
             layer_idx,
+            metadata.replay_counts,
+            enable_eager_state=self.enable_eager_state,
         )
         return output.squeeze(1)
 

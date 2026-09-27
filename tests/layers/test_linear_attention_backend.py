@@ -90,6 +90,80 @@ def test_decode_graph_metadata_uses_capture_buffers() -> None:
     assert backend.capture.write_slots.tolist() == [4, 9]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("read_slots,write_slots", [([1, 3], [1, 3]), ([1, 3], [2, 3])])
+def test_decode_recurrent_direct_store_matches_gather_scatter(
+    read_slots: list[int], write_slots: list[int]
+) -> None:
+    from logssms.kernel.linear_attention.vendor.fla import (
+        fused_recurrent_gated_delta_rule,
+        fused_recurrent_gated_delta_rule_to_slots,
+    )
+
+    inputs = _make_inputs(seq_len=1)
+    pool = torch.randn(5, 2, 4, 64, 64, device="cuda", dtype=torch.bfloat16)
+    before = pool.clone()
+    descriptor = torch.tensor(
+        list(zip(read_slots, write_slots)), device="cuda", dtype=torch.int64
+    )
+    reads, writes = descriptor[:, 0], descriptor[:, 1]
+    reference_output, reference_states = fused_recurrent_gated_delta_rule(
+        inputs["query"], inputs["key"], inputs["value"],
+        inputs["gate"], inputs["beta"], inputs["A_log"], inputs["dt_bias"],
+        pool[:, 1].index_select(0, reads),
+    )
+    output = fused_recurrent_gated_delta_rule_to_slots(
+        inputs["query"], inputs["key"], inputs["value"],
+        inputs["gate"], inputs["beta"], inputs["A_log"], inputs["dt_bias"],
+        pool, reads, writes, 1,
+    )
+    expected = before.clone()
+    expected[:, 1].index_copy_(0, writes, reference_states[:, 0])
+    torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_packed_causal_conv_matches_individual_requests() -> None:
+    from logssms.kernel.linear_attention.packed_conv import (
+        packed_causal_conv1d, packed_conv_snapshots,
+    )
+
+    torch.manual_seed(31)
+    lengths = [1, 17, 79]
+    channels, state_len = 65, 3
+    offsets = [0, 1, 18, 97]
+    x = torch.randn(sum(lengths), channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, 1, state_len + 1, device="cuda", dtype=x.dtype) * 0.1
+    history = torch.randn(len(lengths), channels, state_len, device="cuda", dtype=x.dtype)
+    cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int64)
+    chunks = torch.tensor(
+        [(req, chunk) for req, length in enumerate(lengths)
+         for chunk in range((length + 63) // 64)],
+        device="cuda", dtype=torch.int64,
+    )
+    output = packed_causal_conv1d(x, weight, history, cu_seqlens, chunks)
+    rows = torch.tensor([0, 9, 17, 50, 96], device="cuda", dtype=torch.int64)
+    reqs = torch.tensor([0, 1, 1, 2, 2], device="cuda", dtype=torch.int64)
+    snapshots = packed_conv_snapshots(x, history, cu_seqlens, rows, reqs)
+
+    expected = torch.cat([
+        torch.nn.functional.silu(torch.nn.functional.conv1d(
+            torch.cat([history[i:i+1], x[offsets[i]:offsets[i+1]].T[None]], dim=-1),
+            weight, groups=channels,
+        )).transpose(1, 2).squeeze(0)
+        for i in range(len(lengths))
+    ])
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+    expected_snapshots = torch.stack([
+        torch.cat([history[req], x[offsets[req]:offsets[req+1]].T], dim=-1)[
+            :, row - offsets[req] + 1:row - offsets[req] + state_len + 1
+        ]
+        for row, req in zip(rows.tolist(), reqs.tolist())
+    ])
+    torch.testing.assert_close(snapshots, expected_snapshots, rtol=0, atol=0)
+
+
 def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
     clear_global_ctx()
     backend = LinearAttentionBackend()
@@ -130,6 +204,7 @@ def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_chunk_gated_delta_returns_page_checkpoints() -> None:
     from logssms.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
+    from logssms.layers.linear_attention_backend.native import PackedLinearIndices
 
     inputs = _make_inputs(seq_len=96)
     query = torch.nn.functional.normalize(inputs["query"], dim=-1)
@@ -147,6 +222,14 @@ def test_chunk_gated_delta_returns_page_checkpoints() -> None:
     output, final_state, states = chunk_gated_delta_rule(
         query, key, value, gate, beta, initial_state, cu_seqlens
     )
+    prepared = PackedLinearIndices.from_lengths([96, 96], query.device, 64)
+    prepared_output, prepared_final, prepared_states = chunk_gated_delta_rule(
+        query, key, value, gate, beta, initial_state,
+        prepared.cu_seqlens, **prepared.fla_kwargs(),
+    )
+    torch.testing.assert_close(prepared_output, output, rtol=0, atol=0)
+    torch.testing.assert_close(prepared_final, final_state, rtol=0, atol=0)
+    torch.testing.assert_close(prepared_states, states, rtol=0, atol=0)
 
     assert output.shape == value.shape
     assert final_state.shape == initial_state.shape

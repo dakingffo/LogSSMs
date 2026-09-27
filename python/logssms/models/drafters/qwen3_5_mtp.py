@@ -126,7 +126,7 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
         residual = self.fc.forward(h)
 
         layer = self.layers.op_list[0]
-        h = layer.input_layernorm.forward(residual)
+        h = layer.input_layernorm.forward(residual)[0]
         query, gate, key, value = layer.self_attn.proj(h, positions)
         return residual, query, gate, key, value
 
@@ -144,7 +144,7 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
         )
         h = residual + h
         residual = h
-        h = layer.post_attention_layernorm.forward(h)
+        h = layer.post_attention_layernorm.forward(h)[0]
         h = layer.mlp.forward(h)
         h = self.norm.forward(residual + h)
         return self.get_logits(h), h

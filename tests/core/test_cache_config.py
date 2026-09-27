@@ -21,6 +21,7 @@ def test_logstate_arguments_build_algorithm_specific_config() -> None:
     parser = make_cache_argument_parser("logstate")
     kwargs = vars(parser.parser.parse_args([
         "--granularity", "32",
+        "--enable-eager-state",
         "--enable-merge-adjustment",
         "--min-sampling-len", "512",
         "--max-merge-intensity", "12",
@@ -30,6 +31,7 @@ def test_logstate_arguments_build_algorithm_specific_config() -> None:
     config = parser.make_config(kwargs)
     assert config == LogStateCacheConfig(
         granularity=32,
+        enable_eager_state=True,
         enable_merge_adjustment=True,
         min_sampling_len=512,
         max_merge_intensity=12,
@@ -50,6 +52,8 @@ def test_server_rejects_cache_arguments_from_another_cache_type(tmp_path) -> Non
         parse_args(common + ["--cache-type", "logstate", "--page-size", "32"])
     with pytest.raises(SystemExit):
         parse_args(common + ["--cache-type", "radix", "--granularity", "16"])
+    with pytest.raises(SystemExit):
+        parse_args(common + ["--cache-type", "radix", "--enable-eager-state"])
 
 
 def test_server_uses_logstate_defaults(tmp_path) -> None:
@@ -61,6 +65,7 @@ def test_server_uses_logstate_defaults(tmp_path) -> None:
     ])
 
     assert args.cache_config == LogStateCacheConfig()
+    assert not args.cache_config.enable_eager_state
     assert args.cache_config.granularity == LOG_STATE_GRANULARITY == 32
     assert args.page_size == 64
 

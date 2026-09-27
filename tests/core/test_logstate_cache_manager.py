@@ -192,6 +192,41 @@ def test_allocation_profile_separates_work_prefill_and_pool_reserve():
     assert phases["prefill"]["timing_ms"]["total_ms"] == sample["timing_ms"]["total_ms"]
 
 
+def test_prefill_passes_physical_first_offset_without_device_sync():
+    manager = make_manager()
+    req = new_req(manager, torch.arange(130, dtype=torch.int32))
+    manager.allocate([req], phase="prefill")
+    batch = Batch(reqs=[req], phase="prefill")
+    manager.prepare_batch(batch)
+    assert batch.logstate_first_offsets == [0]
+
+    # A continued chunk starts part-way through a physical 64-token page.
+    req.cached_len = 70
+    next_batch = Batch(reqs=[req], phase="prefill")
+    manager.prepare_batch(next_batch)
+    assert next_batch.logstate_first_offsets == [6]
+
+
+def test_decode_replay_count_tracks_prefill_tail_and_page_boundary():
+    manager = make_manager(num_pages=12, num_states=12)
+    req = new_req(manager, torch.arange(35, dtype=torch.int32))
+    req.max_device_len = 100
+    manager.allocate([req], phase="prefill")
+    prefill = Batch(reqs=[req], phase="prefill")
+    manager.prepare_batch(prefill)
+
+    for token in range(35, 66):
+        req.cached_len = token
+        req.device_len = token + 1
+        manager.allocate([req], phase="decode")
+        batch = Batch(reqs=[req], phase="decode")
+        batch.padded_reqs = [req, req]
+        manager.prepare_batch(batch)
+        assert batch.logstate_replay_counts == [
+            token - max(35, (token // 16) * 16), 0,
+        ]
+
+
 def test_partial_log_hit_restores_only_matched_granule():
     manager = make_manager()
     original = new_req(manager, torch.arange(128, dtype=torch.int32))

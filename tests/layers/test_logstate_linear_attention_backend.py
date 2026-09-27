@@ -139,7 +139,7 @@ def test_logstate_uses_physical_offsets_after_unaligned_prefix_hit() -> None:
         backend.prepare_metadata(batch)
         metadata = batch.linear_attn_metadata
         assert metadata.token_offsets.tolist() == list(range(16))
-        assert metadata.conv_snapshot_rows[0].tolist() == [15]
+        assert metadata.conv_snapshot_rows.tolist() == [15]
         assert metadata.conv_write_granules.tolist() == [0]
 
         decode = Batch(reqs=[_make_request(17, 18)], phase="decode")
@@ -164,6 +164,7 @@ def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> N
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(16, 32, dtype=torch.int32, device=device)
     batch.out_loc = ctx.page_table[0, 16:32]
+    batch.logstate_first_offsets = [16]
 
     set_global_ctx(ctx)
     try:
@@ -174,7 +175,7 @@ def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert profile is not None
     assert profile["aggregate"]["prefill_batches"] == 1
-    assert profile["aggregate"]["item_calls"] == 1
+    assert profile["aggregate"]["item_calls"] == 0
     assert profile["aggregate"]["metadata_cpu_ms"] >= 0
     assert profile["aggregate"]["repeat_interleave_cpu_ms"] >= 0
     assert profile["aggregate"]["item_cpu_ms"] >= 0
@@ -242,7 +243,8 @@ def test_logstate_decode_graph_metadata_uses_int32_capture_buffers() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_decode_direct_logstate_store_matches_temporary_outputs() -> None:
+@pytest.mark.parametrize("block_v", [8, 16, 32])
+def test_decode_direct_logstate_store_matches_temporary_outputs(block_v: int) -> None:
     device = torch.device("cuda")
     pool = FramedMHALogStatePool(
         num_frames=64,
@@ -285,9 +287,12 @@ def test_decode_direct_logstate_store_matches_temporary_outputs() -> None:
     actual_output = fused_recurrent_gated_delta_rule_to_framed_logstate(
         query, key, value, gate, beta, A_log, dt_bias,
         pool, work_slots, log_slots, offsets, 1,
+        torch.zeros(3, dtype=torch.int32, device=device), block_v=block_v,
     )
     torch.testing.assert_close(actual_output, expected_output)
-    torch.testing.assert_close(pool.read_states(work_slots, 1), expected_state[:, 0])
+    actual_state = pool.read_states(work_slots, 1)
+    torch.testing.assert_close(actual_state[:2], initial[:2], rtol=0, atol=0)
+    torch.testing.assert_close(actual_state[2], expected_state[2, 0])
     for row, (slot, offset) in enumerate(zip(log_slots.tolist(), offsets.tolist())):
         for head in range(2):
             log = pool.head_view(slot, 1, head, state=False)
@@ -295,6 +300,162 @@ def test_decode_direct_logstate_store_matches_temporary_outputs() -> None:
             value_offset = 64 * 32 + offset * 32
             torch.testing.assert_close(log[value_offset:value_offset + 32], expected_value[row, 0, head])
         torch.testing.assert_close(pool.decay_view(slot)[1, offset], expected_decay[row, 0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_framed_recurrent_auto_tile_matches_reference_for_128d_heads(
+    batch_size: int,
+) -> None:
+    device = torch.device("cuda")
+    pool = FramedMHALogStatePool(
+        num_frames=64, page_size=64, granularity=16,
+        num_attention_layers=1, num_kv_heads=1, head_dim=128,
+        num_linear_layers=1, num_key_heads=2, num_value_heads=2,
+        head_k_dim=128, head_v_dim=128, conv_dim=768, state_len=3,
+        device=device, dtype=torch.bfloat16,
+    )
+    assert pool.reserve(logs=4, works=4) is not None
+    torch.manual_seed(96)
+    query = torch.randn(batch_size, 1, 2, 128, device=device, dtype=pool.dtype)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    gate = torch.randn(batch_size, 1, 2, device=device, dtype=pool.dtype)
+    beta = torch.randn_like(gate)
+    A_log = torch.zeros(2, device=device)
+    dt_bias = torch.zeros(2, device=device)
+    work = torch.arange(4, 4 + batch_size, device=device, dtype=torch.int32)
+    logs = torch.arange(batch_size, device=device, dtype=torch.int32)
+    offsets = torch.zeros(batch_size, device=device, dtype=torch.int32)
+    initial = torch.randn(batch_size, 2, 128, 128, device=device, dtype=pool.dtype)
+    pool.write_states(work, 0, initial)
+    expected, expected_state, *_ = fused_recurrent_gated_delta_rule_with_log(
+        query, key, value, gate, beta, A_log, dt_bias, initial
+    )
+    actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        query, key, value, gate, beta, A_log, dt_bias,
+        pool, work, logs, offsets, 0,
+        torch.zeros(batch_size, dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(pool.read_states(work, 0), initial, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("first_offset", [0, 20, 48])
+def test_decode_replays_log_and_commits_work_only_at_granule_end(
+    first_offset: int,
+) -> None:
+    device = torch.device("cuda")
+    pool = _make_pool(device)
+    torch.manual_seed(103)
+    work = torch.tensor([2], dtype=torch.int32, device=device)
+    log = torch.tensor([0], dtype=torch.int32, device=device)
+    initial = torch.randn(1, 2, 32, 32, device=device, dtype=pool.dtype) * 0.1
+    pool.write_states(work, 0, initial)
+    baseline = initial
+    length = 16 - first_offset % 16
+    A_log = torch.zeros(2, device=device)
+    dt_bias = torch.zeros(2, device=device)
+    for step in range(length):
+        query = torch.randn(1, 1, 2, 32, device=device, dtype=pool.dtype)
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+        gate = torch.randn(1, 1, 2, device=device, dtype=pool.dtype)
+        beta = torch.randn_like(gate)
+        expected, states = fused_recurrent_gated_delta_rule_with_log(
+            query, key, value, gate, beta, A_log, dt_bias, baseline
+        )[:2]
+        actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query, key, value, gate, beta, A_log, dt_bias,
+            pool, work, log,
+            torch.tensor([first_offset + step], dtype=torch.int32, device=device),
+            0, torch.tensor([step], dtype=torch.int32, device=device),
+        )
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+        baseline = states[:, 0]
+        stored = pool.read_states(work, 0)
+        if step + 1 < length:
+            torch.testing.assert_close(stored, initial, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(stored, baseline, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_decode_eager_state_writes_work_every_token() -> None:
+    device = torch.device("cuda")
+    pool = _make_pool(device)
+    torch.manual_seed(105)
+    work = torch.tensor([2], dtype=torch.int32, device=device)
+    log = torch.tensor([0], dtype=torch.int32, device=device)
+    initial = torch.randn(1, 2, 32, 32, device=device, dtype=pool.dtype) * 0.1
+    pool.write_states(work, 0, initial)
+    A_log = torch.zeros(2, device=device)
+    dt_bias = torch.zeros(2, device=device)
+    for step in range(3):
+        query = torch.randn(1, 1, 2, 32, device=device, dtype=pool.dtype)
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+        gate = torch.randn(1, 1, 2, device=device, dtype=pool.dtype)
+        beta = torch.randn_like(gate)
+        expected, states = fused_recurrent_gated_delta_rule_with_log(
+            query, key, value, gate, beta, A_log, dt_bias, initial
+        )[:2]
+        actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query, key, value, gate, beta, A_log, dt_bias,
+            pool, work, log,
+            torch.tensor([20 + step], dtype=torch.int32, device=device),
+            0, torch.tensor([step], dtype=torch.int32, device=device),
+            enable_eager_state=True,
+        )
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(
+            pool.read_states(work, 0), states[:, 0], rtol=3e-2, atol=3e-2
+        )
+        initial = states[:, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_replay_count_and_offset_are_mutable_cuda_graph_inputs() -> None:
+    device = torch.device("cuda")
+    pool = _make_pool(device)
+    torch.manual_seed(104)
+    work = torch.tensor([2], dtype=torch.int32, device=device)
+    log = torch.tensor([0], dtype=torch.int32, device=device)
+    initial = torch.randn(1, 2, 32, 32, device=device, dtype=pool.dtype) * 0.1
+    pool.write_states(work, 0, initial)
+    query = torch.randn(1, 1, 2, 32, device=device, dtype=pool.dtype)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    gate = torch.randn(1, 1, 2, device=device, dtype=pool.dtype)
+    beta = torch.randn_like(gate)
+    A_log = torch.zeros(2, device=device)
+    dt_bias = torch.zeros(2, device=device)
+    offsets = torch.zeros(1, dtype=torch.int32, device=device)
+    counts = torch.zeros_like(offsets)
+    first_output, first_states = fused_recurrent_gated_delta_rule_with_log(
+        query, key, value, gate, beta, A_log, dt_bias, initial
+    )[:2]
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query, key, value, gate, beta, A_log, dt_bias,
+            pool, work, log, offsets, 0, counts,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_output, first_output, rtol=3e-2, atol=3e-2)
+    offsets.fill_(1)
+    counts.fill_(1)
+    query.copy_(torch.randn_like(query))
+    expected, *_ = fused_recurrent_gated_delta_rule_with_log(
+        query, key, value, gate, beta, A_log, dt_bias, first_states[:, 0]
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_output, expected, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(pool.read_states(work, 0), initial, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -331,6 +492,8 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
             device=device,
         )
         batch.out_loc = batch.positions
+        if phase == "decode":
+            batch.logstate_replay_counts = [req.cached_len - 20]
         length = req.extend_len
         mixed_qkv = torch.randn(length, 192, dtype=dtype, device=device)
         gate = torch.randn(length, 2, dtype=dtype, device=device)
@@ -350,12 +513,13 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
     set_global_ctx(ctx)
     try:
         assert run(_make_request(0, 20), "prefill").shape == (20, 2, 32)
-        assert run(_make_request(20, 21), "decode").shape == (1, 2, 32)
+        for token in range(20, 32):
+            assert run(_make_request(token, token + 1), "decode").shape == (1, 2, 32)
     finally:
         clear_global_ctx()
 
     state = torch.zeros(2, 32, 32, device=device)
-    for token in range(21):
+    for token in range(32):
         for head in range(2):
             log = pool.head_view(0, 0, head, state=False)
             key = log[token * 32:(token + 1) * 32].float()
@@ -435,6 +599,10 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
         batch.padded_reqs = batch.reqs
         batch.positions = torch.arange(begin, end, dtype=torch.int32, device=device)
         batch.out_loc = batch.positions
+        if phase == "decode":
+            batch.logstate_replay_counts = [
+                begin - max(35, (begin // 16) * 16)
+            ]
         backend.prepare_metadata(batch)
         backend.forward(
             mixed_qkv[begin:end], gate[begin:end], beta[begin:end],

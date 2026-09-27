@@ -25,6 +25,7 @@ class StandardCacheConfig(BaseCacheConfig):
 @dataclass(frozen=True)
 class LogStateCacheConfig(BaseCacheConfig):
     granularity              : int  = 32
+    enable_eager_state       : bool = False
     enable_merge_adjustment  : bool = False
     min_sampling_len         : int  = 1024
     max_merge_intensity      : int  = 16

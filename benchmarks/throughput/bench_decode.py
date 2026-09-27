@@ -17,6 +17,14 @@ Examples:
 For a multi-turn sweep, ``--num-concurrent-sessions`` denotes concurrent sessions and
 ``--num-sessions`` denotes the fixed workload size. The workload is sampled once and
 reused verbatim; every concurrency point gets a fresh server/cache.
+
+For a Radix/LogState A/B run, keep the model, dataset, seed, concurrency sweep,
+session count, generation length, and server budgets identical. Use
+``--history-mode fixed --ignore-eos`` so the next turn's input does not depend on
+which cache policy produced the previous assistant reply. Run twice, changing
+only ``--cache-type radix --page-size 256`` to
+``--cache-type logstate --granularity 32``, with distinct ``--out`` and
+``--history`` paths. The latter records the actual request texts for audit.
 """
 import asyncio
 import os

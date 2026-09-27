@@ -54,8 +54,14 @@ def test_dflash_hidden_capture_and_messages() -> None:
     layer_3 = layer_1 + 20
     captor.capture(HiddenCapturePoint.DECODER_INPUT, 1, layer_1 - 1)
     positions = torch.arange(len(layer_1))
-    captor.capture(HiddenCapturePoint.DECODER_INPUT, 2, layer_1, positions)
-    captor.capture(HiddenCapturePoint.DECODER_INPUT, 4, layer_3, positions)
+    captor.capture(HiddenCapturePoint.DECODER_INPUT, 2, layer_1, None, positions)
+    captor.capture(
+        HiddenCapturePoint.DECODER_INPUT,
+        4,
+        layer_3 - 2,
+        torch.full_like(layer_3, 2),
+        positions,
+    )
     expected = torch.cat([layer_1, layer_3], dim=-1)
     torch.testing.assert_close(captor.full_hidden, expected)
 

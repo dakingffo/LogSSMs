@@ -43,9 +43,12 @@ def _fused_recurrent_gated_delta_kernel(
     log_slots,
     token_offsets,
     work_slots,
+    read_slots,
+    write_slots,
     key_log_pool,
     value_log_pool,
     decay_log_pool,
+    replay_counts,
     scale,
     SEQ_LEN,
     NUM_K_HEADS: tl.constexpr,
@@ -56,10 +59,13 @@ def _fused_recurrent_gated_delta_kernel(
     BLOCK_V    : tl.constexpr,
     STORE_LOG  : tl.constexpr,
     DIRECT_STORE: tl.constexpr,
+    SLOTTED_STORE: tl.constexpr,
     LAYER      : tl.constexpr,
     STATE_SLOT_STRIDE: tl.constexpr,
     STATE_LAYER_STRIDE: tl.constexpr,
     STATE_HEAD_STRIDE: tl.constexpr,
+    READ_SLOT_STRIDE: tl.constexpr,
+    WRITE_SLOT_STRIDE: tl.constexpr,
     KEY_SLOT_STRIDE: tl.constexpr,
     KEY_LAYER_STRIDE: tl.constexpr,
     KEY_TOKEN_STRIDE: tl.constexpr,
@@ -78,6 +84,8 @@ def _fused_recurrent_gated_delta_kernel(
     HEAD_PAYLOAD_BYTES: tl.constexpr,
     DECAY_RECORD_BYTES: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    GRANULARITY: tl.constexpr,
+    REPLAY_WORK: tl.constexpr,
 ):
     value_block = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -91,7 +99,26 @@ def _fused_recurrent_gated_delta_kernel(
     v_mask = v_offset < HEAD_V_DIM
     state_mask = k_mask[:, None] & v_mask[None, :]
 
-    if DIRECT_STORE:
+    if SLOTTED_STORE:
+        read_slot = tl.load(read_slots + batch_idx * READ_SLOT_STRIDE)
+        write_slot = tl.load(write_slots + batch_idx * WRITE_SLOT_STRIDE)
+        state_ptr = (
+            initial_state
+            + read_slot * STATE_SLOT_STRIDE
+            + LAYER * STATE_LAYER_STRIDE
+            + value_head * STATE_HEAD_STRIDE
+            + k_offset[:, None] * HEAD_V_DIM
+            + v_offset[None, :]
+        )
+        write_state_ptr = (
+            initial_state
+            + write_slot * STATE_SLOT_STRIDE
+            + LAYER * STATE_LAYER_STRIDE
+            + value_head * STATE_HEAD_STRIDE
+            + k_offset[:, None] * HEAD_V_DIM
+            + v_offset[None, :]
+        )
+    elif DIRECT_STORE:
         work_slot = tl.load(work_slots + batch_idx)
         if FRAMED:
             head_offset = (LAYER * NUM_V_HEADS + value_head) * HEAD_PAYLOAD_BYTES
@@ -123,6 +150,44 @@ def _fused_recurrent_gated_delta_kernel(
             + v_offset[None, :]
         )
     state = tl.load(state_ptr, mask=state_mask, other=0.0).to(tl.float32)
+    if REPLAY_WORK:
+        count = tl.load(replay_counts + batch_idx)
+        log_slot = tl.load(log_slots + batch_idx)
+        current_offset = tl.load(token_offsets + batch_idx)
+        head_offset = (LAYER * NUM_V_HEADS + value_head) * HEAD_PAYLOAD_BYTES
+        log_frame = tl.load(
+            key_log_pool + log_slot * FRAMES_PER_SLOT
+            + head_offset // FRAME_BYTES
+        )
+        log_head = (initial_state
+            + _frame_byte_offset(log_frame, FRAME_BYTES)
+            + head_offset % FRAME_BYTES
+        ).to(tl.pointer_type(query.dtype.element_ty))
+        decay_frame = tl.load(value_log_pool + log_slot * 2)
+        decay_index = tl.load(value_log_pool + log_slot * 2 + 1)
+        decay_head = (initial_state
+            + _frame_byte_offset(decay_frame, FRAME_BYTES)
+            + decay_index * DECAY_RECORD_BYTES
+        ).to(tl.pointer_type(tl.float32))
+        for index in range(count):
+            prior_offset = current_offset - count + index
+            logged_key = tl.load(
+                log_head + prior_offset * HEAD_K_DIM + k_offset,
+                mask=k_mask, other=0.0,
+            ).to(tl.float32)
+            logged_value = tl.load(
+                log_head + PAGE_SIZE * HEAD_K_DIM
+                + prior_offset * HEAD_V_DIM + v_offset,
+                mask=v_mask, other=0.0,
+            ).to(tl.float32)
+            logged_decay = tl.load(
+                decay_head + (LAYER * PAGE_SIZE + prior_offset) * NUM_V_HEADS
+                + value_head
+            )
+            state = state * logged_decay + (
+                logged_key[:, None] * logged_value[None, :]
+            )
+            state = state.to(query.dtype.element_ty).to(tl.float32)
     A = tl.load(A_log + value_head).to(tl.float32)
     bias = tl.load(dt_bias + value_head).to(tl.float32)
 
@@ -242,7 +307,9 @@ def _fused_recurrent_gated_delta_kernel(
                 tl.store(prepared_key_ptr, k, mask=k_mask)
                 tl.store(decay_ptr, decay)
 
-        if DIRECT_STORE:
+        if SLOTTED_STORE:
+            snapshot_ptr = write_state_ptr
+        elif DIRECT_STORE:
             snapshot_ptr = state_ptr
         else:
             snapshot_ptr = (
@@ -254,7 +321,12 @@ def _fused_recurrent_gated_delta_kernel(
                 + k_offset[:, None] * HEAD_V_DIM
                 + v_offset[None, :]
             )
-        tl.store(snapshot_ptr, state, mask=state_mask)
+        if REPLAY_WORK:
+            current_offset = tl.load(token_offsets + batch_idx)
+            if (current_offset + 1) % GRANULARITY == 0:
+                tl.store(snapshot_ptr, state, mask=state_mask)
+        else:
+            tl.store(snapshot_ptr, state, mask=state_mask)
 
         query_ptr += NUM_K_HEADS * HEAD_K_DIM
         key_ptr += NUM_K_HEADS * HEAD_K_DIM
@@ -340,6 +412,9 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     log_slots    : torch.Tensor,
     token_offsets: torch.Tensor,
     layer        : int,
+    replay_counts: torch.Tensor,
+    block_v      : int | None = None,
+    enable_eager_state: bool = False,
 ) -> torch.Tensor:
     """Decode directly into noncontiguous frame-backed work and log slots."""
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
@@ -349,17 +424,25 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     assert head_k_dim == pool.layout.head_k_dim
     assert head_v_dim == pool.layout.head_v_dim
     assert num_v_heads == pool.layout.num_value_heads
+    assert replay_counts.shape == (batch_size,)
     assert pool.frame_bytes % pool.head_payload_bytes == 0
     output = torch.empty_like(value)
     block_k = triton.next_power_of_2(head_k_dim)
-    block_v = min(8, triton.next_power_of_2(head_v_dim))
+    if block_v is None:
+        # Wider value heads amortize the framed state lookup across more columns.
+        block_v = 8 if head_v_dim < 128 else (
+            16 if batch_size == 1 else 32
+        )
+    assert block_v in (8, 16, 32)
+    block_v = min(block_v, triton.next_power_of_2(head_v_dim))
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
     _fused_recurrent_gated_delta_kernel[grid](
         query.contiguous(), key.contiguous(), value.contiguous(),
         gate.contiguous(), beta.contiguous(), A_log, dt_bias,
         pool.storage, output, None, None, None, None,
-        log_slots, token_offsets, work_slots,
+        log_slots, token_offsets, work_slots, None, None,
         pool.payload_frame_table, pool.decay_frame_table, None,
+        replay_counts,
         head_k_dim ** -0.5, 1,
         NUM_K_HEADS=num_k_heads,
         NUM_V_HEADS=num_v_heads,
@@ -369,10 +452,13 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         BLOCK_V=block_v,
         STORE_LOG=True,
         DIRECT_STORE=True,
+        SLOTTED_STORE=False,
         LAYER=layer,
         STATE_SLOT_STRIDE=0,
         STATE_LAYER_STRIDE=0,
         STATE_HEAD_STRIDE=0,
+        READ_SLOT_STRIDE=0,
+        WRITE_SLOT_STRIDE=0,
         KEY_SLOT_STRIDE=0,
         KEY_LAYER_STRIDE=0,
         KEY_TOKEN_STRIDE=0,
@@ -391,6 +477,81 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         HEAD_PAYLOAD_BYTES=pool.head_payload_bytes,
         DECAY_RECORD_BYTES=pool.layout.log_decay_bytes,
         PAGE_SIZE=pool.page_size,
+        GRANULARITY=pool.layout.granularity,
+        REPLAY_WORK=not enable_eager_state,
+        num_warps=1,
+        num_stages=3,
+    )
+    return output
+
+
+@torch.compiler.disable
+def fused_recurrent_gated_delta_rule_to_slots(
+    query       : torch.Tensor,
+    key         : torch.Tensor,
+    value       : torch.Tensor,
+    gate        : torch.Tensor,
+    beta        : torch.Tensor,
+    A_log       : torch.Tensor,
+    dt_bias     : torch.Tensor,
+    state_pool  : torch.Tensor,
+    read_slots  : torch.Tensor,
+    write_slots : torch.Tensor,
+    layer       : int,
+) -> torch.Tensor:
+    """Decode from one page state into another, or update a page in place."""
+    batch_size, seq_len, num_k_heads, head_k_dim = query.shape
+    num_v_heads, head_v_dim = value.shape[2:]
+    assert seq_len == 1 and state_pool.ndim == 5
+    assert read_slots.shape == write_slots.shape == (batch_size,)
+    assert state_pool.shape[2:] == (num_v_heads, head_k_dim, head_v_dim)
+    assert num_v_heads % num_k_heads == 0
+    output = torch.empty_like(value)
+    block_k = triton.next_power_of_2(head_k_dim)
+    block_v = min(32, triton.next_power_of_2(head_v_dim))
+    grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
+    _fused_recurrent_gated_delta_kernel[grid](
+        query.contiguous(), key.contiguous(), value.contiguous(),
+        gate.contiguous(), beta.contiguous(), A_log, dt_bias,
+        state_pool, output, None, None, None, None,
+        None, None, None, read_slots, write_slots,
+        None, None, None, None,
+        head_k_dim ** -0.5, 1,
+        NUM_K_HEADS=num_k_heads,
+        NUM_V_HEADS=num_v_heads,
+        HEAD_K_DIM=head_k_dim,
+        HEAD_V_DIM=head_v_dim,
+        BLOCK_K=block_k,
+        BLOCK_V=block_v,
+        STORE_LOG=False,
+        DIRECT_STORE=False,
+        SLOTTED_STORE=True,
+        LAYER=layer,
+        STATE_SLOT_STRIDE=state_pool.stride(0),
+        STATE_LAYER_STRIDE=state_pool.stride(1),
+        STATE_HEAD_STRIDE=state_pool.stride(2),
+        READ_SLOT_STRIDE=read_slots.stride(0),
+        WRITE_SLOT_STRIDE=write_slots.stride(0),
+        KEY_SLOT_STRIDE=0,
+        KEY_LAYER_STRIDE=0,
+        KEY_TOKEN_STRIDE=0,
+        KEY_HEAD_STRIDE=0,
+        VALUE_SLOT_STRIDE=0,
+        VALUE_LAYER_STRIDE=0,
+        VALUE_TOKEN_STRIDE=0,
+        VALUE_HEAD_STRIDE=0,
+        DECAY_SLOT_STRIDE=0,
+        DECAY_LAYER_STRIDE=0,
+        DECAY_TOKEN_STRIDE=0,
+        DECAY_HEAD_STRIDE=0,
+        FRAMED=False,
+        FRAME_BYTES=0,
+        FRAMES_PER_SLOT=0,
+        HEAD_PAYLOAD_BYTES=0,
+        DECAY_RECORD_BYTES=0,
+        PAGE_SIZE=0,
+        GRANULARITY=0,
+        REPLAY_WORK=False,
         num_warps=1,
         num_stages=3,
     )
@@ -467,6 +628,9 @@ def _fused_recurrent_gated_delta_rule(
         None,
         None,
         None,
+        None,
+        None,
+        None,
         head_k_dim ** -0.5,
         seq_len,
         NUM_K_HEADS=num_k_heads,
@@ -477,10 +641,13 @@ def _fused_recurrent_gated_delta_rule(
         BLOCK_V=block_v,
         STORE_LOG=store_log,
         DIRECT_STORE=False,
+        SLOTTED_STORE=False,
         LAYER=0,
         STATE_SLOT_STRIDE=0,
         STATE_LAYER_STRIDE=0,
         STATE_HEAD_STRIDE=0,
+        READ_SLOT_STRIDE=0,
+        WRITE_SLOT_STRIDE=0,
         KEY_SLOT_STRIDE=0,
         KEY_LAYER_STRIDE=0,
         KEY_TOKEN_STRIDE=0,
@@ -499,6 +666,8 @@ def _fused_recurrent_gated_delta_rule(
         HEAD_PAYLOAD_BYTES=0,
         DECAY_RECORD_BYTES=0,
         PAGE_SIZE=0,
+        GRANULARITY=0,
+        REPLAY_WORK=False,
         num_warps=1,
         num_stages=3,
     )
@@ -508,5 +677,6 @@ def _fused_recurrent_gated_delta_rule(
 __all__ = [
     "fused_recurrent_gated_delta_rule",
     "fused_recurrent_gated_delta_rule_to_framed_logstate",
+    "fused_recurrent_gated_delta_rule_to_slots",
     "fused_recurrent_gated_delta_rule_with_log",
 ]

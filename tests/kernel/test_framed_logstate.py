@@ -200,8 +200,9 @@ def test_framed_decode_matches_recurrent_reference():
         query, key, value, gate, beta, A_log, dt_bias, pool,
         torch.tensor(works, dtype=torch.int32, device="cuda"),
         torch.tensor(logs, dtype=torch.int32, device="cuda"),
-        torch.tensor([7, 23], dtype=torch.int32, device="cuda"),
+        torch.tensor([15, 31], dtype=torch.int32, device="cuda"),
         0,
+        torch.zeros(2, dtype=torch.int32, device="cuda"),
     )
     torch.testing.assert_close(actual, expected)
     for row, slot in enumerate(logs):
@@ -211,7 +212,7 @@ def test_framed_decode_matches_recurrent_reference():
                 states[row, 0, head],
             )
             log = pool.head_view(slot, 0, head, state=False)
-            position = [7, 23][row]
+            position = [15, 31][row]
             torch.testing.assert_close(
                 log[position * 32:(position + 1) * 32],
                 prepared_key[row, 0, head],

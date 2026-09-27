@@ -17,7 +17,7 @@ from logssms.distributed import (
     enable_pynccl_distributed,
     set_tp_info,
 )
-from logssms.cache import get_cache_factory
+from logssms.cache import LogStateCacheConfig, get_cache_factory
 from logssms.layers import set_rope_device
 from logssms.models import make_model, load_target_weight
 from logssms.utils import (
@@ -153,8 +153,14 @@ class Engine:
             config.attention_backend, config.model_config
         )
         if config.model_config.is_hybrid:
+            eager_state = (
+                isinstance(config.cache_config, LogStateCacheConfig)
+                and config.cache_config.enable_eager_state
+            )
             self.ctx.linear_attn_backend = self.linear_attn_backend = (
-                make_linear_attention_backend(config.cache_type)
+                make_linear_attention_backend(
+                    config.cache_type, enable_eager_state=eager_state
+                )
             )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = make_moe_backend(config.moe_backend)

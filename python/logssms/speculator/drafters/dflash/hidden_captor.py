@@ -36,7 +36,11 @@ class DFlashHiddenCaptor(HiddenCaptorBase):
             return
 
         hidden = args[0] if args else kwargs["x"]
+        residual = args[1] if len(args) > 1 else kwargs.get("residual")
         assert isinstance(hidden, torch.Tensor)
+        if residual is not None:
+            assert isinstance(residual, torch.Tensor)
+            hidden = hidden + residual
         self._layers[target_layer_id] = hidden
 
     @property

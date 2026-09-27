@@ -24,6 +24,11 @@ def chunk_gated_delta_rule(
     initial_state: torch.Tensor,
     cu_seqlens   : torch.Tensor,
     chunk_size   : int = 64,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    continuing: torch.Tensor | None = None,
+    endings: torch.Tensor | None = None,
+    ending_sequences: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output, final_state, chunk_states, _ = _chunk_gated_delta_rule(
         query,
@@ -34,6 +39,11 @@ def chunk_gated_delta_rule(
         initial_state,
         cu_seqlens,
         chunk_size,
+        chunk_indices,
+        chunk_offsets,
+        continuing,
+        endings,
+        ending_sequences,
     )
     return output, final_state, chunk_states
 
@@ -48,6 +58,11 @@ def chunk_gated_delta_rule_with_log(
     initial_state: torch.Tensor,
     cu_seqlens   : torch.Tensor,
     chunk_size   : int = 64,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    continuing: torch.Tensor | None = None,
+    endings: torch.Tensor | None = None,
+    ending_sequences: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run packed GDN and also return every token's realized value update."""
     return _chunk_gated_delta_rule(
@@ -59,6 +74,11 @@ def chunk_gated_delta_rule_with_log(
         initial_state,
         cu_seqlens,
         chunk_size,
+        chunk_indices,
+        chunk_offsets,
+        continuing,
+        endings,
+        ending_sequences,
     )
 
 
@@ -71,6 +91,11 @@ def _chunk_gated_delta_rule(
     initial_state: torch.Tensor,
     cu_seqlens   : torch.Tensor,
     chunk_size   : int,
+    chunk_indices: torch.Tensor | None,
+    chunk_offsets: torch.Tensor | None,
+    continuing: torch.Tensor | None,
+    endings: torch.Tensor | None,
+    ending_sequences: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run packed variable-length GDN and expose every post-chunk state.
 
@@ -83,7 +108,8 @@ def _chunk_gated_delta_rule(
     assert chunk_size in (16, 32, 64)
     assert cu_seqlens.ndim == 1 and len(cu_seqlens) == len(initial_state) + 1
 
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     cumulative_gate = chunk_local_cumsum(
         gate,
         chunk_size=chunk_size,
@@ -109,6 +135,7 @@ def _chunk_gated_delta_rule(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
         chunk_size=chunk_size,
     )
     assert value_new is not None and final_state is not None
@@ -124,17 +151,19 @@ def _chunk_gated_delta_rule(
         chunk_size=chunk_size,
     )
 
-    sequence_ids = chunk_indices[:, 0].to(torch.int64)
-    is_last = torch.ones(len(chunk_indices), dtype=torch.bool, device=query.device)
-    is_last[:-1] = sequence_ids[:-1] != sequence_ids[1:]
     chunk_states = torch.empty_like(hidden[0])
-    continuing = (~is_last[:-1]).nonzero().flatten()
+    if continuing is None or endings is None or ending_sequences is None:
+        sequence_ids = chunk_indices[:, 0].to(torch.int64)
+        is_last = torch.ones(len(chunk_indices), dtype=torch.bool, device=query.device)
+        is_last[:-1] = sequence_ids[:-1] != sequence_ids[1:]
+        continuing = (~is_last[:-1]).nonzero().flatten()
+        endings = is_last.nonzero().flatten()
+        ending_sequences = sequence_ids.index_select(0, endings)
     chunk_states.index_copy_(0, continuing, hidden[0].index_select(0, continuing + 1))
-    endings = is_last.nonzero().flatten()
     chunk_states.index_copy_(
         0,
         endings,
-        final_state.index_select(0, sequence_ids.index_select(0, endings)).to(chunk_states),
+        final_state.index_select(0, ending_sequences).to(chunk_states),
     )
     # Keep every asynchronous kernel input alive until all dependent launches
     # above have been enqueued. In particular, the solved intra-chunk matrix is

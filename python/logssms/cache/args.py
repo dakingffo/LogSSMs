@@ -61,6 +61,11 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             help="Adapt LogState merge intensity from online branch-hit samples.",
         )
         parser.add_argument(
+            "--enable-eager-state",
+            action="store_true",
+            help="Write the LogState decode work state after every token instead of replaying logs within a granule.",
+        )
+        parser.add_argument(
             "--min-sampling-len",
             type=int,
             default=LogStateCacheConfig.min_sampling_len,
@@ -83,6 +88,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
     def make_config(kwargs: dict) -> LogStateCacheConfig:
         return LogStateCacheConfig(
             granularity=kwargs.pop("granularity"),
+            enable_eager_state=kwargs.pop("enable_eager_state"),
             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
             min_sampling_len=kwargs.pop("min_sampling_len"),
             max_merge_intensity=kwargs.pop("max_merge_intensity"),
