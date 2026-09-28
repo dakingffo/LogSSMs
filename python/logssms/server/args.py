@@ -8,6 +8,7 @@ import torch
 from logssms.distributed import DistributedInfo
 from logssms.scheduler import SchedulerConfig
 from logssms.utils import init_logger
+from logssms.utils.args import parse_bool
 
 
 @dataclass(frozen=True)
@@ -235,8 +236,10 @@ def parse_args(args: list[str]) -> ServerArgs:
     )
 
     parser.add_argument(
-        "--enable-dt-separation",
-        action="store_true",
+        "--dt-separation",
+        type=parse_bool,
+        default=ServerArgs.dt_separation,
+        metavar="{true,false}",
         dest="dt_separation",
         help="Run the drafter on a separate device (requires tp_size + 1 GPUs).",
     )

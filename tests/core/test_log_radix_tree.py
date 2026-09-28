@@ -112,6 +112,21 @@ def test_evict_returns_kv_and_linear_slots_without_freeing_them():
     tree.check_integrity()
 
 
+def test_evict_prefers_log_branch_over_older_checkpoint_branch():
+    tree = make_tree()
+    checkpoint = tree.insert(
+        ids(4), ids(4, 100),
+        (LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),),
+    ).node
+    log = tree.insert(
+        ids(4, 20), ids(4, 200),
+        (LogStateEntry(1, LogStateKind.LOG, 0, 4),),
+    ).node
+    checkpoint.timestamp = 1
+    log.timestamp = 2
+    assert list(tree.iter_evict_candidates()) == [log, checkpoint]
+
+
 def test_new_tail_smaller_than_one_physical_page_is_not_admitted():
     tree = make_tree()
     history = ids(8)

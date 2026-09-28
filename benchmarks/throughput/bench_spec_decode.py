@@ -147,7 +147,7 @@ if __name__ == "__main__":
 #       1K -> 1,2,4,8,16,32,64,128
 #    spec_bench (--dataset spec_bench, --output-len 512): 1,2,4,8,16,32,64,128
 #
-# B. DT 分离 (--tensor-parallel-size 1 --enable-dt-separation --max-running-seq 16)
+# B. DT 分离 (--tensor-parallel-size 1 --dt-separation true --max-running-seq 16)
 #    随机乱码:
 #      16K -> 1        8K -> 1,2
 #       4K -> 1,2,4    2K -> 1,2,4,8

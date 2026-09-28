@@ -429,6 +429,10 @@ class FramedMHALogStatePool:
             self.allocator.materialize(slot)
             self._write_descriptor(slot, self.allocator.slot(slot))
 
+    def commit_checkpoint(self, slot: int) -> None:
+        self.allocator.commit_checkpoint(slot)
+        self._write_descriptor(slot, self.allocator.slot(slot))
+
     def poll_reclamation(self, timings: dict[str, float] | None = None) -> None:
         remaining = []
         for event, slot in self._retired_materializations:

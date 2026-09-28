@@ -4,6 +4,7 @@ import argparse
 from abc import ABC, abstractmethod
 
 from logssms.utils import Registry
+from logssms.utils.args import parse_bool
 
 from .config import (
     BaseCacheConfig,
@@ -56,14 +57,28 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             ),
         )
         parser.add_argument(
-            "--enable-merge-adjustment",
-            action="store_true",
+            "--merge-adjustment",
+            type=parse_bool,
+            dest="enable_merge_adjustment",
+            default=LogStateCacheConfig.enable_merge_adjustment,
+            metavar="{true,false}",
             help="Adapt LogState merge intensity from online branch-hit samples.",
         )
         parser.add_argument(
-            "--enable-eager-state",
-            action="store_true",
+            "--eager-state",
+            type=parse_bool,
+            dest="enable_eager_state",
+            default=LogStateCacheConfig.enable_eager_state,
+            metavar="{true,false}",
             help="Write the LogState decode work state after every token instead of replaying logs within a granule.",
+        )
+        parser.add_argument(
+            "--memorized-evict",
+            type=parse_bool,
+            dest="enable_memorized_evict",
+            default=LogStateCacheConfig.enable_memorized_evict,
+            metavar="{true,false}",
+            help="Remember evicted cache layout on CPU (default: true). Set false to disable memorized eviction.",
         )
         parser.add_argument(
             "--min-sampling-len",
@@ -89,6 +104,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
         return LogStateCacheConfig(
             granularity=kwargs.pop("granularity"),
             enable_eager_state=kwargs.pop("enable_eager_state"),
+            enable_memorized_evict=kwargs.pop("enable_memorized_evict"),
             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
             min_sampling_len=kwargs.pop("min_sampling_len"),
             max_merge_intensity=kwargs.pop("max_merge_intensity"),

@@ -52,13 +52,14 @@ def test_mtp_acceptance_excludes_mandatory_target_token():
 
 def test_dt_server_flag_is_rebuilt_once():
     cmd = make_server_cmd(
-        ["--model-path", "model", "--enable-dt-separation"],
+        ["--model-path", "model", "--dt-separation", "false"],
         port=1234,
         enable_specualtive_decoding=True,
         num_spec_tokens=3,
         enable_dt=True,
     )
-    assert cmd.count("--enable-dt-separation") == 1
+    assert cmd.count("--dt-separation") == 1
+    assert cmd[cmd.index("--dt-separation") + 1] == "true"
 
 
 def test_save_json_persists_each_completed_point(tmp_path):

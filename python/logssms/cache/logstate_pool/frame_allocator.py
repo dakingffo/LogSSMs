@@ -240,6 +240,14 @@ class LogStateFrameAllocator:
         )
         return released
 
+    def commit_checkpoint(self, slot: int) -> None:
+        """Turn a directly written one-snapshot work slot into a checkpoint."""
+        record = self._slots[slot]
+        assert record.kind == "work" and record.decay is None
+        self._slots[slot] = LinearFrameSlot(
+            record.payload, record.conv, None, "checkpoint"
+        )
+
     def release_kv(self, frames: list[int] | tuple[int, ...]) -> None:
         assert len(frames) == len(set(frames)) and set(frames) <= self._kv
         self._kv.difference_update(frames)

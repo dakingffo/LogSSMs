@@ -6,7 +6,10 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
-from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias
+from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from logssms.cache.logstate_recycle import RecycledMatch
 
 import torch
 
@@ -211,6 +214,7 @@ class LogStateCacheHandle(BaseCacheHandle):
     merge_stats       : LogStateMergeStats | None = None
     source_merge_stats: LogStateMergeStats | None = None
     match_position    : int = 0
+    recycle_match     : RecycledMatch | None = None
 
     def get_matched_indices(self) -> torch.Tensor:
         return self.kv_indices
@@ -496,12 +500,18 @@ class LogRadixTree(BasePrefixCache):
         return self.evict_nodes(selected, evicted_nodes)
 
     def iter_evict_candidates(self) -> Iterator[LogRadixTreeNode]:
-        """Yield LRU nodes in the order they can be removed, without mutating the tree."""
-        leaves = self._collect_leaves_for_evict()
+        """Prefer Log-only leaves; use LRU within each representation class."""
+        def priority(node: LogRadixTreeNode) -> tuple[int, int, int]:
+            has_checkpoint = any(
+                entry.kind is LogStateKind.CHECKPOINT for entry in node.entries
+            )
+            return int(has_checkpoint), node.timestamp, node.uuid
+
+        leaves = [(priority(node), node) for node in self._collect_leaves_for_evict()]
         heapq.heapify(leaves)
         remaining_children: dict[LogRadixTreeNode, int] = {}
         while leaves:
-            node = heapq.heappop(leaves)
+            _, node = heapq.heappop(leaves)
             yield node
             parent = node.parent
             if not parent.is_root() and not parent.is_locked:
@@ -510,7 +520,7 @@ class LogRadixTree(BasePrefixCache):
                 ) - 1
                 remaining_children[parent] = remaining
                 if remaining == 0:
-                    heapq.heappush(leaves, parent)
+                    heapq.heappush(leaves, (priority(parent), parent))
 
     def slot_entry_count(self, slot: int) -> int:
         return len(self._slot_entries[slot])

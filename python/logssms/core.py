@@ -123,6 +123,8 @@ class Batch:
     linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
     logstate_first_offsets: list[int] | None = field(init=False, default=None)
     logstate_replay_counts: list[int] | None = field(init=False, default=None)
+    logstate_checkpoint_writes: list[tuple[int, int]] = field(init=False, default_factory=list)
+    logstate_checkpoint_ranges: list[tuple[int, int, int]] = field(init=False, default_factory=list)
 
     @property
     def is_prefill(self) -> bool:

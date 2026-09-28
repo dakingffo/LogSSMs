@@ -440,8 +440,8 @@ def resolve_port(server_argv: list[str], server_args: Any) -> int:
 _MTP_VALUE_FLAGS = (
     "--port", "--speculative-algorithm",
     "--speculative-num-draft-tokens", "--speculative-draft-model-path",
+    "--dt-separation",
 )
-_MTP_BOOL_FLAGS = ("--enable-dt-separation",)
 
 
 def _flag_value(argv: list[str], name: str) -> str | None:
@@ -473,10 +473,7 @@ def make_server_cmd(server_argv: list[str], *, port: int, enable_specualtive_dec
         if a in _MTP_VALUE_FLAGS:
             i += 2  # skip flag + value
             continue
-        if a in _MTP_BOOL_FLAGS:
-            i += 1  # store_true
-            continue
-        if any(a.startswith(f + "=") for f in _MTP_VALUE_FLAGS + _MTP_BOOL_FLAGS):
+        if any(a.startswith(f + "=") for f in _MTP_VALUE_FLAGS):
             i += 1
             continue
         argv.append(a)
@@ -492,7 +489,7 @@ def make_server_cmd(server_argv: list[str], *, port: int, enable_specualtive_dec
                  "--speculative-num-draft-tokens", str(num_spec_tokens),
                  "--speculative-draft-model-path", model_path]
         if enable_dt:
-            argv += ["--enable-dt-separation"]
+            argv += ["--dt-separation", "true"]
     return [sys.executable, "-m", "logssms"] + argv
 
 

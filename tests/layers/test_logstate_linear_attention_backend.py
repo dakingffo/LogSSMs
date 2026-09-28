@@ -154,6 +154,97 @@ def test_logstate_uses_physical_offsets_after_unaligned_prefix_hit() -> None:
         clear_global_ctx()
 
 
+def test_recycled_checkpoint_prefill_metadata_skips_log_writes() -> None:
+    clear_global_ctx()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ctx = _make_context(device)
+    reserved = ctx.linear_state.reserve(works=1)
+    assert reserved is not None
+    checkpoint_slot = reserved[2][0]
+    ctx.state_table[0].fill_(-1)
+    backend = LogStateLinearAttentionBackend()
+    req = _make_request(cached_len=0, device_len=128)
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.positions = torch.arange(128, dtype=torch.int32, device=device)
+    batch.out_loc = ctx.page_table[0]
+    batch.logstate_first_offsets = [0]
+    batch.logstate_checkpoint_writes = [(127, checkpoint_slot)]
+    batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+
+    set_global_ctx(ctx)
+    try:
+        backend.prepare_metadata(batch)
+    finally:
+        clear_global_ctx()
+
+    metadata = batch.linear_attn_metadata
+    assert metadata.log_row_indices.numel() == 0
+    assert metadata.conv_snapshot_rows.tolist() == [127]
+    assert metadata.conv_write_slots.numel() == 0
+    assert metadata.checkpoint_slots.tolist() == [checkpoint_slot]
+    assert metadata.checkpoint_state_indices.tolist() == [7]
+    assert metadata.checkpoint_snapshot_indices.tolist() == [0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_direct_checkpoint_prefill_matches_log_prefill() -> None:
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(213)
+    mixed_qkv = torch.randn(128, 192, device=device, dtype=dtype) * 0.1
+    gate = torch.randn(128, 2, device=device, dtype=dtype) * 0.1
+    beta = torch.randn_like(gate)
+    conv_weight = torch.randn(192, 1, 4, device=device, dtype=dtype) * 0.02
+    config = GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0)
+    A_log = torch.zeros(2, device=device)
+    dt_bias = torch.zeros(2, device=device)
+
+    def run(direct: bool):
+        clear_global_ctx()
+        ctx = _make_context(device)
+        pool = ctx.linear_state
+        checkpoint_slot = None
+        if direct:
+            reserved = pool.reserve(works=1)
+            assert reserved is not None
+            checkpoint_slot = reserved[2][0]
+            ctx.state_table[0].fill_(-1)
+        backend = LogStateLinearAttentionBackend()
+        batch = Batch(reqs=[_make_request(0, 128)], phase="prefill")
+        batch.positions = torch.arange(128, device=device, dtype=torch.int32)
+        batch.out_loc = ctx.page_table[0]
+        batch.logstate_first_offsets = [0]
+        if direct:
+            batch.logstate_checkpoint_writes = [(127, checkpoint_slot)]
+            batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+        set_global_ctx(ctx)
+        try:
+            backend.prepare_metadata(batch)
+            output = backend.forward(
+                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias,
+                config, batch,
+            )
+            state_slot = 2 if not direct else checkpoint_slot
+            state = pool.read_states(
+                torch.tensor([state_slot], device=device), 0
+            ).clone()
+            conv_slot, conv_granule = (1, 3) if not direct else (checkpoint_slot, 0)
+            conv = pool.read_conv(
+                torch.tensor([conv_slot], device=device),
+                torch.tensor([conv_granule], device=device), 0,
+            ).clone()
+            torch.cuda.synchronize()
+            return output.clone(), state, conv
+        finally:
+            clear_global_ctx()
+
+    log_output, log_state, log_conv = run(False)
+    direct_output, direct_state, direct_conv = run(True)
+    torch.testing.assert_close(direct_output, log_output, rtol=0, atol=0)
+    torch.testing.assert_close(direct_state, log_state, rtol=0, atol=0)
+    torch.testing.assert_close(direct_conv, log_conv, rtol=0, atol=0)
+
+
 def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", "1")
     clear_global_ctx()

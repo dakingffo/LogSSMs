@@ -448,12 +448,12 @@ class Engine:
                 import torch as _torch
 
                 assert _torch.cuda.device_count() > config.tp_info.size, (
-                    "--enable-dt-separation requires at least tp_size + 1 GPUs "
+                    "--dt-separation requires at least tp_size + 1 GPUs "
                     f"(tp_size={config.tp_info.size})."
                 )
         elif config.speculator_config is not None:
             raise ValueError("speculator_config requires --speculative-algorithm.")
         elif config.dt_separation:
             raise ValueError(
-                "--enable-dt-separation requires --speculative-algorithm."
+                "--dt-separation requires --speculative-algorithm."
             )
