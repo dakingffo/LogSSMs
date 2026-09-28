@@ -32,8 +32,8 @@ class LogStateSlotLayout:
         assert self.num_linear_layers > 0
         assert self.num_key_heads > 0
         assert self.num_value_heads > 0
-        assert self.num_key_heads == self.num_value_heads, (
-            "The in-place LogState layout requires one key head per value head."
+        assert self.num_value_heads % self.num_key_heads == 0, (
+            "LogState requires an integer number of value heads per key head."
         )
         assert self.head_k_dim > 0
         assert self.head_v_dim > 0

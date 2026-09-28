@@ -24,6 +24,33 @@ def make_pool(device: torch.device | None = None) -> FramedMHALogStatePool:
     )
 
 
+def test_grouped_value_heads_use_value_head_payloads():
+    pool = FramedMHALogStatePool(
+        num_frames=64,
+        page_size=64,
+        granularity=32,
+        num_attention_layers=2,
+        num_kv_heads=1,
+        head_dim=32,
+        num_linear_layers=2,
+        num_key_heads=2,
+        num_value_heads=6,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_dim=320,
+        state_len=3,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+    )
+    assert pool.layout.num_value_heads == 3 * pool.layout.num_key_heads
+    allocated = pool.reserve(works=1)
+    assert allocated is not None
+    slots = torch.tensor(allocated[2], dtype=torch.int32)
+    values = torch.arange(6 * 32 * 32, dtype=pool.dtype).view(1, 6, 32, 32)
+    pool.write_states(slots, 0, values)
+    torch.testing.assert_close(pool.read_states(slots, 0), values)
+
+
 def test_reserve_profile_separates_allocator_and_descriptor_work():
     pool = make_pool()
     timings = {}

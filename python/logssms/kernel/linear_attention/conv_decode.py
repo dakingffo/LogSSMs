@@ -6,6 +6,11 @@ import triton.language as tl
 
 
 @triton.jit
+def _frame_element_offset(frame, frame_elems: tl.constexpr):
+    return frame.to(tl.int64) * frame_elems
+
+
+@triton.jit
 def _conv_decode(
     X, W, Q, K, V, StandardState, Storage, FrameTable,
     ReadSlots, ReadGranules, WriteSlots, WriteGranules, WorkSlots,
@@ -34,9 +39,9 @@ def _conv_decode(
         )
         work_frame = tl.load(FrameTable + work_slot * NUM_GRANULES)
         state_ptr = tl.cast(Storage, tl.pointer_type(X.dtype.element_ty))
-        old_base = read_frame * FRAME_ELEMS + LAYER * C * STATE_LEN
-        new_base = write_frame * FRAME_ELEMS + LAYER * C * STATE_LEN
-        work_base = work_frame * FRAME_ELEMS + LAYER * C * STATE_LEN
+        old_base = _frame_element_offset(read_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
+        new_base = _frame_element_offset(write_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
+        work_base = _frame_element_offset(work_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
     else:
         state_ptr = StandardState
         old_base = (read_slot * NUM_LAYERS + LAYER) * C * STATE_LEN

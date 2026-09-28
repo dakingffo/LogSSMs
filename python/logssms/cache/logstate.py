@@ -1092,6 +1092,8 @@ class LogStateCacheManager(BaseCacheManager):
             "max_admission_wait_ms": 0.0,
             "eviction_rounds": 0,
             "evicted_kv_tokens": 0,
+            "recycle_matches": 0,
+            "recycle_matched_tokens": 0,
             "released_state_slots_from_eviction": 0,
             "released_state_slots_from_merge": 0,
             "scheduled_payload_conv_frames_from_merge": 0,
@@ -1141,6 +1143,11 @@ class LogStateCacheManager(BaseCacheManager):
             )
             if self.recycle_bin is not None else None
         )
+        if self._profile_enabled and recycle_match is not None:
+            self._profile_stats["recycle_matches"] += 1
+            self._profile_stats["recycle_matched_tokens"] += (
+                recycle_match.matched_len - handle.cached_len
+            )
         if not self.enable_merge_adjustment:
             return MatchResult(
                 replace(handle, recycle_match=recycle_match),

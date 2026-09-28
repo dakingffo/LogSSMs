@@ -1,10 +1,29 @@
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.conv_decode import conv_decode_qkv
+from logssms.kernel.linear_attention.conv_decode import (
+    _frame_element_offset,
+    conv_decode_qkv,
+)
 from logssms.layers.gated_delta import GatedDeltaConfig
+
+
+@triton.jit
+def _large_frame_offset_kernel(frame, result):
+    value = tl.load(frame)
+    tl.store(result, _frame_element_offset(value, 1 << 20))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_framed_decode_conv_uses_64_bit_frame_offsets():
+    frame = torch.tensor([2048], device="cuda", dtype=torch.int32)
+    result = torch.empty(1, device="cuda", dtype=torch.int64)
+    _large_frame_offset_kernel[(1,)](frame, result)
+    assert result.item() == 1 << 31
 
 
 def _config() -> GatedDeltaConfig:
