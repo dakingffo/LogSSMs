@@ -108,7 +108,10 @@ class ARManagerBase:
                                                 # real device len = devel_len - 1 if inflight
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+                reply.append(DetokenizeMsg(
+                    uid=req.uid, next_token=next_token, finished=finished,
+                    return_token_ids=req.return_token_ids,
+                ))
 
                 if finished and req not in self.finished_reqs:
                     if req not in self.inflight_uids[1]:

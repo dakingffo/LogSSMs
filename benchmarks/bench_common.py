@@ -680,6 +680,7 @@ async def _run_conversation(
     fixed_assistant: str | None = None,
     prefix_tokenizer: Any | None = None,
     ignore_eos: bool = True,
+    preserve_generated_reply: bool = False,
 ) -> list[tuple[StreamResult, list[dict[str, Any]] | str]]:
     history = [_message_dict(message) for message in conversation.initial_messages]
     results = []
@@ -716,7 +717,10 @@ async def _run_conversation(
         results.append((result, request_messages))
         assistant = result.output if fixed_assistant is None else fixed_assistant
         if prefix_tokenizer is None:
-            history.append({"role": "assistant", "content": assistant})
+            message = {"role": "assistant", "content": assistant}
+            if preserve_generated_reply:
+                message["raw_generated"] = assistant
+            history.append(message)
         elif turn_index + 1 < len(conversation.user_turns):
             next_user = _message_dict(conversation.user_turns[turn_index + 1])
             next_prefix_prompt = (
@@ -779,6 +783,10 @@ async def run_multiturn_bench(
         if history_mode in ("fixed", "prefix_fixed") else None
     )
     prefix_tokenizer = tokenizer if history_mode.startswith("prefix_") else None
+    preserve_generated_reply = bool(
+        getattr(tokenizer, "_logssms_preserve_generated_reasoning", False)
+        and history_mode == "generated"
+    )
     if prefix_tokenizer is not None and tokenizer.eos_token != "<|im_end|>":
         raise ValueError("prefix history mode currently requires a ChatML tokenizer")
     client = httpx.AsyncClient(
@@ -799,6 +807,7 @@ async def run_multiturn_bench(
                 fixed_assistant,
                 prefix_tokenizer,
                 ignore_eos,
+                preserve_generated_reply,
             )
         num_turns = len(conversations[0].user_turns) if conversations else 0
         assert all(
@@ -830,6 +839,7 @@ async def run_multiturn_bench(
                     fixed_assistant,
                     prefix_tokenizer,
                     ignore_eos,
+                    preserve_generated_reply,
                 )
 
         await asyncio.gather(*[worker() for _ in range(concurrency)])

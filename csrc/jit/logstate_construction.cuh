@@ -328,7 +328,8 @@ void scan_page_affine_kernel(
     ? state_pointer<T, kHeadKDim, kHeadVDim>(params, base_slot, layer, head)
     : base_slot == -2
       ? static_cast<const T *>(params.carry_state)
-        + (layer * params.num_heads + head) * kHeadKDim * kHeadVDim
+        + ((task * params.num_layers + layer) * params.num_heads + head)
+          * kHeadKDim * kHeadVDim
       : nullptr;
 #pragma unroll
   for (auto item = 0; item < div_ceil(kTileSize, 256); ++item) {
@@ -374,7 +375,8 @@ void scan_page_affine_kernel(
   }
 
   auto *carry = static_cast<T *>(params.carry_state)
-    + (layer * params.num_heads + head) * kHeadKDim * kHeadVDim;
+    + ((task * params.num_layers + layer) * params.num_heads + head)
+      * kHeadKDim * kHeadVDim;
 #pragma unroll
   for (auto item = 0; item < div_ceil(kTileSize, 256); ++item) {
     const auto local = threadIdx.x + item * 256;

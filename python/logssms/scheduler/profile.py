@@ -111,7 +111,10 @@ class SchedulerProfiler:
         self.phases = {
             phase: _PhaseProfile() for phase in ("prefill", "decode", "verify")
         }
-        self.pending_gpu: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self.pending_gpu: list[tuple[
+            str, torch.cuda.Event, torch.cuda.Event, dict | None,
+        ]] = []
+        self.prefill_forward_batches: list[dict] = []
         self.schedule_ns = 0
 
     @contextmanager
@@ -163,16 +166,25 @@ class SchedulerProfiler:
 
     @contextmanager
     @nvtx_annotate("Scheduler::forward(submit)")
-    def record_submit(self, phase: str):
+    def record_submit(self, batch: Batch):
         if not self.enabled:
             yield
             return
+        sample = None
+        if batch.is_prefill:
+            sample = {
+                "request_tags": [req.profile_tag for req in batch.reqs],
+                "batch_size": batch.size,
+                "input_tokens": sum(req.extend_len for req in batch.reqs),
+                "submit_ms": None,
+                "gpu_ms": None,
+            }
         tic = perf_counter_ns()
-        events = self._begin_submit(phase)
+        events = self._begin_submit(batch.phase)
         try:
             yield
         finally:
-            self._finish_submit(phase, events, perf_counter_ns() - tic)
+            self._finish_submit(batch.phase, events, perf_counter_ns() - tic, sample)
 
     def _begin_submit(self, phase: str) -> tuple[torch.cuda.Event, torch.cuda.Event]:
         if phase in ("decode", "verify"):
@@ -187,11 +199,15 @@ class SchedulerProfiler:
         phase    : str,
         events   : tuple[torch.cuda.Event, torch.cuda.Event],
         submit_ns: int,
+        sample   : dict | None,
     ) -> None:
         self.phases[phase].submit_ns += submit_ns
         start, end = events
         end.record()
-        self.pending_gpu.append((phase, start, end))
+        if sample is not None:
+            sample["submit_ms"] = submit_ns / 1e6
+            self.prefill_forward_batches.append(sample)
+        self.pending_gpu.append((phase, start, end, sample))
 
     @contextmanager
     @nvtx_annotate("Scheduler::wait_output")
@@ -226,11 +242,14 @@ class SchedulerProfiler:
             return
         self.cache_manager.poll_profile()
         remaining = []
-        for phase, start, end in self.pending_gpu:
+        for phase, start, end, sample in self.pending_gpu:
             if end.query():
-                self.phases[phase].gpu_ns += int(start.elapsed_time(end) * 1e6)
+                gpu_ms = start.elapsed_time(end)
+                self.phases[phase].gpu_ns += int(gpu_ms * 1e6)
+                if sample is not None:
+                    sample["gpu_ms"] = gpu_ms
             else:
-                remaining.append((phase, start, end))
+                remaining.append((phase, start, end, sample))
         self.pending_gpu = remaining
         if (
             self.path
@@ -251,6 +270,7 @@ class SchedulerProfiler:
             "phases": {
                 phase: profile.as_dict() for phase, profile in self.phases.items()
             },
+            "prefill_forward_batches": self.prefill_forward_batches,
         }
         cache = self.cache_manager.profile_result()
         if cache is not None:

@@ -14,6 +14,11 @@ class TokenizeManager:
         results: list[torch.Tensor] = []
         # TODO: batch tokenization
         for msg in msgs:
+            if msg.input_ids is not None:
+                assert msg.input_ids.ndim == 1 and msg.input_ids.dtype == torch.int32
+                results.append(msg.input_ids)
+                continue
+            assert msg.text is not None
             prompt = (
                 render_chat_prompt(self.tokenizer, msg.text)
                 if isinstance(msg.text, list) else msg.text

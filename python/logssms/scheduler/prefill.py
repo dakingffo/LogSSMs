@@ -32,6 +32,7 @@ class PendingRequest:
     input_ids      : torch.Tensor
     sampling_params: SamplingParams
     profile_tag    : str | None = None
+    return_token_ids: bool = False
     chunked_req    : ChunkedRequest | None = None
     queued_at_ns   : int = field(default_factory=perf_counter_ns)
     admitted       : bool = False
@@ -135,6 +136,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             profile_tag=pending_req.profile_tag,
+            return_token_ids=pending_req.return_token_ids,
             max_device_len=len(pending_req.input_ids) + pending_req.output_len,
         )
 
@@ -188,6 +190,7 @@ class PrefillManager:
             req.input_ids,
             req.sampling_params,
             profile_tag=req.profile_tag,
+            return_token_ids=req.return_token_ids,
         ))
 
     @property

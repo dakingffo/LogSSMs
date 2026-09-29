@@ -256,7 +256,10 @@ class VerifyManager(ARManagerBase):
                         break
 
                 reply.append(
-                    DetokenizeMsg(uid=req.uid, next_token=sampled_token[:stop], finished=finish)
+                    DetokenizeMsg(
+                        uid=req.uid, next_token=sampled_token[:stop], finished=finish,
+                        return_token_ids=req.return_token_ids,
+                    )
                 )
                 req.append_host(torch.tensor(sampled_token, dtype=torch.int32))
 

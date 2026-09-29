@@ -115,6 +115,36 @@ def test_finished_request_waits_for_overlapping_forward() -> None:
     assert scheduler._deferred_req_frees == []
 
 
+def test_finished_requests_release_in_uid_order() -> None:
+    class Finished:
+        def __init__(self, uid: int) -> None:
+            self.uid = uid
+
+    reqs = [Finished(9), Finished(2), Finished(5)]
+    calls = []
+    previous = (
+        SimpleNamespace(batch=SimpleNamespace(reqs=reqs, phase="decode")),
+        SimpleNamespace(copy_done_event=_Event(calls)),
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler._debug_tp_schedule = False
+    scheduler._deferred_req_frees = []
+    scheduler.ar_manager = SimpleNamespace(
+        process=lambda *_args: ([], set(reqs))
+    )
+    scheduler.profiler = SimpleNamespace(
+        record_wait=lambda _phase: nullcontext(),
+        record_process=lambda _phase: nullcontext(),
+    )
+    scheduler.engine = SimpleNamespace(ctx=None)
+    scheduler.send_result = lambda _reply: None
+    scheduler._free_req_resources = lambda req, inflight=False: calls.append(req.uid)
+
+    scheduler._process_last_data(previous)
+
+    assert calls == ["synchronize", 2, 5, 9]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_scheduler_cache_profile_sampling_is_opt_in(enabled: bool) -> None:
     calls = []

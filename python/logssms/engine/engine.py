@@ -159,7 +159,7 @@ class Engine:
             )
             self.ctx.linear_attn_backend = self.linear_attn_backend = (
                 make_linear_attention_backend(
-                    config.cache_type, enable_eager_state=eager_state
+                    config.cache_type, enable_eager_state=eager_state,
                 )
             )
         if config.model_config.is_moe:

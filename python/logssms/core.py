@@ -47,6 +47,7 @@ class Request:
     cache_handle   : BaseCacheHandle
     max_device_len : int
     profile_tag    : str | None = None
+    return_token_ids: bool = False
     device_len     : int  = field(init=False)
     aborted        : bool = field(default=False, init=False)
 

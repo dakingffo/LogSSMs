@@ -162,6 +162,44 @@ def test_multiturn_history_records_full_context_and_actual_reply(monkeypatch, tm
     assert json.loads(open(path).read())["sessions"] == records
 
 
+def test_qwen36_generated_history_keeps_raw_reasoning(monkeypatch):
+    class ThinkingTokenizer(FakeTokenizer):
+        _logssms_preserve_generated_reasoning = True
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt,
+                                preserve_thinking):
+            assert preserve_thinking
+            return " ".join(message["content"] for message in messages)
+
+    monkeypatch.setattr(
+        bench_common, "_load_benchmark_tokenizer", lambda _model: ThinkingTokenizer()
+    )
+    conversation = bench_common.BenchmarkConversation(
+        uid="thinking", initial_messages=(),
+        user_turns=(
+            DatasetMessage(role="user", content="first"),
+            DatasetMessage(role="user", content="second"),
+        ),
+    )
+    seen = []
+
+    async def fake_stream(_client, _base, _model, messages, _output_len, _progress,
+                          profile_tag=None, ignore_eos=True):
+        seen.append([dict(message) for message in messages])
+        return bench_common.StreamResult(
+            tics=[0.0, 0.1, 0.2, 0.3, 0.4], output="unfinished reasoning",
+        )
+
+    monkeypatch.setattr(bench_common, "stream_messages", fake_stream)
+    asyncio.run(bench_common.run_multiturn_bench(
+        "http://unused", "unused-model", [conversation], 2, pbar=False,
+    ))
+    assert seen[1][-2] == {
+        "role": "assistant", "content": "unfinished reasoning",
+        "raw_generated": "unfinished reasoning",
+    }
+
+
 def test_fixed_history_keeps_request_inputs_independent_of_generated_reply(monkeypatch):
     from transformers import AutoTokenizer
 

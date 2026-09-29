@@ -88,13 +88,33 @@ def test_other_chat_templates_are_unchanged(tmp_path: Path):
     render_chat_prompt(tokenizer, [])
     assert "preserve_thinking" not in tokenizer.last_kwargs
 
+
+def test_qwen36_template_uses_existing_preserve_thinking_branch(tmp_path: Path):
+    class Tokenizer:
+        chat_template = (
+            "{%- if (preserve_thinking is defined and preserve_thinking is true) "
+            "or (loop.index0 > ns.last_query_index) %}"
+            '{%- elif message.role == "assistant" %}'
+            "assistant-body"
+            '{%- elif message.role == "tool" %}'
+        )
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.last_kwargs = kwargs
+            return "rendered"
+
+    tokenizer = Tokenizer()
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
-    tokenizer.chat_template = (
-        "{%- if (preserve_thinking is defined and preserve_thinking is true) "
-        "or (loop.index0 > ns.last_query_index) %}"
-    )
     configure_chat_tokenizer(tokenizer, str(tmp_path))
-    assert "_logssms_preserve_thinking" not in vars(tokenizer)
+    assert "message.raw_generated is string" in tokenizer.chat_template
+    assert "assistant-body" in tokenizer.chat_template
+    assert tokenizer._logssms_preserve_generated_reasoning
+    assert render_chat_prompt(tokenizer, [{"role": "user", "content": "hi"}]) == "rendered"
+    assert tokenizer.last_kwargs == {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "preserve_thinking": True,
+    }
 
 
 def test_local_qwen35_chat_template_token_prefix():

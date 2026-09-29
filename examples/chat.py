@@ -274,7 +274,10 @@ class Chat:
             print()
             raise
         print()
-        self.active.messages.append({"role": "assistant", "content": "".join(reply)})
+        assistant = "".join(reply)
+        self.active.messages.append({
+            "role": "assistant", "content": assistant, "raw_generated": assistant,
+        })
 
     def run(self) -> None:
         print("\nLogSSMs chat")

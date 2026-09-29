@@ -33,12 +33,13 @@ def make_manager(
     enable_merge_adjustment: bool = False,
     enable_memorized_evict: bool = True,
     max_seq_len           : int = MAX_SEQ_LEN,
+    granularity           : int = GRANULARITY,
 ) -> LogStateCacheManager:
     num_work_states = MAX_RUNNING_REQ + 1
     pool = FramedMHALogStatePool(
         num_frames=(num_pages + 1) + (num_states + num_work_states + 1) * 7,
         page_size=PAGE_SIZE,
-        granularity=GRANULARITY,
+        granularity=granularity,
         num_attention_layers=1,
         num_kv_heads=2,
         head_dim=4,
@@ -71,7 +72,7 @@ def make_manager(
         num_work_states=num_work_states,
         page_size=PAGE_SIZE,
         resources=resources,
-        granularity=GRANULARITY,
+        granularity=granularity,
         enable_memorized_evict=enable_memorized_evict,
         enable_merge_adjustment=enable_merge_adjustment,
     )
@@ -229,8 +230,9 @@ def test_prefill_passes_physical_first_offset_without_device_sync():
     assert next_batch.logstate_first_offsets == [6]
 
 
-def test_decode_replay_count_tracks_prefill_tail_and_page_boundary():
-    manager = make_manager(num_pages=12, num_states=12)
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+def test_decode_replay_count_tracks_prefill_tail_and_page_boundary(granularity):
+    manager = make_manager(num_pages=12, num_states=12, granularity=granularity)
     req = new_req(manager, torch.arange(35, dtype=torch.int32))
     req.max_device_len = 100
     manager.allocate([req], phase="prefill")

@@ -71,6 +71,7 @@ def tokenize_worker(
                             input_ids=t,
                             sampling_params=msg.sampling_params,
                             profile_tag=msg.profile_tag,
+                            return_token_ids=msg.return_token_ids,
                         )
                         for msg, t in zip(tokenize_msg, tensors, strict=True)
                     ]
@@ -133,6 +134,10 @@ def detokenize_worker(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
+                            token_ids=(
+                                [msg.next_token] if isinstance(msg.next_token, int)
+                                else list(msg.next_token)
+                            ) if msg.return_token_ids else None,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
                     ]

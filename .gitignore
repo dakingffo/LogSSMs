@@ -18,6 +18,7 @@ datasets/swe_agent/trajs/
 datasets/agentic_coding_trajectories/.cache/
 datasets/agentic_coding_trajectories/sessions.parquet
 experiment/results/
+experiment/random_multiturn/*/
 
 # profiling data
 *.nsys-rep

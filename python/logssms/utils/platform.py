@@ -14,6 +14,8 @@ _QWEN35_PRESERVED_BRANCH = (
     "{%- if (preserve_thinking is defined and preserve_thinking is true) "
     "or (loop.index0 > ns.last_query_index) %}"
 )
+_QWEN36_ASSISTANT_BRANCH = '{%- elif message.role == "assistant" %}'
+_QWEN36_TOOL_BRANCH = '{%- elif message.role == "tool" %}'
 
 
 class DisabledTqdm(tqdm):
@@ -35,7 +37,7 @@ def configure_chat_tokenizer(
     tokenizer : PreTrainedTokenizerBase,
     model_path: str,
 ) -> PreTrainedTokenizerBase:
-    """Keep Qwen3.5's non-thinking assistant prefix stable across turns."""
+    """Keep Qwen3.5/3.6 assistant prefixes stable across turns."""
     config_path = os.path.join(model_path, "config.json")
     if not os.path.isfile(config_path):
         return tokenizer
@@ -43,13 +45,32 @@ def configure_chat_tokenizer(
         return tokenizer
 
     template = tokenizer.chat_template
-    if not isinstance(template, str) or _QWEN35_HISTORY_BRANCH not in template:
-        # Qwen3.6 already has preserve_thinking; leave its defaults unchanged.
+    if not isinstance(template, str):
         return tokenizer
-    tokenizer.chat_template = template.replace(
-        _QWEN35_HISTORY_BRANCH, _QWEN35_PRESERVED_BRANCH, 1
-    )
-    tokenizer._logssms_preserve_thinking = True
+    if _QWEN35_HISTORY_BRANCH in template:
+        tokenizer.chat_template = template.replace(
+            _QWEN35_HISTORY_BRANCH, _QWEN35_PRESERVED_BRANCH, 1
+        )
+        tokenizer._logssms_preserve_thinking = True
+    elif (_QWEN35_PRESERVED_BRANCH in template
+          and _QWEN36_ASSISTANT_BRANCH in template
+          and _QWEN36_TOOL_BRANCH in template):
+        # This newer template re-parses and trims historical assistant replies.
+        # Preserve the exact generated text, including an unfinished <think> block.
+        tokenizer.chat_template = template.replace(
+            _QWEN36_ASSISTANT_BRANCH,
+            _QWEN36_ASSISTANT_BRANCH + "\n"
+            '        {%- if message.raw_generated is string %}\n'
+            "            {{- '<|im_start|>assistant\\n<think>\\n' + "
+            "message.raw_generated + '<|im_end|>\\n' }}\n"
+            "        {%- else %}",
+            1,
+        ).replace(
+            _QWEN36_TOOL_BRANCH,
+            "        {%- endif %}\n    " + _QWEN36_TOOL_BRANCH,
+            1,
+        )
+        tokenizer._logssms_preserve_generated_reasoning = True
     return tokenizer
 
 
@@ -57,10 +78,12 @@ def render_chat_prompt(
     tokenizer: PreTrainedTokenizerBase,
     messages : list[dict[str, Any]],
 ) -> str:
-    kwargs = (
-        {"preserve_thinking": True, "enable_thinking": False}
-        if getattr(tokenizer, "_logssms_preserve_thinking", False) else {}
-    )
+    if getattr(tokenizer, "_logssms_preserve_thinking", False):
+        kwargs = {"preserve_thinking": True, "enable_thinking": False}
+    elif getattr(tokenizer, "_logssms_preserve_generated_reasoning", False):
+        kwargs = {"preserve_thinking": True}
+    else:
+        kwargs = {}
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, **kwargs
     )

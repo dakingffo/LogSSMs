@@ -6,6 +6,9 @@ from logssms.cache import (
     make_cache_argument_parser,
 )
 from logssms.cache.logstate_pool.layout import LOG_STATE_GRANULARITY
+from logssms.layers.linear_attention_backend import (
+    LogStateLinearAttentionBackend, make_linear_attention_backend,
+)
 from logssms.server.args import parse_args
 
 
@@ -80,6 +83,12 @@ def test_logstate_rejects_sub_chunk_granularity() -> None:
 
     with pytest.raises(SystemExit):
         parser.parser.parse_args(["--granularity", "8"])
+
+
+def test_logstate_backend_receives_eager_state() -> None:
+    backend = make_linear_attention_backend("logstate", enable_eager_state=True)
+    assert isinstance(backend, LogStateLinearAttentionBackend)
+    assert backend.enable_eager_state
 
 
 @pytest.mark.parametrize("flag", [

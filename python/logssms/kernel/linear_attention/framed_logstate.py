@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.tvm import call_cuda_ffi, load_jit, make_cpp_args
+
+if TYPE_CHECKING:
+    from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 
 
 @functools.cache
@@ -86,25 +89,41 @@ def construct_framed_log_state_chains(
     ],
     *,
     wave_size: int = 8,
+    max_tasks: int = 8,
 ) -> int:
     if not chains:
         return 0
-    assert wave_size > 0
+    assert wave_size > 0 and max_tasks > 0
     module = _construction_module(
         pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim
     )
     layout = pool.layout
-    carry = torch.empty(
-        (layout.num_linear_layers, layout.num_value_heads,
-         layout.head_k_dim, layout.head_v_dim),
-        dtype=pool.dtype, device=pool.device,
-    )
-    peak = carry.numel() * carry.element_size()
-    for base, segments, outputs in chains:
-        assert len(segments) == len(outputs)
-        for wave_begin in range(0, len(segments), wave_size):
-            current = segments[wave_begin:wave_begin + wave_size]
-            current_outputs = outputs[wave_begin:wave_begin + wave_size]
+    peak = 0
+    for task_begin in range(0, len(chains), max_tasks):
+        group = chains[task_begin:task_begin + max_tasks]
+        carry = torch.empty(
+            (len(group), layout.num_linear_layers, layout.num_value_heads,
+             layout.head_k_dim, layout.head_v_dim),
+            dtype=pool.dtype, device=pool.device,
+        )
+        carry_bytes = carry.numel() * carry.element_size()
+        peak = max(peak, carry_bytes)
+        for base, segments, outputs in group:
+            assert len(segments) == len(outputs)
+        max_segments = max(len(segments) for _base, segments, _outputs in group)
+        for wave_begin in range(0, max_segments, wave_size):
+            current = []
+            current_outputs = []
+            task_offsets = [0]
+            base_slots = []
+            for base, segments, outputs in group:
+                wave = segments[wave_begin:wave_begin + wave_size]
+                current.extend(wave)
+                current_outputs.extend(outputs[wave_begin:wave_begin + wave_size])
+                task_offsets.append(len(current))
+                base_slots.append(
+                    (-1 if base is None else base) if wave_begin == 0 else -2
+                )
             count = len(current)
             gamma = torch.empty(
                 (count, layout.num_linear_layers, layout.num_value_heads),
@@ -122,8 +141,8 @@ def construct_framed_log_state_chains(
                 output_offsets.append(len(output_slots))
             call_cuda_ffi(module.construct,
                 *_construction_args(pool),
-                _vector([(-1 if base is None else base) if wave_begin == 0 else -2], pool.device),
-                _vector([0, count], pool.device),
+                _vector(base_slots, pool.device),
+                _vector(task_offsets, pool.device),
                 _vector([slot for slot, _begin, _end in current], pool.device),
                 _vector([begin for _slot, begin, _end in current], pool.device),
                 _vector([end for _slot, _begin, end in current], pool.device),
@@ -136,7 +155,7 @@ def construct_framed_log_state_chains(
             )
             peak = max(
                 peak,
-                carry.numel() * carry.element_size()
+                carry_bytes
                 + gamma.numel() * gamma.element_size()
                 + bias.numel() * bias.element_size(),
             )

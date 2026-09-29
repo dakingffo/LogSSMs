@@ -182,7 +182,7 @@ public:
         .with_device(views.device)
         .verify(affine_bias);
     auto dtype = SymbolicDType{};
-    TensorMatcher({num_layers, num_heads, head_k_dim, head_v_dim})
+    TensorMatcher({num_tasks, num_layers, num_heads, head_k_dim, head_v_dim})
         .with_dtype(dtype)
         .with_device(views.device)
         .verify(carry_state);

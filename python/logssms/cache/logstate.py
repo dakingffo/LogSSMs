@@ -20,7 +20,11 @@ from logssms.utils import align_ceil, align_down, div_ceil, init_logger
 
 from .base import BaseCacheManager, CacheResources
 from .factory import BaseCacheFactory, CachePlan, SUPPORTED_CACHE_FACTORIES
-from .logstate_pool.layout import LOG_STATE_GRANULARITY, LogStateSlotLayout
+from .logstate_pool.layout import (
+    LOG_STATE_GRANULARITY,
+    LOG_STATE_REPLAY_WINDOW,
+    LogStateSlotLayout,
+)
 from .logstate_pool.frame_pool import FramedMHALogStatePool
 from .logstate_recycle import LogStateRecycleBin, RecycledMatch
 from .prefix_cache.base import BaseCacheHandle, MatchResult
@@ -301,14 +305,28 @@ class OnlineAnalysisScheduler:
         round_info: LogStateRound | None = None,
         *,
         collect_diagnostics: bool = False,
+        step_timing_ms: dict[str, float] | None = None,
     ) -> LogStatePlan:
         assert tree.page_size == self.page_size
         assert tree.granularity == self.granularity
         if round_info is None:
             round_info = self.begin_round(tree)
 
+        step_start = perf_counter_ns() if step_timing_ms is not None else 0
         analysis_nodes, endpoints = self._analysis_paths(tree, input_ids)
-        pending = self._find_protections(tree, input_ids)
+        if step_timing_ms is not None:
+            step_timing_ms["matched_paths_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
+            step_start = perf_counter_ns()
+        pending = self._find_protections(
+            tree, input_ids, step_timing_ms=step_timing_ms,
+        )
+        if step_timing_ms is not None:
+            step_timing_ms["protection_total_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
+            step_start = perf_counter_ns()
         protections = []
         for value in pending:
             entry = self._covering_log(tree, value)
@@ -330,9 +348,19 @@ class OnlineAnalysisScheduler:
             for value in pending
             if (restore := self._plan_work_state_restore(tree, value)) is not None
         )
+        if step_timing_ms is not None:
+            step_timing_ms["protection_and_restore_plan_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
+            step_start = perf_counter_ns()
         materialize = self._plan_materialize(
             tree, round_info.eligible_slots, pending, analysis_nodes
         )
+        if step_timing_ms is not None:
+            step_timing_ms["materialize_plan_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
+            step_start = perf_counter_ns()
         diagnostics = {} if collect_diagnostics else None
         coalesce = self._plan_coalesce(
             tree,
@@ -343,6 +371,10 @@ class OnlineAnalysisScheduler:
             endpoints,
             diagnostics,
         )
+        if step_timing_ms is not None:
+            step_timing_ms["coalesce_plan_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
         return LogStatePlan(
             tree_revision=tree.revision,
             protections=tuple(protections),
@@ -397,8 +429,15 @@ class OnlineAnalysisScheduler:
         self,
         tree     : LogRadixTree,
         input_ids: Sequence[torch.Tensor],
+        *,
+        step_timing_ms: dict[str, float] | None = None,
     ) -> tuple[_PendingProtection, ...]:
+        branch_start = perf_counter_ns() if step_timing_ms is not None else 0
         candidates = self._batch_branch_points(input_ids)
+        if step_timing_ms is not None:
+            step_timing_ms["batch_branch_points_ms"] = (
+                perf_counter_ns() - branch_start
+            ) / 1e6
 
         for request_index, values in enumerate(input_ids):
             usable_len = align_down(len(values), self.granularity)
@@ -1694,10 +1733,10 @@ class LogStateCacheManager(BaseCacheManager):
                     assert offset is not None, "Decode token has no LogState page"
                     committed_pos = self._work_committed_pos[req.table_idx]
                     count = req.cached_len - committed_pos
-                    assert 0 <= count < self.granularity
-                    assert count <= offset % self.granularity
+                    assert 0 <= count < LOG_STATE_REPLAY_WINDOW
+                    assert count <= offset % LOG_STATE_REPLAY_WINDOW
                     replay_counts.append(count)
-                    if (offset + 1) % self.granularity == 0:
+                    if (offset + 1) % LOG_STATE_REPLAY_WINDOW == 0:
                         self._work_committed_pos[req.table_idx] = req.cached_len + 1
                 batch.logstate_replay_counts = replay_counts + [
                     0 for _ in range(batch.padded_size - batch.size)
@@ -1746,8 +1785,21 @@ class LogStateCacheManager(BaseCacheManager):
             if self._profile_enabled else 0.0
         )
         analysis_start = perf_counter_ns() if self._profile_enabled else 0
+        analysis_step_timing_ms: dict[str, float] | None = (
+            {} if self._profile_enabled else None
+        )
+        round_start = perf_counter_ns() if self._profile_enabled else 0
         round_info = self.analyzer.begin_round(self.tree)
+        if analysis_step_timing_ms is not None:
+            analysis_step_timing_ms["eligible_tree_scan_ms"] = (
+                perf_counter_ns() - round_start
+            ) / 1e6
+        recycle_start = perf_counter_ns() if self._profile_enabled else 0
         blocked = self._unmaterialized_recycle_slots()
+        if analysis_step_timing_ms is not None:
+            analysis_step_timing_ms["recycle_filter_ms"] = (
+                perf_counter_ns() - recycle_start
+            ) / 1e6
         if blocked:
             round_info = LogStateRound(round_info.eligible_slots - blocked)
         plan = self.analyzer.analyze(
@@ -1755,6 +1807,7 @@ class LogStateCacheManager(BaseCacheManager):
             [req.input_ids for req in batch.reqs],
             round_info,
             collect_diagnostics=self._profile_enabled,
+            step_timing_ms=analysis_step_timing_ms,
         )
         for protection in plan.protections:
             if protection.node is not None:
@@ -1766,7 +1819,12 @@ class LogStateCacheManager(BaseCacheManager):
                 self.tree.protect_entry(protection.log_slot)
 
         self.last_plan = plan
+        task_start = perf_counter_ns() if self._profile_enabled else 0
         tasks = self._make_restore_tasks(batch)
+        if analysis_step_timing_ms is not None:
+            analysis_step_timing_ms["restore_tasks_ms"] = (
+                perf_counter_ns() - task_start
+            ) / 1e6
         analysis_and_tasks_cpu_ms = (
             (perf_counter_ns() - analysis_start) / 1e6
             if self._profile_enabled else 0.0
@@ -1800,6 +1858,7 @@ class LogStateCacheManager(BaseCacheManager):
                     ),
                     "merge_diagnostics": dict(plan.merge_diagnostics),
                 },
+                "analysis_step_timing_ms": analysis_step_timing_ms,
             }
             profile_before_cpu_ms = (
                 perf_counter_ns() - profile_before_start
@@ -2569,6 +2628,10 @@ class LogStateCacheManager(BaseCacheManager):
         restores   : Sequence[_ReconstructionTask],
         materialize: Sequence[PageMaterialize],
     ) -> dict:
+        submit_timing_ms: dict[str, float] | None = (
+            {} if self._profile_enabled else None
+        )
+        step_start = perf_counter_ns() if submit_timing_ms is not None else 0
         events = None
         event_setup_cpu_ms = 0.0
         if self._profile_enabled and (restores or materialize):
@@ -2589,8 +2652,17 @@ class LogStateCacheManager(BaseCacheManager):
             for task in direct:
                 assert task.base_slot is not None
                 pool.copy_state(task.base_slot, task.output_slot)
+        if submit_timing_ms is not None:
+            submit_timing_ms["direct_state_copy_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
+            step_start = perf_counter_ns()
         restores = [task for task in restores if task.logs]
         chains = self._make_construction_chains(restores, materialize)
+        if submit_timing_ms is not None:
+            submit_timing_ms["chain_planning_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
         device = self.device
         pool = self.logstate_pool
 
@@ -2616,6 +2688,7 @@ class LogStateCacheManager(BaseCacheManager):
                 "cuda_ms": None,
             }
             if restore_chains:
+                step_start = perf_counter_ns() if submit_timing_ms is not None else 0
                 restore_framed_log_state_chains(
                     pool,
                     [
@@ -2634,7 +2707,12 @@ class LogStateCacheManager(BaseCacheManager):
                         for chain in restore_chains
                     ],
                 )
+                if submit_timing_ms is not None:
+                    submit_timing_ms["restore_submit_ms"] = (
+                        perf_counter_ns() - step_start
+                    ) / 1e6
             if material_chains:
+                step_start = perf_counter_ns() if submit_timing_ms is not None else 0
                 construction["workspace_bytes"] = construct_framed_log_state_chains(
                     pool,
                     [
@@ -2653,6 +2731,10 @@ class LogStateCacheManager(BaseCacheManager):
                         for chain in material_chains
                     ],
                 )
+                if submit_timing_ms is not None:
+                    submit_timing_ms["materialize_submit_ms"] = (
+                        perf_counter_ns() - step_start
+                    ) / 1e6
         else:
             construction = {
                 "chains": 0,
@@ -2663,7 +2745,11 @@ class LogStateCacheManager(BaseCacheManager):
                 "cuda_ms": 0.0,
             }
 
+        step_start = perf_counter_ns() if submit_timing_ms is not None else 0
         if conv_restores:
+            from logssms.kernel.linear_attention.conv_copy import (
+                copy_framed_conv_snapshots,
+            )
             source_slots = tensor([
                 task.source_conv_slot for task in conv_restores
             ])
@@ -2676,11 +2762,14 @@ class LogStateCacheManager(BaseCacheManager):
             output_granules = tensor([
                 task.output_conv_granule for task in conv_restores
             ])
-            for layer in range(pool.layout.num_linear_layers):
-                pool.write_conv(
-                    output_slots, output_granules, layer,
-                    pool.read_conv(source_slots, source_granules, layer),
-                )
+            copy_framed_conv_snapshots(
+                pool, source_slots, source_granules,
+                output_slots, output_granules,
+            )
+        if submit_timing_ms is not None:
+            submit_timing_ms["conv_restore_submit_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
         if events is not None:
             event_end_setup_start = perf_counter_ns()
             events[1].record()
@@ -2691,6 +2780,8 @@ class LogStateCacheManager(BaseCacheManager):
                 perf_counter_ns() - event_end_setup_start
             ) / 1e6
         construction["event_setup_cpu_ms"] = event_setup_cpu_ms
+        if submit_timing_ms is not None:
+            construction["submit_timing_ms"] = submit_timing_ms
         return construction
 
     @staticmethod

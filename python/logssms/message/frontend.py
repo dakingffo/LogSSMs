@@ -26,3 +26,4 @@ class UserReply(BaseFrontendMsg):
     uid               : int
     incremental_output: str
     finished          : bool
+    token_ids         : list[int] | None = None

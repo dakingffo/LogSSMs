@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
+
 from .op import exp
 
 
@@ -84,7 +86,7 @@ def _fused_recurrent_gated_delta_kernel(
     HEAD_PAYLOAD_BYTES: tl.constexpr,
     DECAY_RECORD_BYTES: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    GRANULARITY: tl.constexpr,
+    REPLAY_WINDOW: tl.constexpr,
     REPLAY_WORK: tl.constexpr,
 ):
     value_block = tl.program_id(0)
@@ -169,25 +171,34 @@ def _fused_recurrent_gated_delta_kernel(
             + _frame_byte_offset(decay_frame, FRAME_BYTES)
             + decay_index * DECAY_RECORD_BYTES
         ).to(tl.pointer_type(tl.float32))
-        for index in range(count):
-            prior_offset = current_offset - count + index
-            logged_key = tl.load(
-                log_head + prior_offset * HEAD_K_DIM + k_offset,
-                mask=k_mask, other=0.0,
-            ).to(tl.float32)
-            logged_value = tl.load(
-                log_head + PAGE_SIZE * HEAD_K_DIM
-                + prior_offset * HEAD_V_DIM + v_offset,
-                mask=v_mask, other=0.0,
-            ).to(tl.float32)
-            logged_decay = tl.load(
-                decay_head + (LAYER * PAGE_SIZE + prior_offset) * NUM_V_HEADS
-                + value_head
-            )
-            state = state * logged_decay + (
-                logged_key[:, None] * logged_value[None, :]
-            )
-            state = state.to(query.dtype.element_ty).to(tl.float32)
+        replay_index = tl.arange(0, REPLAY_WINDOW)
+        prior_offsets = current_offset - count + replay_index
+        valid = replay_index < count
+        decays = tl.load(
+            decay_head + (LAYER * PAGE_SIZE + prior_offsets) * NUM_V_HEADS
+            + value_head,
+            mask=valid, other=1.0,
+        )
+        log_decays = tl.log(tl.maximum(decays, 1e-30))
+        total_decay = tl.sum(log_decays, axis=0)
+        suffix_decay = tl.exp(total_decay - tl.cumsum(log_decays))
+        logged_keys = tl.load(
+            log_head + prior_offsets[None, :] * HEAD_K_DIM
+            + k_offset[:, None],
+            mask=k_mask[:, None] & valid[None, :], other=0.0,
+        )
+        logged_values = tl.load(
+            log_head + PAGE_SIZE * HEAD_K_DIM
+            + prior_offsets[:, None] * HEAD_V_DIM
+            + v_offset[None, :],
+            mask=valid[:, None] & v_mask[None, :], other=0.0,
+        )
+        scaled_values = (
+            logged_values.to(tl.float32) * suffix_decay[:, None]
+        ).to(query.dtype.element_ty)
+        state = state * tl.exp(total_decay) + tl.dot(
+            logged_keys, scaled_values,
+        )
     A = tl.load(A_log + value_head).to(tl.float32)
     bias = tl.load(dt_bias + value_head).to(tl.float32)
 
@@ -322,8 +333,7 @@ def _fused_recurrent_gated_delta_kernel(
                 + v_offset[None, :]
             )
         if REPLAY_WORK:
-            current_offset = tl.load(token_offsets + batch_idx)
-            if (current_offset + 1) % GRANULARITY == 0:
+            if (current_offset + 1) % REPLAY_WINDOW == 0:
                 tl.store(snapshot_ptr, state, mask=state_mask)
         else:
             tl.store(snapshot_ptr, state, mask=state_mask)
@@ -435,6 +445,8 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         )
     assert block_v in (8, 16, 32)
     block_v = min(block_v, triton.next_power_of_2(head_v_dim))
+    if not enable_eager_state:
+        block_v = max(block_v, 16)
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
     _fused_recurrent_gated_delta_kernel[grid](
         query.contiguous(), key.contiguous(), value.contiguous(),
@@ -477,9 +489,9 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         HEAD_PAYLOAD_BYTES=pool.head_payload_bytes,
         DECAY_RECORD_BYTES=pool.layout.log_decay_bytes,
         PAGE_SIZE=pool.page_size,
-        GRANULARITY=pool.layout.granularity,
+        REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
         REPLAY_WORK=not enable_eager_state,
-        num_warps=1,
+        num_warps=4 if not enable_eager_state else 1,
         num_stages=3,
     )
     return output
@@ -550,7 +562,7 @@ def fused_recurrent_gated_delta_rule_to_slots(
         HEAD_PAYLOAD_BYTES=0,
         DECAY_RECORD_BYTES=0,
         PAGE_SIZE=0,
-        GRANULARITY=0,
+        REPLAY_WINDOW=0,
         REPLAY_WORK=False,
         num_warps=1,
         num_stages=3,
@@ -666,7 +678,7 @@ def _fused_recurrent_gated_delta_rule(
         HEAD_PAYLOAD_BYTES=0,
         DECAY_RECORD_BYTES=0,
         PAGE_SIZE=0,
-        GRANULARITY=0,
+        REPLAY_WINDOW=0,
         REPLAY_WORK=False,
         num_warps=1,
         num_stages=3,

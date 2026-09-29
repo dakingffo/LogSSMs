@@ -11,6 +11,7 @@ from typing import Callable, Literal
 import uvicorn
 import fastapi
 import pydantic
+import torch
 from fastapi.responses import StreamingResponse
 
 from logssms.core import SamplingParams
@@ -58,14 +59,16 @@ class GenerateRequest(pydantic.BaseModel):
 class Message(pydantic.BaseModel):
     role   : Literal["system", "user", "assistant"]
     content: str
+    raw_generated: str | None = None
 
 
 class OpenAICompletionRequest(pydantic.BaseModel):
     """Unified request model for OpenAI-style completions and chat-completions."""
 
-    model   : str
-    prompt  : str | None           = None
-    messages: list[Message] | None = None
+    model           : str
+    prompt          : str | None           = None
+    prompt_token_ids: list[int] | None     = None
+    messages        : list[Message] | None = None
 
     max_tokens       : int       = 16
     temperature      : float     = 1.0
@@ -77,6 +80,7 @@ class OpenAICompletionRequest(pydantic.BaseModel):
     presence_penalty : float     = 0.0
     frequency_penalty: float     = 0.0
     ignore_eos       : bool      = False
+    return_token_ids : bool      = False
 
 
 class ModelCard(pydantic.BaseModel):
@@ -152,7 +156,7 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int):
+    async def stream_chat_completions(self, uid: int, return_token_ids: bool = False):
         first_chunk = True
         async for ack in self.wait_for_ack(uid):
             delta = {}
@@ -161,6 +165,8 @@ class FrontendManager:
                 first_chunk = False
             if ack.incremental_output:
                 delta["content"] = ack.incremental_output
+            if return_token_ids:
+                delta["token_ids"] = ack.token_ids or []
 
             chunk = {
                 "id": f"cmpl-{uid}",
@@ -251,10 +257,21 @@ async def v1_root():
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request):
     state = get_global_state()
-    if req.messages:
-        prompt = [msg.model_dump() for msg in req.messages]
+    if sum(value is not None for value in (req.messages, req.prompt, req.prompt_token_ids)) != 1:
+        raise fastapi.HTTPException(
+            status_code=422,
+            detail="Specify exactly one of messages, prompt, or prompt_token_ids",
+        )
+    if req.prompt_token_ids is not None:
+        vocab_size = state.config.model_config.vocab_size
+        if not req.prompt_token_ids or any(
+            token < 0 or token >= vocab_size for token in req.prompt_token_ids
+        ):
+            raise fastapi.HTTPException(status_code=422, detail="Invalid prompt_token_ids")
+        prompt = None
+    elif req.messages is not None:
+        prompt = [msg.model_dump(exclude_none=True) for msg in req.messages]
     else:
-        assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
 
     # TODO: support more sampling parameters
@@ -263,6 +280,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
         TokenizeMsg(
             uid=uid,
             text=prompt,
+            input_ids=(
+                torch.tensor(req.prompt_token_ids, dtype=torch.int32)
+                if req.prompt_token_ids is not None else None
+            ),
+            return_token_ids=req.return_token_ids,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
@@ -276,13 +298,18 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
 
     if req.stream:
         return StreamingResponse(
-            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            state.stream_with_cancellation(
+                state.stream_chat_completions(uid, req.return_token_ids), request, uid
+            ),
             media_type="text/event-stream",
         )
     else:
         full_content = ""
+        full_token_ids: list[int] = []
         async for ack in state.wait_for_ack(uid):
             full_content += ack.incremental_output
+            if req.return_token_ids:
+                full_token_ids.extend(ack.token_ids or [])
             if ack.finished:
                 break
 
@@ -294,7 +321,10 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": full_content},
+                    "message": {
+                        "role": "assistant", "content": full_content,
+                        **({"token_ids": full_token_ids} if req.return_token_ids else {}),
+                    },
                     "finish_reason": "stop",
                 }
             ],

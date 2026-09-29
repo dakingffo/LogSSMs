@@ -114,7 +114,7 @@ class Scheduler(SchedulerIOMixin):
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 batch = forward_input.batch
-                with self.profiler.record_submit(batch.phase):
+                with self.profiler.record_submit(batch):
                     ongoing_data = (forward_input, self._forward(forward_input))
                     if not batch.is_prefill:
                         self.ar_manager.advance_for_overlap(batch)
@@ -153,7 +153,9 @@ class Scheduler(SchedulerIOMixin):
                 self.engine.ctx, last_input, last_output
             )
             self.send_result(reply)
-            for req in finished_reqs:
+            # finished_reqs is a set of identity-hashed Requests. TP ranks must
+            # release them in the same order to keep cache allocation aligned.
+            for req in sorted(finished_reqs, key=lambda req: req.uid):
                 if ongoing_data is not None and any(
                     candidate is req for candidate in ongoing_data[0].batch.reqs
                 ):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from logssms.core import SamplingParams
 
 from .utils import deserialize_type, serialize_type
@@ -25,17 +27,20 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
-    uid       : int
-    next_token: int | list[int] # decode or verify 
-    finished  : bool
+    uid              : int
+    next_token       : int | list[int] # decode or verify
+    finished         : bool
+    return_token_ids: bool = False
 
 
 @dataclass
 class TokenizeMsg(BaseTokenizerMsg):
     uid            : int
-    text           : str | list[dict[str, str]]
+    text           : str | list[dict[str, str]] | None
     sampling_params: SamplingParams
-    profile_tag    : str | None = None
+    profile_tag     : str | None       = None
+    input_ids       : torch.Tensor | None = None
+    return_token_ids: bool             = False
 
 
 @dataclass

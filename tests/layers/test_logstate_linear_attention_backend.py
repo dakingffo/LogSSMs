@@ -507,6 +507,57 @@ def test_decode_eager_state_writes_work_every_token() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+def test_gemm_replay_matches_eager_window(granularity: int) -> None:
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size = 2
+    torch.manual_seed(121)
+    query = torch.randn(batch_size, granularity, 2, 128, device=device, dtype=dtype) * 0.2
+    key = torch.randn_like(query) * 0.2
+    value = torch.randn_like(query) * 0.2
+    gate = torch.randn(batch_size, granularity, 2, device=device, dtype=dtype) * 0.1
+    beta = torch.randn_like(gate) * 0.1
+    A_log = torch.full((2,), -3.0, device=device)
+    dt_bias = torch.zeros_like(A_log)
+    initial = torch.randn(batch_size, 2, 128, 128, device=device, dtype=dtype) * 0.02
+
+    def run(mode: str) -> tuple[torch.Tensor, torch.Tensor]:
+        pool = FramedMHALogStatePool(
+            num_frames=128, page_size=64, granularity=granularity,
+            num_attention_layers=1, num_kv_heads=1, head_dim=128,
+            num_linear_layers=1, num_key_heads=2, num_value_heads=2,
+            head_k_dim=128, head_v_dim=128, conv_dim=768, state_len=3,
+            device=device, dtype=dtype,
+        )
+        assert pool.reserve(logs=batch_size, works=batch_size) is not None
+        work = torch.arange(batch_size, 2 * batch_size, device=device, dtype=torch.int32)
+        logs = torch.arange(batch_size, device=device, dtype=torch.int32)
+        pool.write_states(work, 0, initial)
+        outputs = []
+        for step in range(granularity):
+            output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+                query[:, step:step + 1].contiguous(),
+                key[:, step:step + 1].contiguous(),
+                value[:, step:step + 1].contiguous(),
+                gate[:, step:step + 1].contiguous(),
+                beta[:, step:step + 1].contiguous(),
+                A_log, dt_bias, pool, work, logs,
+                torch.full((batch_size,), step, device=device, dtype=torch.int32),
+                0, torch.full((batch_size,), step, device=device, dtype=torch.int32),
+                enable_eager_state=mode == "eager",
+            )
+            outputs.append(output)
+        torch.cuda.synchronize()
+        return torch.cat(outputs, dim=1), pool.read_states(work, 0).clone()
+
+    eager_output, eager_state = run("eager")
+    gemm_output, gemm_state = run("gemm")
+    torch.testing.assert_close(gemm_output, eager_output, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(gemm_state, eager_state, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_replay_count_and_offset_are_mutable_cuda_graph_inputs() -> None:
     device = torch.device("cuda")
     pool = _make_pool(device)

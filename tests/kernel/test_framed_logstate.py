@@ -156,6 +156,64 @@ def test_framed_restore_keeps_concurrent_requests_separate():
                     rtol=3e-2, atol=3e-2,
                 )
 
+    construct_framed_log_state_chains(
+        pool,
+        [(None, [(log, 0, 64)], [(work,)]) for log, work in zip(logs, works)],
+    )
+    for row, slot in enumerate(works):
+        for layer in range(2):
+            for head in range(2):
+                torch.testing.assert_close(
+                    pool.head_view(slot, layer, head, state=True),
+                    expected[row, layer, head].to(torch.bfloat16),
+                    rtol=3e-2, atol=3e-2,
+                )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_framed_construct_keeps_carry_across_waves_per_chain():
+    pool = FramedMHALogStatePool(
+        num_frames=256,
+        page_size=64,
+        granularity=16,
+        num_attention_layers=1,
+        num_kv_heads=1,
+        head_dim=64,
+        num_linear_layers=1,
+        num_key_heads=1,
+        num_value_heads=1,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_dim=64,
+        state_len=3,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+    allocated = pool.reserve(logs=11, works=2)
+    assert allocated is not None
+    logs, works = allocated[1:]
+    chains = []
+    for row, row_logs in enumerate((logs[:9], logs[9:])):
+        for slot in row_logs:
+            view = pool.head_view(slot, 0, 0, state=False)
+            view[:64 * 32].fill_(0.01 * (row + 1))
+            view[64 * 32:].fill_(0.01)
+            pool.decay_view(slot)[0, :, 0].fill_(1)
+        chains.append((
+            None,
+            [(slot, 0, 64) for slot in row_logs],
+            [()] * (len(row_logs) - 1) + [(works[row],)],
+        ))
+
+    construct_framed_log_state_chains(pool, chains)
+    for row, count in enumerate((9, 2)):
+        expected = 64 * count * 0.01 * (row + 1) * 0.01
+        torch.testing.assert_close(
+            pool.head_view(works[row], 0, 0, state=True),
+            torch.full((32, 32), expected, device="cuda", dtype=torch.bfloat16),
+            rtol=5e-2, atol=1e-3,
+        )
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_framed_decode_matches_recurrent_reference():
@@ -224,6 +282,71 @@ def test_framed_decode_matches_recurrent_reference():
             torch.testing.assert_close(
                 pool.decay_view(slot)[0, position, head],
                 decay[row, 0, head],
+            )
+
+
+@pytest.mark.parametrize("granularity", [32, 64])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_framed_decode_replays_at_fixed_sixteen_token_intervals(granularity):
+    torch.manual_seed(39)
+    pool = FramedMHALogStatePool(
+        num_frames=64,
+        page_size=64,
+        granularity=granularity,
+        num_attention_layers=1,
+        num_kv_heads=1,
+        head_dim=128,
+        num_linear_layers=1,
+        num_key_heads=1,
+        num_value_heads=1,
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_dim=128,
+        state_len=3,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+    allocated = pool.reserve(logs=2, works=2)
+    assert allocated is not None
+    logs, works = allocated[1:]
+    for slot in works:
+        pool.zero_state(slot)
+    eager_log = torch.tensor([logs[0]], dtype=torch.int32, device="cuda")
+    eager_work = torch.tensor([works[0]], dtype=torch.int32, device="cuda")
+    replay_log = torch.tensor([logs[1]], dtype=torch.int32, device="cuda")
+    replay_work = torch.tensor([works[1]], dtype=torch.int32, device="cuda")
+    A_log = torch.zeros(1, device="cuda")
+    dt_bias = torch.zeros_like(A_log)
+    committed = pool.head_view(works[1], 0, 0, state=True).clone()
+
+    for offset in range(granularity):
+        query = torch.randn(1, 1, 1, 128, dtype=pool.dtype, device="cuda")
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+        gate = torch.zeros(1, 1, 1, dtype=pool.dtype, device="cuda")
+        beta = torch.zeros_like(gate)
+        position = torch.tensor([offset], dtype=torch.int32, device="cuda")
+        count = torch.tensor([offset % 16], dtype=torch.int32, device="cuda")
+        eager = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query, key, value, gate, beta, A_log, dt_bias, pool,
+            eager_work, eager_log, position, 0, count,
+            enable_eager_state=True,
+        )
+        replay = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query, key, value, gate, beta, A_log, dt_bias, pool,
+            replay_work, replay_log, position, 0, count,
+        )
+        torch.testing.assert_close(replay, eager, atol=0.04, rtol=0.04)
+        if (offset + 1) % 16 == 0:
+            torch.testing.assert_close(
+                pool.head_view(works[1], 0, 0, state=True),
+                pool.head_view(works[0], 0, 0, state=True),
+                atol=0.04, rtol=0.04,
+            )
+            committed = pool.head_view(works[1], 0, 0, state=True).clone()
+        else:
+            assert torch.equal(
+                pool.head_view(works[1], 0, 0, state=True), committed
             )
 
 

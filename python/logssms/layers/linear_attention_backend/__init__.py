@@ -12,7 +12,7 @@ from .logstate import (
 
 
 def make_linear_attention_backend(
-    cache_type: str, *, enable_eager_state: bool = False
+    cache_type: str, *, enable_eager_state: bool = False,
 ) -> BaseLinearAttentionBackend:
     if cache_type == "logstate":
         return LogStateLinearAttentionBackend(enable_eager_state=enable_eager_state)
