@@ -5,6 +5,7 @@ import torch
 from logssms.cache.logstate import (
     OnlineAnalysisScheduler,
     WorkStateRestoreMode,
+    _MergePathContext,
 )
 from logssms.cache.prefix_cache.logstate import (
     LogRadixTree,
@@ -369,6 +370,29 @@ def make_checkpoint_history(
         ),
     )
     return tree, tree.leaves()[0]
+
+
+def test_cached_merge_path_checks_match_tree_checks():
+    tree, leaf = make_checkpoint_history(6)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    tree.protect_entry(2)
+    branch = torch.cat([ids(80), ids(32, 10_000)])
+    pending = scheduler._find_protections(tree, [branch])
+    assert pending
+
+    path = tree.path(leaf)
+    context = _MergePathContext.build(
+        tree, path, scheduler._entries_for_node(tree, leaf), pending,
+    )
+    for begin in range(0, 6 * PAGE_SIZE, GRANULARITY):
+        for end in range(begin + GRANULARITY, 6 * PAGE_SIZE + 1, GRANULARITY):
+            assert context.is_protected(begin, end) == scheduler._interval_is_protected(
+                tree, leaf, begin, end, pending,
+            )
+    for position in range(0, 6 * PAGE_SIZE + 1, GRANULARITY):
+        assert (position in context.lock_boundaries) == tree.is_lock_boundary(
+            leaf, position,
+        )
 
 
 def test_adaptive_merge_uses_intensity_as_a_maximum_group_size():

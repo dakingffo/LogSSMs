@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from bisect import bisect_right
 from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -71,6 +72,65 @@ class WorkStateRestoreMode(Enum):
 @dataclass(frozen=True)
 class LogStateRound:
     eligible_slots: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _MergePathContext:
+    protected_depths : tuple[int, ...]
+    protected_entries: tuple[LogStateEntry, ...]
+    pending_positions : tuple[int, ...]
+    lock_boundaries   : frozenset[int]
+
+    @classmethod
+    def build(
+        cls,
+        tree   : LogRadixTree,
+        path   : Sequence[LogRadixTreeNode],
+        entries: Sequence[LogStateEntry],
+        pending: Sequence[_PendingProtection],
+    ) -> _MergePathContext:
+        path_ids = {node.uuid for node in path}
+        protected_slots: dict[int, bool] = {}
+        protected_entries = []
+        for entry in entries:
+            protected = protected_slots.get(entry.slot)
+            if protected is None:
+                protected = tree.entry_is_protected(entry.slot)
+                protected_slots[entry.slot] = protected
+            if protected:
+                protected_entries.append(entry)
+        return cls(
+            protected_depths=tuple(sorted(
+                node.depth for node in path if node.is_protected
+            )),
+            protected_entries=tuple(protected_entries),
+            pending_positions=tuple(sorted(
+                value.position for value in pending
+                if value.trace.node.uuid in path_ids
+            )),
+            lock_boundaries=frozenset(
+                node.depth for node in path
+                if node.ref_count > sum(
+                    child.ref_count for child in node.children.values()
+                )
+            ),
+        )
+
+    def is_protected(self, begin: int, end: int) -> bool:
+        if self.protected_depths:
+            index = bisect_right(self.protected_depths, begin)
+            if index < len(self.protected_depths) and self.protected_depths[index] < end:
+                return True
+        if any(
+            begin <= entry.begin and entry.end <= end
+            for entry in self.protected_entries
+        ):
+            return True
+        if self.pending_positions:
+            index = bisect_right(self.pending_positions, begin)
+            if index < len(self.pending_positions) and self.pending_positions[index] < end:
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -668,7 +728,14 @@ class OnlineAnalysisScheduler:
             if diagnostics is not None:
                 diagnostics["merge_anchors"] += 1
             stats = leaf.merge_stats
-            path_entries = self._entries_for_node(tree, leaf)
+            path = tree.path(leaf)
+            path_entries = sorted(
+                (entry for node in path for entry in node.entries),
+                key=lambda entry: (entry.begin, entry.end, entry.slot),
+            )
+            path_context = _MergePathContext.build(
+                tree, path, path_entries, pending,
+            )
             if matched_len is not None:
                 in_match = [
                     entry for entry in path_entries
@@ -729,7 +796,8 @@ class OnlineAnalysisScheduler:
                 2
             )
             segments = self._merge_segments(
-                tree, leaf, entries, pending, diagnostics
+                tree, leaf, entries, pending, diagnostics,
+                path_context=path_context,
             )
             if diagnostics is not None:
                 diagnostics["segments"] += len(segments)
@@ -758,6 +826,7 @@ class OnlineAnalysisScheduler:
                 reason = self._coalesce_rejection_reason(
                     tree, leaf, group, pending,
                     require_equal_level=True,
+                    path_context=path_context,
                 )
                 if reason is not None:
                     if diagnostics is not None:
@@ -787,6 +856,7 @@ class OnlineAnalysisScheduler:
                 reason = self._coalesce_rejection_reason(
                     tree, leaf, group, pending,
                     require_equal_level=False,
+                    path_context=path_context,
                 )
                 if reason is not None:
                     if diagnostics is not None:
@@ -807,28 +877,31 @@ class OnlineAnalysisScheduler:
         entries: Sequence[LogStateEntry],
         pending: tuple[_PendingProtection, ...],
         diagnostics: dict[str, int] | None,
+        *,
+        path_context: _MergePathContext | None = None,
     ) -> tuple[tuple[LogStateEntry, ...], ...]:
+        if path_context is None:
+            path = tree.path(leaf)
+            path_context = _MergePathContext.build(
+                tree, path, self._entries_for_node(tree, leaf), pending,
+            )
         result = []
         current = []
         for entry in entries:
-            entry_is_blocked = self._interval_is_protected(
-                tree, leaf, entry.begin, entry.end, pending
-            )
+            entry_is_blocked = path_context.is_protected(entry.begin, entry.end)
             if diagnostics is None:
                 boundary_is_blocked = bool(current) and (
                     current[-1].end != entry.begin
-                    or tree.is_lock_boundary(leaf, current[-1].end)
-                    or self._interval_is_protected(
-                        tree, leaf, current[-1].begin, entry.end, pending
-                    )
+                    or current[-1].end in path_context.lock_boundaries
+                    or path_context.is_protected(current[-1].begin, entry.end)
                 )
             else:
                 gap = bool(current) and current[-1].end != entry.begin
-                lock_boundary = bool(current) and tree.is_lock_boundary(
-                    leaf, current[-1].end
+                lock_boundary = bool(current) and (
+                    current[-1].end in path_context.lock_boundaries
                 )
-                protected_boundary = bool(current) and self._interval_is_protected(
-                    tree, leaf, current[-1].begin, entry.end, pending
+                protected_boundary = bool(current) and path_context.is_protected(
+                    current[-1].begin, entry.end
                 )
                 diagnostics["protected_entries"] += int(entry_is_blocked)
                 diagnostics["gaps"] += int(gap)
@@ -910,7 +983,13 @@ class OnlineAnalysisScheduler:
         pending            : tuple[_PendingProtection, ...],
         *,
         require_equal_level: bool,
+        path_context: _MergePathContext | None = None,
     ) -> str | None:
+        if path_context is None:
+            path = tree.path(leaf)
+            path_context = _MergePathContext.build(
+                tree, path, self._entries_for_node(tree, leaf), pending,
+            )
         if len(entries) < 2:
             return "too_few_entries"
         levels = [entry.span_pages for entry in entries]
@@ -925,11 +1004,9 @@ class OnlineAnalysisScheduler:
         for left, right in zip(entries, entries[1:]):
             if left.end != right.begin:
                 return "discontinuity"
-            if tree.is_lock_boundary(leaf, left.end):
+            if left.end in path_context.lock_boundaries:
                 return "lock_boundary"
-        if self._interval_is_protected(
-            tree, leaf, entries[0].begin, entries[-1].end, pending
-        ):
+        if path_context.is_protected(entries[0].begin, entries[-1].end):
             return "protected_interval"
         return None
 
@@ -1141,6 +1218,7 @@ class LogStateCacheManager(BaseCacheManager):
             "merge_commit_skips": {},
         }
         self._profile_samples: list[dict] = []
+        self._cache_req_samples: list[dict] = []
         self._profile_allocation_samples: list[dict] = []
         self._profile_active_requests: list[dict] = []
         self._profile_cuda_events: list[
@@ -1394,6 +1472,7 @@ class LogStateCacheManager(BaseCacheManager):
             "aggregate": stats,
             "match_samples": self._match_profile_samples,
             "prefill_batches": self._profile_samples,
+            "cache_req_samples": self._cache_req_samples,
             "allocation_profile": {
                 "phases": allocation_phases,
                 "samples": self._profile_allocation_samples,
@@ -1973,6 +2052,7 @@ class LogStateCacheManager(BaseCacheManager):
         return True
 
     def cache_req(self, req: Request, *, finished: bool) -> None:
+        profile_start = perf_counter_ns() if self._profile_enabled else 0
         old_handle = req.cache_handle
         assert isinstance(old_handle, LogStateCacheHandle)
         pages = self._live_pages.get(req.table_idx, [])
@@ -1984,10 +2064,15 @@ class LogStateCacheManager(BaseCacheManager):
             insert_len = page.end
         assert insert_len % self.granularity == 0
 
+        stage_start = perf_counter_ns() if self._profile_enabled else 0
         insert = self.tree.insert(
             req.input_ids[: req.cached_len],
             self.page_table[req.table_idx, : req.cached_len],
             cache_len=insert_len,
+        )
+        tree_insert_ms = (
+            (perf_counter_ns() - stage_start) / 1e6
+            if self._profile_enabled else 0.0
         )
         adopted = [
             page
@@ -1995,13 +2080,19 @@ class LogStateCacheManager(BaseCacheManager):
             if old_handle.cached_len <= page.begin
             and page.end <= insert.inserted_len
         ]
+        stage_start = perf_counter_ns() if self._profile_enabled else 0
         existing = self.tree.match_prefix(
             req.input_ids[: insert.inserted_len]
         ).cuda_handle
+        tree_match_ms = (
+            (perf_counter_ns() - stage_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
         assert isinstance(existing, LogStateCacheHandle)
         covered_len = existing.cached_len
         released_kv_pages = []
         released_state_slots = []
+        retain_kv_ms = 0.0
         for page in adopted:
             logical_begin = max(page.begin, covered_len)
             if page.checkpoint_begin is not None and logical_begin < page.end:
@@ -2036,9 +2127,13 @@ class LogStateCacheManager(BaseCacheManager):
 
             kv_begin = max(page.begin, insert.previous_len)
             if kv_begin < page.end:
-                self._retain_cached_kv(
-                    self.page_table[req.table_idx, kv_begin:page.end]
+                stage_start = perf_counter_ns() if self._profile_enabled else 0
+                self._cached_page_tokens[page.kv_page] = (
+                    self._cached_page_tokens.get(page.kv_page, 0)
+                    + page.end - kv_begin
                 )
+                if self._profile_enabled:
+                    retain_kv_ms += (perf_counter_ns() - stage_start) / 1e6
             else:
                 released_kv_pages.append(page.kv_page)
 
@@ -2085,39 +2180,40 @@ class LogStateCacheManager(BaseCacheManager):
 
         state_table = self.state_table
         assert state_table is not None
+        stage_start = perf_counter_ns() if self._profile_enabled else 0
         state_table[req.table_idx, : insert.inserted_len].fill_(-1)
         self.page_table[
             req.table_idx, : insert.inserted_len
         ].copy_(new_handle.kv_indices)
+        mapping_update_ms = (
+            (perf_counter_ns() - stage_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
 
         remaining = [
             page for page in pages if page not in adopted and page not in duplicates
         ]
+        conv_copy_ms = 0.0
+        work_slot_lookup_ms = 0.0
         if (
             not finished
             and adopted
             and req.cached_len == adopted[-1].end
         ):
-            work_state_table = self.work_state_table
-            assert work_state_table is not None
-            work_slot = int(work_state_table[req.table_idx, 0])
+            stage_start = perf_counter_ns() if self._profile_enabled else 0
+            work_slot = self._work_slots[req.table_idx]
+            if self._profile_enabled:
+                work_slot_lookup_ms = (perf_counter_ns() - stage_start) / 1e6
             assert adopted[-1].state_slot is not None
-            source = torch.tensor(
-                [adopted[-1].state_slot], dtype=torch.int32, device=self.device
+            source_granule = (
+                adopted[-1].end - adopted[-1].begin - 1
+            ) // self.granularity
+            stage_start = perf_counter_ns() if self._profile_enabled else 0
+            self.logstate_pool.copy_conv_snapshot(
+                adopted[-1].state_slot, source_granule, work_slot,
             )
-            destination = torch.tensor(
-                [work_slot], dtype=torch.int32, device=self.device
-            )
-            source_granule = torch.tensor(
-                [(adopted[-1].end - adopted[-1].begin - 1) // self.granularity],
-                dtype=torch.int32, device=self.device,
-            )
-            zero = torch.zeros(1, dtype=torch.int32, device=self.device)
-            for layer in range(self.logstate_pool.layout.num_linear_layers):
-                self.logstate_pool.write_conv(
-                    destination, zero, layer,
-                    self.logstate_pool.read_conv(source, source_granule, layer),
-                )
+            if self._profile_enabled:
+                conv_copy_ms = (perf_counter_ns() - stage_start) / 1e6
         if finished:
             recycled = self._recycle_matches.pop(req.table_idx, None)
             if (
@@ -2153,6 +2249,19 @@ class LogStateCacheManager(BaseCacheManager):
             req.cache_handle = new_handle
             self.lock(new_handle)
             self._live_pages[req.table_idx] = remaining
+        if self._profile_enabled:
+            self._cache_req_samples.append({
+                "tag": req.profile_tag,
+                "finished": finished,
+                "adopted_pages": len(adopted),
+                "tree_insert_ms": tree_insert_ms,
+                "tree_match_ms": tree_match_ms,
+                "retain_kv_ms": retain_kv_ms,
+                "mapping_update_ms": mapping_update_ms,
+                "work_slot_lookup_ms": work_slot_lookup_ms,
+                "conv_copy_ms": conv_copy_ms,
+                "total_ms": (perf_counter_ns() - profile_start) / 1e6,
+            })
 
     def _restore_recycled_layout(
         self,
@@ -2659,6 +2768,7 @@ class LogStateCacheManager(BaseCacheManager):
             step_start = perf_counter_ns()
         restores = [task for task in restores if task.logs]
         chains = self._make_construction_chains(restores, materialize)
+        waves = self._schedule_construction_waves(chains, materialize)
         if submit_timing_ms is not None:
             submit_timing_ms["chain_planning_ms"] = (
                 perf_counter_ns() - step_start
@@ -2670,74 +2780,85 @@ class LogStateCacheManager(BaseCacheManager):
             return torch.tensor(values, dtype=torch.int32, device=device)
 
         if chains:
-            material_chains = [chain for chain in chains if chain.materialize]
-            restore_chains = [chain for chain in chains if not chain.materialize]
-            segments = [entry for chain in chains for entry in chain.segments]
+            segments = [entry for wave in waves for chain in wave for entry in chain.segments]
             outputs = [
                 slot
-                for chain in chains
+                for wave in waves
+                for chain in wave
                 for values in chain.outputs
                 for slot in values
             ]
             construction = {
                 "chains": len(chains),
+                "waves": len(waves),
                 "segments": len(segments),
                 "outputs": len(outputs),
                 "direct_checkpoint_copies": len(direct),
                 "workspace_bytes": 0,
                 "cuda_ms": None,
             }
-            if restore_chains:
-                step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-                restore_framed_log_state_chains(
-                    pool,
-                    [
-                        (
-                            chain.base_slot,
+            restore_submit_ms = 0.0
+            materialize_submit_ms = 0.0
+            for wave in waves:
+                restore_chains = [
+                    chain for chain in wave
+                    if not chain.materialize
+                ]
+                material_chains = [chain for chain in wave if chain.materialize]
+                if restore_chains:
+                    step_start = perf_counter_ns() if submit_timing_ms is not None else 0
+                    restore_framed_log_state_chains(
+                        pool,
+                        [
+                            (
+                                chain.base_slot,
+                                [
+                                    (
+                                        entry.slot,
+                                        entry.begin - entry.physical_begin,
+                                        entry.end - entry.physical_begin,
+                                    )
+                                    for entry in chain.segments
+                                ],
+                                chain.outputs[-1][0],
+                            )
+                            for chain in restore_chains
+                        ],
+                    )
+                    if submit_timing_ms is not None:
+                        restore_submit_ms += (perf_counter_ns() - step_start) / 1e6
+                if material_chains:
+                    step_start = perf_counter_ns() if submit_timing_ms is not None else 0
+                    construction["workspace_bytes"] = max(
+                        construction["workspace_bytes"],
+                        construct_framed_log_state_chains(
+                            pool,
                             [
                                 (
-                                    entry.slot,
-                                    entry.begin - entry.physical_begin,
-                                    entry.end - entry.physical_begin,
+                                    chain.base_slot,
+                                    [
+                                        (
+                                            entry.slot,
+                                            entry.begin - entry.physical_begin,
+                                            entry.end - entry.physical_begin,
+                                        )
+                                        for entry in chain.segments
+                                    ],
+                                    chain.outputs,
                                 )
-                                for entry in chain.segments
+                                for chain in material_chains
                             ],
-                            chain.outputs[-1][0],
-                        )
-                        for chain in restore_chains
-                    ],
-                )
-                if submit_timing_ms is not None:
-                    submit_timing_ms["restore_submit_ms"] = (
-                        perf_counter_ns() - step_start
-                    ) / 1e6
-            if material_chains:
-                step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-                construction["workspace_bytes"] = construct_framed_log_state_chains(
-                    pool,
-                    [
-                        (
-                            chain.base_slot,
-                            [
-                                (
-                                    entry.slot,
-                                    entry.begin - entry.physical_begin,
-                                    entry.end - entry.physical_begin,
-                                )
-                                for entry in chain.segments
-                            ],
-                            chain.outputs,
-                        )
-                        for chain in material_chains
-                    ],
-                )
-                if submit_timing_ms is not None:
-                    submit_timing_ms["materialize_submit_ms"] = (
-                        perf_counter_ns() - step_start
-                    ) / 1e6
+                        ),
+                    )
+                    if submit_timing_ms is not None:
+                        materialize_submit_ms += (perf_counter_ns() - step_start) / 1e6
+            if submit_timing_ms is not None:
+                submit_timing_ms["restore_submit_ms"] = restore_submit_ms
+                submit_timing_ms["materialize_submit_ms"] = materialize_submit_ms
         else:
             construction = {
                 "chains": 0,
+                "waves": 0,
                 "segments": 0,
                 "outputs": 0,
                 "direct_checkpoint_copies": len(direct),
@@ -2783,6 +2904,79 @@ class LogStateCacheManager(BaseCacheManager):
         if submit_timing_ms is not None:
             construction["submit_timing_ms"] = submit_timing_ms
         return construction
+
+    @staticmethod
+    def _schedule_construction_waves(
+        chains     : Sequence[_ConstructionChain],
+        materialize: Sequence[PageMaterialize],
+    ) -> tuple[tuple[_ConstructionChain, ...], ...]:
+        """Order in-place writes after old-Log readers, or rebase readers on a new checkpoint."""
+        if not chains:
+            return ()
+
+        plans = {plan.log_slot: plan for plan in materialize}
+        writers: dict[int, int] = {}
+        for index, chain in enumerate(chains):
+            for outputs in chain.outputs:
+                for slot in outputs:
+                    if slot not in plans:
+                        continue
+                    assert slot not in writers, "Checkpoint has multiple writers"
+                    writers[slot] = index
+        assert set(writers) == set(plans), "Missing Checkpoint writer"
+
+        rebased = []
+        for index, chain in enumerate(chains):
+            # A chain may skip a prefix that another chain materializes only
+            # when it has not already promised an output within that prefix.
+            # Otherwise it must consume the old Log before the in-place write.
+            last = None
+            has_outputs = False
+            for segment_index, entry in enumerate(chain.segments):
+                if (entry.slot in writers
+                    and writers[entry.slot] != index
+                    and entry.end == plans[entry.slot].end
+                    and not has_outputs
+                    and not chain.outputs[segment_index]):
+                    last = segment_index
+                has_outputs |= bool(chain.outputs[segment_index])
+            if last is None:
+                rebased.append(chain)
+                continue
+            rebased.append(_ConstructionChain(
+                base_slot=chain.segments[last].slot,
+                segments=chain.segments[last + 1:],
+                outputs=chain.outputs[last + 1:],
+                materialize=chain.materialize,
+            ))
+
+        predecessors: list[set[int]] = [set() for _ in rebased]
+        log_readers: dict[int, set[int]] = {}
+        base_readers: dict[int, set[int]] = {}
+        for index, chain in enumerate(rebased):
+            for entry in chain.segments:
+                log_readers.setdefault(entry.slot, set()).add(index)
+            if chain.base_slot is not None:
+                base_readers.setdefault(chain.base_slot, set()).add(index)
+        for slot, writer in writers.items():
+            for reader in base_readers.get(slot, ()):
+                if reader != writer:
+                    predecessors[reader].add(writer)
+            for reader in log_readers.get(slot, ()):
+                if reader != writer:
+                    predecessors[writer].add(reader)
+
+        remaining = set(range(len(rebased)))
+        waves = []
+        while remaining:
+            ready = sorted(index for index in remaining if not predecessors[index])
+            if not ready:
+                raise RuntimeError("Cyclic LogState construction dependencies")
+            waves.append(tuple(rebased[index] for index in ready))
+            remaining.difference_update(ready)
+            for deps in predecessors:
+                deps.difference_update(ready)
+        return tuple(waves)
 
     @staticmethod
     def _make_construction_chains(
@@ -3035,17 +3229,6 @@ class LogStateCacheManager(BaseCacheManager):
                 self._lazy_free_pages.append(pages)
             if len(states) > 0:
                 self._lazy_free_states.append(states)
-
-    def _retain_cached_kv(self, indices: torch.Tensor) -> None:
-        pages = torch.div(
-            indices.to(torch.int64), self.page_size,
-            rounding_mode="floor",
-        ) * self.page_size
-        unique, counts = torch.unique(pages, return_counts=True)
-        for page, count in zip(unique.tolist(), counts.tolist()):
-            self._cached_page_tokens[page] = (
-                self._cached_page_tokens.get(page, 0) + count
-            )
 
     def _release_cached_kv(self, page_counts: Counter[int]) -> None:
         released = []

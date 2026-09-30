@@ -99,14 +99,19 @@ def test_disable_memorized_evict_has_no_recycle_bin() -> None:
 def test_restore_unfused_chain_before_inplace_materialization() -> None:
     manager = make_manager()
     segment = SimpleNamespace(
-        slot=4, begin=0, end=PAGE_SIZE, physical_begin=0
+        slot=4, begin=0, end=GRANULARITY, physical_begin=0
     )
     restore = SimpleNamespace(
         base_slot=None, segments=(segment,), outputs=((3,),), materialize=False
     )
-    materialize = SimpleNamespace(
-        base_slot=None, segments=(segment,), outputs=((4,),), materialize=True
+    full_segment = SimpleNamespace(
+        slot=4, begin=0, end=PAGE_SIZE, physical_begin=0
     )
+    materialize = SimpleNamespace(
+        base_slot=None, segments=(full_segment,), outputs=((4,),), materialize=True
+    )
+    entry = LogStateEntry(4, LogStateKind.LOG, 0, PAGE_SIZE)
+    plan = PageMaterialize(4, 0, PAGE_SIZE, None, (entry,))
     order = []
     with (
         patch.object(manager, "_make_construction_chains", return_value=(materialize, restore)),
@@ -119,8 +124,52 @@ def test_restore_unfused_chain_before_inplace_materialization() -> None:
             side_effect=lambda *_args: order.append("materialize") or 0,
         ),
     ):
-        manager._construct((), (object(),))
+        manager._construct((), (plan,))
     assert order == ["restore", "materialize"]
+
+
+def test_shared_log_materialization_rebases_branches_across_task_groups() -> None:
+    manager = make_manager()
+    shared = LogStateEntry(1, LogStateKind.LOG, 0, PAGE_SIZE)
+    branches = [
+        LogStateEntry(slot, LogStateKind.LOG, PAGE_SIZE, 2 * PAGE_SIZE)
+        for slot in range(2, 8)
+    ]
+    plans = [PageMaterialize(1, 0, PAGE_SIZE, None, (shared,))]
+    plans.extend(
+        PageMaterialize(entry.slot, PAGE_SIZE, 2 * PAGE_SIZE,
+                        None, (shared, entry))
+        for entry in branches
+    )
+    independent = LogStateEntry(8, LogStateKind.LOG, 0, PAGE_SIZE)
+    plans.append(PageMaterialize(8, 0, PAGE_SIZE, None, (independent,)))
+    chains = manager._make_construction_chains((), plans)
+    waves = manager._schedule_construction_waves(chains, plans)
+
+    assert len(waves) == 2
+    assert len(waves[0]) == 2
+    assert {
+        slot for chain in waves[0]
+        for outputs in chain.outputs
+        for slot in outputs
+    } == {1, 2, 8}
+    assert len(waves[1]) == 5  # crosses the kernel's max_tasks=4 boundary
+    assert all(chain.base_slot == 1 for chain in waves[1])
+    assert all(
+        [entry.slot for entry in chain.segments] == [branch.slot]
+        for chain, branch in zip(waves[1], branches[1:])
+    )
+
+    launches = []
+    with patch(
+        "logssms.cache.logstate.construct_framed_log_state_chains",
+        side_effect=lambda _pool, group: launches.append(group) or 0,
+    ):
+        manager._construct((), plans)
+    assert len(launches) == 2
+    assert len(launches[0]) == 2
+    assert len(launches[1]) == 5
+    assert all(base == 1 for base, _segments, _outputs in launches[1])
 
 
 def new_req(
@@ -327,6 +376,26 @@ def test_complete_pages_move_from_request_to_tree_and_tail_is_released():
     manager.check_integrity()
 
 
+def test_cache_req_profile_tracks_prefill_conv_handoff():
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = make_manager()
+    req = new_req(manager, torch.arange(128, dtype=torch.int32))
+    req.profile_tag = "session/turn-1"
+    manager.allocate([req])
+    cached_pages = [page.kv_page for page in manager._live_pages[req.table_idx][:2]]
+    req.cached_len = 128
+
+    manager.cache_req(req, finished=False)
+
+    sample = manager.profile_result()["cache_req_samples"][-1]
+    assert sample["tag"] == req.profile_tag
+    assert sample["adopted_pages"] == 2
+    assert not sample["finished"]
+    assert sample["conv_copy_ms"] >= 0
+    assert sample["total_ms"] >= sample["conv_copy_ms"]
+    assert all(manager._cached_page_tokens[page] == PAGE_SIZE for page in cached_pages)
+
+
 def test_adaptive_sampling_records_hit_only_after_successful_admission():
     manager = make_manager(
         num_pages=12,
@@ -526,7 +595,7 @@ def test_direct_recycled_checkpoint_aligns_after_granularity_hit() -> None:
         (LogStateEntry(allocated[1][0], LogStateKind.LOG, 0, 16),),
         cache_len=16,
     )
-    manager._retain_cached_kv(kv)
+    manager._cached_page_tokens[allocated[0][0] * PAGE_SIZE] = len(kv)
     ghost_tree = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     ghost = ghost_tree.insert(history, history + 1000, (
         LogStateEntry(50, LogStateKind.CHECKPOINT, 256, 512, span_pages=4),
@@ -963,7 +1032,10 @@ def test_prepare_batch_applies_branch_protection_and_commits_plan():
         torch.arange(1000, 1032, dtype=torch.int32),
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
-    with patch("logssms.cache.logstate.construct_framed_log_state_chains") as construct:
+    with patch(
+        "logssms.cache.logstate.construct_framed_log_state_chains",
+        return_value=0,
+    ) as construct:
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
     assert construct.call_count == 1
@@ -990,7 +1062,7 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
 
     request = new_req(manager, input_ids, table_idx=1)
     batch = Batch(reqs=[request], phase="prefill")
-    with patch("logssms.cache.logstate.construct_framed_log_state_chains"):
+    with patch("logssms.cache.logstate.construct_framed_log_state_chains", return_value=0):
         manager.prepare_batch(batch)
 
     checkpoints = manager.tree.iter_entries()
@@ -1084,7 +1156,7 @@ def test_active_branch_recovery_anchor_survives_same_round_maintenance():
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
     assert branch.cached_len == 64
-    with patch("logssms.cache.logstate.construct_framed_log_state_chains"):
+    with patch("logssms.cache.logstate.construct_framed_log_state_chains", return_value=0):
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
     checkpoints = [

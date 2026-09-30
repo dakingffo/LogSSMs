@@ -83,83 +83,46 @@ def restore_framed_log_state_chains(
 
 
 def construct_framed_log_state_chains(
-    pool     : FramedMHALogStatePool,
-    chains   : Sequence[
+    pool  : FramedMHALogStatePool,
+    chains: Sequence[
         tuple[int | None, Sequence[tuple[int, int, int]], Sequence[Sequence[int]]]
     ],
     *,
-    wave_size: int = 8,
-    max_tasks: int = 8,
+    max_tasks: int | None = None,
 ) -> int:
     if not chains:
         return 0
-    assert wave_size > 0 and max_tasks > 0
+    if max_tasks is None:
+        max_tasks = torch.cuda.get_device_properties(pool.device).multi_processor_count
+    assert max_tasks > 0
     module = _construction_module(
         pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim
     )
-    layout = pool.layout
-    peak = 0
     for task_begin in range(0, len(chains), max_tasks):
         group = chains[task_begin:task_begin + max_tasks]
-        carry = torch.empty(
-            (len(group), layout.num_linear_layers, layout.num_value_heads,
-             layout.head_k_dim, layout.head_v_dim),
-            dtype=pool.dtype, device=pool.device,
-        )
-        carry_bytes = carry.numel() * carry.element_size()
-        peak = max(peak, carry_bytes)
-        for base, segments, outputs in group:
-            assert len(segments) == len(outputs)
-        max_segments = max(len(segments) for _base, segments, _outputs in group)
-        for wave_begin in range(0, max_segments, wave_size):
-            current = []
-            current_outputs = []
-            task_offsets = [0]
-            base_slots = []
-            for base, segments, outputs in group:
-                wave = segments[wave_begin:wave_begin + wave_size]
-                current.extend(wave)
-                current_outputs.extend(outputs[wave_begin:wave_begin + wave_size])
-                task_offsets.append(len(current))
-                base_slots.append(
-                    (-1 if base is None else base) if wave_begin == 0 else -2
-                )
-            count = len(current)
-            gamma = torch.empty(
-                (count, layout.num_linear_layers, layout.num_value_heads),
-                dtype=torch.float32, device=pool.device,
-            )
-            bias = torch.empty(
-                (count, layout.num_linear_layers, layout.num_value_heads,
-                 layout.head_k_dim, layout.head_v_dim),
-                dtype=torch.float32, device=pool.device,
-            )
-            output_offsets = [0]
-            output_slots = []
-            for values in current_outputs:
-                output_slots.extend(values)
+        segments = []
+        output_slots = []
+        task_offsets = [0]
+        output_offsets = [0]
+        for _base, logs, outputs in group:
+            assert len(logs) == len(outputs)
+            segments.extend(logs)
+            task_offsets.append(len(segments))
+            for slots in outputs:
+                output_slots.extend(slots)
                 output_offsets.append(len(output_slots))
-            call_cuda_ffi(module.construct,
-                *_construction_args(pool),
-                _vector(base_slots, pool.device),
-                _vector(task_offsets, pool.device),
-                _vector([slot for slot, _begin, _end in current], pool.device),
-                _vector([begin for _slot, begin, _end in current], pool.device),
-                _vector([end for _slot, _begin, end in current], pool.device),
-                _vector(output_offsets, pool.device),
-                _vector(output_slots, pool.device),
-                gamma,
-                bias,
-                carry,
-                *_construction_dims(pool),
-            )
-            peak = max(
-                peak,
-                carry_bytes
-                + gamma.numel() * gamma.element_size()
-                + bias.numel() * bias.element_size(),
-            )
-    return peak
+        call_cuda_ffi(module.construct,
+            *_construction_args(pool),
+            _vector([-1 if base is None else base for base, _logs, _outputs in group], pool.device),
+            _vector(task_offsets, pool.device),
+            _vector([slot for slot, _begin, _end in segments], pool.device),
+            _vector([begin for _slot, begin, _end in segments], pool.device),
+            _vector([end for _slot, _begin, end in segments], pool.device),
+            _vector(output_offsets, pool.device),
+            _vector(output_slots, pool.device),
+            *_construction_dims(pool),
+        )
+    return 0
 
 
 def store_framed_log_states(

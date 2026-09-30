@@ -147,9 +147,6 @@ public:
     const tvm::ffi::TensorView log_ends,
     const tvm::ffi::TensorView output_offsets,
     const tvm::ffi::TensorView output_slots,
-    const tvm::ffi::TensorView affine_gamma,
-    const tvm::ffi::TensorView affine_bias,
-    const tvm::ffi::TensorView carry_state,
     std::int64_t num_layers,
     std::int64_t num_heads,
     std::int64_t head_payload_bytes,
@@ -173,21 +170,6 @@ public:
     runtime_assert(log_begins.size(0) == num_segments);
     runtime_assert(log_ends.size(0) == num_segments);
     runtime_assert(output_offsets.size(0) == num_segments + 1);
-    TensorMatcher({num_segments, num_layers, num_heads})
-        .with_dtype<float>()
-        .with_device(views.device)
-        .verify(affine_gamma);
-    TensorMatcher({num_segments, num_layers, num_heads, head_k_dim, head_v_dim})
-        .with_dtype<float>()
-        .with_device(views.device)
-        .verify(affine_bias);
-    auto dtype = SymbolicDType{};
-    TensorMatcher({num_tasks, num_layers, num_heads, head_k_dim, head_v_dim})
-        .with_dtype(dtype)
-        .with_device(views.device)
-        .verify(carry_state);
-    runtime_assert(dtype.unwrap().bits == 16);
-    runtime_assert((dtype.unwrap().code == kDLBfloat) == is_bfloat16);
     if (num_tasks == 0 || num_segments == 0) {
       return;
     }
@@ -200,29 +182,17 @@ public:
     params.log_ends = static_cast<const std::int32_t *>(log_ends.data_ptr());
     params.output_offsets = static_cast<const std::int32_t *>(output_offsets.data_ptr());
     params.construction_output_slots = static_cast<const std::int32_t *>(output_slots.data_ptr());
-    params.affine_gamma = static_cast<float *>(affine_gamma.data_ptr());
-    params.affine_bias = static_cast<float *>(affine_bias.data_ptr());
-    params.carry_state = carry_state.data_ptr();
     params.num_tasks = num_tasks;
-    params.num_segments = num_segments;
-    params.num_outputs = output_slots.size(0);
-    const auto macro_tiles = div_ceil(head_k_dim, std::size_t{32})
-                           * div_ceil(head_v_dim, std::size_t{64});
-    const auto affine_blocks = num_segments * num_layers * num_heads * macro_tiles;
-    const auto scan_blocks = num_tasks * num_layers * num_heads * macro_tiles;
+    const auto blocks = num_tasks * num_layers * num_heads;
     if (is_bfloat16) {
-      LaunchKernel(affine_blocks, 256, views.device)(
-        build_page_affine_kernel<__nv_bfloat16, head_k_dim, head_v_dim>, params
-      );
-      LaunchKernel(scan_blocks, 256, views.device)(
-        scan_page_affine_kernel<__nv_bfloat16, head_k_dim, head_v_dim>, params
+      LaunchKernel(blocks, 256, views.device)(
+        construct_log_state_kernel<__nv_bfloat16, head_k_dim, head_v_dim>,
+        params
       );
     } else {
-      LaunchKernel(affine_blocks, 256, views.device)(
-        build_page_affine_kernel<__half, head_k_dim, head_v_dim>, params
-      );
-      LaunchKernel(scan_blocks, 256, views.device)(
-        scan_page_affine_kernel<__half, head_k_dim, head_v_dim>, params
+      LaunchKernel(blocks, 256, views.device)(
+        construct_log_state_kernel<__half, head_k_dim, head_v_dim>,
+        params
       );
     }
   }

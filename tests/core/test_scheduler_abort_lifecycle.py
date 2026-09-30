@@ -45,7 +45,8 @@ def test_abort_waits_for_submitted_forward_before_reusing_resources(
     )
     scheduler.profiler = SimpleNamespace(
         record_wait=lambda _phase: nullcontext(),
-        record_process=lambda _phase: nullcontext(),
+        record_process=lambda *_args: nullcontext(),
+        record_process_step=lambda *_args: nullcontext(),
     )
     scheduler.engine = SimpleNamespace(ctx=None)
     scheduler.send_result = lambda _reply: None
@@ -99,7 +100,8 @@ def test_finished_request_waits_for_overlapping_forward() -> None:
     scheduler.ar_manager = SimpleNamespace(process=lambda *_args: ([], [req]))
     scheduler.profiler = SimpleNamespace(
         record_wait=lambda _phase: nullcontext(),
-        record_process=lambda _phase: nullcontext(),
+        record_process=lambda *_args: nullcontext(),
+        record_process_step=lambda *_args: nullcontext(),
     )
     scheduler.engine = SimpleNamespace(ctx=None)
     scheduler.send_result = lambda _reply: None
@@ -134,7 +136,8 @@ def test_finished_requests_release_in_uid_order() -> None:
     )
     scheduler.profiler = SimpleNamespace(
         record_wait=lambda _phase: nullcontext(),
-        record_process=lambda _phase: nullcontext(),
+        record_process=lambda *_args: nullcontext(),
+        record_process_step=lambda *_args: nullcontext(),
     )
     scheduler.engine = SimpleNamespace(ctx=None)
     scheduler.send_result = lambda _reply: None

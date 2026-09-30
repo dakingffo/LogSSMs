@@ -1,9 +1,13 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
+from logssms.cache.logstate import LogStateCacheManager, PageMaterialize
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.prefix_cache.logstate import LogStateEntry, LogStateKind
 from logssms.kernel.linear_attention.framed_logstate import (
     construct_framed_log_state_chains,
     restore_framed_log_state_chains,
@@ -216,6 +220,69 @@ def test_framed_construct_keeps_carry_across_waves_per_chain():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shared_log_materialization_reconstructs_later_branches():
+    pool = FramedMHALogStatePool(
+        num_frames=128,
+        page_size=64,
+        granularity=16,
+        num_attention_layers=1,
+        num_kv_heads=1,
+        head_dim=64,
+        num_linear_layers=1,
+        num_key_heads=1,
+        num_value_heads=1,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_dim=64,
+        state_len=3,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+    allocated = pool.reserve(logs=7)
+    assert allocated is not None
+    slots = allocated[1]
+    entries = [
+        LogStateEntry(slots[0], LogStateKind.LOG, 0, 64),
+        *(
+            LogStateEntry(slot, LogStateKind.LOG, 64, 128)
+            for slot in slots[1:]
+        ),
+    ]
+    for index, slot in enumerate(slots):
+        log = pool.head_view(slot, 0, 0, state=False)
+        log[:64 * 32].fill_(0.01 * (index + 1))
+        log[64 * 32:].fill_(0.01)
+        pool.decay_view(slot)[0, :, 0].fill_(1)
+
+    plans = [PageMaterialize(slots[0], 0, 64, None, (entries[0],))]
+    plans.extend(
+        PageMaterialize(entry.slot, 64, 128, None, (entries[0], entry))
+        for entry in entries[1:]
+    )
+    chains = LogStateCacheManager._make_construction_chains((), plans)
+    waves = LogStateCacheManager._schedule_construction_waves(chains, plans)
+    assert [len(wave) for wave in waves] == [1, 5]
+    manager = SimpleNamespace(
+        _profile_enabled=False,
+        _make_construction_chains=LogStateCacheManager._make_construction_chains,
+        _schedule_construction_waves=LogStateCacheManager._schedule_construction_waves,
+        device=pool.device,
+        logstate_pool=pool,
+    )
+    LogStateCacheManager._construct(manager, (), plans)
+
+    for index, slot in enumerate(slots):
+        expected = 64 * 0.01 * 0.01
+        if index:
+            expected += 64 * 0.01 * (index + 1) * 0.01
+        torch.testing.assert_close(
+            pool.head_view(slot, 0, 0, state=True),
+            torch.full((32, 32), expected, device="cuda", dtype=torch.bfloat16),
+            rtol=5e-2, atol=1e-3,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_framed_decode_matches_recurrent_reference():
     torch.manual_seed(12)
     pool = FramedMHALogStatePool(
@@ -407,3 +474,99 @@ def test_framed_construct_restores_internal_branch_before_inplace_checkpoint():
             expected_at_64[head].to(torch.bfloat16),
             rtol=3e-2, atol=3e-2,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_framed_construct_splits_groups_at_sm_count():
+    tasks = torch.cuda.get_device_properties("cuda").multi_processor_count + 1
+    pool = FramedMHALogStatePool(
+        num_frames=tasks * 8 + 32,
+        page_size=64,
+        granularity=16,
+        num_attention_layers=1,
+        num_kv_heads=1,
+        head_dim=32,
+        num_linear_layers=1,
+        num_key_heads=1,
+        num_value_heads=1,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_dim=32,
+        state_len=3,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+    allocated = pool.reserve(logs=tasks, works=tasks)
+    assert allocated is not None
+    logs, works = allocated[1:]
+    for slot in logs:
+        log = pool.head_view(slot, 0, 0, state=False)
+        log[:64 * 32].fill_(0.01)
+        log[64 * 32:].fill_(0.01)
+        pool.decay_view(slot)[0, :, 0].fill_(1)
+    workspace = construct_framed_log_state_chains(
+        pool,
+        [(None, [(log, 0, 64)], [(work,)]) for log, work in zip(logs, works)],
+    )
+    assert workspace == 0
+    expected = torch.full((32, 32), 64 * 0.01 * 0.01,
+                          device="cuda", dtype=torch.bfloat16)
+    for slot in works:
+        torch.testing.assert_close(
+            pool.head_view(slot, 0, 0, state=True), expected,
+            rtol=5e-2, atol=1e-3,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_framed_construct_prefetches_partial_chunks(dtype: torch.dtype):
+    torch.manual_seed(41)
+    pool = FramedMHALogStatePool(
+        num_frames=64,
+        page_size=64,
+        granularity=16,
+        num_attention_layers=1,
+        num_kv_heads=1,
+        head_dim=32,
+        num_linear_layers=1,
+        num_key_heads=1,
+        num_value_heads=1,
+        head_k_dim=32,
+        head_v_dim=32,
+        conv_dim=32,
+        state_len=3,
+        device=torch.device("cuda"),
+        dtype=dtype,
+    )
+    allocated = pool.reserve(logs=1, works=1)
+    assert allocated is not None
+    log_slot, work_slot = allocated[1][0], allocated[2][0]
+    keys = (torch.randn((64, 32), device="cuda") * 0.01).to(dtype)
+    values = (torch.randn((64, 32), device="cuda") * 0.01).to(dtype)
+    decays = torch.empty((64,), device="cuda").uniform_(0.98, 0.999)
+    log = pool.head_view(log_slot, 0, 0, state=False)
+    log[:64 * 32].copy_(keys.flatten())
+    log[64 * 32:].copy_(values.flatten())
+    pool.decay_view(log_slot)[0, :, 0].copy_(decays)
+
+    expected = torch.zeros((32, 32), device="cuda")
+    for token in range(35):
+        expected *= decays[token]
+        expected += keys[token].float()[:, None] * values[token].float()[None, :]
+        if token == 8:
+            expected_at_9 = expected.clone()
+
+    construct_framed_log_state_chains(
+        pool,
+        [(None, [(log_slot, 0, 9), (log_slot, 9, 35)],
+          [(work_slot,), (log_slot,)])],
+    )
+    torch.testing.assert_close(
+        pool.head_view(work_slot, 0, 0, state=True),
+        expected_at_9.to(dtype), rtol=4e-2, atol=4e-2,
+    )
+    torch.testing.assert_close(
+        pool.head_view(log_slot, 0, 0, state=True),
+        expected.to(dtype), rtol=4e-2, atol=4e-2,
+    )

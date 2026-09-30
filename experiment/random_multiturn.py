@@ -313,6 +313,10 @@ def _parse_args(argv: list[str]):
         "--profile-only", action="store_true",
         help="skip the separate unprofiled timing run (diagnostics only)",
     )
+    parser.add_argument(
+        "--no-profile", action="store_true",
+        help="run only the unprofiled timing workload (cache hits are unmeasured)",
+    )
     bench, server_argv = parser.parse_known_args(argv)
 
     from logssms.server.args import parse_args
@@ -330,6 +334,8 @@ def _parse_args(argv: list[str]):
         parser.error("--shared-prefix-len must lie between 0 and --input-len")
     if any(c < 1 or c > bench.num_sessions for c in concurrencies):
         parser.error("concurrency must be between 1 and --num-sessions")
+    if bench.profile_only and bench.no_profile:
+        parser.error("--profile-only and --no-profile are mutually exclusive")
     if server_args.speculative_algorithm is not None:
         parser.error("random_multiturn currently supports AR only")
     max_input = bench.input_len + (bench.num_turns - 1) * (
@@ -412,34 +418,45 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 kill_server(proc)
 
-        profiled_stats, profiled_history = run_server(profile=True)
-        if not profiled_stats["chunks_ok"]:
-            raise RuntimeError("Profiled output token count differs from requested length")
-        cache = attach_cache_matches(profiled_history, profile_path)
-        profile_trace_path = run_dir / f"history-profile-c{concurrency}.json"
-        save_json(str(profile_trace_path), {"sessions": profiled_history})
+        profiled_history = None
+        cache = None
+        profile_trace_path = None
+        if not bench.no_profile:
+            profiled_stats, profiled_history = run_server(profile=True)
+            if not profiled_stats["chunks_ok"]:
+                raise RuntimeError("Profiled output token count differs from requested length")
+            cache = attach_cache_matches(profiled_history, profile_path)
+            profile_trace_path = run_dir / f"history-profile-c{concurrency}.json"
+            save_json(str(profile_trace_path), {"sessions": profiled_history})
 
         if bench.profile_only:
+            assert profiled_history is not None
             stats, history = profiled_stats, profiled_history
         else:
             stats, history = run_server(profile=False)
             if not stats["chunks_ok"]:
                 raise RuntimeError("Unprofiled output token count differs from requested length")
-        same_trace = input_trace_digest(history) == input_trace_digest(profiled_history)
+        same_trace = (
+            input_trace_digest(history) == input_trace_digest(profiled_history)
+            if profiled_history is not None else None
+        )
         stats["cache"] = cache
         stats["profiled_timing"] = bench.profile_only
         stats["profile_vs_timing_input_equal"] = same_trace
         stats["profile_vs_timing_output_equal"] = (
             output_trace_digest(history) == output_trace_digest(profiled_history)
+            if profiled_history is not None else None
         )
         trace_path = run_dir / f"history-c{concurrency}.json"
         save_json(str(trace_path), {"sessions": history})
         stats["history_path"] = str(trace_path)
-        stats["profile_history_path"] = str(profile_trace_path)
-        stats["profile_path"] = str(profile_path)
+        stats["profile_history_path"] = (
+            str(profile_trace_path) if profile_trace_path is not None else None
+        )
+        stats["profile_path"] = str(profile_path) if profiled_history is not None else None
         stats["input_trace_sha256"] = input_trace_digest(history)
         stats["output_trace_sha256"] = output_trace_digest(history)
-        if not same_trace:
+        if same_trace is False:
             print(
                 "WARNING: profiled and unprofiled runs generated different input "
                 "traces; cache-match figures are not paired with the timing run",
@@ -451,12 +468,14 @@ def main(argv: list[str] | None = None) -> int:
             f"random_multiturn tp={server_args.tp_info.size} "
             f"c={concurrency} turns={bench.num_turns}", stats,
         )
-        cache = stats["cache"]
-        print(
-            f"  reusable: {cache['expected_reusable_tokens']} tok; "
-            f"tree match: {cache['tree_match_fraction']:.1%}; "
-            f"admitted: {cache['admitted_hit_fraction']:.1%}"
-        )
+        if cache is not None:
+            print(
+                f"  reusable: {cache['expected_reusable_tokens']} tok; "
+                f"tree match: {cache['tree_match_fraction']:.1%}; "
+                f"admitted: {cache['admitted_hit_fraction']:.1%}"
+            )
+        else:
+            print("  cache hits: unmeasured (--no-profile)")
     print(f"Results: {run_dir}")
     return 0
 

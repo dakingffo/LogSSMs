@@ -98,6 +98,27 @@ def test_framed_work_state_and_conv_roundtrip():
     torch.testing.assert_close(pool.read_conv(slots, granules, 1), conv)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_copy_conv_snapshot_copies_all_layers(device: str):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    pool = make_pool(torch.device(device))
+    allocated = pool.reserve(logs=1, works=1)
+    assert allocated is not None
+    source, destination = allocated[1][0], allocated[2][0]
+    expected = torch.arange(
+        pool.layout.num_linear_layers * pool.layout.conv_dim * pool.layout.state_len,
+        dtype=pool.dtype, device=device,
+    ).view(pool.layout.num_linear_layers, pool.layout.conv_dim, pool.layout.state_len)
+    pool.conv_view(source, 2).copy_(expected)
+    pool.conv_view(destination, 0).fill_(-1)
+
+    pool.copy_conv_snapshot(source, 2, destination)
+
+    torch.testing.assert_close(pool.conv_view(destination, 0), expected)
+    torch.testing.assert_close(pool.conv_view(source, 2), expected)
+
+
 def test_batch_zero_work_slots_does_not_clear_log_or_descriptors():
     pool = make_pool()
     allocated = pool.reserve(logs=1, works=2)

@@ -296,6 +296,17 @@ class FramedMHALogStatePool:
             self._conv_indices(slots, granules, layer)
         ] = values.to(self.dtype).flatten(1)
 
+    def copy_conv_snapshot(
+        self,
+        source_slot    : int,
+        source_granule : int,
+        output_slot    : int,
+        output_granule : int = 0,
+    ) -> None:
+        self.conv_view(output_slot, output_granule).copy_(
+            self.conv_view(source_slot, source_granule)
+        )
+
     def zero_work_conv(self, slot: int) -> None:
         slots = torch.tensor([slot], dtype=torch.int64, device=self.device)
         granules = torch.zeros(1, dtype=torch.int64, device=self.device)

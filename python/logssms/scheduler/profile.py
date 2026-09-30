@@ -115,6 +115,11 @@ class SchedulerProfiler:
             str, torch.cuda.Event, torch.cuda.Event, dict | None,
         ]] = []
         self.prefill_forward_batches: list[dict] = []
+        self.prefill_process_batches: list[dict] = []
+        self.process_stage_ns = {
+            phase: Counter() for phase in ("prefill", "decode", "verify")
+        }
+        self._current_process_sample: dict | None = None
         self.schedule_ns = 0
 
     @contextmanager
@@ -223,7 +228,30 @@ class SchedulerProfiler:
 
     @contextmanager
     @nvtx_annotate("Scheduler::process_output")
-    def record_process(self, phase: str):
+    def record_process(self, phase: str, batch: Batch | None = None):
+        if not self.enabled:
+            yield
+            return
+        sample = None
+        if phase == "prefill" and batch is not None:
+            sample = {
+                "request_tags": [req.profile_tag for req in batch.reqs],
+                "batch_size": batch.size,
+            }
+            self._current_process_sample = sample
+        tic = perf_counter_ns()
+        try:
+            yield
+        finally:
+            elapsed_ns = perf_counter_ns() - tic
+            self.phases[phase].process_ns += elapsed_ns
+            if sample is not None:
+                sample["total_ms"] = elapsed_ns / 1e6
+                self.prefill_process_batches.append(sample)
+                self._current_process_sample = None
+
+    @contextmanager
+    def record_process_step(self, phase: str, name: str):
         if not self.enabled:
             yield
             return
@@ -231,7 +259,10 @@ class SchedulerProfiler:
         try:
             yield
         finally:
-            self.phases[phase].process_ns += perf_counter_ns() - tic
+            elapsed_ns = perf_counter_ns() - tic
+            self.process_stage_ns[phase][name] += elapsed_ns
+            if self._current_process_sample is not None:
+                self._current_process_sample[name + "_ms"] = elapsed_ns / 1e6
 
     def record_ar_no_batch(self) -> None:
         if self.enabled:
@@ -271,6 +302,11 @@ class SchedulerProfiler:
                 phase: profile.as_dict() for phase, profile in self.phases.items()
             },
             "prefill_forward_batches": self.prefill_forward_batches,
+            "prefill_process_batches": self.prefill_process_batches,
+            "process_stages_ms": {
+                phase: {name: elapsed / 1e6 for name, elapsed in stages.items()}
+                for phase, stages in self.process_stage_ns.items()
+            },
         }
         cache = self.cache_manager.profile_result()
         if cache is not None:

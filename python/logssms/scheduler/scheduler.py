@@ -148,30 +148,34 @@ class Scheduler(SchedulerIOMixin):
         with self.profiler.record_wait(last_input.batch.phase):
             last_output.copy_done_event.synchronize()
 
-        with self.profiler.record_process(last_input.batch.phase):
-            reply, finished_reqs = self.ar_manager.process(
-                self.engine.ctx, last_input, last_output
-            )
-            self.send_result(reply)
-            # finished_reqs is a set of identity-hashed Requests. TP ranks must
-            # release them in the same order to keep cache allocation aligned.
-            for req in sorted(finished_reqs, key=lambda req: req.uid):
-                if ongoing_data is not None and any(
-                    candidate is req for candidate in ongoing_data[0].batch.reqs
-                ):
-                    # The next forward was submitted before this result was
-                    # processed. Its graph can still access this request's frames.
-                    self._deferred_req_frees.append((ongoing_data[1], req, False))
-                else:
-                    self._free_req_resources(req)
+        phase = last_input.batch.phase
+        with self.profiler.record_process(phase, last_input.batch):
+            with self.profiler.record_process_step(phase, "ar_process"):
+                reply, finished_reqs = self.ar_manager.process(
+                    self.engine.ctx, last_input, last_output
+                )
+            with self.profiler.record_process_step(phase, "send_result"):
+                self.send_result(reply)
+            with self.profiler.record_process_step(phase, "release"):
+                # finished_reqs is a set of identity-hashed Requests. TP ranks must
+                # release them in the same order to keep cache allocation aligned.
+                for req in sorted(finished_reqs, key=lambda req: req.uid):
+                    if ongoing_data is not None and any(
+                        candidate is req for candidate in ongoing_data[0].batch.reqs
+                    ):
+                        # The next forward was submitted before this result was
+                        # processed. Its graph can still access this request's frames.
+                        self._deferred_req_frees.append((ongoing_data[1], req, False))
+                    else:
+                        self._free_req_resources(req)
 
-            remaining = []
-            for output, req, inflight in self._deferred_req_frees:
-                if output is last_output:
-                    self._free_req_resources(req, inflight)
-                else:
-                    remaining.append((output, req, inflight))
-            self._deferred_req_frees = remaining
+                remaining = []
+                for output, req, inflight in self._deferred_req_frees:
+                    if output is last_output:
+                        self._free_req_resources(req, inflight)
+                    else:
+                        remaining.append((output, req, inflight))
+                self._deferred_req_frees = remaining
 
     def _process_one_msg(
         self,
