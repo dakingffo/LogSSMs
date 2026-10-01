@@ -18,11 +18,12 @@ from logssms.layers import (
     VocabParallelEmbedding,
 )
 from logssms.speculator.hidden_captor import HiddenCapturePoint, with_speculator
-from logssms.utils import nvtx_annotate
+from logssms.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
 from .config import (
     ModelConfig,
+    AffineLogCacheSpec,
     make_common_config_kwargs,
     make_moe_config_kwargs,
     unwrap_text_config,
@@ -62,6 +63,18 @@ class Qwen3NextConfig(ModelConfig):
     @property
     def num_linear_layers(self) -> int:
         return sum(layer_type == "linear_attention" for layer_type in self.layer_types)
+
+    def make_linear_cache_spec(self, tp_size: int) -> AffineLogCacheSpec:
+        key_heads = div_even(self.linear_num_key_heads, tp_size)
+        value_heads = div_even(self.linear_num_value_heads, tp_size)
+        conv_dim = key_heads * self.linear_key_head_dim * 2 + value_heads * self.linear_value_head_dim
+        return AffineLogCacheSpec(
+            recurrent_type="gdn",
+            num_layers=self.num_linear_layers,
+            state_shape=(value_heads, self.linear_key_head_dim, self.linear_value_head_dim),
+            conv_shape=(conv_dim, self.linear_conv_kernel_dim - 1),
+            num_groups=key_heads,
+        )
 
     def use_moe(self, layer_id: int) -> bool:
         return (

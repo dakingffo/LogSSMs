@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from tests.logstate_helpers import head_view
 from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import LogStateLinearAttentionBackend
@@ -386,7 +387,7 @@ def test_decode_direct_logstate_store_matches_temporary_outputs(block_v: int) ->
     torch.testing.assert_close(actual_state[2], expected_state[2, 0])
     for row, (slot, offset) in enumerate(zip(log_slots.tolist(), offsets.tolist())):
         for head in range(2):
-            log = pool.head_view(slot, 1, head, state=False)
+            log = head_view(pool, slot, 1, head, state=False)
             torch.testing.assert_close(log[offset * 32:(offset + 1) * 32], expected_key[row, 0, head])
             value_offset = 64 * 32 + offset * 32
             torch.testing.assert_close(log[value_offset:value_offset + 32], expected_value[row, 0, head])
@@ -544,7 +545,7 @@ def test_gemm_replay_matches_eager_window(granularity: int) -> None:
                 beta[:, step:step + 1].contiguous(),
                 A_log, dt_bias, pool, work, logs,
                 torch.full((batch_size,), step, device=device, dtype=torch.int32),
-                0, torch.full((batch_size,), step, device=device, dtype=torch.int32),
+                0, torch.full((batch_size,), step % 16, device=device, dtype=torch.int32),
                 enable_eager_state=mode == "eager",
             )
             outputs.append(output)
@@ -663,7 +664,7 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
     state = torch.zeros(2, 32, 32, device=device)
     for token in range(32):
         for head in range(2):
-            log = pool.head_view(0, 0, head, state=False)
+            log = head_view(pool, 0, 0, head, state=False)
             key = log[token * 32:(token + 1) * 32].float()
             value_begin = 64 * 32 + token * 32
             value = log[value_begin:value_begin + 32].float()

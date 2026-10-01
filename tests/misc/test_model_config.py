@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from logssms.models import make_model_config
 from logssms.models.qwen3 import Qwen3Config, Qwen3MoeConfig
 from logssms.models.qwen3_next import Qwen3_5Config, Qwen3_5MoeConfig, Qwen3NextConfig
@@ -101,6 +104,27 @@ def test_make_qwen3_5_moe_config():
     assert config.is_moe
     assert config.use_moe(0)
     assert config.num_experts == 16
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_qwen_cache_spec_preserves_local_shapes_and_storage(tp_size):
+    top, _ = _hybrid_config("Qwen3_5ForConditionalGeneration")
+    config = make_model_config(top)
+    spec = config.make_linear_cache_spec(tp_size)
+    key_heads = 4 // tp_size
+    value_heads = 8 // tp_size
+    conv_dim = 2 * key_heads * 64 + value_heads * 64
+
+    assert spec.recurrent_type == "gdn"
+    assert spec.num_layers == config.num_linear_layers
+    assert spec.num_groups == key_heads
+    assert spec.state_shape == (value_heads, 64, 64)
+    assert spec.conv_shape == (conv_dim, 3)
+    assert spec.slot_bytes(torch.bfloat16.itemsize) == 2 * (conv_dim * 3 + value_heads * 64 * 64) * 2
+
+
+def test_dense_model_has_no_linear_cache_spec():
+    assert make_model_config(_config()).make_linear_cache_spec(1) is None
 
 
 def test_make_qwen3_next_config():

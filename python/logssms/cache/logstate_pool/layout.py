@@ -7,7 +7,6 @@ import torch
 
 LOG_STATE_GRANULARITY = 32
 LOG_STATE_REPLAY_WINDOW = 16
-DEFAULT_LOG_STATE_PAGE_SIZE = 64
 
 
 @dataclass(frozen=True)

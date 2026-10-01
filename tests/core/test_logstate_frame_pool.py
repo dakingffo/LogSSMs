@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from tests.logstate_helpers import head_view
 
 
 def make_pool(device: torch.device | None = None) -> FramedMHALogStatePool:
@@ -197,9 +198,9 @@ def test_head_overlay_and_side_views_survive_noncontiguous_allocation():
     allocated = pool.reserve(logs=1)
     assert allocated is not None
     slot = allocated[1][0]
-    log_head = pool.head_view(slot, 1, 0, state=False)
+    log_head = head_view(pool, slot, 1, 0, state=False)
     log_head[0] = 7
-    assert pool.head_view(slot, 1, 0, state=True)[0, 0] == 7
+    assert head_view(pool, slot, 1, 0, state=True)[0, 0] == 7
     pool.conv_view(slot, 3).fill_(5)
     assert torch.all(pool.conv_view(slot, 3) == 5)
     pool.decay_view(slot).fill_(0.75)
@@ -217,9 +218,9 @@ def test_cuda_frame_descriptors_and_kv_views():
     frame = allocated[0][0]
     slot = allocated[1][0]
     pool.k_cache(0)[frame * 4 + 2].fill_(3)
-    pool.head_view(slot, 0, 0, state=False).fill_(4)
+    head_view(pool, slot, 0, 0, state=False).fill_(4)
     assert torch.all(pool.k_cache(0)[frame * 4 + 2] == 3)
-    assert torch.all(pool.head_view(slot, 0, 0, state=True) == 4)
+    assert torch.all(head_view(pool, slot, 0, 0, state=True) == 4)
     torch.testing.assert_close(
         pool.payload_frame_table[slot],
         torch.tensor(pool.allocator.slot(slot).payload, dtype=torch.int32, device="cuda"),
@@ -276,7 +277,7 @@ def test_cuda_store_framed_log_updates_payload_and_decay():
         torch.tensor([17], dtype=torch.int32, device="cuda"),
         keys, values, decays, 1,
     )
-    head = pool.head_view(slot, 1, 0, state=False)
+    head = head_view(pool, slot, 1, 0, state=False)
     key_size = pool.layout.head_log_key_bytes // pool.dtype.itemsize
     assert torch.all(head[17 * 32:18 * 32] == 3)
     assert torch.all(head[key_size + 17 * 32:key_size + 18 * 32] == 5)
@@ -318,7 +319,7 @@ def test_cuda_store_qwen35_2b_layout_across_payload_frames():
         torch.tensor([63], dtype=torch.int32, device="cuda"),
         keys, values, decays, 17,
     )
-    head = pool.head_view(slot, 17, 15, state=False)
+    head = head_view(pool, slot, 17, 15, state=False)
     assert torch.all(head[63 * 128:64 * 128] == 3)
     assert torch.all(head[64 * 128 + 63 * 128:] == 5)
     assert torch.all(pool.decay_view(slot)[17, 63] == 0.75)

@@ -4,15 +4,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import os
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Sequence, TypeAlias
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
 from logssms.core import Request
 
 from .kv_pool.base import BaseKVCachePool
-from .logstate_pool.frame_pool import FramedMHALogStatePool
-from .linear_pool.state_pool import LinearStatePool
+from .linear_pool.base import LinearCachePool
 from .prefix_cache.base import BaseCacheHandle, BasePrefixCache, MatchResult
 
 if TYPE_CHECKING:
@@ -21,12 +20,9 @@ if TYPE_CHECKING:
     from logssms.scheduler.prefill import PendingRequest
 
 
-LinearCachePool: TypeAlias = LinearStatePool | FramedMHALogStatePool
-
-
 @dataclass
 class CacheResources:
-    kv_pool         : BaseKVCachePool | FramedMHALogStatePool
+    kv_pool         : BaseKVCachePool
     page_table      : torch.Tensor
     linear_state    : LinearCachePool | None
     state_table     : torch.Tensor | None
@@ -79,11 +75,6 @@ class BaseCacheManager(ABC):
     @property
     def linear_pool(self) -> LinearCachePool | None:
         return self.resources.linear_state
-
-    @property
-    def state_pool(self) -> LinearCachePool | None:
-        # Compatibility name used by the standard checkpoint manager.
-        return self.linear_pool
 
     def match_req(self, req: PendingRequest) -> MatchResult:
         input_len = req.input_len

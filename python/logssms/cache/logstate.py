@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import math
 import os
+import bisect
+import sys
 from bisect import bisect_right
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from time import perf_counter_ns
 from typing import TYPE_CHECKING, Sequence
 
 import torch
 
 from logssms.core import Request
-from logssms.kernel.linear_attention.framed_logstate import (
-    construct_framed_log_state_chains,
-    restore_framed_log_state_chains,
-)
 from logssms.utils import align_ceil, align_down, div_ceil, init_logger
 
 from .base import BaseCacheManager, CacheResources
@@ -27,7 +24,6 @@ from .logstate_pool.layout import (
     LogStateSlotLayout,
 )
 from .logstate_pool.frame_pool import FramedMHALogStatePool
-from .logstate_recycle import LogStateRecycleBin, RecycledMatch
 from .prefix_cache.base import BaseCacheHandle, MatchResult
 from .prefix_cache.logstate import (
     LogStateCacheHandle,
@@ -44,11 +40,169 @@ if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.engine import EngineConfig
     from logssms.message import UserMsg
+    from logssms.models.config import AffineLogCacheSpec
     from logssms.scheduler.prefill import PendingRequest
     from logssms.speculator import SpeculatorReserve
 
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class RecycledEntry:
+    kind      : LogStateKind
+    begin     : int
+    end       : int
+    span_pages: int | None
+
+
+@dataclass(frozen=True)
+class RecycledBranch:
+    tokens            : tuple[int, ...]
+    entries           : tuple[RecycledEntry, ...]
+    protected_endpoints: frozenset[int]
+
+    @property
+    def bytes(self) -> int:
+        return (
+            sys.getsizeof(self) + sys.getsizeof(self.tokens)
+            + sum(sys.getsizeof(token) for token in self.tokens)
+            + sys.getsizeof(self.entries)
+            + sum(
+                sys.getsizeof(entry)
+                + sys.getsizeof(entry.begin) + sys.getsizeof(entry.end)
+                + sys.getsizeof(entry.span_pages)
+                for entry in self.entries
+            )
+            + sys.getsizeof(self.protected_endpoints)
+            + sum(sys.getsizeof(position) for position in self.protected_endpoints)
+            + 80  # OrderedDict node and sorted-index pointer
+        )
+
+
+@dataclass(frozen=True)
+class RecycledMatch:
+    branch     : RecycledBranch
+    matched_len: int
+
+
+class LogStateRecycleBin:
+    """Bounded CPU-only prefix/layout history; never owns device buffers."""
+
+    def __init__(self, capacity_bytes: int) -> None:
+        assert capacity_bytes >= 0
+        self.capacity_bytes = capacity_bytes
+        self.used_bytes = 0
+        self._branches: OrderedDict[tuple[int, ...], RecycledBranch] = OrderedDict()
+        self._sorted_keys: list[tuple[int, ...]] = []
+
+    def _remove_key(self, key: tuple[int, ...]) -> None:
+        index = bisect.bisect_left(self._sorted_keys, key)
+        assert self._sorted_keys[index] == key
+        self._sorted_keys.pop(index)
+
+    def remember(self, tree: LogRadixTree, node: LogRadixTreeNode) -> None:
+        if self.capacity_bytes == 0:
+            return
+        path = tree.path(node)
+        branch = RecycledBranch(
+            tokens=tuple(token for part in path for token in part.key.tolist()),
+            entries=tuple(
+                RecycledEntry(entry.kind, entry.begin, entry.end, entry.span_pages)
+                for part in path for entry in part.entries
+            ),
+            protected_endpoints=frozenset(
+                part.depth for part in path if part.is_protected
+            ),
+        )
+        # A previously evicted child may survive while its still-resident
+        # ancestor is materialized or merged.  Once that ancestor is evicted,
+        # refresh the copied prefix of every descendant record; otherwise a
+        # later ghost hit could resurrect the ancestor's obsolete layout.
+        prefix_len = len(branch.tokens)
+        index = bisect.bisect_left(self._sorted_keys, branch.tokens)
+        while index < len(self._sorted_keys):
+            key = self._sorted_keys[index]
+            if key[:prefix_len] != branch.tokens:
+                break
+            if len(key) == prefix_len:
+                index += 1
+                continue
+            previous = self._branches[key]
+            if any(
+                entry.begin < prefix_len < entry.end
+                for entry in previous.entries
+            ):
+                # A checkpoint spanning the cut cannot be reconciled with a
+                # newly changed ancestor without recomputing its whole span.
+                del self._branches[key]
+                self.used_bytes -= previous.bytes
+                self._sorted_keys.pop(index)
+                continue
+            updated = RecycledBranch(
+                tokens=key,
+                entries=branch.entries + tuple(
+                    entry for entry in previous.entries
+                    if entry.end > prefix_len
+                ),
+                protected_endpoints=(
+                    branch.protected_endpoints
+                    | frozenset(position for position in previous.protected_endpoints
+                                if position > prefix_len)
+                ),
+            )
+            self._branches[key] = updated
+            self.used_bytes += updated.bytes - previous.bytes
+            index += 1
+        if branch.bytes > self.capacity_bytes:
+            while self.used_bytes > self.capacity_bytes:
+                _key, forgotten = self._branches.popitem(last=False)
+                self._remove_key(_key)
+                self.used_bytes -= forgotten.bytes
+            return
+        old = self._branches.pop(branch.tokens, None)
+        if old is not None:
+            self.used_bytes -= old.bytes
+        else:
+            bisect.insort(self._sorted_keys, branch.tokens)
+        self._branches[branch.tokens] = branch
+        self.used_bytes += branch.bytes
+        while self.used_bytes > self.capacity_bytes:
+            _key, forgotten = self._branches.popitem(last=False)
+            self._remove_key(_key)
+            self.used_bytes -= forgotten.bytes
+
+    def match(self, tokens: torch.Tensor, *, start: int, granularity: int) -> RecycledMatch | None:
+        assert tokens.device.type == "cpu"
+        best: RecycledMatch | None = None
+        values = tuple(tokens.tolist())
+        index = bisect.bisect_left(self._sorted_keys, values)
+        candidates = self._sorted_keys[max(0, index - 1):index + 1]
+        for key in candidates:
+            branch = self._branches[key]
+            limit = min(len(key), len(values))
+            if limit <= start:
+                continue
+            matched = 0
+            for left, right in zip(key[:limit], values[:limit], strict=True):
+                if left != right:
+                    break
+                matched += 1
+            matched = matched // granularity * granularity
+            if matched > start and (best is None or matched > best.matched_len):
+                best = RecycledMatch(branch, matched)
+        if best is not None:
+            self._branches.move_to_end(best.branch.tokens)
+        return best
+
+    def discard(self, branch: RecycledBranch) -> None:
+        if self._branches.get(branch.tokens) is branch:
+            del self._branches[branch.tokens]
+            self.used_bytes -= branch.bytes
+            self._remove_key(branch.tokens)
+
+    def __len__(self) -> int:
+        return len(self._branches)
 
 
 class LogStateCapacityError(RuntimeError):
@@ -57,16 +211,10 @@ class LogStateCapacityError(RuntimeError):
 
 @dataclass(frozen=True)
 class LogStateCachePlan(CachePlan):
+    linear_spec       : AffineLogCacheSpec
     num_states        : int
     num_work_states   : int
-    cache_per_page    : int
-    cache_per_log_slot: int
     state_units       : int
-
-
-class WorkStateRestoreMode(Enum):
-    LOG_REPLAY = "log_replay"
-    PREFILL = "prefill"
 
 
 @dataclass(frozen=True)
@@ -142,31 +290,12 @@ class BranchProtection:
 
 
 @dataclass(frozen=True)
-class WorkStateRestore:
-    request_indices     : tuple[int, ...]
-    position            : int
-    replay_end          : int
-    mode                : WorkStateRestoreMode
-    base_checkpoint_slot: int | None
-    logs                : tuple[LogStateEntry, ...]
-
-    @property
-    def log_slots(self) -> tuple[int, ...]:
-        return tuple(entry.slot for entry in self.logs)
-
-
-@dataclass(frozen=True)
 class PageMaterialize:
     log_slot            : int
     begin               : int
     end                 : int
     base_checkpoint_slot: int | None
     replay_logs         : tuple[LogStateEntry, ...]
-
-    @property
-    def replay_log_slots(self) -> tuple[int, ...]:
-        return tuple(entry.slot for entry in self.replay_logs)
-
 
 @dataclass(frozen=True)
 class CheckpointCoalesce:
@@ -187,9 +316,7 @@ class CheckpointCoalesce:
 
 @dataclass(frozen=True)
 class LogStatePlan:
-    tree_revision    : int
     protections      : tuple[BranchProtection, ...]
-    restores         : tuple[WorkStateRestore, ...]
     materialize      : tuple[PageMaterialize, ...]
     coalesce         : tuple[CheckpointCoalesce, ...]
     merge_diagnostics: tuple[tuple[str, int], ...] = ()
@@ -214,7 +341,6 @@ class _BatchPrefixNode:
 @dataclass(frozen=True)
 class _PendingProtection:
     request_indices: tuple[int, ...]
-    request_index  : int
     position       : int
     trace          : LogRadixTrace
 
@@ -403,11 +529,6 @@ class OnlineAnalysisScheduler:
                     log_slot=None if entry is None else entry.slot,
                     node=node,
                 ))
-        restores = tuple(
-            restore
-            for value in pending
-            if (restore := self._plan_work_state_restore(tree, value)) is not None
-        )
         if step_timing_ms is not None:
             step_timing_ms["protection_and_restore_plan_ms"] = (
                 perf_counter_ns() - step_start
@@ -436,9 +557,7 @@ class OnlineAnalysisScheduler:
                 perf_counter_ns() - step_start
             ) / 1e6
         return LogStatePlan(
-            tree_revision=tree.revision,
             protections=tuple(protections),
-            restores=restores,
             materialize=materialize,
             coalesce=coalesce,
             merge_diagnostics=(
@@ -528,7 +647,6 @@ class OnlineAnalysisScheduler:
             pending.append(
                 _PendingProtection(
                     request_indices=tuple(sorted(request_indices)),
-                    request_index=request_index,
                     position=position,
                     trace=trace,
                 )
@@ -565,41 +683,6 @@ class OnlineAnalysisScheduler:
             for key, child in node.children.items():
                 stack.append((child, prefix + key))
         return branches
-
-    def _plan_work_state_restore(
-        self,
-        tree   : LogRadixTree,
-        pending: _PendingProtection,
-    ) -> WorkStateRestore | None:
-        entries = self._entries_for_trace(tree, pending.trace)
-        checkpoints = [
-            entry
-            for entry in entries
-            if entry.kind is LogStateKind.CHECKPOINT
-            and entry.end <= pending.position
-        ]
-        exact = [entry for entry in checkpoints if entry.end == pending.position]
-        if exact:
-            return None
-
-        base = max(checkpoints, key=lambda entry: entry.end, default=None)
-        base_end = 0 if base is None else base.end
-        logs, covered_end = self._cover_with_logs(
-            entries, base_end, pending.position
-        )
-        mode = (
-            WorkStateRestoreMode.LOG_REPLAY
-            if covered_end == pending.position
-            else WorkStateRestoreMode.PREFILL
-        )
-        return WorkStateRestore(
-            request_indices=pending.request_indices,
-            position=pending.position,
-            replay_end=covered_end,
-            mode=mode,
-            base_checkpoint_slot=None if base is None else base.slot,
-            logs=tuple(logs),
-        )
 
     def _plan_materialize(
         self,
@@ -1044,7 +1127,7 @@ class OnlineAnalysisScheduler:
         tree   : LogRadixTree,
         pending: _PendingProtection,
     ) -> LogStateEntry | None:
-        entries = self._entries_for_trace(tree, pending.trace)
+        entries = self._entries_for_node(tree, pending.trace.node)
         candidates = [
             entry
             for entry in entries
@@ -1055,13 +1138,6 @@ class OnlineAnalysisScheduler:
         if not candidates:
             return None
         return min(candidates, key=lambda entry: entry.end - entry.begin)
-
-    def _entries_for_trace(
-        self,
-        tree : LogRadixTree,
-        trace: LogRadixTrace,
-    ) -> list[LogStateEntry]:
-        return self._entries_for_node(tree, trace.node)
 
     def _entries_for_node(
         self,
@@ -1151,21 +1227,13 @@ class LogStateCacheManager(BaseCacheManager):
             max_merge_intensity=max_merge_intensity,
             default_merge_growth_rate=default_merge_growth_rate,
         )
-        self.state_units = (
-            pool.allocator.payload_frames
-            + pool.layout.num_granules * pool.allocator.conv_frames
-            + 1
-        )
-        self.kv_units_per_page = 1
         self._allocator = pool.allocator
-        self.enable_memorized_evict = enable_memorized_evict
         self.recycle_bin = (
             LogStateRecycleBin(64 * 1024 * 1024)
             if enable_memorized_evict else None
         )
         self.num_pages = num_pages
         self.num_states = num_states
-        self.num_work_states = num_work_states
         self._work_slots: dict[int, int] = {}
         self._work_committed_pos: dict[int, int] = {}
         self._recycle_matches: dict[int, RecycledMatch] = {}
@@ -2807,7 +2875,7 @@ class LogStateCacheManager(BaseCacheManager):
                 material_chains = [chain for chain in wave if chain.materialize]
                 if restore_chains:
                     step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-                    restore_framed_log_state_chains(
+                    pool.kernels.restore(
                         pool,
                         [
                             (
@@ -2831,7 +2899,7 @@ class LogStateCacheManager(BaseCacheManager):
                     step_start = perf_counter_ns() if submit_timing_ms is not None else 0
                     construction["workspace_bytes"] = max(
                         construction["workspace_bytes"],
-                        construct_framed_log_state_chains(
+                        pool.kernels.construct(
                             pool,
                             [
                                 (
@@ -2868,9 +2936,6 @@ class LogStateCacheManager(BaseCacheManager):
 
         step_start = perf_counter_ns() if submit_timing_ms is not None else 0
         if conv_restores:
-            from logssms.kernel.linear_attention.conv_copy import (
-                copy_framed_conv_snapshots,
-            )
             source_slots = tensor([
                 task.source_conv_slot for task in conv_restores
             ])
@@ -2883,7 +2948,7 @@ class LogStateCacheManager(BaseCacheManager):
             output_granules = tensor([
                 task.output_conv_granule for task in conv_restores
             ])
-            copy_framed_conv_snapshots(
+            pool.kernels.copy_conv(
                 pool, source_slots, source_granules,
                 output_slots, output_granules,
             )
@@ -3283,23 +3348,24 @@ class LogStateCacheFactory(BaseCacheFactory):
             * config.dtype.itemsize
             * config.model_config.num_attention_layers
         )
-        model = config.model_config
-        from .pools import local_linear_head_counts
-        num_k_heads, num_v_heads = local_linear_head_counts(model)
-        conv_dim = (
-            num_k_heads * model.linear_key_head_dim * 2
-            + num_v_heads * model.linear_value_head_dim
-        )
+        from logssms.models.config import AffineLogCacheSpec
+        from .pools import make_linear_cache_spec
+
+        spec = make_linear_cache_spec(config.model_config)
+        if not isinstance(spec, AffineLogCacheSpec):
+            raise NotImplementedError(f"LogState storage for {spec.recurrent_type} is not implemented.")
+        num_v_heads, head_k_dim, head_v_dim = spec.state_shape
+        conv_dim, state_len = spec.conv_shape
         layout = LogStateSlotLayout(
             page_size=config.page_size,
             granularity=config.cache_config.granularity,
-            num_linear_layers=model.num_linear_layers,
-            num_key_heads=num_k_heads,
+            num_linear_layers=spec.num_layers,
+            num_key_heads=spec.num_groups,
             num_value_heads=num_v_heads,
-            head_k_dim=model.linear_key_head_dim,
-            head_v_dim=model.linear_value_head_dim,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
             conv_dim=conv_dim,
-            state_len=model.linear_conv_kernel_dim - 1,
+            state_len=state_len,
             dtype=config.dtype,
         )
         num_work_states = config.max_running_req + 1
@@ -3308,7 +3374,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             layout.head_recurrent_state_bytes,
         )
         payload_frames = div_ceil(
-            model.num_linear_layers * num_v_heads * head_bytes,
+            spec.num_layers * num_v_heads * head_bytes,
             cache_per_page,
         )
         conv_frames = div_ceil(
@@ -3316,9 +3382,6 @@ class LogStateCacheFactory(BaseCacheFactory):
         )
         assert layout.log_decay_bytes <= cache_per_page
         state_units = payload_frames + layout.num_granules * conv_frames + 1
-        cache_per_log_slot = (
-            payload_frames + layout.num_granules * conv_frames
-        ) * cache_per_page + layout.log_decay_bytes
         work_units = payload_frames + conv_frames
         # The manager also allocates one dummy KV frame, log slot and work slot.
         num_pages = available_memory // cache_per_page - 1
@@ -3339,14 +3402,13 @@ class LogStateCacheFactory(BaseCacheFactory):
             // (1 + state_units) * config.page_size,
         )
         return LogStateCachePlan(
+            linear_spec=spec,
             num_pages=num_pages,
             num_tokens=num_tokens,
             max_seq_len=max_seq_len,
             aligned_max_seq_len=align_ceil(max_seq_len, 32),
             num_states=num_states,
             num_work_states=num_work_states,
-            cache_per_page=cache_per_page,
-            cache_per_log_slot=cache_per_log_slot,
             state_units=state_units,
         )
 
@@ -3361,16 +3423,13 @@ class LogStateCacheFactory(BaseCacheFactory):
 
         assert isinstance(plan, LogStateCachePlan)
         assert isinstance(config.cache_config, LogStateCacheConfig)
-        from .pools import local_linear_head_counts
         from logssms.distributed import try_get_tp_info
         from logssms.utils import div_even
 
         model = config.model_config
-        num_k_heads, num_v_heads = local_linear_head_counts(model)
-        conv_dim = (
-            num_k_heads * model.linear_key_head_dim * 2
-            + num_v_heads * model.linear_value_head_dim
-        )
+        spec = plan.linear_spec
+        num_v_heads, head_k_dim, head_v_dim = spec.state_shape
+        conv_dim, state_len = spec.conv_shape
         tp_info = try_get_tp_info()
         assert tp_info is not None
         shared_pool = FramedMHALogStatePool(
@@ -3379,16 +3438,17 @@ class LogStateCacheFactory(BaseCacheFactory):
             num_attention_layers=model.num_attention_layers,
             num_kv_heads=div_even(model.num_kv_heads, tp_info.size, allow_replicate=True),
             head_dim=model.head_dim,
-            num_linear_layers=model.num_linear_layers,
-            num_key_heads=num_k_heads,
+            num_linear_layers=spec.num_layers,
+            num_key_heads=spec.num_groups,
             num_value_heads=num_v_heads,
-            head_k_dim=model.linear_key_head_dim,
-            head_v_dim=model.linear_value_head_dim,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
             conv_dim=conv_dim,
-            state_len=model.linear_conv_kernel_dim - 1,
+            state_len=state_len,
             device=device,
             dtype=dtype,
             granularity=config.cache_config.granularity,
+            recurrent_type=spec.recurrent_type,
         )
         assert (
             shared_pool.allocator.payload_frames
@@ -3471,6 +3531,4 @@ __all__ = [
     "LogStateCachePlan",
     "OnlineAnalysisScheduler",
     "PageMaterialize",
-    "WorkStateRestore",
-    "WorkStateRestoreMode",
 ]

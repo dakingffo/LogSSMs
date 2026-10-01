@@ -7,6 +7,28 @@ from transformers import PretrainedConfig
 
 
 @dataclass(frozen=True)
+class LinearCacheSpec:
+    """Per-TP-rank storage requirements, independent of decoder layer layout."""
+
+    recurrent_type: str
+    num_layers    : int
+    state_shape   : tuple[int, int, int]
+    conv_shape    : tuple[int, int]
+
+    def slot_bytes(self, itemsize: int) -> int:
+        heads, rows, columns = self.state_shape
+        channels, history = self.conv_shape
+        return self.num_layers * (heads * rows * columns + channels * history) * itemsize
+
+
+@dataclass(frozen=True)
+class AffineLogCacheSpec(LinearCacheSpec):
+    """Per-head rank-one updates plus scalar decay, grouped across heads."""
+
+    num_groups: int
+
+
+@dataclass(frozen=True)
 class RotaryConfig:
     rotary_dim  : int
     max_position: int
@@ -42,6 +64,9 @@ class ModelConfig:
     @property
     def num_linear_layers(self) -> int:
         return 0
+
+    def make_linear_cache_spec(self, tp_size: int) -> LinearCacheSpec | None:
+        return None
 
 
 def unwrap_text_config(
@@ -106,4 +131,4 @@ def make_moe_config_kwargs(config: PretrainedConfig) -> dict[str, Any]:
     }
 
 
-__all__ = ["ModelConfig", "RotaryConfig", "unwrap_text_config", "make_common_config_kwargs", "make_moe_config_kwargs"]
+__all__ = ["ModelConfig", "RotaryConfig", "LinearCacheSpec", "AffineLogCacheSpec", "unwrap_text_config", "make_common_config_kwargs", "make_moe_config_kwargs"]

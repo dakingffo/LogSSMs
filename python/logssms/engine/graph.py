@@ -12,6 +12,7 @@ from logssms.distributed import get_tp_info
 from logssms.utils import init_logger, nvtx_annotate
 
 if TYPE_CHECKING:
+    from .profile import EngineProfiler
     from logssms.layers.attention_backend import BaseAttnBackend
     from logssms.layers.linear_attention_backend import BaseLinearAttentionBackend
     from logssms.models import BaseLLMModel
@@ -154,13 +155,27 @@ class GraphRunner:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     @nvtx_annotate("Graph::replay")
-    def replay(self, batch: Batch) -> torch.Tensor:
+    def replay(self, batch: Batch, *, profiler: EngineProfiler | None = None) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        if profiler is not None:
+            return self._replay_profiled(batch, profiler)
         self.buffer.copy_from(batch)
         self.attn_backend.prepare_for_replay(batch)
         if self.linear_attn_backend is not None:
             self.linear_attn_backend.prepare_for_replay(batch)
         self.graph_map[batch.padded_size].replay()
+        return self.buffer.logits[:batch.size]
+
+    def _replay_profiled(self, batch: Batch, profiler: EngineProfiler) -> torch.Tensor:
+        with profiler.record_stage("graph_copy_inputs"):
+            self.buffer.copy_from(batch)
+        with profiler.record_stage("graph_attention_metadata"):
+            self.attn_backend.prepare_for_replay(batch)
+        with profiler.record_stage("graph_linear_metadata"):
+            if self.linear_attn_backend is not None:
+                self.linear_attn_backend.prepare_for_replay(batch)
+        with profiler.record_stage("graph_replay"):
+            self.graph_map[batch.padded_size].replay()
         return self.buffer.logits[:batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

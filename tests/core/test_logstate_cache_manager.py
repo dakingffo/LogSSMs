@@ -15,7 +15,7 @@ from logssms.cache.logstate import (
 from logssms.cache.prefix_cache.logstate import LogStateCacheHandle
 from logssms.cache.prefix_cache.logstate import LogStateEntry
 from logssms.cache.prefix_cache.logstate import LogStateKind
-from logssms.cache.logstate_recycle import LogStateRecycleBin, RecycledBranch, RecycledMatch
+from logssms.cache.logstate import LogStateRecycleBin, RecycledBranch, RecycledMatch
 from logssms.core import Batch, Request, SamplingParams
 from logssms.message import UserMsg
 from logssms.scheduler.prefill import PendingRequest
@@ -25,6 +25,20 @@ PAGE_SIZE = 64
 GRANULARITY = 16
 MAX_RUNNING_REQ = 3
 MAX_SEQ_LEN = 512
+
+
+@pytest.fixture(autouse=True)
+def cpu_convolution_copy():
+    # These tests check tree/allocator transitions, not CUDA kernel arithmetic.
+    # Preserve actual snapshot-copy semantics without sending CPU pointers to Triton.
+    def copy(pool, sources, source_granules, outputs, output_granules):
+        for source, source_granule, output, output_granule in zip(
+            sources.tolist(), source_granules.tolist(), outputs.tolist(), output_granules.tolist(), strict=True,
+        ):
+            pool.copy_conv_snapshot(source, source_granule, output, output_granule)
+
+    with patch("logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.copy_conv", side_effect=copy):
+        yield
 
 
 def make_manager(
@@ -116,11 +130,11 @@ def test_restore_unfused_chain_before_inplace_materialization() -> None:
     with (
         patch.object(manager, "_make_construction_chains", return_value=(materialize, restore)),
         patch(
-            "logssms.cache.logstate.restore_framed_log_state_chains",
+            "logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.restore",
             side_effect=lambda *_args: order.append("restore"),
         ),
         patch(
-            "logssms.cache.logstate.construct_framed_log_state_chains",
+            "logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.construct",
             side_effect=lambda *_args: order.append("materialize") or 0,
         ),
     ):
@@ -162,7 +176,7 @@ def test_shared_log_materialization_rebases_branches_across_task_groups() -> Non
 
     launches = []
     with patch(
-        "logssms.cache.logstate.construct_framed_log_state_chains",
+        "logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.construct",
         side_effect=lambda _pool, group: launches.append(group) or 0,
     ):
         manager._construct((), plans)
@@ -407,7 +421,7 @@ def test_adaptive_sampling_records_hit_only_after_successful_admission():
     manager.allocate([original])
     original.cached_len = len(input_ids)
     manager.cache_req(original, finished=True)
-    source = manager.tree.merge_owners()[0].merge_stats
+    source = next(node.merge_stats for node in manager.tree.path(manager.tree.trace(input_ids).node) if node.merge_stats is not None)
     assert source is not None
 
     pending = PendingRequest(
@@ -1033,7 +1047,7 @@ def test_prepare_batch_applies_branch_protection_and_commits_plan():
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
     with patch(
-        "logssms.cache.logstate.construct_framed_log_state_chains",
+        "logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.construct",
         return_value=0,
     ) as construct:
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
@@ -1062,7 +1076,7 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
 
     request = new_req(manager, input_ids, table_idx=1)
     batch = Batch(reqs=[request], phase="prefill")
-    with patch("logssms.cache.logstate.construct_framed_log_state_chains", return_value=0):
+    with patch("logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.construct", return_value=0):
         manager.prepare_batch(batch)
 
     checkpoints = manager.tree.iter_entries()
@@ -1156,7 +1170,7 @@ def test_active_branch_recovery_anchor_survives_same_round_maintenance():
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
     assert branch.cached_len == 64
-    with patch("logssms.cache.logstate.construct_framed_log_state_chains", return_value=0):
+    with patch("logssms.kernel.linear_attention.GATED_DELTA_LOG_STATE_KERNELS.construct", return_value=0):
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
     checkpoints = [

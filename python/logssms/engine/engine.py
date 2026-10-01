@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
-import os
-from time import perf_counter_ns
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import torch
@@ -26,6 +24,7 @@ from logssms.utils import (
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
+from .profile import EngineProfiler
 from .sample import BatchSamplingArgs, Sampler
 
 if TYPE_CHECKING:
@@ -63,12 +62,7 @@ class Engine:
         set_tp_info(config.tp_info)
         self._adjust_config(config)
         self.config = config
-        self._profile_prepare_enabled = os.getenv(
-            "LOGSSMS_PROFILE_SCHEDULER", "0"
-        ).lower() in ("1", "true", "yes")
-        self._prepare_profile_totals: dict[str, dict[str, float]] = {}
-        self._prepare_profile_counts: dict[str, int] = {}
-        self._prepare_profile_prefill_samples: list[dict] = []
+        self.profiler = EngineProfiler()
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -159,7 +153,9 @@ class Engine:
             )
             self.ctx.linear_attn_backend = self.linear_attn_backend = (
                 make_linear_attention_backend(
-                    config.cache_type, enable_eager_state=eager_state,
+                    config.cache_type,
+                    recurrent_type=config.model_config.make_linear_cache_spec(config.tp_info.size).recurrent_type,
+                    enable_eager_state=eager_state,
                 )
             )
         if config.model_config.is_moe:
@@ -249,63 +245,19 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:
-        timings: dict[str, float] | None = (
-            {} if self._profile_prepare_enabled else None
-        )
-        start = perf_counter_ns() if timings is not None else 0
-        stage = start
+        if self.profiler.enabled:
+            return self._prepare_batch_profiled(batch, cache_manager)
         self.graph_runner.pad_batch(batch)
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["pad_batch_ms"] = (now - stage) / 1e6
-            stage = now
         cache_manager.allocate(batch.reqs, phase=batch.phase)
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["allocate_ms"] = (now - stage) / 1e6
-            stage = now
         batch.positions = self._make_positions(batch, self.device)
         input_mapping = self._make_input_tuple(batch, self.device)
         write_mapping = self._make_write_tuple(batch, self.device)
         batch.out_loc = self.page_table[input_mapping]
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["positions_mappings_ms"] = (now - stage) / 1e6
-            stage = now
         cache_manager.prepare_batch(batch)
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["cache_prepare_ms"] = (now - stage) / 1e6
-            stage = now
         self.attn_backend.prepare_metadata(batch)
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["attention_metadata_ms"] = (now - stage) / 1e6
-            stage = now
         if self.config.model_config.is_hybrid:
             self.linear_attn_backend.prepare_metadata(batch)
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["linear_metadata_ms"] = (now - stage) / 1e6
-            stage = now
         sample_args = self.sampler.prepare(batch)
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["sampler_prepare_ms"] = (now - stage) / 1e6
-            timings["total_ms"] = (now - start) / 1e6
-            phase = batch.phase
-            totals = self._prepare_profile_totals.setdefault(phase, {})
-            for key, value in timings.items():
-                totals[key] = totals.get(key, 0.0) + value
-            self._prepare_profile_counts[phase] = (
-                self._prepare_profile_counts.get(phase, 0) + 1
-            )
-            if batch.is_prefill:
-                self._prepare_profile_prefill_samples.append({
-                    "batch_size": batch.size,
-                    "logical_tokens": sum(req.extend_len for req in batch.reqs),
-                    **timings,
-                })
         return ForwardInput(
             batch=batch,
             sample_args=sample_args,
@@ -313,16 +265,38 @@ class Engine:
             write_tuple=write_mapping,
         )
 
+    def _prepare_batch_profiled(self, batch: Batch, cache_manager) -> ForwardInput:
+        profiler = self.profiler
+        graph_used = self.graph_runner.can_use_cuda_graph(batch)
+        with profiler.record_batch(batch, "prepare", graph_used=graph_used):
+            with profiler.record_stage("pad_batch"):
+                self.graph_runner.pad_batch(batch)
+            with profiler.record_stage("allocate"):
+                cache_manager.allocate(batch.reqs, phase=batch.phase)
+            with profiler.record_stage("positions"):
+                batch.positions = self._make_positions(batch, self.device)
+            with profiler.record_stage("input_mapping"):
+                input_mapping = self._make_input_tuple(batch, self.device)
+            with profiler.record_stage("write_mapping"):
+                write_mapping = self._make_write_tuple(batch, self.device)
+            with profiler.record_stage("out_loc"):
+                batch.out_loc = self.page_table[input_mapping]
+            with profiler.record_stage("cache_prepare"):
+                cache_manager.prepare_batch(batch)
+            with profiler.record_stage("attention_metadata"):
+                self.attn_backend.prepare_metadata(batch)
+            with profiler.record_stage("linear_metadata"):
+                if self.config.model_config.is_hybrid:
+                    self.linear_attn_backend.prepare_metadata(batch)
+            with profiler.record_stage("sampler_prepare"):
+                sample_args = self.sampler.prepare(batch)
+        return ForwardInput(batch, sample_args, input_mapping, write_mapping)
+
     def prepare_profile_result(self) -> dict | None:
-        if not self._profile_prepare_enabled:
-            return None
-        return {
-            "phases": {
-                phase: {"batches": count, **self._prepare_profile_totals[phase]}
-                for phase, count in self._prepare_profile_counts.items()
-            },
-            "prefill_batches": self._prepare_profile_prefill_samples,
-        }
+        return self.profiler.result("prepare")
+
+    def forward_profile_result(self) -> dict | None:
+        return self.profiler.result("forward")
 
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs
@@ -338,6 +312,8 @@ class Engine:
             assert algorithm is not None and speculator_config is not None
             batch.hidden_captor = make_hidden_captor(algorithm, speculator_config)
 
+        if self.profiler.enabled:
+            return self._forward_batch_profiled(batch, args)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -351,6 +327,39 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
 
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _forward_batch_profiled(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        profiler = self.profiler
+        graph_used = self.graph_runner.can_use_cuda_graph(batch)
+        with profiler.record_batch(batch, "forward", graph_used=graph_used) as sample:
+            if self.config.model_config.is_hybrid:
+                sample["linear_backend"] = type(self.linear_attn_backend).__name__
+                if hasattr(self.linear_attn_backend, "enable_eager_state"):
+                    sample["eager_state"] = self.linear_attn_backend.enable_eager_state
+            counts = batch.logstate_replay_counts
+            if counts is not None:
+                # Already CPU-side; do not inspect captured GPU buffers or dummy rows.
+                sample["replay_counts"] = list(counts[:batch.size])
+                sample["effective_replay_counts"] = (
+                    [0] * batch.size if sample.get("eager_state", False)
+                    else list(counts[:batch.size])
+                )
+            with self.ctx.forward_batch(batch):
+                if graph_used:
+                    logits = self.graph_runner.replay(batch, profiler=profiler)
+                else:
+                    with profiler.record_stage("model"):
+                        logits = self.model.forward()
+            with profiler.record_stage("sampling"):
+                next_tokens_gpu = (
+                    self.sampler.reject_sample(logits, batch) if batch.is_verify
+                    else self.sampler.sample(logits[:batch.size], args)
+                ).to(torch.int32)
+            with profiler.record_stage("output_copy"):
+                next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+                copy_done_event = torch.cuda.Event()
+                copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:

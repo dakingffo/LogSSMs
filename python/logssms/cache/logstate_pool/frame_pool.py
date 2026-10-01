@@ -5,11 +5,13 @@ from collections.abc import Sequence
 
 import torch
 
+from logssms.kernel.linear_attention import SUPPORTED_LOG_STATE_KERNELS
 from .frame_allocator import LinearFrameSlot, LogStateFrameAllocator
 from .layout import LogStateSlotLayout
+from ..kv_pool.base import BaseKVCachePool
 
 
-class FramedMHALogStatePool:
+class FramedMHALogStatePool(BaseKVCachePool):
     """Fixed-size physical frames with stable, device-visible slot maps.
 
     The KV view preserves the existing 16/32/64-token FlashInfer page layout:
@@ -37,6 +39,7 @@ class FramedMHALogStatePool:
         state_len           : int,
         device              : torch.device,
         dtype               : torch.dtype,
+        recurrent_type      : str = "gdn",
     ) -> None:
         layout = LogStateSlotLayout(
             page_size=page_size,
@@ -69,9 +72,9 @@ class FramedMHALogStatePool:
             num_granules=layout.num_granules,
         )
         self.layout = layout
+        self.kernels = SUPPORTED_LOG_STATE_KERNELS[recurrent_type]
         self.allocator = allocator
-        self.device = device
-        self.dtype = dtype
+        self._dtype = dtype
         self.page_size = page_size
         self.kv_page_size = granularity
         self.frame_bytes = frame_bytes
@@ -82,7 +85,7 @@ class FramedMHALogStatePool:
         self.storage = torch.empty(
             (num_frames, frame_bytes), dtype=torch.uint8, device=device
         )
-        self.device = self.storage.device
+        self._device = self.storage.device
         self.payload_frame_table = torch.full(
             (num_frames, allocator.payload_frames), -1,
             dtype=torch.int32, device=device,
@@ -109,6 +112,14 @@ class FramedMHALogStatePool:
             for layer in range(num_attention_layers)
         ]
         self._retired_materializations: list[tuple[torch.cuda.Event, int]] = []
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def _kv_view(self, byte_offset: int) -> torch.Tensor:
         itemsize = self.dtype.itemsize
@@ -148,31 +159,6 @@ class FramedMHALogStatePool:
         shape = (out_loc.numel(), self._k_heads, self._head_dim)
         self._k_buffer[layer_id][pages, offsets] = k.reshape(shape)
         self._v_buffer[layer_id][pages, offsets] = v.reshape(shape)
-
-    def head_view(
-        self, slot: int, layer: int, head: int, *, state: bool
-    ) -> torch.Tensor:
-        """Return one contiguous head overlay; useful for testing the frame map.
-
-        Production kernels must do the equivalent lookup on the GPU. A head
-        crossing a frame boundary needs a tiled kernel instead of a tensor view.
-        """
-        assert 0 <= layer < self.layout.num_linear_layers
-        assert 0 <= head < self._num_value_heads
-        logical_offset = (
-            layer * self._num_value_heads + head
-        ) * self.head_payload_bytes
-        frame_index, offset = divmod(logical_offset, self.frame_bytes)
-        if offset + self.head_payload_bytes > self.frame_bytes:
-            raise ValueError("One head crosses a physical frame boundary")
-        frame = self.allocator.slot(slot).payload[frame_index]
-        storage = self.storage[frame, offset:offset + self.head_payload_bytes]
-        if state:
-            return storage[:self.layout.head_recurrent_state_bytes].view(
-                self.dtype
-            ).view(self.layout.head_k_dim, self.layout.head_v_dim)
-        size = self.layout.head_log_key_bytes + self.layout.head_log_value_bytes
-        return storage[:size].view(self.dtype)
 
     def conv_view(self, slot: int, granule: int) -> torch.Tensor:
         record = self.allocator.slot(slot)

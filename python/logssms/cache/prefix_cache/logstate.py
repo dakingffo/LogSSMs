@@ -9,7 +9,7 @@ from itertools import count
 from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from logssms.cache.logstate_recycle import RecycledMatch
+    from logssms.cache.logstate import RecycledMatch
 
 import torch
 
@@ -177,11 +177,6 @@ class LogRadixTreeNode:
         return self.timestamp < other.timestamp
 
 
-class LogRadixMatch(NamedTuple):
-    node       : LogRadixTreeNode
-    matched_len: int
-
-
 class LogRadixTrace(NamedTuple):
     node            : LogRadixTreeNode
     matched_len     : int
@@ -260,10 +255,6 @@ class LogRadixTree(BasePrefixCache):
         self.revision = 0
         self._entry_owners: dict[int, LogRadixTreeNode] = {}
         self._slot_entries: dict[int, list[LogStateEntry]] = {}
-
-    def match(self, input_ids: torch.Tensor) -> LogRadixMatch:
-        node, matched_len = self._tree_walk(input_ids)
-        return LogRadixMatch(node, matched_len)
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         usable_len = align_down(len(input_ids), self.granularity)
@@ -662,12 +653,6 @@ class LogRadixTree(BasePrefixCache):
                 stack.extend(node.children.values())
         return tuple(leaves)
 
-    def merge_owners(self) -> tuple[LogRadixTreeNode, ...]:
-        return tuple(
-            node for node in self._iter_nodes()
-            if node.merge_stats is not None
-        )
-
     def path(self, node: LogRadixTreeNode) -> tuple[LogRadixTreeNode, ...]:
         return tuple(self._path(node))
 
@@ -969,7 +954,6 @@ class LogRadixTree(BasePrefixCache):
 __all__ = [
     "LogRadixEviction",
     "LogRadixInsert",
-    "LogRadixMatch",
     "LogRadixTrace",
     "LogRadixTree",
     "LogRadixTreeNode",

@@ -1,4 +1,6 @@
-from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from logssms.utils import Registry
+
+from .base import BaseGatedDeltaBackend, BaseLinearAttentionBackend, BaseLinearAttentionMetadata
 from .native import (
     LinearAttentionBackend,
     LinearAttentionCaptureData,
@@ -11,15 +13,22 @@ from .logstate import (
 )
 
 
+SUPPORTED_LINEAR_ATTENTION_BACKENDS = Registry[type[BaseLinearAttentionBackend]]("linear attention backend")
+for cache_type in ("naive", "radix"):
+    SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"gdn/{cache_type}")(LinearAttentionBackend)
+SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("gdn/logstate")(LogStateLinearAttentionBackend)
+
+
 def make_linear_attention_backend(
-    cache_type: str, *, enable_eager_state: bool = False,
+    cache_type: str, *, recurrent_type: str = "gdn", enable_eager_state: bool = False,
 ) -> BaseLinearAttentionBackend:
-    if cache_type == "logstate":
-        return LogStateLinearAttentionBackend(enable_eager_state=enable_eager_state)
-    return LinearAttentionBackend()
+    backend = SUPPORTED_LINEAR_ATTENTION_BACKENDS[f"{recurrent_type}/{cache_type}"]
+    return backend(enable_eager_state=enable_eager_state) if cache_type == "logstate" else backend()
 
 __all__ = [
     "BaseLinearAttentionBackend",
+    "BaseGatedDeltaBackend",
+    "SUPPORTED_LINEAR_ATTENTION_BACKENDS",
     "BaseLinearAttentionMetadata",
     "LinearAttentionBackend",
     "LinearAttentionCaptureData",

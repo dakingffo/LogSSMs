@@ -29,7 +29,7 @@ def test_insert_match_and_collect_path_values():
     )
 
     result = tree.insert(token_ids, kv, entries)
-    match = tree.match(token_ids)
+    match = tree.trace(token_ids)
 
     assert result.previous_len == 0
     assert result.inserted_len == 12

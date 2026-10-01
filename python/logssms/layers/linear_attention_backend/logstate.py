@@ -12,7 +12,7 @@ from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.core import get_global_ctx
 from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
 
-from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from .base import BaseGatedDeltaBackend, BaseLinearAttentionMetadata
 from .native import PackedLinearIndices, _causal_conv1d_update, _prepare_gdn
 
 if TYPE_CHECKING:
@@ -70,7 +70,7 @@ class LogStateLinearAttentionCaptureData:
         )
 
 
-class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
+class LogStateLinearAttentionBackend(BaseGatedDeltaBackend):
     """Gated DeltaNet backend backed by lossless per-token update logs."""
 
     def __init__(self, *, enable_eager_state: bool = False) -> None:

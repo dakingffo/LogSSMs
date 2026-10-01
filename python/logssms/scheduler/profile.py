@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import os
 from time import perf_counter_ns
-from collections import Counter
-from contextlib import contextmanager
+from collections import Counter, deque
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 
 from logssms.distributed import get_tp_info
+from logssms.engine.profile import batch_identity, batch_snapshot
 from logssms.utils import init_logger, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -114,12 +115,21 @@ class SchedulerProfiler:
         self.pending_gpu: list[tuple[
             str, torch.cuda.Event, torch.cuda.Event, dict | None,
         ]] = []
-        self.prefill_forward_batches: list[dict] = []
-        self.prefill_process_batches: list[dict] = []
+        self.sample_limit = int(os.getenv("LOGSSMS_PROFILE_MAX_BATCH_SAMPLES", "8192"))
+        if self.sample_limit < 1:
+            raise ValueError("LOGSSMS_PROFILE_MAX_BATCH_SAMPLES must be positive")
+        self.batch_samples = {
+            kind: {phase: deque(maxlen=self.sample_limit) for phase in self.phases}
+            for kind in ("prepare", "forward", "process")
+        }
+        self.prefill_forward_batches = self.batch_samples["forward"]["prefill"]
+        self.prefill_process_batches = self.batch_samples["process"]["prefill"]
         self.process_stage_ns = {
             phase: Counter() for phase in ("prefill", "decode", "verify")
         }
         self._current_process_sample: dict | None = None
+        self._process_stage_name = ""
+        self._last_wait_ms = 0.0
         self.schedule_ns = 0
 
     @contextmanager
@@ -168,6 +178,12 @@ class SchedulerProfiler:
         profile.prepare_ns += prepare_ns
         profile.logical_bs[batch.size] += 1
         profile.padded_bs[batch.padded_size] += 1
+        self.batch_samples["prepare"][batch.phase].append({
+            **batch_snapshot(batch),
+            "graph_used": graph_used,
+            "schedule_ms": self.schedule_ns / 1e6,
+            "prepare_ms": prepare_ns / 1e6,
+        })
 
     @contextmanager
     @nvtx_annotate("Scheduler::forward(submit)")
@@ -175,15 +191,11 @@ class SchedulerProfiler:
         if not self.enabled:
             yield
             return
-        sample = None
-        if batch.is_prefill:
-            sample = {
-                "request_tags": [req.profile_tag for req in batch.reqs],
-                "batch_size": batch.size,
-                "input_tokens": sum(req.extend_len for req in batch.reqs),
-                "submit_ms": None,
-                "gpu_ms": None,
-            }
+        sample = {
+            **batch_snapshot(batch),
+            "submit_ms": None,
+            "gpu_ms": None,
+        }
         tic = perf_counter_ns()
         events = self._begin_submit(batch.phase)
         try:
@@ -211,7 +223,7 @@ class SchedulerProfiler:
         end.record()
         if sample is not None:
             sample["submit_ms"] = submit_ns / 1e6
-            self.prefill_forward_batches.append(sample)
+            self.batch_samples["forward"][phase].append(sample)
         self.pending_gpu.append((phase, start, end, sample))
 
     @contextmanager
@@ -224,7 +236,9 @@ class SchedulerProfiler:
         try:
             yield
         finally:
-            self.phases[phase].wait_ns += perf_counter_ns() - tic
+            elapsed_ns = perf_counter_ns() - tic
+            self.phases[phase].wait_ns += elapsed_ns
+            self._last_wait_ms = elapsed_ns / 1e6
 
     @contextmanager
     @nvtx_annotate("Scheduler::process_output")
@@ -233,10 +247,11 @@ class SchedulerProfiler:
             yield
             return
         sample = None
-        if phase == "prefill" and batch is not None:
+        if batch is not None:
             sample = {
-                "request_tags": [req.profile_tag for req in batch.reqs],
+                **batch_identity(batch),
                 "batch_size": batch.size,
+                "wait_ms": self._last_wait_ms,
             }
             self._current_process_sample = sample
         tic = perf_counter_ns()
@@ -247,11 +262,18 @@ class SchedulerProfiler:
             self.phases[phase].process_ns += elapsed_ns
             if sample is not None:
                 sample["total_ms"] = elapsed_ns / 1e6
-                self.prefill_process_batches.append(sample)
+                self.batch_samples["process"][phase].append(sample)
                 self._current_process_sample = None
 
-    @contextmanager
     def record_process_step(self, phase: str, name: str):
+        if not self.enabled:
+            return nullcontext()
+        self._process_stage_name = name
+        return self._record_process_step(phase, name)
+
+    @contextmanager
+    @nvtx_annotate("Scheduler::{}", layer_id_field="_process_stage_name")
+    def _record_process_step(self, phase: str, name: str):
         if not self.enabled:
             yield
             return
@@ -272,6 +294,8 @@ class SchedulerProfiler:
         if not self.enabled:
             return
         self.cache_manager.poll_profile()
+        if self.engine is not None:
+            self.engine.profiler.poll()
         remaining = []
         for phase, start, end, sample in self.pending_gpu:
             if end.query():
@@ -301,13 +325,26 @@ class SchedulerProfiler:
             "phases": {
                 phase: profile.as_dict() for phase, profile in self.phases.items()
             },
-            "prefill_forward_batches": self.prefill_forward_batches,
-            "prefill_process_batches": self.prefill_process_batches,
+            "schema_version": 2,
+            "sample_limit_per_phase": self.sample_limit,
+            "dropped_batch_samples": {
+                phase: max(0, profile.batches - self.sample_limit)
+                for phase, profile in self.phases.items()
+            },
+            "timing_semantics": {
+                "cpu": "host wall time including any blocking API calls",
+                "gpu": "CUDA stream intervals, including idle/wait/contention; not kernel-duration sums",
+                "overlap": "CPU/GPU and prepare/forward intervals overlap; do not add them into TPOT",
+                "graph": "events bracket replay at runtime; graph-internal operator attribution requires a node-level GPU trace",
+            },
             "process_stages_ms": {
                 phase: {name: elapsed / 1e6 for name, elapsed in stages.items()}
                 for phase, stages in self.process_stage_ns.items()
             },
         }
+        for kind, phases in self.batch_samples.items():
+            for phase, samples in phases.items():
+                result[f"{phase}_{kind}_batches"] = list(samples)
         cache = self.cache_manager.profile_result()
         if cache is not None:
             result["cache"] = cache
@@ -319,6 +356,9 @@ class SchedulerProfiler:
             prepare = self.engine.prepare_profile_result()
             if prepare is not None:
                 result["engine_prepare"] = prepare
+            forward = self.engine.forward_profile_result()
+            if forward is not None:
+                result["engine_forward"] = forward
         return result
 
     def _write_result(self) -> None:

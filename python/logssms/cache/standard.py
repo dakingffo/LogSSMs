@@ -123,7 +123,7 @@ class StandardCacheManager(BaseCacheManager):
 
     def plan_prefill_chunk(self, remain_len: int, token_budget: int) -> int:
         chunk_size = min(remain_len, token_budget)
-        if chunk_size < remain_len and self.state_pool is not None:
+        if chunk_size < remain_len and self.linear_pool is not None:
             chunk_size = align_down(chunk_size, 64)
         return chunk_size
 
@@ -151,7 +151,7 @@ class StandardCacheManager(BaseCacheManager):
         if needed_pages > 0:
             allocated = self._allocate(
                 needed_pages=needed_pages,
-                needed_states=needed_pages if self.state_pool is not None else 0,
+                needed_states=needed_pages if self.linear_pool is not None else 0,
                 phase=phase,
                 request_tags=(
                     [req.profile_tag for req in reqs]
@@ -253,7 +253,7 @@ class StandardCacheManager(BaseCacheManager):
         req.device_len = min(req.cached_len + 1, req.max_device_len)
 
     def commit_speculative(self, req: Request, C: int, num_sampled: int) -> None:
-        if self.state_pool is None or self.state_table is None:
+        if self.linear_pool is None or self.state_table is None:
             return
         uid = req.table_idx
         ps = self.page_size
@@ -285,7 +285,7 @@ class StandardCacheManager(BaseCacheManager):
             )
         if self.page_size > 1:
             assert torch.all(self.free_pages % self.page_size == 0)
-        if self.state_pool is not None and self.state_table is not None:
+        if self.linear_pool is not None and self.state_table is not None:
             # Idle (the only time this runs): live rows have no request-owned refs.
             # The last row belongs to CUDA Graph padding; work slots remain populated.
             free_state = len(self.free_states)
@@ -382,7 +382,7 @@ class StandardCacheManager(BaseCacheManager):
             else:
                 evicted_pages, evicted_states = self.prefix_cache.evict(needed_evict)
             self.free_pages = torch.cat([self.free_pages, evicted_pages[:: self.page_size]])
-            if self.state_pool is not None and evicted_states is not None:
+            if self.linear_pool is not None and evicted_states is not None:
                 self.free_states = torch.cat([self.free_states, evicted_states])
             if trace_eviction:
                 self._record_lifecycle_event({

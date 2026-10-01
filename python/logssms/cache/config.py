@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .logstate_pool.layout import LOG_STATE_GRANULARITY
 
 LOG_STATE_PAGE_SIZE = 64
 LOG_STATE_GRANULARITIES = (16, 32, 64)
@@ -24,7 +25,7 @@ class StandardCacheConfig(BaseCacheConfig):
 
 @dataclass(frozen=True)
 class LogStateCacheConfig(BaseCacheConfig):
-    granularity              : int  = 32
+    granularity              : int  = LOG_STATE_GRANULARITY
     enable_eager_state       : bool = False
     enable_memorized_evict   : bool = True
     enable_merge_adjustment  : bool = False

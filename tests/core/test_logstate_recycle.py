@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import random
 
-from logssms.cache.logstate_recycle import LogStateRecycleBin
-from logssms.cache.logstate_recycle import RecycledBranch, RecycledEntry, RecycledMatch
+from logssms.cache.logstate import LogStateRecycleBin
+from logssms.cache.logstate import RecycledBranch, RecycledEntry, RecycledMatch
 from logssms.cache.logstate import LogStateCacheManager, OnlineAnalysisScheduler, _LivePage
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.cache.prefix_cache.logstate import LogRadixTree, LogStateEntry, LogStateKind
@@ -213,7 +213,7 @@ def test_recycled_checkpoint_shape_is_restored_from_new_logs() -> None:
         manager._restore_recycled_layout(req, leaf, 0, 8, 0, pages)
 
     assert len(submitted) == 1
-    assert submitted[0].replay_log_slots == (11, 12)
+    assert tuple(entry.slot for entry in submitted[0].replay_logs) == (11, 12)
     assert released == [11]
     materialize.assert_called_once_with(12)
     assert tree.matched_entries(leaf) == (
@@ -272,7 +272,7 @@ def test_recycled_checkpoint_waits_for_later_prefill_chunk() -> None:
             second_req, second, 4, 8, 4, (_LivePage(4, 8, 104, 12),)
         )
     assert len(submitted) == 1
-    assert submitted[0].replay_log_slots == (11, 12)
+    assert tuple(entry.slot for entry in submitted[0].replay_logs) == (11, 12)
     assert tree.matched_entries(second) == (
         LogStateEntry(12, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),
     )

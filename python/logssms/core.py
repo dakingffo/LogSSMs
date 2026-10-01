@@ -108,6 +108,7 @@ class ChunkedRequest(Request):
 class Batch:
     reqs     : list[Request]
     phase    : Literal["prefill", "decode", "verify"]
+    profile_id: int | None = field(init=False, default=None)
     # these fields should be set by scheduler
     input_ids  : torch.Tensor  = field(init=False)
     positions  : torch.Tensor  = field(init=False)

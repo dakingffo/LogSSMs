@@ -4,7 +4,6 @@ import torch
 
 from logssms.cache.logstate import (
     OnlineAnalysisScheduler,
-    WorkStateRestoreMode,
     _MergePathContext,
 )
 from logssms.cache.prefix_cache.logstate import (
@@ -52,11 +51,10 @@ def test_branch_inside_log_page_restores_work_state_and_protects_page():
     assert len(plan.protections) == 1
     assert plan.protections[0].position == 80
     assert plan.protections[0].log_slot == 1
-    assert len(plan.restores) == 1
-    assert plan.restores[0].mode is WorkStateRestoreMode.LOG_REPLAY
-    assert plan.restores[0].replay_end == 80
-    assert plan.restores[0].base_checkpoint_slot == 0
-    assert plan.restores[0].log_slots == (1,)
+    recovery = tree.match_prefix(request).cuda_handle.recovery
+    assert recovery.position == 80
+    assert recovery.base_checkpoint_slot == 0
+    assert recovery.log_slots == (1,)
     assert plan.materialize == ()
 
 
@@ -78,7 +76,6 @@ def test_branch_at_checkpoint_uses_checkpoint_and_blocks_crossing_coalesce():
     assert len(plan.protections) == 1
     assert plan.protections[0].node is not None
     assert plan.protections[0].node.depth == 64
-    assert plan.restores == ()
     assert not any(
         task.begin < 64 < task.end for task in plan.coalesce
     )
@@ -295,10 +292,7 @@ def test_branch_between_checkpoints_blocks_coalesce_without_covering_log():
     )
 
     assert len(plan.protections) == 0
-    assert len(plan.restores) == 1
-    assert plan.restores[0].position == 96
-    assert plan.restores[0].replay_end == 64
-    assert plan.restores[0].mode is WorkStateRestoreMode.PREFILL
+    assert tree.match_prefix(request).cuda_handle.cached_len == 64
     assert len(plan.coalesce) == 0
     diagnostics = dict(plan.merge_diagnostics)
     assert diagnostics["entries_beyond_match_endpoint"] == 1

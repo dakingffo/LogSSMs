@@ -32,6 +32,10 @@ class BaseLinearAttentionBackend(ABC):
     @abstractmethod
     def prepare_for_replay(self, batch: Batch) -> None: ...
 
+
+class BaseGatedDeltaBackend(BaseLinearAttentionBackend):
+    """GDN compute contract; other recurrences share only the lifecycle API."""
+
     @abstractmethod
     def forward(
         self,
@@ -46,4 +50,4 @@ class BaseLinearAttentionBackend(ABC):
     ) -> torch.Tensor: ...
 
 
-__all__ = ["BaseLinearAttentionBackend", "BaseLinearAttentionMetadata"]
+__all__ = ["BaseLinearAttentionBackend", "BaseLinearAttentionMetadata", "BaseGatedDeltaBackend"]

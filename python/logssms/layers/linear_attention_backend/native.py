@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from logssms.core import get_global_ctx
 from logssms.kernel import store_state
 
-from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from .base import BaseGatedDeltaBackend, BaseLinearAttentionMetadata
 
 if TYPE_CHECKING:
     from logssms.core import Batch
@@ -150,7 +150,7 @@ def _prepare_gdn(
     )
 
 
-class LinearAttentionBackend(BaseLinearAttentionBackend):
+class LinearAttentionBackend(BaseGatedDeltaBackend):
     def __init__(self) -> None:
         self.capture: LinearAttentionCaptureData | None = None
         self.capture_bs: list[int] = []
