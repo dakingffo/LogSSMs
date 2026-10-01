@@ -1,10 +1,12 @@
 import asyncio
 import json
 
+import httpx
 import pytest
 import torch
 
-from experiment import random_multiturn
+from experiment.random_multiturn import client as random_multiturn
+from experiment.random_multiturn.profile import attach_cache_matches
 from logssms.core import SamplingParams
 from logssms.message import BaseTokenizerMsg, TokenizeMsg, UserReply
 from logssms.server.api_server import FrontendManager, OpenAICompletionRequest
@@ -84,7 +86,8 @@ def test_closed_loop_appends_actual_generated_ids(monkeypatch):
     )
     seen = []
 
-    async def fake_stream(_client, _base, _model, prompt, output_len, tag):
+    async def fake_stream(_client, _base, _model, prompt, output_len, tag, api):
+        assert api == "logssms"
         seen.append((tag, list(prompt)))
         token = 70 + int(tag.rsplit("-", 1)[1])
         # start, output_len chunks, finish_reason, DONE
@@ -165,8 +168,113 @@ def test_cache_matches_distinguish_eligible_from_admitted(tmp_path):
         {"tag": "random-0/turn-2", "tree_match_len": 8,
          "admitted_cached_len": 4},
     ]}}))
-    summary = random_multiturn.attach_cache_matches(records, path)
+    summary = attach_cache_matches(records, path)
     assert summary["expected_reusable_tokens"] == 10
     assert summary["tree_match_fraction"] == pytest.approx(0.8)
     assert summary["admitted_hit_fraction"] == pytest.approx(0.4)
     assert records[0]["turns"][1]["cache_match"]["tree_match_len"] == 8
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_sglang_stream_uses_generated_ids_and_cache_counts(incremental):
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            for count, ids in ((1, [4]), (2, [5] if incremental else [4, 5])):
+                yield "data: " + json.dumps({
+                    "output_ids": ids,
+                    "meta_info": {"completion_tokens": count, "cached_tokens": 2},
+                })
+            yield "data: " + json.dumps({
+                "output_ids": [] if incremental else [4, 5],
+                "meta_info": {
+                    "completion_tokens": 2,
+                    "cached_tokens": 2,
+                    "finish_reason": {"type": "length"},
+                },
+            })
+            yield "data: [DONE]"
+
+    class Context:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            pass
+
+    class Client:
+        def stream(self, method, url, json, headers):
+            assert method == "POST" and url == "http://unused/generate"
+            assert json["input_ids"] == [1, 2, 3]
+            assert json["sampling_params"]["ignore_eos"]
+            assert "text" not in json and "messages" not in json
+            return Context()
+
+    result = asyncio.run(random_multiturn.stream_token_ids(
+        Client(), "http://unused", "unused", [1, 2, 3], 2,
+        "s/turn-1", "sglang",
+    ))
+    assert result.token_ids == [4, 5]
+    assert result.cached_tokens == 2
+    assert len(result.tics) == 5
+
+
+def test_sglang_response_cache_excludes_noncontinuation_hits():
+    records = [{"turns": [
+        {"expected_reusable_len": 0, "cached_tokens": 9},
+        {"expected_reusable_len": 10, "cached_tokens": 8},
+    ]}]
+    cache = random_multiturn.summarize_response_cache(records)
+    assert cache["expected_reusable_tokens"] == 10
+    assert cache["admitted_cached_tokens"] == 8
+    assert cache["admitted_hit_fraction"] == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("api", ["logssms", "sglang"])
+def test_http_client_continues_actual_output_ids(api, monkeypatch):
+    sessions = random_multiturn.make_sessions(
+        FakeTokenizer(), count=1, turns=2, input_len=3,
+        append_len=2, shared_len=0, seed=7,
+    )
+    prompts = []
+
+    def respond(request):
+        payload = json.loads(request.content)
+        prompt = payload["input_ids" if api == "sglang" else "prompt_token_ids"]
+        prompts.append(prompt)
+        ids = [31, 32]
+        if api == "sglang":
+            assert request.url.path == "/generate"
+            events = [
+                {"output_ids": ids[:1], "meta_info": {
+                    "completion_tokens": 1, "cached_tokens": 0,
+                }},
+                {"output_ids": ids, "meta_info": {
+                    "completion_tokens": 2, "cached_tokens": len(prompt) - 1,
+                    "finish_reason": {"type": "length"},
+                }},
+            ]
+        else:
+            assert request.url.path == "/v1/chat/completions"
+            events = [
+                {"choices": [{"delta": {"token_ids": [token]}}]}
+                for token in ids
+            ] + [{"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+        body = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+        body += "data: [DONE]\n\n"
+        return httpx.Response(200, text=body)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    stats, records = asyncio.run(random_multiturn.run_point(
+        "http://unused", "model", sessions, concurrency=1,
+        output_len=2, request_timeout=3, api=api,
+    ))
+    assert stats["chunks_ok"]
+    assert prompts[1] == prompts[0] + [31, 32] + list(sessions[0].increments[0])
+    assert records[0]["turns"][1]["generated_token_ids"] == [31, 32]

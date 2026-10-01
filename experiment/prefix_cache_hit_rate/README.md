@@ -1,6 +1,6 @@
 # Prefix-cache locality experiments
 
-`prefix_cache_hit_rate.py` replays agentic trajectories offline. It reconstructs
+`python -m experiment.prefix_cache_hit_rate` replays agentic trajectories offline. It reconstructs
 every model invocation from the message history and finds its prefix match
 endpoint by exact token-ID comparison. Native assistant tool calls and tool
 responses are retained when applying the target model's chat template.
@@ -8,7 +8,7 @@ responses are retained when applying the target model's chat template.
 No inference server or model weights are required; only the tokenizer is loaded.
 
 ```bash
-python experiment/prefix_cache_hit_rate.py \
+python -m experiment.prefix_cache_hit_rate \
   --tokenizer /path/to/model \
   --dataset swe_agent \
   --page-sizes 1,16,32,64,128,256 \
@@ -20,7 +20,7 @@ python experiment/prefix_cache_hit_rate.py \
 For the Thoughtworks agentic-coding corpus:
 
 ```bash
-python experiment/prefix_cache_hit_rate.py \
+python -m experiment.prefix_cache_hit_rate \
   --tokenizer /path/to/model \
   --dataset agentic_coding_trajectories \
   --min-isl 8192 \
