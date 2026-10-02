@@ -28,7 +28,7 @@ class LogStateCacheConfig(BaseCacheConfig):
     granularity              : int  = LOG_STATE_GRANULARITY
     enable_eager_state       : bool = False
     enable_memorized_evict   : bool = True
-    enable_merge_adjustment  : bool = False
+    enable_merge_adjustment  : bool = True
     min_sampling_len         : int  = 1024
     max_merge_intensity      : int  = 16
     default_merge_growth_rate: int = 2

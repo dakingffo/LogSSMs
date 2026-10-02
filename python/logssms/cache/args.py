@@ -62,7 +62,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             dest="enable_merge_adjustment",
             default=LogStateCacheConfig.enable_merge_adjustment,
             metavar="{true,false}",
-            help="Adapt LogState merge intensity from online branch-hit samples.",
+            help="Adapt LogState merge intensity from online branch-hit samples (default: true). Set false for binary merging.",
         )
         parser.add_argument(
             "--eager-state",

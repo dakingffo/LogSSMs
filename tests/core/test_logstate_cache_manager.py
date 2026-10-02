@@ -454,6 +454,32 @@ def test_adaptive_sampling_records_hit_only_after_successful_admission():
     manager.unlock(admitted)
 
 
+def test_manager_exports_online_merge_profile_and_cache_req_timing():
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = make_manager(enable_merge_adjustment=True)
+    req = new_req(manager, torch.arange(130, dtype=torch.int32))
+    manager.allocate([req])
+    req.cached_len = 130
+    manager.cache_req(req, finished=True)
+
+    pending = PendingRequest(
+        uid=1, input_ids=torch.arange(150, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=16),
+    )
+    match = manager.match_req(pending)
+    assert manager.prefill_acquire(PAGE_SIZE, match.cuda_handle)
+    profile = manager.profile_result()
+    online = profile["online_merge"]
+    assert online["enabled"]
+    assert online["min_sampling_len"] == 1024
+    assert online["aggregate"]["owners_created"] == 2
+    assert online["aggregate"]["hits_recorded"] == 1
+    assert online["aggregate"]["advances_below_update_boundary"] == 1
+    assert online["updates"] == []
+    assert profile["cache_req_samples"][-1]["merge_stats_ms"] >= 0
+    manager.unlock(match.cuda_handle)
+
+
 def test_adaptive_sampling_owner_moves_to_the_latest_chain_node():
     manager = make_manager(enable_merge_adjustment=True)
     req = new_req(manager, torch.arange(130, dtype=torch.int32))

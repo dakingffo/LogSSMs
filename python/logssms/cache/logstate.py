@@ -384,10 +384,11 @@ class OnlineAnalysisScheduler:
         self,
         page_size                : int,
         granularity              : int  = LOG_STATE_GRANULARITY,
-        enable_merge_adjustment  : bool = False,
+        enable_merge_adjustment  : bool = True,
         min_sampling_len         : int  = 1024,
         max_merge_intensity      : int  = 16,
         default_merge_growth_rate: int = 2,
+        profile_enabled          : bool = False,
     ) -> None:
         assert page_size > 0
         assert granularity > 0 and page_size % granularity == 0
@@ -400,32 +401,95 @@ class OnlineAnalysisScheduler:
         self.min_sampling_len = min_sampling_len
         self.max_merge_intensity = max_merge_intensity
         self.default_merge_growth_rate = default_merge_growth_rate
+        self._merge_profile = (
+            {"aggregate": Counter(), "timing_ms": Counter(),
+             "updates": deque(maxlen=8192)}
+            if profile_enabled else None
+        )
+
+    def profile_result(self) -> dict | None:
+        profile = self._merge_profile
+        if profile is None:
+            return None
+        return {
+            "enabled": self.enable_merge_adjustment,
+            "min_sampling_len": self.min_sampling_len,
+            "max_merge_intensity": self.max_merge_intensity,
+            "default_merge_growth_rate": self.default_merge_growth_rate,
+            "aggregate": dict(profile["aggregate"]),
+            "timing_ms": dict(profile["timing_ms"]),
+            "updates": list(profile["updates"]),
+            "dropped_updates": max(
+                0, profile["aggregate"]["interval_updates"] - len(profile["updates"])
+            ),
+        }
 
     def make_merge_stats(self, origin: int) -> LogStateMergeStats | None:
         if not self.enable_merge_adjustment:
             return None
+        if self._merge_profile is not None:
+            self._merge_profile["aggregate"]["owners_created"] += 1
         return LogStateMergeStats(
             origin=origin, tail=origin,
             next_update_tail=origin + self.min_sampling_len,
         )
 
-    def record_hit(self, stats: LogStateMergeStats, position: int) -> None:
-        if position < stats.origin or position > stats.tail:
-            return
-        stats.hit_positions.append(position)
+    def record_hit(self, stats: LogStateMergeStats | None, position: int) -> None:
+        profile = self._merge_profile
+        start = perf_counter_ns() if profile is not None else 0
+        if stats is None:
+            outcome = "hits_without_owner"
+        elif position <= 0:
+            outcome = "hits_without_prefix"
+        elif position < stats.origin:
+            outcome = "hits_before_origin"
+        elif position > stats.tail:
+            outcome = "hits_after_tail"
+        else:
+            stats.hit_positions.append(position)
+            outcome = "hits_recorded"
+        if profile is not None:
+            profile["aggregate"]["hit_attempts"] += 1
+            profile["aggregate"][outcome] += 1
+            profile["timing_ms"]["record_hit_ms"] += (
+                perf_counter_ns() - start
+            ) / 1e6
 
     def advance_merge_stats(
         self,
         stats: LogStateMergeStats,
         tail : int,
+        *,
+        owner_uuid: int | None = None,
     ) -> None:
         if tail <= stats.tail:
             return
+        profile = self._merge_profile
+        start = perf_counter_ns() if profile is not None else 0
+        updates = 0
         boundary = stats.next_update_tail
         if boundary is None:
             boundary = stats.origin + self.min_sampling_len
         while boundary <= tail:
-            fitted = self._fit_merge_intensity(stats, boundary)
+            previous_intensity = stats.intensity
+            details = {} if profile is not None else None
+            sample_start = perf_counter_ns() if profile is not None else 0
+            queued_hits = len(stats.hit_positions) if profile is not None else 0
+            bins = {}
+            remaining = deque()
+            window_begin = boundary - self.min_sampling_len
+            for position in stats.hit_positions:
+                if position >= boundary:
+                    remaining.append(position)
+                elif position >= window_begin:
+                    distance = max(self.granularity, boundary - position)
+                    index = (distance - 1) // self.page_size
+                    bins[index] = bins.get(index, 0) + 1
+            stats.hit_positions = remaining
+            sample_ms = (perf_counter_ns() - sample_start) / 1e6 if profile is not None else 0.0
+            fit_start = perf_counter_ns() if profile is not None else 0
+            fitted = self._fit_hit_bins(bins, details)
+            fit_ms = (perf_counter_ns() - fit_start) / 1e6 if profile is not None else 0.0
             stats.intensity = (
                 fitted if fitted is not None else
                 min(
@@ -433,27 +497,54 @@ class OnlineAnalysisScheduler:
                     stats.intensity * self.default_merge_growth_rate,
                 )
             )
-            stats.hit_positions = deque(
-                position for position in stats.hit_positions
-                if position >= boundary
-            )
+            if profile is not None:
+                assert details is not None
+                counts = profile["aggregate"]
+                counts["interval_updates"] += 1
+                counts["fit_updates" if fitted is not None else "fallback_updates"] += 1
+                counts[details["reason"]] += 1
+                counts["sampled_hits"] += details["sampled_hits"]
+                counts["retired_hits"] += queued_hits - len(stats.hit_positions)
+                counts["intensity_changes"] += int(stats.intensity != previous_intensity)
+                profile["timing_ms"]["fit_ms"] += fit_ms
+                profile["timing_ms"]["sample_and_retire_ms"] += sample_ms
+                profile["updates"].append({
+                    "owner_uuid": owner_uuid,
+                    "origin": stats.origin,
+                    "tail_before": stats.tail,
+                    "tail_after": tail,
+                    "window_begin": boundary - self.min_sampling_len,
+                    "window_end": boundary,
+                    "queued_hits_before": queued_hits,
+                    "queued_hits_after": len(stats.hit_positions),
+                    "previous_intensity": previous_intensity,
+                    "intensity": stats.intensity,
+                    "fit_ms": fit_ms,
+                    "sample_and_retire_ms": sample_ms,
+                    **details,
+                })
+            updates += 1
             boundary += self.min_sampling_len
         stats.next_update_tail = boundary
         stats.tail = tail
+        if profile is not None:
+            profile["aggregate"]["tail_advances"] += 1
+            profile["aggregate"]["advances_below_update_boundary"] += int(updates == 0)
+            profile["timing_ms"]["advance_stats_ms"] += (
+                perf_counter_ns() - start
+            ) / 1e6
 
-    def _fit_merge_intensity(
+    def _fit_hit_bins(
         self,
-        stats: LogStateMergeStats,
-        boundary: int,
+        bins: dict[int, int],
+        diagnostics: dict | None = None,
     ) -> int | None:
-        bins: dict[int, int] = {}
-        for position in stats.hit_positions:
-            if not boundary - self.min_sampling_len <= position < boundary:
-                continue
-            distance = max(self.granularity, boundary - position)
-            index = (distance - 1) // self.page_size
-            bins[index] = bins.get(index, 0) + 1
         if len(bins) < 2:
+            if diagnostics is not None:
+                diagnostics.update(
+                    reason="no_hits" if not bins else "insufficient_bins",
+                    sampled_hits=sum(bins.values()), occupied_bins=len(bins),
+                )
             return None
 
         xs = [math.log((index + 0.5) * self.page_size) for index in bins]
@@ -462,17 +553,36 @@ class OnlineAnalysisScheduler:
         y_mean = sum(ys) / len(ys)
         denominator = sum((value - x_mean) ** 2 for value in xs)
         if denominator == 0:
+            if diagnostics is not None:
+                diagnostics.update(
+                    reason="degenerate_fit", sampled_hits=sum(bins.values()),
+                    occupied_bins=len(bins),
+                )
             return None
         slope = sum(
             (x - x_mean) * (y - y_mean)
             for x, y in zip(xs, ys, strict=True)
         ) / denominator
         fitted = math.floor(-slope)
+        if diagnostics is not None:
+            intercept = y_mean - slope * x_mean
+            total_variance = sum((y - y_mean) ** 2 for y in ys)
+            residual = sum(
+                (y - intercept - slope * x) ** 2
+                for x, y in zip(xs, ys, strict=True)
+            )
+            diagnostics.update(
+                reason="fitted", sampled_hits=sum(bins.values()),
+                occupied_bins=len(bins), slope=slope, exponent=-slope,
+                floored_exponent=fitted,
+                clamp=("min" if fitted < 2 else "max" if fitted > self.max_merge_intensity else None),
+                r_squared=1 - residual / total_variance if total_variance > 0 else None,
+            )
         return min(self.max_merge_intensity, max(2, fitted))
 
     def begin_round(self, tree: LogRadixTree) -> LogStateRound:
         return LogStateRound(
-            frozenset(entry.slot for entry in tree.iter_entries())
+            frozenset(tree.unique_slots())
         )
 
     def analyze(
@@ -490,14 +600,18 @@ class OnlineAnalysisScheduler:
             round_info = self.begin_round(tree)
 
         step_start = perf_counter_ns() if step_timing_ms is not None else 0
-        analysis_nodes, endpoints = self._analysis_paths(tree, input_ids)
+        traces = tuple(
+            tree.trace(values[:align_down(len(values), self.granularity)])
+            for values in input_ids
+        )
+        analysis_nodes, endpoints = self._analysis_paths(tree, traces)
         if step_timing_ms is not None:
             step_timing_ms["matched_paths_ms"] = (
                 perf_counter_ns() - step_start
             ) / 1e6
             step_start = perf_counter_ns()
         pending = self._find_protections(
-            tree, input_ids, step_timing_ms=step_timing_ms,
+            tree, input_ids, traces=traces, step_timing_ms=step_timing_ms,
         )
         if step_timing_ms is not None:
             step_timing_ms["protection_total_ms"] = (
@@ -525,8 +639,9 @@ class OnlineAnalysisScheduler:
                 perf_counter_ns() - step_start
             ) / 1e6
             step_start = perf_counter_ns()
+        path_cache = {}
         materialize = self._plan_materialize(
-            tree, round_info.eligible_slots, pending, analysis_nodes
+            tree, round_info.eligible_slots, pending, analysis_nodes, path_cache,
         )
         if step_timing_ms is not None:
             step_timing_ms["materialize_plan_ms"] = (
@@ -542,6 +657,7 @@ class OnlineAnalysisScheduler:
             analysis_nodes,
             endpoints,
             diagnostics,
+            path_cache,
         )
         if step_timing_ms is not None:
             step_timing_ms["coalesce_plan_ms"] = (
@@ -560,7 +676,7 @@ class OnlineAnalysisScheduler:
     def _analysis_paths(
         self,
         tree     : LogRadixTree,
-        input_ids: Sequence[torch.Tensor],
+        traces   : Sequence[LogRadixTrace],
     ) -> tuple[
         tuple[LogRadixTreeNode, ...],
         tuple[_AnalysisEndpoint, ...],
@@ -576,9 +692,7 @@ class OnlineAnalysisScheduler:
         """
         nodes: dict[int, LogRadixTreeNode] = {}
         endpoints: dict[tuple[int, int], _AnalysisEndpoint] = {}
-        for values in input_ids:
-            usable_len = align_down(len(values), self.granularity)
-            trace = tree.trace(values[:usable_len])
+        for trace in traces:
             if trace.matched_len == 0:
                 continue
             endpoint = _AnalysisEndpoint(trace.node, trace.matched_len)
@@ -600,6 +714,7 @@ class OnlineAnalysisScheduler:
         tree     : LogRadixTree,
         input_ids: Sequence[torch.Tensor],
         *,
+        traces: Sequence[LogRadixTrace] | None = None,
         step_timing_ms: dict[str, float] | None = None,
     ) -> tuple[_PendingProtection, ...]:
         branch_start = perf_counter_ns() if step_timing_ms is not None else 0
@@ -611,7 +726,10 @@ class OnlineAnalysisScheduler:
 
         for request_index, values in enumerate(input_ids):
             usable_len = align_down(len(values), self.granularity)
-            trace = tree.trace(values[:usable_len])
+            trace = (
+                tree.trace(values[:usable_len]) if traces is None else
+                traces[request_index]
+            )
             if trace.matched_len == 0:
                 continue
             ends_in_existing_edge = not trace.is_exact
@@ -677,12 +795,29 @@ class OnlineAnalysisScheduler:
                 stack.append((depth, begin))
         return branches
 
+    def _cached_path_entries(
+        self,
+        tree   : LogRadixTree,
+        node   : LogRadixTreeNode,
+        cache  : dict[int, tuple[tuple[LogRadixTreeNode, ...], list[LogStateEntry]]],
+    ) -> tuple[tuple[LogRadixTreeNode, ...], list[LogStateEntry]]:
+        # Scoped to one analysis call; never retain stale tree paths across batches.
+        if node.uuid not in cache:
+            path = tree.path(node)
+            entries = sorted(
+                (entry for part in path for entry in part.entries),
+                key=lambda entry: (entry.begin, entry.end, entry.slot),
+            )
+            cache[node.uuid] = (path, entries)
+        return cache[node.uuid]
+
     def _plan_materialize(
         self,
         tree          : LogRadixTree,
         eligible_slots: frozenset[int],
         pending       : tuple[_PendingProtection, ...],
         analysis_nodes: tuple[LogRadixTreeNode, ...],
+        path_cache    : dict,
     ) -> tuple[PageMaterialize, ...]:
         result = []
         entries = {
@@ -701,9 +836,14 @@ class OnlineAnalysisScheduler:
                 # persistent Checkpoint representation is page-sized.
                 continue
             owner = tree.entry_owner(entry)
-            if self._interval_is_protected(tree, owner, entry.begin, entry.end, pending):
+            path, path_entries = self._cached_path_entries(
+                tree, owner, path_cache,
+            )
+            if self._interval_is_protected(
+                tree, owner, entry.begin, entry.end, pending,
+                path=path, path_entries=path_entries,
+            ):
                 continue
-            path_entries = self._entries_for_node(tree, owner)
             checkpoints = [
                 value
                 for value in path_entries
@@ -738,6 +878,7 @@ class OnlineAnalysisScheduler:
         analysis_nodes: tuple[LogRadixTreeNode, ...],
         endpoints     : tuple[_AnalysisEndpoint, ...],
         diagnostics   : dict[str, int] | None,
+        path_cache    : dict,
     ) -> tuple[CheckpointCoalesce, ...]:
         projected = {
             plan.log_slot: LogStateEntry(
@@ -782,6 +923,11 @@ class OnlineAnalysisScheduler:
                 "rejected_protected_interval": 0,
                 "planned_groups": 0,
                 "planned_slot_releases": 0,
+                "same_span_groups": 0,
+                "cross_span_groups": 0,
+                "planned_covered_tokens": 0,
+                "anchors_with_stats": 0,
+                "anchors_without_stats": 0,
             })
         # Every matched endpoint is an anchor, including an internal node
         # without an adaptive owner. Owner nodes on the matched path retain
@@ -804,10 +950,8 @@ class OnlineAnalysisScheduler:
             if diagnostics is not None:
                 diagnostics["merge_anchors"] += 1
             stats = leaf.merge_stats
-            path = tree.path(leaf)
-            path_entries = sorted(
-                (entry for node in path for entry in node.entries),
-                key=lambda entry: (entry.begin, entry.end, entry.slot),
+            path, path_entries = self._cached_path_entries(
+                tree, leaf, path_cache,
             )
             path_context = _MergePathContext.build(
                 tree, path, path_entries, pending,
@@ -865,12 +1009,16 @@ class OnlineAnalysisScheduler:
                 if diagnostics is not None:
                     diagnostics["anchors_without_eligible_entries"] += 1
                 continue
-            entries.sort(key=lambda entry: (entry.begin, entry.end, entry.slot))
             intensity = (
                 stats.intensity
                 if self.enable_merge_adjustment and stats is not None else
                 2
             )
+            if diagnostics is not None:
+                key = "anchors_with_stats" if stats is not None else "anchors_without_stats"
+                diagnostics[key] += 1
+                key = f"anchors_intensity_{intensity}"
+                diagnostics[key] = diagnostics.get(key, 0) + 1
             segments = self._merge_segments(
                 tree, leaf, entries, pending, diagnostics,
                 path_context=path_context,
@@ -913,6 +1061,10 @@ class OnlineAnalysisScheduler:
                 if diagnostics is not None:
                     diagnostics["planned_groups"] += 1
                     diagnostics["planned_slot_releases"] += len(group) - 1
+                    diagnostics["same_span_groups"] += 1
+                    diagnostics["planned_covered_tokens"] += group[-1].end - group[0].begin
+                    key = f"planned_arity_{len(group)}"
+                    diagnostics[key] = diagnostics.get(key, 0) + 1
 
             if not self.enable_merge_adjustment:
                 continue
@@ -943,6 +1095,9 @@ class OnlineAnalysisScheduler:
                 if diagnostics is not None:
                     diagnostics["planned_groups"] += 1
                     diagnostics["planned_slot_releases"] += 1
+                    diagnostics["cross_span_groups"] += 1
+                    diagnostics["planned_covered_tokens"] += right.end - left.begin
+                    diagnostics["planned_arity_2"] = diagnostics.get("planned_arity_2", 0) + 1
         result.sort(key=lambda value: (value.begin, value.end, value.left_slot))
         return tuple(result)
 
@@ -1093,20 +1248,27 @@ class OnlineAnalysisScheduler:
         begin  : int,
         end    : int,
         pending: tuple[_PendingProtection, ...],
+        *,
+        path        : Sequence[LogRadixTreeNode] | None = None,
+        path_entries: Sequence[LogStateEntry] | None = None,
     ) -> bool:
+        if path is None:
+            path = tree.path(node)
         if any(
             path_node.is_protected and begin < path_node.depth < end
-            for path_node in tree.path(node)
+            for path_node in path
         ):
             return True
+        if path_entries is None:
+            path_entries = self._entries_for_node(tree, node)
         entries = [
             entry
-            for entry in self._entries_for_node(tree, node)
+            for entry in path_entries
             if begin <= entry.begin and entry.end <= end
         ]
         if any(tree.entry_is_protected(entry.slot) for entry in entries):
             return True
-        path_ids = {value.uuid for value in tree.path(node)}
+        path_ids = {value.uuid for value in path}
         for value in pending:
             if not begin < value.position < end:
                 continue
@@ -1185,7 +1347,7 @@ class LogStateCacheManager(BaseCacheManager):
         resources                : CacheResources,
         granularity              : int  = LOG_STATE_GRANULARITY,
         enable_memorized_evict   : bool = True,
-        enable_merge_adjustment  : bool = False,
+        enable_merge_adjustment  : bool = True,
         min_sampling_len         : int  = 1024,
         max_merge_intensity      : int  = 16,
         default_merge_growth_rate: int = 2,
@@ -1212,6 +1374,9 @@ class LogStateCacheManager(BaseCacheManager):
             resources=resources,
             prefix_cache=tree,
         )
+        self._profile_enabled = os.getenv(
+            "LOGSSMS_PROFILE_SCHEDULER", "0"
+        ).lower() in ("1", "true", "yes")
         self.analyzer = OnlineAnalysisScheduler(
             page_size=page_size,
             granularity=granularity,
@@ -1219,6 +1384,7 @@ class LogStateCacheManager(BaseCacheManager):
             min_sampling_len=min_sampling_len,
             max_merge_intensity=max_merge_intensity,
             default_merge_growth_rate=default_merge_growth_rate,
+            profile_enabled=self._profile_enabled,
         )
         self._allocator = pool.allocator
         self.recycle_bin = (
@@ -1253,9 +1419,6 @@ class LogStateCacheManager(BaseCacheManager):
         self._cached_page_tokens: dict[int, int] = {}
         self._lazy_free_pages: list[torch.Tensor] | None = None
         self._lazy_free_states: list[torch.Tensor] | None = None
-        self._profile_enabled = os.getenv(
-            "LOGSSMS_PROFILE_SCHEDULER", "0"
-        ).lower() in ("1", "true", "yes")
         self._profile_stats = {
             "admission_attempts": 0,
             "admission_rejections": 0,
@@ -1363,10 +1526,9 @@ class LogStateCacheManager(BaseCacheManager):
         if not self.enable_merge_adjustment:
             return True
         assert isinstance(handle, LogStateCacheHandle)
-        if handle.source_merge_stats is not None and handle.match_position > 0:
-            self.analyzer.record_hit(
-                handle.source_merge_stats, handle.match_position
-            )
+        self.analyzer.record_hit(
+            handle.source_merge_stats, handle.match_position
+        )
         return True
 
     def record_prefill_queue(
@@ -1531,6 +1693,7 @@ class LogStateCacheManager(BaseCacheManager):
                 "decay_records_per_frame": self._allocator.decay_records_per_frame,
             },
             "aggregate": stats,
+            "online_merge": self.analyzer.profile_result(),
             "match_samples": self._match_profile_samples,
             "prefill_batches": self._profile_samples,
             "cache_req_samples": self._cache_req_samples,
@@ -1828,7 +1991,17 @@ class LogStateCacheManager(BaseCacheManager):
             live = self._live_pages.get(req.table_idx, ())
             handle = req.cache_handle
             cached_entries = ()
+            merge_stats = None
             if isinstance(handle, LogStateCacheHandle):
+                owner = handle.source_merge_stats
+                if owner is not None:
+                    merge_stats = {
+                        "origin": owner.origin,
+                        "tail": owner.tail,
+                        "intensity": owner.intensity,
+                        "queued_hits": len(owner.hit_positions),
+                        "next_update_tail": owner.next_update_tail,
+                    }
                 cached_entries = tuple(
                     entry
                     for node in self.tree.path(handle.node)
@@ -1839,6 +2012,7 @@ class LogStateCacheManager(BaseCacheManager):
                 "uid": req.uid,
                 "cached_len": req.cached_len,
                 "device_len": req.device_len,
+                "source_merge_stats": merge_stats,
                 "recovery_log_slots": (
                     0 if recovery is None else len(recovery.logs)
                 ),
@@ -2228,14 +2402,21 @@ class LogStateCacheManager(BaseCacheManager):
                 old_handle.cached_len, adopted,
             )
 
+        merge_stats_start = perf_counter_ns() if self._profile_enabled else 0
         stats = old_handle.merge_stats
         if stats is not None:
-            self.analyzer.advance_merge_stats(stats, insert.inserted_len)
+            self.analyzer.advance_merge_stats(
+                stats, insert.inserted_len, owner_uuid=insert.node.uuid,
+            )
             if insert.previous_len < insert.inserted_len:
                 if old_handle.node.merge_stats is stats:
                     old_handle.node.merge_stats = None
                 assert insert.node.merge_stats in (None, stats)
                 insert.node.merge_stats = stats
+        merge_stats_ms = (
+            (perf_counter_ns() - merge_stats_start) / 1e6
+            if self._profile_enabled else 0.0
+        )
         new_handle = replace(
             self.tree.make_handle(insert.node, insert.inserted_len),
             merge_stats=stats,
@@ -2322,6 +2503,7 @@ class LogStateCacheManager(BaseCacheManager):
                 "tree_insert_ms": tree_insert_ms,
                 "tree_match_ms": tree_match_ms,
                 "retain_kv_ms": retain_kv_ms,
+                "merge_stats_ms": merge_stats_ms,
                 "mapping_update_ms": mapping_update_ms,
                 "work_slot_lookup_ms": work_slot_lookup_ms,
                 "conv_copy_ms": conv_copy_ms,

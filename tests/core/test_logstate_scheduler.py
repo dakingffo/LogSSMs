@@ -1,6 +1,8 @@
 from collections import deque
 import random
+from unittest.mock import patch
 
+import pytest
 import torch
 
 from logssms.cache.logstate import (
@@ -591,3 +593,159 @@ def test_merge_sampling_uses_complete_nonoverlapping_token_intervals():
     assert stats.intensity == 4
     scheduler.advance_merge_stats(stats, 2048)
     assert stats.intensity == 8
+
+
+def test_online_merge_profile_reports_sampling_and_fallback_intervals():
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY, min_sampling_len=128, profile_enabled=True,
+    )
+    stats = scheduler.make_merge_stats(0)
+    assert stats is not None
+    scheduler.advance_merge_stats(stats, 64, owner_uuid=10)
+    scheduler.record_hit(None, 64)
+    scheduler.record_hit(stats, 65)
+    scheduler.advance_merge_stats(stats, 128, owner_uuid=10)
+    assert stats.intensity == 4
+    scheduler.advance_merge_stats(stats, 192, owner_uuid=10)
+    scheduler.record_hit(stats, 192)
+    scheduler.advance_merge_stats(stats, 256, owner_uuid=10)
+    assert stats.intensity == 8
+
+    profile = scheduler.profile_result()
+    assert profile is not None
+    aggregate = profile["aggregate"]
+    assert aggregate["owners_created"] == 1
+    assert aggregate["hit_attempts"] == 3
+    assert aggregate["hits_without_owner"] == 1
+    assert aggregate["hits_after_tail"] == 1
+    assert aggregate["hits_recorded"] == 1
+    assert aggregate["interval_updates"] == aggregate["fallback_updates"] == 2
+    assert aggregate["no_hits"] == aggregate["insufficient_bins"] == 1
+    assert aggregate["advances_below_update_boundary"] == 2
+    assert aggregate["sampled_hits"] == aggregate["retired_hits"] == 1
+    assert [update["owner_uuid"] for update in profile["updates"]] == [10, 10]
+    assert [update["window_end"] for update in profile["updates"]] == [128, 256]
+    assert [update["intensity"] for update in profile["updates"]] == [4, 8]
+    assert all(value >= 0 for value in profile["timing_ms"].values())
+
+
+@pytest.mark.parametrize("near_hits, expected, clamp", [(1, 2, "min"), (100, 3, "max")])
+def test_online_merge_profile_reports_fit_clamping(near_hits, expected, clamp):
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY, max_merge_intensity=3, profile_enabled=True,
+    )
+    stats = LogStateMergeStats(
+        0, 1023, hit_positions=deque([992] * near_hits + [928]),
+    )
+    scheduler.advance_merge_stats(stats, 1024)
+
+    profile = scheduler.profile_result()
+    update = profile["updates"][0]
+    assert stats.intensity == expected
+    assert update["reason"] == "fitted"
+    assert update["clamp"] == clamp
+    if near_hits == 1:
+        assert update["r_squared"] is None
+    else:
+        assert update["r_squared"] == pytest.approx(1)
+    assert update["exponent"] == -update["slope"]
+    assert update["sampled_hits"] == near_hits + 1
+    assert update["occupied_bins"] == 2
+    assert profile["aggregate"]["fit_updates"] == 1
+
+
+def test_online_merge_profile_does_not_change_fits_or_queue_retirement():
+    baseline = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY, min_sampling_len=128)
+    profiled = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY, min_sampling_len=128, profile_enabled=True,
+    )
+    original = LogStateMergeStats(0, 127, hit_positions=deque([96, 16, 80, 192]))
+    measured = LogStateMergeStats(0, 127, hit_positions=deque(original.hit_positions))
+    for tail in (128, 192, 256, 384):
+        baseline.advance_merge_stats(original, tail)
+        profiled.advance_merge_stats(measured, tail)
+        assert original == measured
+    assert baseline.profile_result() is None
+
+
+def test_disabled_online_merge_profile_does_not_read_clock():
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    stats = scheduler.make_merge_stats(0)
+    with patch("logssms.cache.logstate.perf_counter_ns", side_effect=AssertionError):
+        scheduler.record_hit(stats, 0)
+        scheduler.advance_merge_stats(stats, 1024)
+    assert scheduler.profile_result() is None
+
+
+def test_online_merge_profile_bounds_update_history_without_losing_totals():
+    scheduler = OnlineAnalysisScheduler(
+        PAGE_SIZE, GRANULARITY, min_sampling_len=128, profile_enabled=True,
+    )
+    scheduler._merge_profile["updates"] = deque(maxlen=1)
+    stats = scheduler.make_merge_stats(0)
+    scheduler.advance_merge_stats(stats, 384)
+    profile = scheduler.profile_result()
+    assert profile["aggregate"]["interval_updates"] == 3
+    assert len(profile["updates"]) == 1
+    assert profile["updates"][0]["window_end"] == 384
+    assert profile["dropped_updates"] == 2
+
+
+def test_online_merge_profile_reports_actual_plan_arity_and_spans():
+    tree, leaf = make_checkpoint_history(7)
+    leaf.merge_stats = LogStateMergeStats(0, 7 * PAGE_SIZE, intensity=8)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    plan = scheduler.analyze(tree, [ids(7 * PAGE_SIZE)], collect_diagnostics=True)
+    diagnostics = dict(plan.merge_diagnostics)
+    assert diagnostics["anchors_intensity_8"] == 1
+    assert diagnostics["planned_arity_6"] == 1
+    assert diagnostics["same_span_groups"] == 1
+    assert diagnostics["cross_span_groups"] == 0
+    assert diagnostics["planned_covered_tokens"] == 6 * PAGE_SIZE
+
+
+def test_analysis_matches_each_request_only_once():
+    tree, history = make_history()
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    request = torch.cat([history, ids(64, 10000)])
+    with patch.object(tree, "trace", wraps=tree.trace) as trace:
+        plan = scheduler.analyze(tree, [request])
+    assert trace.call_count == 1
+    assert len(plan.materialize) == 3
+
+
+def test_round_snapshots_unique_slots_without_scanning_entries():
+    tree, history = make_history()
+    # Splitting a log creates two logical entries with one physical slot.
+    tree.match_prefix(torch.cat([history[:80], ids(32, 10000)]))
+    expected = frozenset(entry.slot for entry in tree.iter_entries())
+    assert tree.slot_is_fragmented(1)
+    with patch.object(tree, "iter_entries", side_effect=AssertionError):
+        actual = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).begin_round(tree)
+    assert actual.eligible_slots == expected
+
+
+def test_analysis_reuses_owner_paths_within_batch_but_not_between_batches():
+    tree, history = make_history()
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    request = torch.cat([history, ids(64, 10000)])
+    with patch.object(tree, "path", wraps=tree.path) as path:
+        first = scheduler.analyze(tree, [request])
+    # Matched path + three log owners + merge anchors. Coalescing reuses
+    # the last owner's path rather than collecting it again.
+    assert path.call_count == 5
+    assert len(first.materialize) == 3
+    tree.protect_entry(1)
+    later = scheduler.analyze(tree, [request])
+    assert 1 not in {task.log_slot for task in later.materialize}
+
+
+def test_fused_sampling_preserves_unsorted_future_and_boundary_hits():
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY, min_sampling_len=128)
+    stats = LogStateMergeStats(
+        0, 127, hit_positions=deque([192, 96, 256, 16, 128, 64]),
+    )
+    scheduler.advance_merge_stats(stats, 128)
+    assert tuple(stats.hit_positions) == (192, 256, 128)
+    scheduler.advance_merge_stats(stats, 256)
+    assert tuple(stats.hit_positions) == (256,)

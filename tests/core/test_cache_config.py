@@ -74,8 +74,17 @@ def test_server_uses_logstate_defaults(tmp_path) -> None:
     assert args.cache_config == LogStateCacheConfig()
     assert not args.cache_config.enable_eager_state
     assert args.cache_config.enable_memorized_evict
+    assert args.cache_config.enable_merge_adjustment
     assert args.cache_config.granularity == LOG_STATE_GRANULARITY == 32
     assert args.page_size == 64
+
+
+def test_server_can_explicitly_disable_merge_adjustment(tmp_path) -> None:
+    args = parse_args([
+        "--model", str(tmp_path), "--dtype", "bfloat16", "--dummy-weight",
+        "--cache-type", "logstate", "--merge-adjustment", "false",
+    ])
+    assert not args.cache_config.enable_merge_adjustment
 
 
 @pytest.mark.parametrize("flag", ["--graph", "--cuda-graph-max-bs"])
