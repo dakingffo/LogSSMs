@@ -104,7 +104,7 @@ class GraphRunner:
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
         self.graph_map: dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
-            return logger.info_rank0("CUDA graph is disabled.")
+            return logger.info_rank0("Decode CUDA graph is disabled.")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
         if self.linear_attn_backend is not None:

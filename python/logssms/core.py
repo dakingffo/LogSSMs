@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 if TYPE_CHECKING:
+    from logssms.engine.prefill_graph import PrefillGraphRunner
     from logssms.utils.batch import BatchIndices
     from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
@@ -166,6 +167,7 @@ class Context:
 
     state_table        : torch.Tensor | None = field(default=None, init=False)
     work_state_table   : torch.Tensor | None = field(default=None, init=False)
+    prefill_graph_runner: PrefillGraphRunner | None = field(default=None, init=False)
 
     _batch      : Batch | None        = field(default=None, init=False)
 

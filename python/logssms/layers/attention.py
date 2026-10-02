@@ -202,5 +202,8 @@ class GatedRotaryAttention(BaseOP):
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         query, gate, key, value = self.proj(x, positions)
         output = self.attn.forward(query, key, value)
+        return self.output(output, gate)
+
+    def output(self, output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         sigmoid_and_mul(output, gate, out=output)
         return self.o_proj.forward(output.flatten(-2))

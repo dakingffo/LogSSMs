@@ -147,7 +147,7 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--graph",
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum batch size for CUDA graph capture. None means auto-tuning based on the GPU memory.",
+        help="The maximum decode batch size for CUDA graph capture. Also enables piecewise prefill graphs. 0 disables both; None means auto-tuning based on the GPU memory.",
     )
 
     parser.add_argument(

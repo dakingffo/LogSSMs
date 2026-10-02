@@ -83,6 +83,34 @@ def test_retained_samples_bounded_but_totals_include_all(monkeypatch):
     assert result["phases"]["decode"]["dropped_samples"] == 3
 
 
+def test_piecewise_prefill_profile_does_not_use_decode_runner(monkeypatch, profiler):
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    engine = object.__new__(Engine)
+    engine.profiler = profiler
+    engine.stream = "stream"
+    engine.config = SimpleNamespace(
+        enable_specualtive_decoding=False, model_config=SimpleNamespace(is_hybrid=False),
+    )
+    runner = SimpleNamespace(can_use_cuda_graph=lambda batch: True, replays=0, padded_tokens=0)
+    @contextmanager
+    def forward_batch(batch): yield
+    engine.ctx = SimpleNamespace(forward_batch=forward_batch, prefill_graph_runner=runner)
+    engine.graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
+    def forward():
+        runner.replays += 4
+        runner.padded_tokens += 12
+        return torch.ones(1, 4)
+    engine.model = SimpleNamespace(forward=forward)
+    engine.sampler = SimpleNamespace(sample=lambda logits, args: torch.tensor([2]))
+    engine.forward_batch(_batch("prefill"), None)
+    _Event.ready = True
+    profiler.poll()
+    sample = profiler.result("forward")["prefill_batches"][0]
+    assert sample["graph_kind"] == "piecewise_prefill"
+    assert sample["prefill_piece_replays"] == 4
+    assert sample["prefill_piece_padding"] == 12
+
+
 @pytest.mark.parametrize("phase", ["prefill", "decode", "verify"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_forward_profile_does_not_change_sampling(monkeypatch, phase, enabled):

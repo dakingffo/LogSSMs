@@ -92,8 +92,9 @@ def test_decode_graph_metadata_uses_capture_buffers() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("read_slots,write_slots", [([1, 3], [1, 3]), ([1, 3], [2, 3])])
+@pytest.mark.parametrize("fused_gates", [False, True])
 def test_decode_recurrent_direct_store_matches_gather_scatter(
-    read_slots: list[int], write_slots: list[int]
+    read_slots: list[int], write_slots: list[int], fused_gates: bool,
 ) -> None:
     from logssms.kernel.linear_attention.vendor.fla import (
         fused_recurrent_gated_delta_rule,
@@ -101,6 +102,10 @@ def test_decode_recurrent_direct_store_matches_gather_scatter(
     )
 
     inputs = _make_inputs(seq_len=1)
+    if fused_gates:
+        inputs["beta"], inputs["gate"] = torch.cat(
+            [inputs["beta"], inputs["gate"]], dim=-1
+        ).chunk(2, dim=-1)
     pool = torch.randn(5, 2, 4, 64, 64, device="cuda", dtype=torch.bfloat16)
     before = pool.clone()
     descriptor = torch.tensor(
@@ -109,7 +114,7 @@ def test_decode_recurrent_direct_store_matches_gather_scatter(
     reads, writes = descriptor[:, 0], descriptor[:, 1]
     reference_output, reference_states = fused_recurrent_gated_delta_rule(
         inputs["query"], inputs["key"], inputs["value"],
-        inputs["gate"], inputs["beta"], inputs["A_log"], inputs["dt_bias"],
+        inputs["gate"].contiguous(), inputs["beta"].contiguous(), inputs["A_log"], inputs["dt_bias"],
         pool[:, 1].index_select(0, reads),
     )
     output = fused_recurrent_gated_delta_rule_to_slots(

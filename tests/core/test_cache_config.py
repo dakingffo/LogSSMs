@@ -78,6 +78,25 @@ def test_server_uses_logstate_defaults(tmp_path) -> None:
     assert args.page_size == 64
 
 
+@pytest.mark.parametrize("flag", ["--graph", "--cuda-graph-max-bs"])
+@pytest.mark.parametrize("max_bs", [0, 4])
+def test_server_uses_common_cuda_graph_configuration(tmp_path, flag, max_bs):
+    args = parse_args([
+        "--model", str(tmp_path), "--dtype", "bfloat16", "--dummy-weight",
+        flag, str(max_bs),
+    ])
+    assert args.cuda_graph_max_bs == max_bs
+    assert not hasattr(args, "prefill_cuda_graph")
+
+
+def test_server_rejects_removed_prefill_graph_switch(tmp_path):
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--model", str(tmp_path), "--dtype", "bfloat16", "--dummy-weight",
+            "--prefill-cuda-graph", "true",
+        ])
+
+
 def test_logstate_rejects_sub_chunk_granularity() -> None:
     parser = make_cache_argument_parser("logstate")
 

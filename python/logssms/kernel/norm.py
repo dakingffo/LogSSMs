@@ -14,6 +14,10 @@ def _rms_norm_gated_kernel(
     output,
     num_cols,
     eps,
+    GATE_ROWS: tl.constexpr,
+    GATE_GROUP_STRIDE: tl.constexpr,
+    GATE_ROW_STRIDE: tl.constexpr,
+    GATE_COL_STRIDE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -26,7 +30,8 @@ def _rms_norm_gated_kernel(
         other=0.0,
     ).to(tl.float32)
     gate_value = tl.load(
-        gate + row * num_cols + offsets,
+        gate + (row // GATE_ROWS) * GATE_GROUP_STRIDE
+        + (row % GATE_ROWS) * GATE_ROW_STRIDE + offsets * GATE_COL_STRIDE,
         mask=mask,
         other=0.0,
     ).to(tl.float32)
@@ -63,7 +68,11 @@ def rms_norm_gated(
     assert block_size <= 65536, f"RMSNorm width is too large for one Triton block: {num_cols}"
 
     hidden = hidden_states.reshape(-1, num_cols).contiguous()
-    gate = gate.reshape(-1, num_cols).contiguous()
+    # Keep the token/head strides of a Z view into a fused QKVZ projection.
+    gate = (
+        gate.reshape(-1, gate.shape[-2], num_cols)
+        if gate.ndim > 1 else gate.view(1, 1, num_cols)
+    )
     weight = weight.contiguous()
     output = torch.empty_like(hidden)
     _rms_norm_gated_kernel[(hidden.shape[0],)](
@@ -73,6 +82,10 @@ def rms_norm_gated(
         output,
         num_cols,
         eps,
+        GATE_ROWS=gate.shape[1],
+        GATE_GROUP_STRIDE=gate.stride(0),
+        GATE_ROW_STRIDE=gate.stride(1),
+        GATE_COL_STRIDE=gate.stride(2),
         BLOCK_SIZE=block_size,
         num_warps=8 if block_size >= 2048 else 4,
     )

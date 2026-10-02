@@ -50,7 +50,8 @@ def _recurrent_gated_delta_rule_with_snapshots(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(3, 5, 4, 32, 32), (2, 5, 16, 128, 128)])
-def test_batched_kernel_matches_torch(shape):
+@pytest.mark.parametrize("fused_gates", [False, True])
+def test_batched_kernel_matches_torch(shape, fused_gates):
     torch.manual_seed(0)
     B, S, H, K, V = shape
     device = torch.device("cuda")
@@ -59,6 +60,8 @@ def test_batched_kernel_matches_torch(shape):
     value = torch.randn(B, S, H, V, device=device, dtype=torch.bfloat16)
     gate = torch.randn(B, S, H, device=device, dtype=torch.bfloat16)
     beta = torch.randn(B, S, H, device=device, dtype=torch.bfloat16)
+    if fused_gates:
+        beta, gate = torch.cat([beta, gate], dim=-1).chunk(2, dim=-1)
     A_log = torch.zeros(H, device=device)
     dt_bias = torch.zeros(H, device=device)
     initial_state = torch.randn(B, H, K, V, device=device, dtype=torch.bfloat16)

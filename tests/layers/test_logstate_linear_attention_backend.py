@@ -336,7 +336,8 @@ def test_logstate_decode_graph_metadata_uses_int32_capture_buffers() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("block_v", [8, 16, 32])
-def test_decode_direct_logstate_store_matches_temporary_outputs(block_v: int) -> None:
+@pytest.mark.parametrize("fused_gates", [False, True])
+def test_decode_direct_logstate_store_matches_temporary_outputs(block_v: int, fused_gates: bool) -> None:
     device = torch.device("cuda")
     pool = FramedMHALogStatePool(
         num_frames=64,
@@ -363,6 +364,8 @@ def test_decode_direct_logstate_store_matches_temporary_outputs(block_v: int) ->
     value = torch.randn_like(query)
     gate = torch.randn(3, 1, 2, device=device, dtype=torch.bfloat16)
     beta = torch.randn_like(gate)
+    if fused_gates:
+        beta, gate = torch.cat([beta, gate], dim=-1).chunk(2, dim=-1)
     A_log = torch.randn(2, device=device)
     dt_bias = torch.randn(2, device=device)
     work_slots = torch.tensor([3, 4, 5], dtype=torch.int32, device=device)
@@ -373,7 +376,7 @@ def test_decode_direct_logstate_store_matches_temporary_outputs(block_v: int) ->
 
     expected_output, expected_state, expected_key, expected_value, expected_decay = (
         fused_recurrent_gated_delta_rule_with_log(
-            query, key, value, gate, beta, A_log, dt_bias, initial
+            query, key, value, gate.contiguous(), beta.contiguous(), A_log, dt_bias, initial
         )
     )
     actual_output = fused_recurrent_gated_delta_rule_to_framed_logstate(

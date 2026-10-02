@@ -64,7 +64,7 @@ def test1_weight_loading(mcfg, model, loaded):
     # spot-check shapes on representative target-model layers
     lt = "model.layers.0.linear_attn"
     at = "model.layers.3.self_attn"
-    for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkv.weight", f"{at}.qkv_proj.weight",
+    for k in (f"{lt}.conv1d.weight", f"{lt}.in_proj_qkvz.weight", f"{at}.qkv_proj.weight",
               f"{at}.q_norm.weight", "model.norm.weight"):
         assert k in sd, f"missing {k}"
         print(f"  {k}: {tuple(sd[k].shape)} {sd[k].dtype}")

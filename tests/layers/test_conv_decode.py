@@ -42,10 +42,15 @@ def _reference(x, weight, history):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("read_slots,write_slots", [([0, 2], [0, 2]), ([0, 2], [1, 2])])
-def test_standard_decode_conv_matches_reference(read_slots, write_slots):
+@pytest.mark.parametrize("fused_input", [False, True])
+def test_standard_decode_conv_matches_reference(read_slots, write_slots, fused_input):
     torch.manual_seed(93)
     config = _config()
     x = torch.randn(2, config.conv_dim, device="cuda", dtype=torch.bfloat16)
+    if fused_input:
+        projected = torch.randn(2, config.conv_dim + config.value_dim, device="cuda", dtype=x.dtype)
+        projected[:, :config.conv_dim].copy_(x)
+        x = projected[:, :config.conv_dim]
     weight = torch.randn(config.conv_dim, 1, 4, device="cuda", dtype=x.dtype) * 0.1
     state = torch.randn(3, 2, config.conv_dim, 3, device="cuda", dtype=x.dtype)
     before = state.clone()
@@ -64,7 +69,8 @@ def test_standard_decode_conv_matches_reference(read_slots, write_slots):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_framed_decode_conv_writes_log_and_work_and_replays_graph():
+@pytest.mark.parametrize("fused_input", [False, True])
+def test_framed_decode_conv_writes_log_and_work_and_replays_graph(fused_input):
     config = _config()
     pool = FramedMHALogStatePool(
         num_frames=64, page_size=64, granularity=16,
@@ -80,6 +86,10 @@ def test_framed_decode_conv_writes_log_and_work_and_replays_graph():
     granules = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
     torch.manual_seed(94)
     x = torch.randn(2, 192, device="cuda", dtype=torch.bfloat16)
+    if fused_input:
+        projected = torch.randn(2, 256, device="cuda", dtype=x.dtype)
+        projected[:, :192].copy_(x)
+        x = projected[:, :192]
     weight = torch.randn(192, 1, 4, device="cuda", dtype=x.dtype) * 0.1
     history = torch.randn(2, 192, 3, device="cuda", dtype=x.dtype)
     pool.write_conv(slots, zeros, 1, history)
@@ -112,3 +122,34 @@ def test_framed_decode_conv_writes_log_and_work_and_replays_graph():
         [tensor.flatten(2) for tensor in graph_output], dim=-1
     )[:, 0]
     torch.testing.assert_close(actual_replay, expected_replay, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_packed_conv_and_snapshots_read_fused_qkv_views():
+    from logssms.kernel.linear_attention.packed_conv import (
+        packed_causal_conv1d, packed_conv_snapshots,
+    )
+
+    torch.manual_seed(95)
+    channels, state_len = 192, 3
+    x = torch.randn(8, channels + 64, device="cuda", dtype=torch.bfloat16)[:, :channels]
+    history = torch.randn(2, channels, state_len, device="cuda", dtype=x.dtype)
+    weight = torch.randn(channels, 1, state_len + 1, device="cuda", dtype=x.dtype) * 0.1
+    offsets = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32)
+    chunks = torch.tensor([[0, 0], [1, 0]], device="cuda", dtype=torch.int32)
+    rows = torch.tensor([0, 2, 3, 7], device="cuda", dtype=torch.int32)
+    requests = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int32)
+    actual = packed_causal_conv1d(x, weight, history, offsets, chunks)
+    expected = torch.cat([
+        F.silu(F.conv1d(
+            torch.cat([history[i:i + 1], x[begin:end].T.unsqueeze(0)], dim=-1),
+            weight, groups=channels,
+        )).squeeze(0).T for i, (begin, end) in enumerate([(0, 3), (3, 8)])
+    ])
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    snapshots = packed_conv_snapshots(x, history, offsets, rows, requests)
+    expected_snapshots = torch.stack([
+        torch.cat([history[i], x[begin:row + 1].T], dim=-1)[:, -state_len:]
+        for i, begin, row in [(0, 0, 0), (0, 0, 2), (1, 3, 3), (1, 3, 7)]
+    ])
+    torch.testing.assert_close(snapshots, expected_snapshots, rtol=0, atol=0)

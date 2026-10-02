@@ -68,6 +68,12 @@ def _fused_recurrent_gated_delta_kernel(
     STATE_HEAD_STRIDE: tl.constexpr,
     READ_SLOT_STRIDE: tl.constexpr,
     WRITE_SLOT_STRIDE: tl.constexpr,
+    GATE_BATCH_STRIDE: tl.constexpr,
+    GATE_SEQ_STRIDE: tl.constexpr,
+    GATE_HEAD_STRIDE: tl.constexpr,
+    BETA_BATCH_STRIDE: tl.constexpr,
+    BETA_SEQ_STRIDE: tl.constexpr,
+    BETA_HEAD_STRIDE: tl.constexpr,
     FRAME_BYTES: tl.constexpr,
     FRAMES_PER_SLOT: tl.constexpr,
     HEAD_PAYLOAD_BYTES: tl.constexpr,
@@ -193,8 +199,8 @@ def _fused_recurrent_gated_delta_kernel(
         + (batch_idx * SEQ_LEN * NUM_V_HEADS + value_head) * HEAD_V_DIM
         + v_offset
     )
-    gate_ptr = gate + batch_idx * SEQ_LEN * NUM_V_HEADS + value_head
-    beta_ptr = beta + batch_idx * SEQ_LEN * NUM_V_HEADS + value_head
+    gate_ptr = gate + batch_idx * GATE_BATCH_STRIDE + value_head * GATE_HEAD_STRIDE
+    beta_ptr = beta + batch_idx * BETA_BATCH_STRIDE + value_head * BETA_HEAD_STRIDE
     output_ptr = (
         output
         + (batch_idx * SEQ_LEN * NUM_V_HEADS + value_head) * HEAD_V_DIM
@@ -307,8 +313,8 @@ def _fused_recurrent_gated_delta_kernel(
         query_ptr += NUM_K_HEADS * HEAD_K_DIM
         key_ptr += NUM_K_HEADS * HEAD_K_DIM
         value_ptr += NUM_V_HEADS * HEAD_V_DIM
-        gate_ptr += NUM_V_HEADS
-        beta_ptr += NUM_V_HEADS
+        gate_ptr += GATE_SEQ_STRIDE
+        beta_ptr += BETA_SEQ_STRIDE
         output_ptr += NUM_V_HEADS * HEAD_V_DIM
 
 
@@ -416,7 +422,7 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
     _fused_recurrent_gated_delta_kernel[grid](
         query.contiguous(), key.contiguous(), value.contiguous(),
-        gate.contiguous(), beta.contiguous(), A_log, dt_bias,
+        gate, beta, A_log, dt_bias,
         pool.storage, output, None, None, None, None,
         log_slots, token_offsets, work_slots, None, None,
         pool.payload_frame_table, pool.decay_frame_table, None,
@@ -437,6 +443,12 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         STATE_HEAD_STRIDE=0,
         READ_SLOT_STRIDE=0,
         WRITE_SLOT_STRIDE=0,
+        GATE_BATCH_STRIDE=gate.stride(0),
+        GATE_SEQ_STRIDE=gate.stride(1),
+        GATE_HEAD_STRIDE=gate.stride(2),
+        BETA_BATCH_STRIDE=beta.stride(0),
+        BETA_SEQ_STRIDE=beta.stride(1),
+        BETA_HEAD_STRIDE=beta.stride(2),
         FRAME_BYTES=pool.frame_bytes,
         FRAMES_PER_SLOT=pool.allocator.payload_frames,
         HEAD_PAYLOAD_BYTES=pool.head_payload_bytes,
@@ -477,7 +489,7 @@ def fused_recurrent_gated_delta_rule_to_slots(
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
     _fused_recurrent_gated_delta_kernel[grid](
         query.contiguous(), key.contiguous(), value.contiguous(),
-        gate.contiguous(), beta.contiguous(), A_log, dt_bias,
+        gate, beta, A_log, dt_bias,
         state_pool, output, None, None, None, None,
         None, None, None, read_slots, write_slots,
         None, None, None, None,
@@ -497,6 +509,12 @@ def fused_recurrent_gated_delta_rule_to_slots(
         STATE_HEAD_STRIDE=state_pool.stride(2),
         READ_SLOT_STRIDE=read_slots.stride(0),
         WRITE_SLOT_STRIDE=write_slots.stride(0),
+        GATE_BATCH_STRIDE=gate.stride(0),
+        GATE_SEQ_STRIDE=gate.stride(1),
+        GATE_HEAD_STRIDE=gate.stride(2),
+        BETA_BATCH_STRIDE=beta.stride(0),
+        BETA_SEQ_STRIDE=beta.stride(1),
+        BETA_HEAD_STRIDE=beta.stride(2),
         FRAME_BYTES=0,
         FRAMES_PER_SLOT=0,
         HEAD_PAYLOAD_BYTES=0,
@@ -544,8 +562,6 @@ def _fused_recurrent_gated_delta_rule(
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
-    gate = gate.contiguous()
-    beta = beta.contiguous()
     initial_state = initial_state.contiguous()
     output = torch.empty_like(value)
     states = torch.empty(
@@ -600,6 +616,12 @@ def _fused_recurrent_gated_delta_rule(
         STATE_HEAD_STRIDE=0,
         READ_SLOT_STRIDE=0,
         WRITE_SLOT_STRIDE=0,
+        GATE_BATCH_STRIDE=gate.stride(0),
+        GATE_SEQ_STRIDE=gate.stride(1),
+        GATE_HEAD_STRIDE=gate.stride(2),
+        BETA_BATCH_STRIDE=beta.stride(0),
+        BETA_SEQ_STRIDE=beta.stride(1),
+        BETA_HEAD_STRIDE=beta.stride(2),
         FRAME_BYTES=0,
         FRAMES_PER_SLOT=0,
         HEAD_PAYLOAD_BYTES=0,

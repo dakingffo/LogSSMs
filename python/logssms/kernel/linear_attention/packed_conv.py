@@ -9,6 +9,7 @@ import triton.language as tl
 def _packed_conv_kernel(
     x, weight, history, offsets, chunks, output,
     C: tl.constexpr, K: tl.constexpr, S: tl.constexpr,
+    X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr,
 ):
     chunk = tl.program_id(0)
@@ -28,7 +29,7 @@ def _packed_conv_kernel(
             mask=active & old[:, None], other=0,
         )
         current = tl.load(
-            x + (begin + source[:, None]) * C + c[None, :],
+            x + (begin + source[:, None]) * X_ROW_STRIDE + c[None, :] * X_COL_STRIDE,
             mask=active & ~old[:, None], other=0,
         )
         w = tl.load(weight + c * K + tap, mask=c < C, other=0)
@@ -42,6 +43,7 @@ def _packed_conv_kernel(
 def _packed_snapshots_kernel(
     x, history, offsets, rows, requests, output,
     C: tl.constexpr, S: tl.constexpr, BS: tl.constexpr, BC: tl.constexpr,
+    X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
 ):
     snapshot = tl.program_id(0)
     request = tl.load(requests + snapshot).to(tl.int32)
@@ -56,7 +58,7 @@ def _packed_snapshots_kernel(
         mask=(c[:, None] < C) & (s[None, :] < S) & old[None, :], other=0,
     )
     current = tl.load(
-        x + (begin + source[None, :]) * C + c[:, None],
+        x + (begin + source[None, :]) * X_ROW_STRIDE + c[:, None] * X_COL_STRIDE,
         mask=(c[:, None] < C) & (s[None, :] < S) & ~old[None, :], other=0,
     )
     tl.store(
@@ -79,10 +81,11 @@ def packed_causal_conv1d(
     state_len = kernel_size - 1
     assert history.shape == (len(cu_seqlens) - 1, channels, state_len)
     assert weight.shape == (channels, 1, kernel_size)
-    output = torch.empty_like(x)
+    output = torch.empty((total_tokens, channels), device=x.device, dtype=x.dtype)
     _packed_conv_kernel[(len(chunk_indices), triton.cdiv(channels, 32))](
         x, weight, history, cu_seqlens, chunk_indices, output,
-        channels, kernel_size, state_len, 64, 32, num_warps=4,
+        channels, kernel_size, state_len, x.stride(0), x.stride(1),
+        64, 32, num_warps=4,
     )
     return output
 
@@ -102,6 +105,7 @@ def packed_conv_snapshots(
     _packed_snapshots_kernel[(len(rows), triton.cdiv(channels, 32))](
         x, history, cu_seqlens, rows, requests, output,
         channels, state_len, triton.next_power_of_2(state_len), 32,
+        x.stride(0), x.stride(1),
         num_warps=4,
     )
     return output

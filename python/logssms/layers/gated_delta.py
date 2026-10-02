@@ -78,39 +78,56 @@ class GatedDeltaNet(BaseOP):
         self.out_proj = LinearRowParallel(
             num_value_heads * head_v_dim, hidden_size, has_bias=False
         )
-        self.in_proj_qkv = LinearColParallelMerged(
+        self.in_proj_qkvz = LinearColParallelMerged(
             hidden_size,
-            [num_key_heads * head_k_dim * 2 + num_value_heads * head_v_dim],
+            [
+                num_key_heads * head_k_dim * 2 + num_value_heads * head_v_dim,
+                num_value_heads * head_v_dim,
+            ],
             has_bias=False,
         )
-        self.in_proj_z = LinearColParallelMerged(
-            hidden_size, [num_value_heads * head_v_dim], has_bias=False
-        )
-        self.in_proj_b = LinearColParallelMerged(
-            hidden_size, [num_value_heads], has_bias=False
-        )
-        self.in_proj_a = LinearColParallelMerged(
-            hidden_size, [num_value_heads], has_bias=False
+        self.in_proj_ba = LinearColParallelMerged(
+            hidden_size, [num_value_heads, num_value_heads], has_bias=False
         )
 
     @nvtx_annotate("GatedDeltaNet", layer_id_field="_linear_layer_idx")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mixed_qkv, z, beta, gate = self.proj(x)
+        core_output = self.attend(mixed_qkv, beta, gate)
+        return self.output(core_output, z)
+
+    def proj(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        config = self._config
+        mixed_qkv, z = self.in_proj_qkvz.forward(x).split(
+            [config.conv_dim, config.value_dim], dim=-1
+        )
+        beta, gate = self.in_proj_ba.forward(x).chunk(2, dim=-1)
+        return mixed_qkv, z, beta, gate
+
+    def attend(
+        self,
+        mixed_qkv: torch.Tensor,
+        beta     : torch.Tensor,
+        gate     : torch.Tensor,
+    ) -> torch.Tensor:
         from logssms.core import get_global_ctx
 
         ctx = get_global_ctx()
-        config = self._config
-        core_output = ctx.linear_attn_backend.forward(
-            mixed_qkv=self.in_proj_qkv.forward(x),
-            gate=self.in_proj_a.forward(x),
-            beta=self.in_proj_b.forward(x),
+        return ctx.linear_attn_backend.forward(
+            mixed_qkv=mixed_qkv,
+            gate=gate,
+            beta=beta,
             conv_weight=self.conv1d.weight,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
-            config=config,
+            config=self._config,
             batch=ctx.batch,
         )
-        z = self.in_proj_z.forward(x).reshape(-1, config.head_v_dim)
+
+    def output(self, core_output: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        config = self._config
+        shape = (core_output.shape[0], config.num_v_heads, config.head_v_dim)
         output = self.norm.forward(
-            core_output.reshape(-1, config.head_v_dim), z
-        ).reshape(x.shape[0], -1)
+            core_output.reshape(shape), z.view(shape)
+        ).reshape(core_output.shape[0], -1)
         return self.out_proj.forward(output)

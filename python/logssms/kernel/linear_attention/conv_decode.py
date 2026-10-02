@@ -15,6 +15,7 @@ def _conv_decode(
     X, W, Q, K, V, StandardState, Storage, FrameTable,
     ReadSlots, ReadGranules, WriteSlots, WriteGranules, WorkSlots,
     C: tl.constexpr, KEY_DIM: tl.constexpr, STATE_LEN: tl.constexpr,
+    X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
     NUM_LAYERS: tl.constexpr, LAYER: tl.constexpr,
     FRAME_ELEMS: tl.constexpr, NUM_GRANULES: tl.constexpr,
     FRAMED: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
@@ -52,7 +53,9 @@ def _conv_decode(
         state_ptr + old_base + ch[:, None] * STATE_LEN + s[None, :],
         channel_ok[:, None] & tap_ok[None, :], other=0,
     )
-    x = tl.load(X + b * C + ch, channel_ok, other=0).to(W.dtype.element_ty)
+    x = tl.load(
+        X + b * X_ROW_STRIDE + ch * X_COL_STRIDE, channel_ok, other=0
+    ).to(W.dtype.element_ty)
     weights = tl.load(
         W + ch[:, None] * (STATE_LEN + 1) + s[None, :],
         channel_ok[:, None] & tap_ok[None, :], other=0,
@@ -129,6 +132,7 @@ def conv_decode_qkv(
         mixed_qkv, weight, q, k, v, state, state, table,
         read_slots, read_granules, write_slots, write_granules, work_slots,
         channels, config.key_dim, config.state_len,
+        mixed_qkv.stride(0), mixed_qkv.stride(1),
         num_layers, config.layer_idx, frame_elems, num_granules,
         framed, 32, triton.next_power_of_2(config.state_len),
         num_warps=4,

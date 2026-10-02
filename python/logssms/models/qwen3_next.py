@@ -18,6 +18,7 @@ from logssms.layers import (
     VocabParallelEmbedding,
 )
 from logssms.speculator.hidden_captor import HiddenCapturePoint, with_speculator
+from logssms.layers.piecewise import prefill_piece
 from logssms.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
@@ -236,13 +237,72 @@ class Qwen3NextDecoderLayer(BaseOP):
         residual : torch.Tensor | None,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h, residual = self.input_layernorm.forward(x, residual)
+        *features, residual = self._prepare_attention(
+            x, residual, None if self.block_type == "linear_attention" else positions
+        )
         if self.block_type == "linear_attention":
-            h = self.linear_attn.forward(h)
+            mixed_qkv, output_gate, beta, gate = features
+            h = self.linear_attn.attend(mixed_qkv, beta, gate)
         else:
-            h = self.self_attn.forward(h, positions)
+            query, output_gate, key, value = features
+            h = self.self_attn.attn.forward(query, key, value)
+        return self._finish_attention(h, output_gate, residual)
+
+    @prefill_piece
+    def _prepare_attention(
+        self,
+        x        : torch.Tensor,
+        residual : torch.Tensor | None,
+        positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
+        h, residual = self.input_layernorm.forward(x, residual)
+        features = (
+            self.linear_attn.proj(h) if self.block_type == "linear_attention"
+            else self.self_attn.proj(h, positions)
+        )
+        return (*features, residual)
+
+    @prefill_piece
+    def _finish_attention(
+        self,
+        h       : torch.Tensor,
+        gate    : torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h = (
+            self.linear_attn.output(h, gate) if self.block_type == "linear_attention"
+            else self.self_attn.output(h, gate)
+        )
         h, residual = self.post_attention_layernorm.forward(h, residual)
         return self.mlp.forward(h), residual
+
+    def prefill_graph_pieces(self):
+        weight = self.mlp.router.weight if isinstance(self.mlp, MoEMLP) else self.mlp.gate_up_proj.weight
+        def sample(*shape):
+            return torch.empty((1,) + shape, device=weight.device, dtype=weight.dtype)
+        hidden = sample(weight.shape[1])
+        residual = None if self._layer_id == 0 else sample(weight.shape[1])
+        positions = (
+            None if self.block_type == "linear_attention"
+            else torch.zeros(1, dtype=torch.int32, device=weight.device)
+        )
+        pieces = [(self._prepare_attention, (hidden, residual, positions),
+                   ("hidden", "residual", "positions"),
+                   (("qkv", "gate", "beta", "decay", "residual")
+                    if self.block_type == "linear_attention"
+                    else ("query", "gate", "key", "value", "residual")))]
+        if isinstance(self.mlp, GatedMLP):
+            if self.block_type == "linear_attention":
+                config = self.linear_attn._config
+                core = sample(config.num_v_heads, config.head_v_dim)
+                gate = sample(config.value_dim)
+            else:
+                core = sample(self.self_attn.num_qo_heads, self.self_attn.head_dim)
+                gate = sample(self.self_attn.num_qo_heads, self.self_attn.head_dim)
+            pieces.append((self._finish_attention, (core, gate, sample(weight.shape[1])),
+                           ("attention_output", "gate", "residual"),
+                           ("hidden", "residual")))
+        return pieces
 
 
 class Qwen3NextModel(BaseOP):

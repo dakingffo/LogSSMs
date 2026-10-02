@@ -30,6 +30,10 @@ _MERGE_GROUPS = {
     ".v_proj": (".qkv_proj", ("q", "k", "v")),
     ".gate_proj": (".gate_up_proj", ("gate", "up")),
     ".up_proj": (".gate_up_proj", ("gate", "up")),
+    ".in_proj_qkv": (".in_proj_qkvz", ("qkv", "z")),
+    ".in_proj_z": (".in_proj_qkvz", ("qkv", "z")),
+    ".in_proj_b": (".in_proj_ba", ("b", "a")),
+    ".in_proj_a": (".in_proj_ba", ("b", "a")),
 }
 _SLOT_NAMES = {
     ".q_proj": "q",
@@ -37,6 +41,10 @@ _SLOT_NAMES = {
     ".v_proj": "v",
     ".gate_proj": "gate",
     ".up_proj": "up",
+    ".in_proj_qkv": "qkv",
+    ".in_proj_z": "z",
+    ".in_proj_b": "b",
+    ".in_proj_a": "a",
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
@@ -168,7 +176,7 @@ def _shard_tensor(
 def _get_merge_info(key: str):
     """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
-        if key.count(suffix):
+        if f"{suffix}." in key or key.endswith(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
     return None
 

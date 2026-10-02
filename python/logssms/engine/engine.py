@@ -195,6 +195,12 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
+        if self.graph_runner.max_graph_bs > 0:
+            from .prefill_graph import PrefillGraphRunner
+
+            self.ctx.prefill_graph_runner = PrefillGraphRunner(
+                self.model, config.max_forward_len, self.stream
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         torch.distributed.init_process_group(
@@ -265,6 +271,10 @@ class Engine:
     def _prepare_batch_profiled(self, batch: Batch, cache_manager) -> ForwardInput:
         profiler = self.profiler
         graph_used = self.graph_runner.can_use_cuda_graph(batch)
+        prefill_runner = getattr(self.ctx, "prefill_graph_runner", None)
+        graph_used = graph_used or (
+            prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
+        )
         with profiler.record_batch(batch, "prepare", graph_used=graph_used):
             with profiler.record_stage("pad_batch"):
                 self.graph_runner.pad_batch(batch)
@@ -322,8 +332,12 @@ class Engine:
 
     def _forward_batch_profiled(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         profiler = self.profiler
-        graph_used = self.graph_runner.can_use_cuda_graph(batch)
+        decode_graph = self.graph_runner.can_use_cuda_graph(batch)
+        prefill_runner = getattr(self.ctx, "prefill_graph_runner", None)
+        prefill_graph = prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
+        graph_used = decode_graph or prefill_graph
         with profiler.record_batch(batch, "forward", graph_used=graph_used) as sample:
+            sample["graph_kind"] = "decode" if decode_graph else "piecewise_prefill" if prefill_graph else None
             if self.config.model_config.is_hybrid:
                 sample["linear_backend"] = type(self.linear_attn_backend).__name__
                 if hasattr(self.linear_attn_backend, "enable_eager_state"):
@@ -337,11 +351,16 @@ class Engine:
                     else list(counts[:batch.size])
                 )
             with self.ctx.forward_batch(batch):
-                if graph_used:
+                if decode_graph:
                     logits = self.graph_runner.replay(batch, profiler=profiler)
                 else:
+                    replays = prefill_runner.replays if prefill_graph else 0
+                    padded = prefill_runner.padded_tokens if prefill_graph else 0
                     with profiler.record_stage("model"):
                         logits = self.model.forward()
+                    if prefill_graph:
+                        sample["prefill_piece_replays"] = prefill_runner.replays - replays
+                        sample["prefill_piece_padding"] = prefill_runner.padded_tokens - padded
             with profiler.record_stage("sampling"):
                 next_tokens_gpu = (
                     self.sampler.reject_sample(logits, batch) if batch.is_verify
@@ -354,6 +373,8 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
+        if self.ctx.prefill_graph_runner is not None:
+            self.ctx.prefill_graph_runner.destroy_cuda_graphs()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
