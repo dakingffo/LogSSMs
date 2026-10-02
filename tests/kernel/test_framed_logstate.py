@@ -75,7 +75,7 @@ def test_framed_reconstruction_matches_serial_recurrence():
                 log[:64 * 128].copy_(keys.flatten())
                 log[64 * 128:].copy_(values.flatten())
                 decay = torch.empty((64,), device="cuda").uniform_(0.98, 0.999)
-                pool.decay_view(slot)[layer, :, head].copy_(decay)
+                pool.decay_view(slot)[layer, :, head].copy_(decay.log())
                 for token in range(64):
                     expected[layer, head] *= decay[token]
                     expected[layer, head] += (
@@ -140,7 +140,7 @@ def test_framed_restore_keeps_concurrent_requests_separate():
                 log[:64 * 128].copy_(keys.flatten())
                 log[64 * 128:].copy_(values.flatten())
                 decay = torch.empty((64,), device="cuda").uniform_(0.98, 0.999)
-                pool.decay_view(slot)[layer, :, head].copy_(decay)
+                pool.decay_view(slot)[layer, :, head].copy_(decay.log())
                 for token in range(64):
                     expected[row, layer, head] *= decay[token]
                     expected[row, layer, head] += (
@@ -203,7 +203,7 @@ def test_framed_construct_keeps_carry_across_long_chains():
             view = head_view(pool, slot, 0, 0, state=False)
             view[:64 * 32].fill_(0.01 * (row + 1))
             view[64 * 32:].fill_(0.01)
-            pool.decay_view(slot)[0, :, 0].fill_(1)
+            pool.decay_view(slot)[0, :, 0].zero_()
         chains.append((
             None,
             [(slot, 0, 64) for slot in row_logs],
@@ -253,7 +253,7 @@ def test_shared_log_materialization_reconstructs_later_branches():
         log = head_view(pool, slot, 0, 0, state=False)
         log[:64 * 32].fill_(0.01 * (index + 1))
         log[64 * 32:].fill_(0.01)
-        pool.decay_view(slot)[0, :, 0].fill_(1)
+        pool.decay_view(slot)[0, :, 0].zero_()
 
     plans = [PageMaterialize(slots[0], 0, 64, None, (entries[0],))]
     plans.extend(
@@ -419,6 +419,144 @@ def test_framed_decode_replays_at_fixed_sixteen_token_intervals(granularity):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_framed_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph):
+    torch.manual_seed(53)
+    bs, H, HV, K, V = 4, 2, 6, 128, 128
+    pool = FramedMHALogStatePool(
+        num_frames=192, page_size=64, granularity=32,
+        num_attention_layers=1, num_kv_heads=1, head_dim=128,
+        num_linear_layers=1, num_key_heads=H, num_value_heads=HV,
+        head_k_dim=K, head_v_dim=V, conv_dim=(2 * H + HV) * K, state_len=3,
+        device=torch.device("cuda"), dtype=dtype,
+    )
+    allocation = pool.reserve(logs=bs, works=bs)
+    assert allocation is not None
+    logs, works = allocation[1:]
+    log_slots = torch.tensor(logs, dtype=torch.int32, device="cuda")
+    work_slots = torch.tensor(works, dtype=torch.int32, device="cuda")
+    positions = torch.zeros(bs, dtype=torch.int32, device="cuda")
+    counts = torch.zeros_like(positions)
+    initial = torch.randn(bs, HV, K, V, dtype=dtype, device="cuda") * 0.02
+    keys = torch.randn(bs, 64, HV, K, dtype=dtype, device="cuda") * 0.02
+    values = torch.randn(bs, 64, HV, V, dtype=dtype, device="cuda") * 0.02
+    alpha = torch.empty(bs, 64, HV, device="cuda").uniform_(0.95, 0.999)
+    query = torch.randn(bs, 1, H, K, dtype=dtype, device="cuda")
+    key = torch.randn_like(query)
+    value = torch.randn(bs, 1, HV, V, dtype=dtype, device="cuda")
+    gate = torch.randn(bs, 1, HV, dtype=dtype, device="cuda")
+    beta = torch.randn_like(gate)
+    A_log = torch.randn(HV, device="cuda") * 0.1
+    dt_bias = torch.randn_like(A_log) * 0.1
+
+    def reset_pool():
+        pool.write_states(work_slots, 0, initial)
+        for row, slot in enumerate(logs):
+            for head in range(HV):
+                log = head_view(pool, slot, 0, head, state=False)
+                log[:64 * K].copy_(keys[row, :, head].flatten())
+                log[64 * K:].copy_(values[row, :, head].flatten())
+            pool.decay_view(slot)[0].copy_(alpha[row].log())
+
+    def run():
+        return fused_recurrent_gated_delta_rule_to_framed_logstate(
+            query, key, value, gate, beta, A_log, dt_bias, pool,
+            work_slots, log_slots, positions, 0, counts,
+        )
+
+    reset_pool()
+    output = run()
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+
+    q = query[:, 0].float()
+    k = key[:, 0].float()
+    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6) * K**-0.5
+    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+    q = q.repeat_interleave(HV // H, dim=1)
+    k = k.repeat_interleave(HV // H, dim=1)
+    log_decay = -A_log.exp() * torch.nn.functional.softplus(gate[:, 0].float() + dt_bias)
+
+    for offsets in ((0, 7, 15, 31), (15, 0, 16, 63), (32, 47, 62, 5)):
+        positions.copy_(torch.tensor(offsets, dtype=torch.int32, device="cuda"))
+        counts.copy_(positions % 16)
+        reset_pool()
+        previous = initial.float().clone()
+        for row, position in enumerate(offsets):
+            for token in range(position - position % 16, position):
+                previous[row] *= alpha[row, token, :, None, None]
+                previous[row] += (
+                    keys[row, token].float()[..., :, None]
+                    * values[row, token].float()[..., None, :]
+                )
+        previous *= log_decay.exp()[..., None, None]
+        residual = (value[:, 0].float() - torch.einsum("bhkv,bhk->bhv", previous, k))
+        residual *= beta[:, 0].float().sigmoid()[..., None]
+        expected_state = previous + k[..., :, None] * residual[..., None, :]
+        expected_output = torch.einsum("bhkv,bhk->bhv", expected_state, q)
+        if use_graph:
+            graph.replay()
+        else:
+            output = run()
+        torch.testing.assert_close(output[:, 0].float(), expected_output, rtol=0.03, atol=0.005)
+        observed = pool.read_states(work_slots, 0)
+        for row, position in enumerate(offsets):
+            if (position + 1) % 16 == 0:
+                torch.testing.assert_close(observed[row].float(), expected_state[row], rtol=0.03, atol=0.01)
+            else:
+                torch.testing.assert_close(observed[row], initial[row], rtol=0, atol=0)
+            for head in range(HV):
+                log = head_view(pool, logs[row], 0, head, state=False)
+                stored_keys = log[:64 * K].view(64, K)
+                stored_values = log[64 * K:].view(64, V)
+                torch.testing.assert_close(stored_keys[position].float(), k[row, head], rtol=0.01, atol=0.001)
+                torch.testing.assert_close(stored_values[position].float(), residual[row, head], rtol=0.03, atol=0.01)
+                # Flush must not discard the logs used for prefix restoration.
+                torch.testing.assert_close(stored_keys[:position], keys[row, :position, head], rtol=0, atol=0)
+                torch.testing.assert_close(stored_values[:position], values[row, :position, head], rtol=0, atol=0)
+            torch.testing.assert_close(pool.decay_view(logs[row])[0, position], log_decay[row], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_decode_preserves_log_decay_beyond_alpha_underflow():
+    pool = FramedMHALogStatePool(
+        num_frames=64, page_size=64, granularity=32,
+        num_attention_layers=1, num_kv_heads=1, head_dim=128,
+        num_linear_layers=1, num_key_heads=1, num_value_heads=1,
+        head_k_dim=128, head_v_dim=128, conv_dim=128, state_len=3,
+        device=torch.device("cuda"), dtype=torch.bfloat16,
+    )
+    allocation = pool.reserve(logs=1, works=1)
+    assert allocation is not None
+    log, work = allocation[1][0], allocation[2][0]
+    pool.zero_state(work)
+    qkv = torch.ones(1, 1, 1, 128, device="cuda", dtype=pool.dtype)
+    A_log = torch.zeros(1, device="cuda")
+    gate = torch.full((1, 1, 1), 1000, device="cuda", dtype=pool.dtype)
+    beta = torch.zeros_like(gate)
+    output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        qkv, qkv, qkv, gate, beta, A_log, A_log, pool,
+        torch.tensor([work], dtype=torch.int32, device="cuda"),
+        torch.tensor([log], dtype=torch.int32, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"), 0,
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+    )
+    torch.testing.assert_close(pool.decay_view(log)[0, 0, 0], -gate[0, 0, 0].float())
+    assert torch.isfinite(output).all()
+    output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        qkv, qkv, qkv, beta, beta, A_log, A_log, pool,
+        torch.tensor([work], dtype=torch.int32, device="cuda"),
+        torch.tensor([log], dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int32, device="cuda"), 0,
+        torch.ones(1, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_framed_construct_restores_internal_branch_before_inplace_checkpoint():
     torch.manual_seed(37)
     pool = FramedMHALogStatePool(
@@ -450,7 +588,7 @@ def test_framed_construct_restores_internal_branch_before_inplace_checkpoint():
         decays = torch.empty(64, device="cuda").uniform_(0.98, 0.999)
         log[:64 * 128].copy_(keys.flatten())
         log[64 * 128:].copy_(values.flatten())
-        pool.decay_view(log_slot)[0, :, head].copy_(decays)
+        pool.decay_view(log_slot)[0, :, head].copy_(decays.log())
         for token in range(64):
             expected_at_64[head] *= decays[token]
             expected_at_64[head] += (
@@ -504,7 +642,7 @@ def test_framed_construct_splits_groups_at_sm_count():
         log = head_view(pool, slot, 0, 0, state=False)
         log[:64 * 32].fill_(0.01)
         log[64 * 32:].fill_(0.01)
-        pool.decay_view(slot)[0, :, 0].fill_(1)
+        pool.decay_view(slot)[0, :, 0].zero_()
     workspace = construct_framed_log_state_chains(
         pool,
         [(None, [(log, 0, 64)], [(work,)]) for log, work in zip(logs, works)],
@@ -549,7 +687,7 @@ def test_framed_construct_prefetches_partial_chunks(dtype: torch.dtype):
     log = head_view(pool, log_slot, 0, 0, state=False)
     log[:64 * 32].copy_(keys.flatten())
     log[64 * 32:].copy_(values.flatten())
-    pool.decay_view(log_slot)[0, :, 0].copy_(decays)
+    pool.decay_view(log_slot)[0, :, 0].copy_(decays.log())
 
     expected = torch.zeros((32, 32), device="cuda")
     for token in range(35):

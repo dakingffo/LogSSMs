@@ -668,7 +668,7 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
             key = log[token * 32:(token + 1) * 32].float()
             value_begin = 64 * 32 + token * 32
             value = log[value_begin:value_begin + 32].float()
-            state[head] = state[head] * pool.decay_view(0)[0, token, head] + key[:, None] * value[None, :]
+            state[head] = state[head] * pool.decay_view(0)[0, token, head].exp() + key[:, None] * value[None, :]
     torch.testing.assert_close(
         pool.read_states(torch.tensor([2], dtype=torch.int32, device=device), 0)[0].float(),
         state,

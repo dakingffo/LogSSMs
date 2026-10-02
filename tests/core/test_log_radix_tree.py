@@ -18,6 +18,24 @@ def ids(length: int, begin: int = 0) -> torch.Tensor:
     return torch.arange(begin, begin + length, dtype=torch.int32)
 
 
+def test_node_depth_survives_entry_splits_and_new_branches():
+    tree = make_tree()
+    history = ids(128)
+    leaf = tree.insert(history, ids(128, 1000)).node
+    tree.insert(torch.cat([history[:39], ids(13, 2000)]), ids(52, 3000))
+    for end in range(4, 129, 4):
+        tree.attach_entry(leaf, LogStateEntry(end, LogStateKind.LOG, end - 4, end))
+    for node in tree._iter_nodes():
+        depth = 0
+        current = node
+        while not current.is_root():
+            depth += current.length
+            current = current.parent
+        assert node.depth == depth
+    assert leaf.depth == 128
+    tree.check_integrity()
+
+
 def test_insert_match_and_collect_path_values():
     tree = make_tree()
     token_ids = ids(12)

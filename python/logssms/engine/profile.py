@@ -131,7 +131,7 @@ class EngineProfiler:
                 sample["logical_tokens"] = sample["input_tokens"]
                 sample["total_ms"] = sample["cpu_total_ms"]
                 sample.update({name + "_ms": value for name, value in sample["cpu_stages_ms"].items()})
-                mapping_names = ("positions", "input_mapping", "write_mapping", "out_loc")
+                mapping_names = ("positions", "input_mapping", "write_mapping", "out_loc", "positions_mappings")
                 sample["positions_mappings_ms"] = sum(
                     sample["cpu_stages_ms"].get(name, 0.0) for name in mapping_names
                 )
@@ -216,7 +216,7 @@ class EngineProfiler:
                 })
                 result["phases"][phase]["positions_mappings_ms"] = sum(
                     totals["cpu_stages_ms"].get(name, 0.0)
-                    for name in ("positions", "input_mapping", "write_mapping", "out_loc")
+                    for name in ("positions", "input_mapping", "write_mapping", "out_loc", "positions_mappings")
                 )
                 result["phases"][phase]["total_ms"] = totals["cpu_total_ms"]
         for phase, samples in self.samples[kind].items():

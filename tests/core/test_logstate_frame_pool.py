@@ -190,6 +190,81 @@ def test_linear_descriptors_change_when_log_becomes_checkpoint():
     assert torch.all(pool.payload_frame_table[log] == -1)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_batch_materialization_and_partial_release(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    pool = make_pool(torch.device(device))
+    allocated = pool.reserve(logs=3)
+    assert allocated is not None
+    logs = allocated[1]
+    payload = pool.payload_frame_table[logs].clone()
+    pool.materialize_slots(logs)
+    if device == "cuda":
+        assert len(pool._retired_materializations) == 1
+        assert all(pool.allocator.slot(slot).kind == "log" for slot in logs)
+    pool.release_slots(logs[:1])
+    assert not pool._retired_materializations
+    assert all(pool.allocator.slot(slot).kind == "checkpoint" for slot in logs[1:])
+    torch.testing.assert_close(pool.payload_frame_table[logs[1:]], payload[1:])
+    assert torch.all(pool.conv_frame_table[logs[1:], :-1] == -1)
+    assert torch.all(pool.decay_frame_table[logs] == -1)
+    assert torch.all(pool.payload_frame_table[logs[0]] == -1)
+    pool.allocator.check_integrity()
+    pool.release_slots(logs[1:])
+    allocated = pool.reserve(logs=3)
+    assert allocated is not None
+    assert torch.all(pool.conv_frame_table[allocated[1]] >= 0)
+    pool.allocator.check_integrity()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_merged_slots_retire_without_reusing_inflight_frames(monkeypatch):
+    pool = make_pool(torch.device("cuda"))
+    actual_event = torch.cuda.Event
+    events = []
+
+    class Event:
+        def __init__(self):
+            self.event = actual_event()
+            self.ready = False
+            self.waits = 0
+            events.append(self)
+
+        def record(self, stream): self.event.record(stream)
+        def query(self): return self.ready and self.event.query()
+        def synchronize(self):
+            self.waits += 1
+            self.event.synchronize()
+            self.ready = True
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    logs = pool.reserve(logs=3)[1]
+    payload = pool.payload_frame_table[logs].clone()
+    pool.materialize_slots(logs)
+    pool.retire_slots(logs[:2])
+    pool.poll_reclamation()
+    assert not any(event.waits for event in events)
+    assert pool.retiring_slots == frozenset(logs[:2])
+    assert all(slot in pool.allocator.allocated_slots for slot in logs)
+    torch.testing.assert_close(pool.payload_frame_table[logs], payload)
+    # A capacity retry, not the merge commit, is allowed to wait. Consume all
+    # remaining raw frames to force that retry deterministically.
+    kv = pool.reserve(kv=len(pool.allocator._free))[0]
+    replacement = pool.reserve(logs=1)
+    assert replacement is not None
+    assert any(event.waits for event in events)
+    assert not pool.retiring_slots
+    assert pool.allocator.slot(logs[2]).kind == "checkpoint"
+    torch.testing.assert_close(pool.payload_frame_table[logs[2]], payload[2])
+    pool.allocator.check_integrity()
+    pool.release_kv(kv)
+    pool.release_slots(replacement[1] + logs[2:])
+    torch.cuda.synchronize()
+    assert not pool.allocator.allocated_slots
+    pool.allocator.check_integrity()
+
+
 def test_head_overlay_and_side_views_survive_noncontiguous_allocation():
     pool = make_pool()
     allocated = pool.reserve(kv=20)

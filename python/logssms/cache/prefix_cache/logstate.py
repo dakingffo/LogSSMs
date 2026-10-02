@@ -91,6 +91,7 @@ class LogRadixTreeNode:
         self.granularity = granularity
         self.children: dict[Any, LogRadixTreeNode] = {}
         self._parent: LogRadixTreeNode | None = None
+        self._depth = 0
         self.ref_count = 0
         self.is_protected = False
         self.timestamp = time.monotonic_ns() if tic is None else tic
@@ -125,6 +126,7 @@ class LogRadixTreeNode:
 
     def set_parent(self, parent: LogRadixTreeNode) -> None:
         self._parent = parent
+        self._depth = parent.depth + self.length
         parent.children[self.key_fn(self._key)] = self
 
     @property
@@ -150,9 +152,7 @@ class LogRadixTreeNode:
 
     @property
     def depth(self) -> int:
-        if self.is_root():
-            return 0
-        return self.parent.depth + self.length
+        return self._depth
 
     @property
     def begin(self) -> int:

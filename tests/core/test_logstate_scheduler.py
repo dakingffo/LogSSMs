@@ -1,4 +1,5 @@
 from collections import deque
+import random
 
 import torch
 
@@ -17,6 +18,32 @@ from logssms.cache.prefix_cache.logstate import (
 
 PAGE_SIZE = 64
 GRANULARITY = 16
+
+
+def test_batch_branch_points_match_granule_trie_oracle():
+    rng = random.Random(711)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    for _ in range(100):
+        paths = []
+        for _ in range(rng.randint(1, 24)):
+            parent = rng.choice(paths) if paths else ()
+            shared = parent[:rng.randrange(len(parent) + 1)]
+            path = shared + tuple(rng.randrange(4) for _ in range(rng.randrange(8)))
+            paths.append(path)
+        inputs = [torch.tensor(
+            [value for value in path for _ in range(GRANULARITY)]
+            + [9] * rng.randrange(GRANULARITY), dtype=torch.int32,
+        ) for path in paths]
+        expected = {}
+        prefixes = {path[:end] for path in paths for end in range(1, len(path) + 1)}
+        for prefix in prefixes:
+            indices = {i for i, path in enumerate(paths) if path[:len(prefix)] == prefix}
+            terminals = sum(paths[i] == prefix for i in indices)
+            children = {paths[i][len(prefix)] for i in indices if len(paths[i]) > len(prefix)}
+            if len(children) + int(terminals > 0) >= 2 or terminals >= 2:
+                tokens = tuple(value for value in prefix for _ in range(GRANULARITY))
+                expected[tokens] = indices
+        assert scheduler._batch_branch_points(inputs) == expected
 
 
 def ids(length: int, begin: int = 0) -> torch.Tensor:

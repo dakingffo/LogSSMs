@@ -151,12 +151,11 @@ def _fused_recurrent_gated_delta_kernel(
         replay_index = tl.arange(0, REPLAY_WINDOW)
         prior_offsets = current_offset - count + replay_index
         valid = replay_index < count
-        decays = tl.load(
+        log_decays = tl.load(
             decay_head + (LAYER * PAGE_SIZE + prior_offsets) * NUM_V_HEADS
             + value_head,
-            mask=valid, other=1.0,
+            mask=valid, other=0.0,
         )
-        log_decays = tl.log(tl.maximum(decays, 1e-30))
         total_decay = tl.sum(log_decays, axis=0)
         suffix_decay = tl.exp(total_decay - tl.cumsum(log_decays))
         logged_keys = tl.load(
@@ -208,13 +207,26 @@ def _fused_recurrent_gated_delta_kernel(
         v = tl.load(value_ptr, mask=v_mask, other=0.0).to(tl.float32)
         q = q * tl.rsqrt(tl.sum(q * q) + 1e-6) * scale
         k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-        decay = exp(-exp(A) * _softplus(tl.load(gate_ptr).to(tl.float32) + bias))
+        log_decay = -exp(A) * _softplus(tl.load(gate_ptr).to(tl.float32) + bias)
+        decay = exp(log_decay)
         beta_value = tl.sigmoid(tl.load(beta_ptr).to(tl.float32))
 
-        state *= decay
-        delta = (v - tl.sum(state * k[:, None], axis=0)) * beta_value
-        state += k[:, None] * delta[None, :]
-        result = tl.sum(state * q[:, None], axis=0)
+        if REPLAY_WORK:
+            if value_block == 0:
+                tl.store(
+                    decay_head + (LAYER * PAGE_SIZE + current_offset) * NUM_V_HEADS
+                    + value_head, log_decay,
+                )
+            # Compute the output without applying the full current-token update.
+            state_k = tl.sum(state * k[:, None], axis=0) * decay
+            state_q = tl.sum(state * q[:, None], axis=0) * decay
+            delta = (v - state_k) * beta_value
+            result = state_q + delta * tl.sum(k * q)
+        else:
+            state *= decay
+            delta = (v - tl.sum(state * k[:, None], axis=0)) * beta_value
+            state += k[:, None] * delta[None, :]
+            result = tl.sum(state * q[:, None], axis=0)
         tl.store(output_ptr, result, mask=v_mask)
 
         if STORE_LOG:
@@ -268,7 +280,8 @@ def _fused_recurrent_gated_delta_kernel(
             tl.store(residual_value_ptr, delta, mask=v_mask)
             if value_block == 0:
                 tl.store(prepared_key_ptr, k, mask=k_mask)
-                tl.store(decay_ptr, decay)
+                if not REPLAY_WORK:
+                    tl.store(decay_ptr, log_decay)
 
         if SLOTTED_STORE:
             snapshot_ptr = write_state_ptr
@@ -286,7 +299,8 @@ def _fused_recurrent_gated_delta_kernel(
             )
         if REPLAY_WORK:
             if (current_offset + 1) % REPLAY_WINDOW == 0:
-                tl.store(snapshot_ptr, state, mask=state_mask)
+                updated_state = state * decay + k[:, None] * delta[None, :]
+                tl.store(snapshot_ptr, updated_state, mask=state_mask)
         else:
             tl.store(snapshot_ptr, state, mask=state_mask)
 
@@ -340,7 +354,7 @@ def fused_recurrent_gated_delta_rule_with_log(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Run short GDN recurrence and expose its lossless update log."""
+    """Return output, states, normalized K, residual V and FP32 log-decay."""
     output, states, prepared_key, residual_value, decay = (
         _fused_recurrent_gated_delta_rule(
             query,

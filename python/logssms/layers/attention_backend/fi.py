@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List
@@ -9,7 +8,7 @@ import torch
 from logssms.core import Batch, get_global_ctx
 from logssms.distributed import get_tp_info
 from logssms.env import ENV
-from logssms.utils import div_ceil, div_even, init_logger, nvtx_annotate
+from logssms.utils import div_even, init_logger, nvtx_annotate
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -21,12 +20,6 @@ if TYPE_CHECKING:
         CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     )
     from logssms.models import ModelConfig
-
-
-def _next_power_of_2(n: int) -> int:
-    if n <= 1:
-        return 1
-    return 1 << math.ceil(math.log2(n))
 
 
 logger = init_logger(__name__)
@@ -111,7 +104,6 @@ class FlashInferBackend(BaseAttnBackend):
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
 
-        self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
@@ -166,14 +158,6 @@ class FlashInferBackend(BaseAttnBackend):
             )
         self.last_event.record()
 
-    def _get_ones_cpu(self, bs: int) -> torch.Tensor:
-        if bs <= len(self.cached_ones_cpu):
-            return self.cached_ones_cpu[:bs]
-        # padding to next pow of 2
-        next_len = _next_power_of_2(bs)
-        self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, pin_memory=True)
-        return self.cached_ones_cpu[:bs]
-
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
@@ -191,57 +175,27 @@ class FlashInferBackend(BaseAttnBackend):
 
     @nvtx_annotate("FlashInfer::metadata")
     def prepare_metadata(self, batch: Batch) -> None:
-        reqs = batch.padded_reqs
+        from logssms.kernel.metadata import gather_paged_indices
+        from logssms.utils.batch import BatchIndices
 
-        padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
-        max_seqlen_q = max(seqlens_q)
-        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-
-        device = self.device
-        seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
-        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
-        if max_seqlen_q == 1:  # decode with all extend_len = 1
-            cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **CPU_KWARGS)
-        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
-            cu_seqlens_q_cpu = cu_seqlens_k_cpu
-        else:  # normal extend prefill, with partial cache hit
-            cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
-
-        page_table = get_global_ctx().page_table
         page_size = getattr(self.kvcache, "kv_page_size", 1)
-        if page_size == 1:
-            indices = torch.cat([
-                page_table[req.table_idx, :req.device_len] for req in reqs
-            ])
-            last_page_len = self._get_ones_cpu(padded_size)
-        else:
-            kv_lengths = [div_ceil(length, page_size) for length in seqlens_k]
-            cu_seqlens_k_cpu = torch.tensor(
-                [0] + kv_lengths, **CPU_KWARGS
-            ).cumsum_(dim=0)
-            indices = torch.cat([
-                page_table[req.table_idx, :req.device_len:page_size] // page_size
-                for req in reqs
-            ])
-            last_page_len = torch.tensor(
-                [(length - 1) % page_size + 1 for length in seqlens_k],
-                **CPU_KWARGS,
-            )
+        packet = batch.prepared_indices
+        if packet is None:  # Graph capture has no Engine.prepare_batch stage.
+            packet = BatchIndices.make(batch, self.device, page_size)
+        assert packet.page_size == page_size
+        indices = gather_paged_indices(packet, get_global_ctx().page_table)
         batch.attn_metadata = FIMetadata(
-            cu_seqlens_q_cpu=cu_seqlens_q_cpu,
-            cu_seqlens_k_cpu=cu_seqlens_k_cpu,
-            cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
+            cu_seqlens_q_cpu=packet.cu_seqlens_q_cpu,
+            cu_seqlens_k_cpu=packet.cu_seqlens_k_cpu,
+            cu_seqlens_q_gpu=packet.cu_seqlens_q_gpu,
             indices=indices,
-            last_page_len_cpu=last_page_len,
+            last_page_len_cpu=packet.last_page_len_cpu,
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
             head_dim=self.config.head_dim,
             page_size=page_size,
             pos_encoding_mode="NONE",
-            seq_lens_cpu=seq_len_cpu,
+            seq_lens_cpu=packet.seq_lens_cpu,
             dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )

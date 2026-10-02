@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from logssms.tvm import call_cuda_ffi, load_jit, make_cpp_args
+from logssms.utils.torch_utils import make_device_vectors
 
 if TYPE_CHECKING:
     from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
@@ -53,10 +54,6 @@ def _construction_dims(pool: FramedMHALogStatePool) -> tuple:
     )
 
 
-def _vector(values: Sequence[int], device: torch.device) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int32, device=device)
-
-
 def restore_framed_log_state_chains(
     pool  : FramedMHALogStatePool,
     chains: Sequence[tuple[int | None, Sequence[tuple[int, int, int]], int]],
@@ -70,14 +67,17 @@ def restore_framed_log_state_chains(
     offsets = [0]
     for _base, logs, _out in chains:
         offsets.append(offsets[-1] + len(logs))
+    vectors = make_device_vectors([
+        [-1 if base is None else base for base, _logs, _out in chains],
+        offsets,
+        [slot for slot, _begin, _end in segments],
+        [begin for _slot, begin, _end in segments],
+        [end for _slot, _begin, end in segments],
+        [output for _base, _logs, output in chains],
+    ], pool.device)
     call_cuda_ffi(module.restore,
         *_construction_args(pool),
-        _vector([-1 if base is None else base for base, _logs, _out in chains], pool.device),
-        _vector(offsets, pool.device),
-        _vector([slot for slot, _begin, _end in segments], pool.device),
-        _vector([begin for _slot, begin, _end in segments], pool.device),
-        _vector([end for _slot, _begin, end in segments], pool.device),
-        _vector([output for _base, _logs, output in chains], pool.device),
+        *vectors,
         *_construction_dims(pool),
     )
 
@@ -111,15 +111,18 @@ def construct_framed_log_state_chains(
             for slots in outputs:
                 output_slots.extend(slots)
                 output_offsets.append(len(output_slots))
+        vectors = make_device_vectors([
+            [-1 if base is None else base for base, _logs, _outputs in group],
+            task_offsets,
+            [slot for slot, _begin, _end in segments],
+            [begin for _slot, begin, _end in segments],
+            [end for _slot, _begin, end in segments],
+            output_offsets,
+            output_slots,
+        ], pool.device)
         call_cuda_ffi(module.construct,
             *_construction_args(pool),
-            _vector([-1 if base is None else base for base, _logs, _outputs in group], pool.device),
-            _vector(task_offsets, pool.device),
-            _vector([slot for slot, _begin, _end in segments], pool.device),
-            _vector([begin for _slot, begin, _end in segments], pool.device),
-            _vector([end for _slot, _begin, end in segments], pool.device),
-            _vector(output_offsets, pool.device),
-            _vector(output_slots, pool.device),
+            *vectors,
             *_construction_dims(pool),
         )
     return 0
@@ -134,6 +137,7 @@ def store_framed_log_states(
     decays         : torch.Tensor,
     layer          : int,
 ) -> None:
+    """Store normalized K, residual V and FP32 logarithmic decays."""
     if len(slots) == 0:
         return
     assert keys.is_cuda and keys.device == pool.device

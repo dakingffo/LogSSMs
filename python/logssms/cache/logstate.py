@@ -15,6 +15,7 @@ import torch
 
 from logssms.core import Request
 from logssms.utils import align_ceil, align_down, div_ceil, init_logger
+from logssms.utils.torch_utils import make_device_vectors
 
 from .base import BaseCacheManager, CacheResources
 from .factory import BaseCacheFactory, CachePlan, SUPPORTED_CACHE_FACTORIES
@@ -326,16 +327,6 @@ class LogStatePlan:
 class _AnalysisEndpoint:
     node       : LogRadixTreeNode
     matched_len: int
-
-
-@dataclass
-class _BatchPrefixNode:
-    depth          : int
-    children       : dict[tuple[int, ...], _BatchPrefixNode] = field(
-        default_factory=dict
-    )
-    request_indices: list[int] = field(default_factory=list)
-    terminal_count : int = 0
 
 
 @dataclass(frozen=True)
@@ -658,30 +649,32 @@ class OnlineAnalysisScheduler:
         self,
         input_ids: Sequence[torch.Tensor],
     ) -> dict[tuple[int, ...], set[int]]:
-        root = _BatchPrefixNode(depth=0)
-        for request_index, values in enumerate(input_ids):
-            usable_len = align_down(len(values), self.granularity)
-            node = root
-            node.request_indices.append(request_index)
-            for begin in range(0, usable_len, self.granularity):
-                key = tuple(values[begin : begin + self.granularity].tolist())
-                child = node.children.get(key)
-                if child is None:
-                    child = _BatchPrefixNode(depth=begin + self.granularity)
-                    node.children[key] = child
-                node = child
-                node.request_indices.append(request_index)
-            node.terminal_count += 1
-
+        # Adjacent lexicographically sorted paths identify every shared branch.
+        # Keep only LCP intervals, rather than allocating a trie node and copying
+        # a full prefix tuple at every granule on every private path.
+        paths = sorted(
+            (tuple(values[:align_down(len(values), self.granularity)].tolist()), index)
+            for index, values in enumerate(input_ids)
+        )
         branches: dict[tuple[int, ...], set[int]] = {}
-        stack: list[tuple[_BatchPrefixNode, tuple[int, ...]]] = [(root, ())]
-        while stack:
-            node, prefix = stack.pop()
-            routes = len(node.children) + int(node.terminal_count > 0)
-            if node.depth > 0 and (routes >= 2 or node.terminal_count >= 2):
-                branches[prefix] = set(node.request_indices)
-            for key, child in node.children.items():
-                stack.append((child, prefix + key))
+        stack: list[tuple[int, int]] = []
+        for index, (values, _request_index) in enumerate(paths):
+            depth = 0
+            if index + 1 < len(paths):
+                following = paths[index + 1][0]
+                for left, right in zip(values, following):
+                    if left != right:
+                        break
+                    depth += 1
+                depth = align_down(depth, self.granularity)
+            begin = index
+            while stack and stack[-1][0] > depth:
+                branch_depth, begin = stack.pop()
+                branches[paths[begin][0][:branch_depth]] = {
+                    paths[position][1] for position in range(begin, index + 1)
+                }
+            if depth and (not stack or stack[-1][0] < depth):
+                stack.append((depth, begin))
         return branches
 
     def _plan_materialize(
@@ -1555,7 +1548,10 @@ class LogStateCacheManager(BaseCacheManager):
             evictable_kv_frames=self.tree.evictable_kv_frames(
                 self._cached_page_tokens
             ),
-            evictable_slots=self.tree.evictable_slots(),
+            # Merged slots are logically reclaimable, just like evictable tree
+            # entries. reserve() waits for their event only if it needs those
+            # frames, rather than evicting unrelated prefixes while they retire.
+            evictable_slots=(*self.tree.evictable_slots(), *self.logstate_pool.retiring_slots),
         ) * self.page_size
 
     def plan_prefill_chunk(self, remain_len: int, token_budget: int) -> int:
@@ -1798,6 +1794,7 @@ class LogStateCacheManager(BaseCacheManager):
         return {
             "frame_usage": self._allocator.profile_usage(),
             "free_frames": self._allocator.free_frames,
+            "pending_merge_reclamation_slots": len(self.logstate_pool.retiring_slots),
             "free_kv_pages": len(self.free_pages),
             "free_state_slots": len(self.free_states),
             "evictable_kv_tokens": self.tree.size_info.evictable_size,
@@ -2557,6 +2554,9 @@ class LogStateCacheManager(BaseCacheManager):
             if page.state_slot is not None
         } | work_slots
         self.logstate_pool.poll_reclamation()
+        # CPU tree ownership is gone, but in-flight construction still owns
+        # merged slots until their retirement event completes.
+        expected_state.update(self.logstate_pool.retiring_slots)
         self._allocator.check_integrity()
         if (self._allocator.allocated_kv != expected_kv
             or self._allocator.allocated_slots != expected_state):
@@ -2844,8 +2844,19 @@ class LogStateCacheManager(BaseCacheManager):
         device = self.device
         pool = self.logstate_pool
 
-        def tensor(values: Sequence[int]) -> torch.Tensor:
-            return torch.tensor(values, dtype=torch.int32, device=device)
+        step_start = perf_counter_ns() if submit_timing_ms is not None else 0
+        # Stage conv metadata before launching construction. In particular, do
+        # not insert blocking H2D tensor constructors after the reconstruction.
+        conv_vectors = make_device_vectors([
+            [task.source_conv_slot for task in conv_restores],
+            [task.source_conv_granule for task in conv_restores],
+            [task.output_slot for task in conv_restores],
+            [task.output_conv_granule for task in conv_restores],
+        ], device) if conv_restores else ()
+        if submit_timing_ms is not None:
+            submit_timing_ms["conv_metadata_submit_ms"] = (
+                perf_counter_ns() - step_start
+            ) / 1e6
 
         if chains:
             segments = [entry for wave in waves for chain in wave for entry in chain.segments]
@@ -2936,22 +2947,7 @@ class LogStateCacheManager(BaseCacheManager):
 
         step_start = perf_counter_ns() if submit_timing_ms is not None else 0
         if conv_restores:
-            source_slots = tensor([
-                task.source_conv_slot for task in conv_restores
-            ])
-            source_granules = tensor([
-                task.source_conv_granule for task in conv_restores
-            ])
-            output_slots = tensor([
-                task.output_slot for task in conv_restores
-            ])
-            output_granules = tensor([
-                task.output_conv_granule for task in conv_restores
-            ])
-            pool.kernels.copy_conv(
-                pool, source_slots, source_granules,
-                output_slots, output_granules,
-            )
+            pool.kernels.copy_conv(pool, *conv_vectors)
         if submit_timing_ms is not None:
             submit_timing_ms["conv_restore_submit_ms"] = (
                 perf_counter_ns() - step_start
@@ -3162,7 +3158,7 @@ class LogStateCacheManager(BaseCacheManager):
                     span_pages=1,
                 ),
             )
-            self.logstate_pool.materialize(plan.log_slot)
+        self.logstate_pool.materialize_slots([plan.log_slot for plan in plans])
 
     @staticmethod
     def _merge_batch_outcome(plan: LogStatePlan, released: int) -> str:
@@ -3247,12 +3243,9 @@ class LogStateCacheManager(BaseCacheManager):
             )
             released.extend(plan.slots[:-1])
         if released:
-            self._return_slots(
-                torch.empty(0, dtype=torch.int32, device=self.device),
-                torch.tensor(
-                    released, dtype=torch.int32, device=self.device
-                ),
-            )
+            # Construction reads can still be in flight on the scheduler stream.
+            # Retain physical frames/descriptors without blocking CPU preparation.
+            self.logstate_pool.retire_slots(released)
         return len(released), released_frames, skips
 
     def _release_live_pages(

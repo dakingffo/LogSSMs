@@ -6,7 +6,8 @@ from collections.abc import Sequence
 import torch
 
 from logssms.kernel.linear_attention import SUPPORTED_LOG_STATE_KERNELS
-from .frame_allocator import LinearFrameSlot, LogStateFrameAllocator
+from logssms.utils.torch_utils import make_device_vectors
+from .frame_allocator import LogStateFrameAllocator
 from .layout import LogStateSlotLayout
 from ..kv_pool.base import BaseKVCachePool
 
@@ -111,7 +112,9 @@ class FramedMHALogStatePool(BaseKVCachePool):
             self._kv_view(layer * layer_bytes + k_bytes)
             for layer in range(num_attention_layers)
         ]
-        self._retired_materializations: list[tuple[torch.cuda.Event, int]] = []
+        self._retired_materializations: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
+        self._retired_releases: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
+        self._retiring_slots: set[int] = set()
 
     @property
     def device(self) -> torch.device:
@@ -182,6 +185,7 @@ class FramedMHALogStatePool(BaseKVCachePool):
         )
 
     def decay_view(self, slot: int) -> torch.Tensor:
+        """FP32 logarithmic decay g, where alpha = exp(g)."""
         record = self.allocator.slot(slot)
         assert record.decay is not None
         size = self.layout.log_decay_bytes
@@ -319,17 +323,12 @@ class FramedMHALogStatePool(BaseKVCachePool):
     def _write_descriptors(self, slots: Sequence[int]) -> None:
         if not slots:
             return
-        payload = torch.full(
-            (len(slots), self.allocator.payload_frames), -1, dtype=torch.int32
-        )
-        conv = torch.full(
-            (len(slots), self.layout.num_granules, self.allocator.conv_frames),
-            -1, dtype=torch.int32,
-        )
-        decay = torch.full((len(slots), 2), -1, dtype=torch.int32)
-        for row, slot in enumerate(slots):
+        payload, conv, decay = [], [], []
+        conv_width = self.layout.num_granules * self.allocator.conv_frames
+        for slot in slots:
             record = self.allocator.slot(slot)
-            payload[row] = torch.tensor(record.payload, dtype=torch.int32)
+            payload.extend(record.payload)
+            row = [-1] * conv_width
             if record.kind == "log":
                 granules = range(self.layout.num_granules)
             elif record.kind == "work":
@@ -337,38 +336,22 @@ class FramedMHALogStatePool(BaseKVCachePool):
             else:
                 granules = (self.layout.num_granules - 1,)
             for granule, frames in zip(granules, record.conv, strict=True):
-                conv[row, granule] = torch.tensor(frames, dtype=torch.int32)
-            if record.decay is not None:
-                decay[row] = torch.tensor(
-                    (record.decay.frame, record.decay.index), dtype=torch.int32
-                )
-        indices = torch.tensor(slots, dtype=torch.int64, device=self.device)
-        self.payload_frame_table.index_copy_(0, indices, payload.to(self.device))
-        self.conv_frame_table.index_copy_(0, indices, conv.to(self.device))
-        self.decay_frame_table.index_copy_(0, indices, decay.to(self.device))
-
-    def _write_descriptor(self, slot: int, record: LinearFrameSlot) -> None:
-        self.payload_frame_table[slot].copy_(
-            torch.tensor(record.payload, dtype=torch.int32, device=self.device)
+                begin = granule * self.allocator.conv_frames
+                row[begin:begin + self.allocator.conv_frames] = frames
+            conv.extend(row)
+            decay.extend(
+                (-1, -1) if record.decay is None else
+                (record.decay.frame, record.decay.index)
+            )
+        indices, payload, conv, decay = make_device_vectors(
+            [slots, payload, conv, decay], self.device
         )
-        self.conv_frame_table[slot].fill_(-1)
-        if record.kind == "log":
-            granules = range(self.layout.num_granules)
-        elif record.kind == "work":
-            granules = (0,)
-        else:
-            granules = (self.layout.num_granules - 1,)
-        for granule, frames in zip(granules, record.conv, strict=True):
-            self.conv_frame_table[slot, granule].copy_(
-                torch.tensor(frames, dtype=torch.int32, device=self.device)
-            )
-        if record.decay is None:
-            self.decay_frame_table[slot].fill_(-1)
-        else:
-            self.decay_frame_table[slot] = torch.tensor(
-                (record.decay.frame, record.decay.index),
-                dtype=torch.int32, device=self.device,
-            )
+        indices = indices.long()
+        self.payload_frame_table.index_copy_(0, indices, payload.reshape(len(slots), -1))
+        self.conv_frame_table.index_copy_(0, indices, conv.reshape(
+            len(slots), self.layout.num_granules, self.allocator.conv_frames
+        ))
+        self.decay_frame_table.index_copy_(0, indices, decay.reshape(len(slots), 2))
 
     def reserve(
         self, *, kv: int = 0, logs: int = 0, works: int = 0,
@@ -385,10 +368,15 @@ class FramedMHALogStatePool(BaseKVCachePool):
             now = perf_counter_ns()
             timings["allocator_reserve_ms"] = (now - stage) / 1e6
             stage = now
-        if allocated is None and self._retired_materializations:
+        if allocated is None and (self._retired_materializations or self._retired_releases):
             if timings is not None:
-                timings["waited_materializations"] = len(self._retired_materializations)
-            for event, _slot in self._retired_materializations:
+                timings["waited_materializations"] = sum(
+                    len(slots) for _event, slots in self._retired_materializations
+                )
+                timings["waited_merge_slots"] = len(self._retiring_slots)
+            for event, _slots in self._retired_materializations:
+                event.synchronize()
+            for event, _slots in self._retired_releases:
                 event.synchronize()
             if timings is not None:
                 now = perf_counter_ns()
@@ -417,22 +405,51 @@ class FramedMHALogStatePool(BaseKVCachePool):
         return allocated
 
     def materialize(self, slot: int) -> None:
+        self.materialize_slots((slot,))
+
+    def materialize_slots(self, slots: Sequence[int]) -> None:
         """Retire Log-only frames after construction kernels have finished."""
+        if not slots:
+            return
         if self.device.type == "cuda":
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(self.device))
-            self._retired_materializations.append((event, slot))
+            self._retired_materializations.append((event, tuple(slots)))
         else:
-            self.allocator.materialize(slot)
-            self._write_descriptor(slot, self.allocator.slot(slot))
+            for slot in slots:
+                self.allocator.materialize(slot)
+            self._write_descriptors(slots)
 
     def commit_checkpoint(self, slot: int) -> None:
         self.allocator.commit_checkpoint(slot)
-        self._write_descriptor(slot, self.allocator.slot(slot))
+        self._write_descriptors((slot,))
+
+    def retire_slots(self, slots: Sequence[int]) -> None:
+        """Remove merged slots from ownership now, reclaim frames after GPU reads.
+
+        Descriptors and allocator records remain live until the event completes.
+        Capacity checks must not count these frames as free before reclamation.
+        """
+        if not slots:
+            return
+        assert len(slots) == len(set(slots))
+        assert not self._retiring_slots.intersection(slots)
+        if self.device.type != "cuda":
+            self.release_slots(slots)
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self._retiring_slots.update(slots)
+        self._retired_releases.append((event, tuple(slots)))
+
+    @property
+    def retiring_slots(self) -> frozenset[int]:
+        return frozenset(self._retiring_slots)
 
     def poll_reclamation(self, timings: dict[str, float] | None = None) -> None:
         remaining = []
-        for event, slot in self._retired_materializations:
+        completed = []
+        for event, slots in self._retired_materializations:
             start = perf_counter_ns() if timings is not None else 0
             if event.query():
                 if timings is not None:
@@ -441,21 +458,22 @@ class FramedMHALogStatePool(BaseKVCachePool):
                         + (perf_counter_ns() - start) / 1e6
                     )
                     start = perf_counter_ns()
-                self.allocator.materialize(slot)
+                materialized = 0
+                for slot in slots:
+                    if slot in self._retiring_slots:
+                        # The entire slot will be freed; do not rewrite a
+                        # checkpoint descriptor only to clear it again.
+                        continue
+                    self.allocator.materialize(slot)
+                    completed.append(slot)
+                    materialized += 1
                 if timings is not None:
                     timings["reclamation_materialize_ms"] = (
                         timings.get("reclamation_materialize_ms", 0.0)
                         + (perf_counter_ns() - start) / 1e6
                     )
-                    start = perf_counter_ns()
-                self._write_descriptor(slot, self.allocator.slot(slot))
-                if timings is not None:
-                    timings["reclamation_descriptor_ms"] = (
-                        timings.get("reclamation_descriptor_ms", 0.0)
-                        + (perf_counter_ns() - start) / 1e6
-                    )
                     timings["reclamation_count"] = (
-                        timings.get("reclamation_count", 0) + 1
+                        timings.get("reclamation_count", 0) + materialized
                     )
             else:
                 if timings is not None:
@@ -463,8 +481,27 @@ class FramedMHALogStatePool(BaseKVCachePool):
                         timings.get("reclamation_query_ms", 0.0)
                         + (perf_counter_ns() - start) / 1e6
                     )
-                remaining.append((event, slot))
+                remaining.append((event, slots))
         self._retired_materializations = remaining
+        remaining_releases = []
+        for event, slots in self._retired_releases:
+            if event.query():
+                self._release_slots(slots, timings=timings)
+                self._retiring_slots.difference_update(slots)
+                if timings is not None:
+                    timings["merge_reclamation_count"] = (
+                        timings.get("merge_reclamation_count", 0) + len(slots)
+                    )
+            else:
+                remaining_releases.append((event, slots))
+        self._retired_releases = remaining_releases
+        start = perf_counter_ns() if timings is not None else 0
+        self._write_descriptors(completed)
+        if timings is not None:
+            timings["reclamation_descriptor_ms"] = (
+                timings.get("reclamation_descriptor_ms", 0.0)
+                + (perf_counter_ns() - start) / 1e6
+            )
 
     def release_kv(self, frames: list[int] | tuple[int, ...]) -> None:
         self.allocator.release_kv(frames)
@@ -480,10 +517,11 @@ class FramedMHALogStatePool(BaseKVCachePool):
         if not slots:
             return
         assert len(slots) == len(set(slots))
+        assert not self._retiring_slots.intersection(slots), "Slot already queued for reclamation"
         stage = perf_counter_ns() if timings is not None else 0
         selected = set(slots)
-        for event, pending_slot in self._retired_materializations:
-            if pending_slot in selected:
+        for event, pending_slots in self._retired_materializations:
+            if selected.intersection(pending_slots):
                 event.synchronize()
         if timings is not None:
             now = perf_counter_ns()
@@ -500,6 +538,12 @@ class FramedMHALogStatePool(BaseKVCachePool):
                 + (now - stage) / 1e6
             )
             stage = now
+        self._release_slots(slots, timings=timings)
+
+    def _release_slots(
+        self, slots: Sequence[int], timings: dict[str, float] | None = None,
+    ) -> None:
+        stage = perf_counter_ns() if timings is not None else 0
         for slot in slots:
             self.allocator.release_slot(slot)
         if timings is not None:
@@ -509,7 +553,7 @@ class FramedMHALogStatePool(BaseKVCachePool):
                 + (now - stage) / 1e6
             )
             stage = now
-        indices = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        indices, = make_device_vectors([slots], self.device, dtype=torch.int64)
         self.payload_frame_table.index_fill_(0, indices, -1)
         self.conv_frame_table.index_fill_(0, indices, -1)
         self.decay_frame_table.index_fill_(0, indices, -1)

@@ -304,14 +304,14 @@ void construct_log_state_kernel(
     const auto end = params.log_ends[segment];
     const auto length = end - begin;
     if (threadIdx.x == 0) {
-      float product = 1.0f;
+      float log_sum = 0.0f;
       for (auto token = length - 1; token >= 0; --token) {
-        suffix[token] = product;
-        product *= *decay_pointer(
+        suffix[token] = expf(log_sum);
+        log_sum += *decay_pointer(
           params, slot, layer, head, begin + token, params.page_size
         );
       }
-      gamma = product;
+      gamma = expf(log_sum);
     }
     __syncthreads();
 
@@ -470,14 +470,14 @@ void restore_log_state_kernel(
     const auto end = params.log_ends[segment];
     const auto length = end - begin;
     if (threadIdx.x == 0) {
-      float product = 1.0f;
+      float log_sum = 0.0f;
       for (auto token = length - 1; token >= 0; --token) {
-        suffix[token] = product;
-        product *= *decay_pointer(
+        suffix[token] = expf(log_sum);
+        log_sum += *decay_pointer(
           params, slot, layer, head, begin + token, params.page_size
         );
       }
-      gamma = product;
+      gamma = expf(log_sum);
     }
     __syncthreads();
 

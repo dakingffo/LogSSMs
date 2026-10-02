@@ -163,14 +163,19 @@ class LinearAttentionBackend(BaseGatedDeltaBackend):
 
         if batch.is_decode:
             reqs = batch.padded_reqs
-            descriptors = torch.tensor(
-                [[req.table_idx, req.cached_len - 1, req.cached_len] for req in reqs],
-                dtype=torch.int64,
-                pin_memory=state_table.is_cuda,
-            ).to(state_table.device, non_blocking=state_table.is_cuda)
-            metadata.slots = state_table[
-                descriptors[:, :1], descriptors[:, 1:]
-            ].to(torch.int64)
+            if batch.prepared_indices is not None and state_table.is_cuda:
+                from logssms.kernel.metadata import gather_linear_slots
+
+                metadata.slots = gather_linear_slots(batch.prepared_indices, state_table)
+            else:
+                descriptors = torch.tensor(
+                    [[req.table_idx, req.cached_len - 1, req.cached_len] for req in reqs],
+                    dtype=torch.int64,
+                    pin_memory=state_table.is_cuda,
+                ).to(state_table.device, non_blocking=state_table.is_cuda)
+                metadata.slots = state_table[
+                    descriptors[:, :1], descriptors[:, 1:]
+                ].to(torch.int64)
             metadata.read_slots = metadata.slots[:, 0]
             metadata.write_slots = metadata.slots[:, 1]
         elif batch.is_prefill:

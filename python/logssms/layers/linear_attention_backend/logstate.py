@@ -117,10 +117,28 @@ class LogStateLinearAttentionBackend(BaseGatedDeltaBackend):
         assert ctx.page_table is not None
         assert work_state_table.shape[1] == 1
 
+        packet = batch.prepared_indices
+        if batch.is_decode and packet is not None and state_table.is_cuda:
+            from logssms.kernel.metadata import gather_linear_slots
+
+            slots = gather_linear_slots(
+                packet, state_table, work_table=work_state_table,
+                out_loc=batch.out_loc, page_size=pool.page_size,
+            )
+            batch.linear_attn_metadata = LogStateLinearAttentionMetadata(
+                phase=batch.phase, work_slots=slots[0], log_slots=slots[1],
+                token_offsets=slots[2], conv_read_slots=slots[0],
+                conv_read_granules=slots[3], replay_counts=packet.replay_counts,
+            )
+            return
+
         reqs = batch.padded_reqs if batch.is_decode else batch.reqs
         table_ids = [req.table_idx for req in reqs]
         repeat_start = perf_counter_ns() if profile else 0
-        if batch.is_decode:
+        use_packet = packet is not None and packet.token_table_ids is not None
+        if use_packet:
+            row_ids = []
+        elif batch.is_decode:
             row_ids = table_ids
         else:
             row_ids = [req.table_idx for req in reqs for _ in range(req.extend_len)]
@@ -130,16 +148,22 @@ class LogStateLinearAttentionBackend(BaseGatedDeltaBackend):
         previous_ids = (
             [] if batch.is_decode else [req.cached_len - 1 for req in reqs]
         )
-        all_ids = torch.tensor(
-            table_ids + ([] if batch.is_decode else row_ids + previous_ids),
-            dtype=torch.int64,
-            pin_memory=state_table.is_cuda,
-        ).to(state_table.device, non_blocking=state_table.is_cuda)
-        table_indices = all_ids[:len(reqs)]
-        row_table_indices = (
-            table_indices
-            if batch.is_decode else all_ids[len(reqs):len(reqs) + len(row_ids)]
-        )
+        if use_packet:
+            table_indices = packet.table_ids
+            row_table_indices = packet.token_table_ids
+            previous_positions = packet.previous_positions
+        else:
+            all_ids = torch.tensor(
+                table_ids + ([] if batch.is_decode else row_ids + previous_ids),
+                dtype=torch.int64,
+                pin_memory=state_table.is_cuda,
+            ).to(state_table.device, non_blocking=state_table.is_cuda)
+            table_indices = all_ids[:len(reqs)]
+            row_table_indices = (
+                table_indices
+                if batch.is_decode else all_ids[len(reqs):len(reqs) + len(row_ids)]
+            )
+            previous_positions = all_ids[len(reqs) + len(row_ids):]
         work_slots = work_state_table[table_indices, 0]
         positions = batch.positions
         assert len(positions) == len(row_table_indices)
@@ -157,7 +181,6 @@ class LogStateLinearAttentionBackend(BaseGatedDeltaBackend):
             conv_read_granules = torch.zeros_like(work_slots)
         else:
             replay_counts = torch.empty(0, dtype=torch.int32, device=pool.device)
-            previous_positions = all_ids[len(reqs) + len(row_ids):]
             previous_slots = state_table[
                 table_indices, previous_positions.clamp_min(0)
             ]
@@ -489,7 +512,7 @@ class LogStateLinearAttentionBackend(BaseGatedDeltaBackend):
             )
         )
         log_rows = metadata.log_row_indices
-        decays = prepared_gate.exp().squeeze(0)
+        log_decays = prepared_gate.squeeze(0)
         if log_rows is None:
             log_slots = metadata.log_slots
             token_offsets = metadata.token_offsets
@@ -500,10 +523,10 @@ class LogStateLinearAttentionBackend(BaseGatedDeltaBackend):
             token_offsets = metadata.token_offsets.index_select(0, log_rows)
             log_keys = key.squeeze(0).index_select(0, log_rows)
             log_values = residual_value.squeeze(0).index_select(0, log_rows)
-            decays = decays.index_select(0, log_rows)
+            log_decays = log_decays.index_select(0, log_rows)
         store_framed_log_states(
             pool,
-            log_slots, token_offsets, log_keys, log_values, decays,
+            log_slots, token_offsets, log_keys, log_values, log_decays,
             layer_idx,
         )
         pool.write_states(metadata.work_slots, layer_idx, final_state.to(pool.dtype))

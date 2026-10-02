@@ -110,6 +110,21 @@ def test_disable_memorized_evict_has_no_recycle_bin() -> None:
     assert list(manager.tree.iter_evict_candidates()) == [log, checkpoint]
 
 
+def test_admission_counts_pending_merge_frames_without_premature_reuse():
+    manager = make_manager()
+    pool = manager.logstate_pool
+    logs = pool.reserve(logs=4)[1]
+    pool.reserve(kv=len(pool.allocator._free))
+    assert manager.available_size == 0
+    # Simulate outstanding GPU retirement without manufacturing a free frame.
+    pool._retiring_slots.update(logs)
+    assert manager.available_size >= PAGE_SIZE
+    assert pool.allocator.free_frames == 0
+    assert pool.allocator.reserve(kv=1, logs=1) is None
+    assert set(logs) <= pool.allocator.allocated_slots
+    pool.allocator.check_integrity()
+
+
 def test_restore_unfused_chain_before_inplace_materialization() -> None:
     manager = make_manager()
     segment = SimpleNamespace(

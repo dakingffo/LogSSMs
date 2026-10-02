@@ -29,9 +29,7 @@ def test_engine_prepare_profile(monkeypatch: pytest.MonkeyPatch, enabled: bool) 
     engine.sampler = SimpleNamespace(prepare=lambda batch: "sample args")
     engine.page_table = torch.zeros((1, 1), dtype=torch.int32)
     mapping = (torch.tensor([0]), torch.tensor([0]))
-    monkeypatch.setattr(engine, "_make_positions", lambda batch, device: mapping[0])
-    monkeypatch.setattr(engine, "_make_input_tuple", lambda batch, device: mapping)
-    monkeypatch.setattr(engine, "_make_write_tuple", lambda batch, device: mapping)
+    monkeypatch.setattr(engine, "_prepare_indices", lambda batch: (mapping, mapping))
     allocation_phases = []
     cache_manager = SimpleNamespace(
         allocate=lambda reqs, *, phase=None: allocation_phases.append(phase),

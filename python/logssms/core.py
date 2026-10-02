@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 if TYPE_CHECKING:
+    from logssms.utils.batch import BatchIndices
     from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from logssms.layers.linear_attention_backend import (
@@ -114,6 +115,7 @@ class Batch:
     positions  : torch.Tensor  = field(init=False)
     out_loc    : torch.Tensor  = field(init=False)
     padded_reqs: list[Request] = field(init=False)
+    prepared_indices: BatchIndices | None = field(init=False, default=None)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
     # spec-decode: drafts the MTP head produced for this verify batch. draft_tokens is

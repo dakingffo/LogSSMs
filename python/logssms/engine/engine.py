@@ -249,11 +249,8 @@ class Engine:
             return self._prepare_batch_profiled(batch, cache_manager)
         self.graph_runner.pad_batch(batch)
         cache_manager.allocate(batch.reqs, phase=batch.phase)
-        batch.positions = self._make_positions(batch, self.device)
-        input_mapping = self._make_input_tuple(batch, self.device)
-        write_mapping = self._make_write_tuple(batch, self.device)
-        batch.out_loc = self.page_table[input_mapping]
         cache_manager.prepare_batch(batch)
+        input_mapping, write_mapping = self._prepare_indices(batch)
         self.attn_backend.prepare_metadata(batch)
         if self.config.model_config.is_hybrid:
             self.linear_attn_backend.prepare_metadata(batch)
@@ -273,16 +270,10 @@ class Engine:
                 self.graph_runner.pad_batch(batch)
             with profiler.record_stage("allocate"):
                 cache_manager.allocate(batch.reqs, phase=batch.phase)
-            with profiler.record_stage("positions"):
-                batch.positions = self._make_positions(batch, self.device)
-            with profiler.record_stage("input_mapping"):
-                input_mapping = self._make_input_tuple(batch, self.device)
-            with profiler.record_stage("write_mapping"):
-                write_mapping = self._make_write_tuple(batch, self.device)
-            with profiler.record_stage("out_loc"):
-                batch.out_loc = self.page_table[input_mapping]
             with profiler.record_stage("cache_prepare"):
                 cache_manager.prepare_batch(batch)
+            with profiler.record_stage("positions_mappings"):
+                input_mapping, write_mapping = self._prepare_indices(batch)
             with profiler.record_stage("attention_metadata"):
                 self.attn_backend.prepare_metadata(batch)
             with profiler.record_stage("linear_metadata"):
@@ -367,45 +358,16 @@ class Engine:
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
-    @staticmethod
-    def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-        needed_size = sum(r.extend_len for r in batch.padded_reqs)
-        indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-        offset = 0
-        for req in batch.padded_reqs:
-            length = req.extend_len
-            torch.arange(
-                req.cached_len,
-                req.device_len,
-                dtype=torch.int32,
-                out=indices_host[offset: offset + length],
-            )
-            offset += length
-        return indices_host.to(device, non_blocking=True)
+    def _prepare_indices(self, batch: Batch) -> tuple[Indice2D, Indice2D]:
+        from logssms.kernel.metadata import make_batch_mapping
+        from logssms.utils.batch import BatchIndices
 
-    @staticmethod
-    def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-        mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-        offset = 0
-        for req in batch.padded_reqs:
-            length = req.extend_len
-            mapping_host[offset: offset + length].fill_(req.table_idx)
-            offset += length
-        return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
-
-    @staticmethod
-    def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-        # verify writes committed tokens itself (settle/process); the write tuple is unused.
-        if batch.is_verify:
-            return (
-                torch.tensor([], dtype=torch.int64, device=device),
-                torch.tensor([], dtype=torch.int64, device=device),
-            )
-        mapping_list = [req.table_idx for req in batch.reqs]
-        mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-        write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+        page_size = getattr(self.ctx.kv_cache, "kv_page_size", 1)
+        indices = BatchIndices.make(batch, self.device, page_size)
+        batch.prepared_indices = indices
+        batch.positions, mapping, batch.out_loc = make_batch_mapping(indices, self.page_table)
+        indices.token_table_ids = mapping[0]
+        return mapping, indices.write_tuple
 
     @staticmethod
     def _adjust_config(config: EngineConfig) -> None:
