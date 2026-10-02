@@ -245,7 +245,7 @@ class Qwen3NextDecoderLayer(BaseOP):
             h = self.linear_attn.attend(mixed_qkv, beta, gate)
         else:
             query, output_gate, key, value = features
-            h = self.self_attn.attn.forward(query, key, value)
+            h = self.self_attn.attend(query, key, value, positions)
         return self._finish_attention(h, output_gate, residual)
 
     @prefill_piece
@@ -258,7 +258,7 @@ class Qwen3NextDecoderLayer(BaseOP):
         h, residual = self.input_layernorm.forward(x, residual)
         features = (
             self.linear_attn.proj(h) if self.block_type == "linear_attention"
-            else self.self_attn.proj(h, positions)
+            else self.self_attn._project(h)
         )
         return (*features, residual)
 

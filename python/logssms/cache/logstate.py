@@ -4,7 +4,6 @@ import math
 import os
 import bisect
 import sys
-from bisect import bisect_right
 from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -264,22 +263,6 @@ class _MergePathContext:
                 )
             ),
         )
-
-    def is_protected(self, begin: int, end: int) -> bool:
-        if self.protected_depths:
-            index = bisect_right(self.protected_depths, begin)
-            if index < len(self.protected_depths) and self.protected_depths[index] < end:
-                return True
-        if any(
-            begin <= entry.begin and entry.end <= end
-            for entry in self.protected_entries
-        ):
-            return True
-        if self.pending_positions:
-            index = bisect_right(self.pending_positions, begin)
-            if index < len(self.pending_positions) and self.pending_positions[index] < end:
-                return True
-        return False
 
 
 @dataclass(frozen=True)
@@ -767,39 +750,21 @@ class OnlineAnalysisScheduler:
         self,
         input_ids: Sequence[torch.Tensor],
     ) -> dict[tuple[int, ...], set[int]]:
-        # Adjacent lexicographically sorted paths identify every shared branch.
-        # Keep only LCP intervals, rather than allocating a trie node and copying
-        # a full prefix tuple at every granule on every private path.
-        paths = sorted(
-            (tuple(values[:align_down(len(values), self.granularity)].tolist()), index)
-            for index, values in enumerate(input_ids)
-        )
-        branches: dict[tuple[int, ...], set[int]] = {}
-        stack: list[tuple[int, int]] = []
-        for index, (values, _request_index) in enumerate(paths):
-            depth = 0
-            if index + 1 < len(paths):
-                following = paths[index + 1][0]
-                for left, right in zip(values, following):
-                    if left != right:
-                        break
-                    depth += 1
-                depth = align_down(depth, self.granularity)
-            begin = index
-            while stack and stack[-1][0] > depth:
-                branch_depth, begin = stack.pop()
-                branches[paths[begin][0][:branch_depth]] = {
-                    paths[position][1] for position in range(begin, index + 1)
-                }
-            if depth and (not stack or stack[-1][0] < depth):
-                stack.append((depth, begin))
+        from logssms.kernel import logstate as planning
+
+        rows = planning.batch_branch_points(input_ids, self.granularity)
+        branches = {}
+        for row in rows:
+            position, *indices = row
+            key = tuple(input_ids[indices[0]][:position].tolist())
+            branches[key] = set(indices)
         return branches
 
     def _cached_path_entries(
         self,
         tree   : LogRadixTree,
         node   : LogRadixTreeNode,
-        cache  : dict[int, tuple[tuple[LogRadixTreeNode, ...], list[LogStateEntry]]],
+        cache  : dict,
     ) -> tuple[tuple[LogRadixTreeNode, ...], list[LogStateEntry]]:
         # Scoped to one analysis call; never retain stale tree paths across batches.
         if node.uuid not in cache:
@@ -811,6 +776,37 @@ class OnlineAnalysisScheduler:
             cache[node.uuid] = (path, entries)
         return cache[node.uuid]
 
+    def _planning_path(
+        self,
+        tree          : LogRadixTree,
+        node          : LogRadixTreeNode,
+        eligible_slots: frozenset[int],
+        pending       : tuple[_PendingProtection, ...],
+        path_cache    : dict,
+    ) -> tuple[list[LogStateEntry], list[int], tuple[int, ...], tuple[int, ...]]:
+        # This is a per-analysis snapshot, never a second persistent tree.
+        key = ("native", node.uuid)
+        if key not in path_cache:
+            path, entries = self._cached_path_entries(tree, node, path_cache)
+            context = _MergePathContext.build(tree, path, entries, pending)
+            protected_slots = {entry.slot for entry in context.protected_entries}
+            rows = [
+                value
+                for entry in entries
+                for value in (
+                    entry.slot, entry.begin, entry.end,
+                    -1 if entry.span_pages is None else entry.span_pages,
+                    entry.physical_begin, int(entry.slot in eligible_slots),
+                    int(entry.slot in protected_slots), int(tree.slot_is_fragmented(entry.slot)),
+                )
+            ]
+            path_cache[key] = (
+                entries, rows,
+                context.protected_depths + context.pending_positions,
+                tuple(context.lock_boundaries),
+            )
+        return path_cache[key]
+
     def _plan_materialize(
         self,
         tree          : LogRadixTree,
@@ -819,53 +815,50 @@ class OnlineAnalysisScheduler:
         analysis_nodes: tuple[LogRadixTreeNode, ...],
         path_cache    : dict,
     ) -> tuple[PageMaterialize, ...]:
-        result = []
-        entries = {
-            entry.slot: entry
-            for node in analysis_nodes
-            for entry in node.entries
-        }
+        from logssms.kernel import logstate as planning
+
+        candidates = []
+        paths = []
+        path_indices = {}
+        entry_indices = []
+        source_entries = []
+        entries = {entry.slot: entry for node in analysis_nodes for entry in node.entries}
+        # Pack a reached path once, not each of its progressively longer
+        # prefixes. Later entries cannot affect a candidate ending earlier.
+        parent_ids = {node.parent.uuid for node in analysis_nodes}
+        owner_paths = {}
+        for node in analysis_nodes:
+            if node.uuid not in parent_ids:
+                for part in tree.path(node):
+                    owner_paths.setdefault(part.uuid, node)
         for entry in entries.values():
             if entry.slot not in eligible_slots or entry.kind is not LogStateKind.LOG:
                 continue
-            if tree.slot_is_fragmented(entry.slot):
-                continue
-            if (entry.end - entry.begin) % self.page_size != 0:
-                # Prefix deduplication can leave a single logical suffix of a
-                # physical Log page.  It remains useful for replay, but the
-                # persistent Checkpoint representation is page-sized.
-                continue
-            owner = tree.entry_owner(entry)
-            path, path_entries = self._cached_path_entries(
-                tree, owner, path_cache,
-            )
-            if self._interval_is_protected(
-                tree, owner, entry.begin, entry.end, pending,
-                path=path, path_entries=path_entries,
-            ):
-                continue
-            checkpoints = [
-                value
-                for value in path_entries
-                if value.kind is LogStateKind.CHECKPOINT
-                and value.end <= entry.begin
-            ]
-            base = max(checkpoints, key=lambda value: value.end, default=None)
-            base_end = 0 if base is None else base.end
-            logs, covered_end = self._cover_with_logs(
-                path_entries, base_end, entry.end
-            )
-            if covered_end != entry.end:
-                continue
-            result.append(
-                PageMaterialize(
-                    log_slot=entry.slot,
-                    begin=entry.begin,
-                    end=entry.end,
-                    base_checkpoint_slot=None if base is None else base.slot,
-                    replay_logs=tuple(logs),
-                )
-            )
+            owner = owner_paths[tree.entry_owner(entry).uuid]
+            if owner.uuid not in path_indices:
+                path_indices[owner.uuid] = len(paths)
+                path = self._planning_path(tree, owner, eligible_slots, pending, path_cache)
+                paths.append(path)
+                entry_indices.append({value: i for i, value in enumerate(path[0])})
+            path_index = path_indices[owner.uuid]
+            candidates.append((path_index, entry_indices[path_index][entry]))
+            source_entries.append(entry)
+        if not candidates:
+            return ()
+        rows = planning.plan_materialize(
+            [path[1] for path in paths], [path[2] for path in paths],
+            candidates, self.page_size,
+        )
+        result = []
+        for row in rows:
+            candidate, base_slot, *logs = row
+            entry = source_entries[candidate]
+            path = paths[candidates[candidate][0]][0]
+            result.append(PageMaterialize(
+                entry.slot, entry.begin, entry.end,
+                None if base_slot < 0 else base_slot,
+                tuple(path[index] for index in logs),
+            ))
         result.sort(key=lambda value: (value.begin, value.end, value.log_slot))
         return tuple(result)
 
@@ -880,18 +873,6 @@ class OnlineAnalysisScheduler:
         diagnostics   : dict[str, int] | None,
         path_cache    : dict,
     ) -> tuple[CheckpointCoalesce, ...]:
-        projected = {
-            plan.log_slot: LogStateEntry(
-                slot=plan.log_slot,
-                kind=LogStateKind.CHECKPOINT,
-                begin=plan.begin,
-                end=plan.end,
-                span_pages=1,
-            )
-            for plan in materialize
-        }
-        result = []
-        used_slots: set[int] = set()
         if diagnostics is not None:
             diagnostics.update({
                 "matched_endpoints": len(endpoints),
@@ -929,353 +910,50 @@ class OnlineAnalysisScheduler:
                 "anchors_with_stats": 0,
                 "anchors_without_stats": 0,
             })
-        # Every matched endpoint is an anchor, including an internal node
-        # without an adaptive owner. Owner nodes on the matched path retain
-        # their own statistics; neither kind may inspect an unmatched suffix.
+        from logssms.kernel import logstate as planning
+
         anchor_limits: dict[int, tuple[LogRadixTreeNode, int]] = {}
         for endpoint in endpoints:
             for node in tree.path(endpoint.node):
                 if node is not endpoint.node and (
-                    not self.enable_merge_adjustment
-                    or node.merge_stats is None
+                    not self.enable_merge_adjustment or node.merge_stats is None
                 ):
                     continue
                 limit = min(node.depth, endpoint.matched_len)
                 previous = anchor_limits.get(node.uuid)
                 if previous is None or limit > previous[1]:
                     anchor_limits[node.uuid] = (node, limit)
-        anchors = tuple(anchor_limits.values())
-
-        for leaf, matched_len in anchors:
-            if diagnostics is not None:
-                diagnostics["merge_anchors"] += 1
-            stats = leaf.merge_stats
-            path, path_entries = self._cached_path_entries(
-                tree, leaf, path_cache,
-            )
-            path_context = _MergePathContext.build(
-                tree, path, path_entries, pending,
-            )
-            if matched_len is not None:
-                in_match = [
-                    entry for entry in path_entries
-                    if entry.end <= matched_len
-                ]
-                if diagnostics is not None:
-                    diagnostics["entries_beyond_match_endpoint"] += (
-                        len(path_entries) - len(in_match)
-                    )
-                path_entries = in_match
-            if diagnostics is not None:
-                diagnostics["entries_not_eligible_this_round"] += sum(
-                    entry.slot not in eligible_slots for entry in path_entries
-                )
-            path_entries = [
-                entry for entry in path_entries
-                if entry.slot in eligible_slots
-            ]
-            if stats is not None:
-                if diagnostics is not None:
-                    diagnostics["entries_outside_adaptive_owner"] += sum(
-                        not (
-                            stats.origin <= entry.begin
-                            and entry.end <= stats.tail
-                        )
-                        for entry in path_entries
-                    )
-            entries = [
-                projected.get(entry.slot, entry)
-                for entry in path_entries
-                if entry.slot not in used_slots
-                and (
-                    stats is None
-                    or stats.origin <= entry.begin
-                    and entry.end <= stats.tail
-                )
-            ]
-            if diagnostics is not None:
-                diagnostics["logs_not_materialized"] += sum(
-                    entry.kind is LogStateKind.LOG for entry in entries
-                )
-            entries = [
-                entry
-                for entry in entries
-                if entry.kind is LogStateKind.CHECKPOINT
-                and entry.span_pages is not None
-            ]
-            if diagnostics is not None:
-                diagnostics["checkpoint_candidates"] += len(entries)
-            if not entries:
-                if diagnostics is not None:
-                    diagnostics["anchors_without_eligible_entries"] += 1
-                continue
-            intensity = (
-                stats.intensity
-                if self.enable_merge_adjustment and stats is not None else
-                2
-            )
-            if diagnostics is not None:
-                key = "anchors_with_stats" if stats is not None else "anchors_without_stats"
-                diagnostics[key] += 1
-                key = f"anchors_intensity_{intensity}"
-                diagnostics[key] = diagnostics.get(key, 0) + 1
-            segments = self._merge_segments(
-                tree, leaf, entries, pending, diagnostics,
-                path_context=path_context,
-            )
-            if diagnostics is not None:
-                diagnostics["segments"] += len(segments)
-                diagnostics["segments_without_merge_pair"] += sum(
-                    len(segment) < 2 for segment in segments
-                )
-            groups = tuple(
-                group
-                for segment in segments
-                for group in (
-                    self._adaptive_merge_groups(segment, intensity)
-                    if self.enable_merge_adjustment else
-                    tuple(
-                        segment[index : index + 2]
-                        for index in range(len(segment) - 1)
-                    )
-                )
-            )
-            for group in groups:
-                if diagnostics is not None:
-                    diagnostics["candidate_groups"] += 1
-                if any(entry.slot in used_slots for entry in group):
-                    if diagnostics is not None:
-                        diagnostics["groups_already_planned"] += 1
-                    continue
-                reason = self._coalesce_rejection_reason(
-                    tree, leaf, group, pending,
-                    require_equal_level=True,
-                    path_context=path_context,
-                )
-                if reason is not None:
-                    if diagnostics is not None:
-                        diagnostics[f"rejected_{reason}"] += 1
-                    continue
-                result.append(self._make_coalesce(group))
-                used_slots.update(entry.slot for entry in group)
-                if diagnostics is not None:
-                    diagnostics["planned_groups"] += 1
-                    diagnostics["planned_slot_releases"] += len(group) - 1
-                    diagnostics["same_span_groups"] += 1
-                    diagnostics["planned_covered_tokens"] += group[-1].end - group[0].begin
-                    key = f"planned_arity_{len(group)}"
-                    diagnostics[key] = diagnostics.get(key, 0) + 1
-
-            if not self.enable_merge_adjustment:
-                continue
-            remaining = [
-                entry for entry in entries if entry.slot not in used_slots
-            ]
-            for left, right in zip(remaining, remaining[1:]):
-                if left.slot in used_slots or right.slot in used_slots:
-                    continue
-                assert left.span_pages is not None
-                assert right.span_pages is not None
-                if left.span_pages >= right.span_pages:
-                    continue
-                group = (left, right)
-                if diagnostics is not None:
-                    diagnostics["candidate_groups"] += 1
-                reason = self._coalesce_rejection_reason(
-                    tree, leaf, group, pending,
-                    require_equal_level=False,
-                    path_context=path_context,
-                )
-                if reason is not None:
-                    if diagnostics is not None:
-                        diagnostics[f"rejected_{reason}"] += 1
-                    continue
-                result.append(self._make_coalesce(group))
-                used_slots.update((left.slot, right.slot))
-                if diagnostics is not None:
-                    diagnostics["planned_groups"] += 1
-                    diagnostics["planned_slot_releases"] += 1
-                    diagnostics["cross_span_groups"] += 1
-                    diagnostics["planned_covered_tokens"] += right.end - left.begin
-                    diagnostics["planned_arity_2"] = diagnostics.get("planned_arity_2", 0) + 1
+        if not anchor_limits:
+            return ()
+        paths = []
+        anchors = []
+        for node, matched_len in anchor_limits.values():
+            stats = node.merge_stats
+            paths.append(self._planning_path(tree, node, eligible_slots, pending, path_cache))
+            anchors.append((
+                len(paths) - 1, matched_len,
+                -1 if stats is None else stats.origin,
+                -1 if stats is None else stats.tail,
+                stats.intensity if self.enable_merge_adjustment and stats is not None else 2,
+                int(stats is not None),
+            ))
+        groups, native_diagnostics = planning.plan_coalesce(
+            [path[1] for path in paths], [path[2] for path in paths],
+            [path[3] for path in paths], anchors,
+            [plan.log_slot for plan in materialize], self.page_size,
+            self.enable_merge_adjustment, diagnostics is not None,
+        )
+        if diagnostics is not None:
+            diagnostics.update(native_diagnostics)
+        result = []
+        for row in groups:
+            values = tuple(row)
+            result.append(CheckpointCoalesce(
+                slots=values[3::2], source_spans=values[4::2],
+                begin=values[0], end=values[1], next_span=values[2],
+            ))
         result.sort(key=lambda value: (value.begin, value.end, value.left_slot))
         return tuple(result)
-
-    def _merge_segments(
-        self,
-        tree   : LogRadixTree,
-        leaf   : LogRadixTreeNode,
-        entries: Sequence[LogStateEntry],
-        pending: tuple[_PendingProtection, ...],
-        diagnostics: dict[str, int] | None,
-        *,
-        path_context: _MergePathContext | None = None,
-    ) -> tuple[tuple[LogStateEntry, ...], ...]:
-        if path_context is None:
-            path = tree.path(leaf)
-            path_context = _MergePathContext.build(
-                tree, path, self._entries_for_node(tree, leaf), pending,
-            )
-        result = []
-        current = []
-        for entry in entries:
-            entry_is_blocked = path_context.is_protected(entry.begin, entry.end)
-            if diagnostics is None:
-                boundary_is_blocked = bool(current) and (
-                    current[-1].end != entry.begin
-                    or current[-1].end in path_context.lock_boundaries
-                    or path_context.is_protected(current[-1].begin, entry.end)
-                )
-            else:
-                gap = bool(current) and current[-1].end != entry.begin
-                lock_boundary = bool(current) and (
-                    current[-1].end in path_context.lock_boundaries
-                )
-                protected_boundary = bool(current) and path_context.is_protected(
-                    current[-1].begin, entry.end
-                )
-                diagnostics["protected_entries"] += int(entry_is_blocked)
-                diagnostics["gaps"] += int(gap)
-                diagnostics["lock_boundaries"] += int(lock_boundary)
-                diagnostics["protected_boundaries"] += int(protected_boundary)
-                boundary_is_blocked = gap or lock_boundary or protected_boundary
-            if entry_is_blocked or boundary_is_blocked:
-                if current:
-                    result.append(tuple(current))
-                current = []
-            if not entry_is_blocked:
-                current.append(entry)
-        if current:
-            result.append(tuple(current))
-        return tuple(result)
-
-    @staticmethod
-    def _adaptive_merge_groups(
-        entries  : Sequence[LogStateEntry],
-        intensity: int,
-    ) -> tuple[tuple[LogStateEntry, ...], ...]:
-        assert intensity >= 2
-        result = []
-        index = 0
-        while index < len(entries):
-            level = entries[index].span_pages
-            end = index + 1
-            while end < len(entries) and entries[end].span_pages == level:
-                end += 1
-            run = entries[index:end]
-            offset = 0
-            while len(run) - offset >= intensity:
-                result.append(tuple(run[offset : offset + intensity]))
-                offset += intensity
-            remaining = len(run) - offset
-            if remaining >= 3:
-                result.append(tuple(run[offset : len(run) - 1]))
-            index = end
-        return tuple(result)
-
-    @staticmethod
-    def _make_coalesce(
-        entries   : Sequence[LogStateEntry],
-    ) -> CheckpointCoalesce:
-        return CheckpointCoalesce(
-            slots=tuple(entry.slot for entry in entries),
-            source_spans=tuple(
-                entry.span_pages for entry in entries  # type: ignore[arg-type]
-            ),
-            begin=entries[0].begin,
-            end=entries[-1].end,
-            next_span=sum(
-                entry.span_pages for entry in entries  # type: ignore[arg-type]
-            ),
-        )
-
-    def _can_coalesce(
-        self,
-        tree   : LogRadixTree,
-        leaf   : LogRadixTreeNode,
-        entries: Sequence[LogStateEntry],
-        pending: tuple[_PendingProtection, ...],
-        *,
-        require_equal_level: bool,
-    ) -> bool:
-        return self._coalesce_rejection_reason(
-            tree,
-            leaf,
-            entries,
-            pending,
-            require_equal_level=require_equal_level,
-        ) is None
-
-    def _coalesce_rejection_reason(
-        self,
-        tree               : LogRadixTree,
-        leaf               : LogRadixTreeNode,
-        entries            : Sequence[LogStateEntry],
-        pending            : tuple[_PendingProtection, ...],
-        *,
-        require_equal_level: bool,
-        path_context: _MergePathContext | None = None,
-    ) -> str | None:
-        if path_context is None:
-            path = tree.path(leaf)
-            path_context = _MergePathContext.build(
-                tree, path, self._entries_for_node(tree, leaf), pending,
-            )
-        if len(entries) < 2:
-            return "too_few_entries"
-        levels = [entry.span_pages for entry in entries]
-        assert all(level is not None for level in levels)
-        if require_equal_level and len(set(levels)) != 1:
-            return "level_mismatch"
-        if any(
-            entry.end - entry.begin != self.page_size * span
-            for entry, span in zip(entries, levels, strict=True)
-        ):
-            return "span_mismatch"
-        for left, right in zip(entries, entries[1:]):
-            if left.end != right.begin:
-                return "discontinuity"
-            if left.end in path_context.lock_boundaries:
-                return "lock_boundary"
-        if path_context.is_protected(entries[0].begin, entries[-1].end):
-            return "protected_interval"
-        return None
-
-    def _interval_is_protected(
-        self,
-        tree   : LogRadixTree,
-        node   : LogRadixTreeNode,
-        begin  : int,
-        end    : int,
-        pending: tuple[_PendingProtection, ...],
-        *,
-        path        : Sequence[LogRadixTreeNode] | None = None,
-        path_entries: Sequence[LogStateEntry] | None = None,
-    ) -> bool:
-        if path is None:
-            path = tree.path(node)
-        if any(
-            path_node.is_protected and begin < path_node.depth < end
-            for path_node in path
-        ):
-            return True
-        if path_entries is None:
-            path_entries = self._entries_for_node(tree, node)
-        entries = [
-            entry
-            for entry in path_entries
-            if begin <= entry.begin and entry.end <= end
-        ]
-        if any(tree.entry_is_protected(entry.slot) for entry in entries):
-            return True
-        path_ids = {value.uuid for value in path}
-        for value in pending:
-            if not begin < value.position < end:
-                continue
-            if value.trace.node.uuid not in path_ids:
-                continue
-            return True
-        return False
 
     def _covering_log(
         self,
@@ -1313,20 +991,15 @@ class OnlineAnalysisScheduler:
         begin  : int,
         end    : int,
     ) -> tuple[list[LogStateEntry], int]:
-        cursor = begin
-        result = []
-        logs = sorted(
-            (entry for entry in entries if entry.kind is LogStateKind.LOG),
-            key=lambda entry: (entry.begin, entry.end),
-        )
-        for entry in logs:
-            if entry.end <= cursor or entry.begin > cursor:
-                continue
-            result.append(entry)
-            cursor = min(end, entry.end)
-            if cursor == end:
-                break
-        return result, cursor
+        from logssms.kernel import logstate as planning
+
+        row = [value for entry in entries for value in (
+            entry.slot, entry.begin, entry.end,
+            -1 if entry.span_pages is None else entry.span_pages,
+            entry.physical_begin, 1, 0, 0,
+        )]
+        cursor, *indices = planning.cover_logs(row, begin, end)
+        return [entries[index] for index in indices], cursor
 
 
 class LogStateCacheManager(BaseCacheManager):
@@ -3153,73 +2826,32 @@ class LogStateCacheManager(BaseCacheManager):
         chains     : Sequence[_ConstructionChain],
         materialize: Sequence[PageMaterialize],
     ) -> tuple[tuple[_ConstructionChain, ...], ...]:
-        """Order in-place writes after old-Log readers, or rebase readers on a new checkpoint."""
+        from logssms.kernel import logstate as planning
+
         if not chains:
             return ()
-
-        plans = {plan.log_slot: plan for plan in materialize}
-        writers: dict[int, int] = {}
-        for index, chain in enumerate(chains):
-            for outputs in chain.outputs:
-                for slot in outputs:
-                    if slot not in plans:
-                        continue
-                    assert slot not in writers, "Checkpoint has multiple writers"
-                    writers[slot] = index
-        assert set(writers) == set(plans), "Missing Checkpoint writer"
-
-        rebased = []
-        for index, chain in enumerate(chains):
-            # A chain may skip a prefix that another chain materializes only
-            # when it has not already promised an output within that prefix.
-            # Otherwise it must consume the old Log before the in-place write.
-            last = None
-            has_outputs = False
-            for segment_index, entry in enumerate(chain.segments):
-                if (entry.slot in writers
-                    and writers[entry.slot] != index
-                    and entry.end == plans[entry.slot].end
-                    and not has_outputs
-                    and not chain.outputs[segment_index]):
-                    last = segment_index
-                has_outputs |= bool(chain.outputs[segment_index])
-            if last is None:
-                rebased.append(chain)
-                continue
-            rebased.append(_ConstructionChain(
-                base_slot=chain.segments[last].slot,
-                segments=chain.segments[last + 1:],
-                outputs=chain.outputs[last + 1:],
-                materialize=chain.materialize,
-            ))
-
-        predecessors: list[set[int]] = [set() for _ in rebased]
-        log_readers: dict[int, set[int]] = {}
-        base_readers: dict[int, set[int]] = {}
-        for index, chain in enumerate(rebased):
-            for entry in chain.segments:
-                log_readers.setdefault(entry.slot, set()).add(index)
-            if chain.base_slot is not None:
-                base_readers.setdefault(chain.base_slot, set()).add(index)
-        for slot, writer in writers.items():
-            for reader in base_readers.get(slot, ()):
-                if reader != writer:
-                    predecessors[reader].add(writer)
-            for reader in log_readers.get(slot, ()):
-                if reader != writer:
-                    predecessors[writer].add(reader)
-
-        remaining = set(range(len(rebased)))
+        packed = []
+        for chain in chains:
+            row = [-1 if chain.base_slot is None else chain.base_slot]
+            for entry, outputs in zip(chain.segments, chain.outputs, strict=True):
+                row.extend((entry.slot, entry.end, len(outputs)))
+                row.extend(outputs)
+            packed.append(row)
+        rows = planning.schedule_construction_waves(
+            packed, [value for plan in materialize for value in (plan.log_slot, plan.end)],
+        )
         waves = []
-        while remaining:
-            ready = sorted(index for index in remaining if not predecessors[index])
-            if not ready:
-                raise RuntimeError("Cyclic LogState construction dependencies")
-            waves.append(tuple(rebased[index] for index in ready))
-            remaining.difference_update(ready)
-            for deps in predecessors:
-                deps.difference_update(ready)
-        return tuple(waves)
+        for wave, index, start, base in rows:
+            while len(waves) <= wave:
+                waves.append([])
+            chain = chains[index]
+            if start:
+                chain = _ConstructionChain(
+                    None if base < 0 else base, chain.segments[start:],
+                    chain.outputs[start:], chain.materialize,
+                )
+            waves[wave].append(chain)
+        return tuple(tuple(wave) for wave in waves)
 
     @staticmethod
     def _make_construction_chains(

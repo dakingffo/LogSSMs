@@ -395,7 +395,7 @@ def make_checkpoint_history(
     return tree, tree.leaves()[0]
 
 
-def test_cached_merge_path_checks_match_tree_checks():
+def test_native_merge_path_metadata_matches_tree_checks():
     tree, leaf = make_checkpoint_history(6)
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
     tree.protect_entry(2)
@@ -407,11 +407,16 @@ def test_cached_merge_path_checks_match_tree_checks():
     context = _MergePathContext.build(
         tree, path, scheduler._entries_for_node(tree, leaf), pending,
     )
-    for begin in range(0, 6 * PAGE_SIZE, GRANULARITY):
-        for end in range(begin + GRANULARITY, 6 * PAGE_SIZE + 1, GRANULARITY):
-            assert context.is_protected(begin, end) == scheduler._interval_is_protected(
-                tree, leaf, begin, end, pending,
-            )
+    assert context.protected_depths == tuple(sorted(
+        node.depth for node in path if node.is_protected
+    ))
+    assert context.protected_entries == tuple(
+        entry for entry in scheduler._entries_for_node(tree, leaf)
+        if tree.entry_is_protected(entry.slot)
+    )
+    assert context.pending_positions == tuple(sorted(
+        value.position for value in pending if value.trace.node in path
+    ))
     for position in range(0, 6 * PAGE_SIZE + 1, GRANULARITY):
         assert (position in context.lock_boundaries) == tree.is_lock_boundary(
             leaf, position,
@@ -731,9 +736,9 @@ def test_analysis_reuses_owner_paths_within_batch_but_not_between_batches():
     request = torch.cat([history, ids(64, 10000)])
     with patch.object(tree, "path", wraps=tree.path) as path:
         first = scheduler.analyze(tree, [request])
-    # Matched path + three log owners + merge anchors. Coalescing reuses
-    # the last owner's path rather than collecting it again.
-    assert path.call_count == 5
+    # Matched path + anchor discovery + one maximal materialize path + packing.
+    # Coalescing shares that snapshot; prefixes are not packed individually.
+    assert path.call_count == 4
     assert len(first.materialize) == 3
     tree.protect_entry(1)
     later = scheduler.analyze(tree, [request])

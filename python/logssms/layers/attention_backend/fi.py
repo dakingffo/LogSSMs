@@ -159,12 +159,11 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event.record()
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         if metadata.page_size == 1:
             kv_cache = tuple(

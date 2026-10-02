@@ -20,6 +20,54 @@ from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
 )
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 16, 31, 32, 48, 64, 128])
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("dims", [(128, 128), (32, 32)])
+def test_framed_decode_selects_launch_config(monkeypatch, batch_size, eager, dims):
+    from logssms.kernel.linear_attention.vendor.fla import framed_replay, fused_recurrent
+
+    launches = []
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((self.name, grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(fused_recurrent, "_fused_recurrent_gated_delta_kernel", Kernel("full"))
+    monkeypatch.setattr(framed_replay, "_framed_replay_kernel", Kernel("tiled"))
+    K, V = dims
+    q = torch.empty(batch_size, 1, 2, K, dtype=torch.bfloat16)
+    v = torch.empty(batch_size, 1, 6, V, dtype=q.dtype)
+    a = torch.empty(batch_size, 1, 6, dtype=q.dtype)
+    slots = torch.zeros(batch_size, dtype=torch.int32)
+    pool = SimpleNamespace(
+        layout=SimpleNamespace(head_k_dim=K, head_v_dim=V, num_value_heads=6, log_decay_bytes=1536),
+        frame_bytes=32768, head_payload_bytes=32768,
+        allocator=SimpleNamespace(payload_frames=6), page_size=64,
+        storage=torch.empty(0, dtype=torch.uint8),
+        payload_frame_table=slots, decay_frame_table=slots,
+    )
+    fused_recurrent_gated_delta_rule_to_framed_logstate(
+        q, q, v, a, a, torch.empty(6), torch.empty(6), pool,
+        slots, slots, slots, 0, slots, enable_eager_state=eager,
+    )
+    name, grid, config = launches.pop()
+    tiled = not eager and dims == (128, 128) and batch_size >= 32
+    assert name == ("tiled" if tiled else "full")
+    assert config["BLOCK_K"] == (32 if tiled else K)
+    expected_v = 64 if tiled else (8 if V < 128 else (16 if batch_size == 1 else 32))
+    if not eager:
+        expected_v = max(expected_v, 16)
+    assert config["BLOCK_V"] == expected_v
+    assert grid == ((V + expected_v - 1) // expected_v, batch_size * 6)
+    assert config["num_warps"] == (1 if eager else 4)
+    assert config["num_stages"] == (1 if tiled and batch_size < 64 else 3)
+
+
 @triton.jit
 def _frame_byte_offset_test_kernel(frames, offsets, FRAME_BYTES: tl.constexpr):
     row = tl.program_id(0)
@@ -354,8 +402,9 @@ def test_framed_decode_matches_recurrent_reference():
 
 
 @pytest.mark.parametrize("granularity", [32, 64])
+@pytest.mark.parametrize("block_k", [None, 16, 32, 64])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_framed_decode_replays_at_fixed_sixteen_token_intervals(granularity):
+def test_framed_decode_replays_at_fixed_sixteen_token_intervals(granularity, block_k):
     torch.manual_seed(39)
     pool = FramedMHALogStatePool(
         num_frames=64,
@@ -402,7 +451,7 @@ def test_framed_decode_replays_at_fixed_sixteen_token_intervals(granularity):
         )
         replay = fused_recurrent_gated_delta_rule_to_framed_logstate(
             query, key, value, gate, beta, A_log, dt_bias, pool,
-            replay_work, replay_log, position, 0, count,
+            replay_work, replay_log, position, 0, count, block_k=block_k,
         )
         torch.testing.assert_close(replay, eager, atol=0.04, rtol=0.04)
         if (offset + 1) % 16 == 0:
@@ -421,13 +470,17 @@ def test_framed_decode_replays_at_fixed_sixteen_token_intervals(granularity):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_graph", [False, True])
-def test_framed_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph):
+@pytest.mark.parametrize("tiling", [None, (16, 32, 4, 1), (32, 64, 4, 3), (64, 32, 8, 2), (128, 16, 4, 3)])
+@pytest.mark.parametrize("dims", [(128, 128), (80, 48)])
+def test_framed_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph, tiling, dims):
     torch.manual_seed(53)
-    bs, H, HV, K, V = 4, 2, 6, 128, 128
+    bs, H, HV = 4, 2, 6
+    K, V = dims
+    layer = 1
     pool = FramedMHALogStatePool(
         num_frames=192, page_size=64, granularity=32,
         num_attention_layers=1, num_kv_heads=1, head_dim=128,
-        num_linear_layers=1, num_key_heads=H, num_value_heads=HV,
+        num_linear_layers=2, num_key_heads=H, num_value_heads=HV,
         head_k_dim=K, head_v_dim=V, conv_dim=(2 * H + HV) * K, state_len=3,
         device=torch.device("cuda"), dtype=dtype,
     )
@@ -447,22 +500,27 @@ def test_framed_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph):
     value = torch.randn(bs, 1, HV, V, dtype=dtype, device="cuda")
     gate = torch.randn(bs, 1, HV, dtype=dtype, device="cuda")
     beta = torch.randn_like(gate)
+    gate, beta = torch.cat((gate, beta), dim=-1).chunk(2, dim=-1)
     A_log = torch.randn(HV, device="cuda") * 0.1
     dt_bias = torch.randn_like(A_log) * 0.1
 
     def reset_pool():
-        pool.write_states(work_slots, 0, initial)
+        pool.storage.fill_(0x2A)
+        pool.write_states(work_slots, layer, initial)
         for row, slot in enumerate(logs):
             for head in range(HV):
-                log = head_view(pool, slot, 0, head, state=False)
+                log = head_view(pool, slot, layer, head, state=False)
                 log[:64 * K].copy_(keys[row, :, head].flatten())
                 log[64 * K:].copy_(values[row, :, head].flatten())
-            pool.decay_view(slot)[0].copy_(alpha[row].log())
+            pool.decay_view(slot)[layer].copy_(alpha[row].log())
 
     def run():
+        tuning = {} if tiling is None else dict(zip(
+            ("block_k", "block_v", "num_warps", "num_stages"), tiling
+        ))
         return fused_recurrent_gated_delta_rule_to_framed_logstate(
             query, key, value, gate, beta, A_log, dt_bias, pool,
-            work_slots, log_slots, positions, 0, counts,
+            work_slots, log_slots, positions, layer, counts, **tuning,
         )
 
     reset_pool()
@@ -502,14 +560,14 @@ def test_framed_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph):
         else:
             output = run()
         torch.testing.assert_close(output[:, 0].float(), expected_output, rtol=0.03, atol=0.005)
-        observed = pool.read_states(work_slots, 0)
+        observed = pool.read_states(work_slots, layer)
         for row, position in enumerate(offsets):
             if (position + 1) % 16 == 0:
                 torch.testing.assert_close(observed[row].float(), expected_state[row], rtol=0.03, atol=0.01)
             else:
                 torch.testing.assert_close(observed[row], initial[row], rtol=0, atol=0)
             for head in range(HV):
-                log = head_view(pool, logs[row], 0, head, state=False)
+                log = head_view(pool, logs[row], layer, head, state=False)
                 stored_keys = log[:64 * K].view(64, K)
                 stored_values = log[64 * K:].view(64, V)
                 torch.testing.assert_close(stored_keys[position].float(), k[row, head], rtol=0.01, atol=0.001)
@@ -517,11 +575,16 @@ def test_framed_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph):
                 # Flush must not discard the logs used for prefix restoration.
                 torch.testing.assert_close(stored_keys[:position], keys[row, :position, head], rtol=0, atol=0)
                 torch.testing.assert_close(stored_values[:position], values[row, :position, head], rtol=0, atol=0)
-            torch.testing.assert_close(pool.decay_view(logs[row])[0, position], log_decay[row], rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(pool.decay_view(logs[row])[layer, position], log_decay[row], rtol=1e-5, atol=1e-5)
+            for head in range(HV):
+                for slot in (logs[row], works[row]):
+                    untouched = head_view(pool, slot, 0, head, state=slot == works[row])
+                    assert torch.all(untouched.view(torch.uint8) == 0x2A)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_decode_preserves_log_decay_beyond_alpha_underflow():
+@pytest.mark.parametrize("block_k", [None, 32])
+def test_decode_preserves_log_decay_beyond_alpha_underflow(block_k):
     pool = FramedMHALogStatePool(
         num_frames=64, page_size=64, granularity=32,
         num_attention_layers=1, num_kv_heads=1, head_dim=128,
@@ -543,6 +606,7 @@ def test_decode_preserves_log_decay_beyond_alpha_underflow():
         torch.tensor([log], dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"), 0,
         torch.zeros(1, dtype=torch.int32, device="cuda"),
+        block_k=block_k,
     )
     torch.testing.assert_close(pool.decay_view(log)[0, 0, 0], -gate[0, 0, 0].float())
     assert torch.isfinite(output).all()
@@ -552,6 +616,7 @@ def test_decode_preserves_log_decay_beyond_alpha_underflow():
         torch.tensor([log], dtype=torch.int32, device="cuda"),
         torch.ones(1, dtype=torch.int32, device="cuda"), 0,
         torch.ones(1, dtype=torch.int32, device="cuda"),
+        block_k=block_k,
     )
     assert torch.isfinite(output).all()
 

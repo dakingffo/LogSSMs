@@ -16,13 +16,30 @@ def single_rank():
 
 
 def test_prefill_buckets_cover_budget_without_dense_capture():
-    expected = [1, 2, 4, 8, 16, 32, 64] + list(range(96, 513, 32)) + list(range(576, 8193, 64))
+    expected = ([1, 2, 4, 8, 16, 32]
+                + list(range(64, 1025, 32))
+                + list(range(1088, 4097, 64))
+                + list(range(4224, 8193, 128)))
     assert prefill_token_buckets(8192) == expected
-    assert len(expected) == 141
+    assert len(expected) == 117
     assert prefill_token_buckets(0) == []
     assert prefill_token_buckets(1) == [1]
     assert prefill_token_buckets(97)[-2:] == [96, 97]
     assert prefill_token_buckets(600)[-2:] == [576, 600]
+
+
+@pytest.mark.parametrize("budget", [1, 16, 31, 32, 33, 1023, 1024, 1025,
+                                   4095, 4096, 4097, 8191, 8192, 8193])
+def test_prefill_buckets_respect_boundaries_and_exact_budget(budget):
+    buckets = prefill_token_buckets(budget)
+    assert buckets == sorted(set(buckets))
+    assert buckets[0] == 1 and buckets[-1] == budget
+    for previous, current in zip(buckets, buckets[1:]):
+        step = 32 if previous < 1024 else 64 if previous < 4096 else 128
+        assert 0 < current - previous <= step
+        if current == budget:
+            continue
+        assert current <= 32 or current % step == 0
 
 
 class _Layer:
@@ -97,6 +114,65 @@ def test_piece_replay_handles_padding_shared_pool_and_changed_metadata(max_token
         batch.hidden_captor = object()
         assert not runner.can_use_cuda_graph(batch)
         assert runner.padded_tokens > 0
+    finally:
+        runner.destroy_cuda_graphs()
+        clear_global_ctx()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen_full_attention_piece_keeps_fused_kv_writes_outside_graph():
+    from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
+    from logssms.models.qwen3_next import Qwen3NextDecoderLayer
+    from logssms.utils import torch_dtype
+
+    torch.manual_seed(43)
+    rotary = SimpleNamespace(rotary_dim=32, max_position=256, base=10000.0, scaling=None)
+    config = SimpleNamespace(
+        layer_types=["full_attention"], hidden_size=128, head_dim=64,
+        num_qo_heads=4, num_kv_heads=2, rotary_config=rotary, rms_norm_eps=1e-6,
+        intermediate_size=256, hidden_act="silu", use_moe=lambda _: False,
+    )
+    with torch.device("cuda"), torch_dtype(torch.bfloat16):
+        layer = Qwen3NextDecoderLayer(config, 0)
+    for weight in layer.state_dict().values():
+        weight.normal_(std=0.05)
+    model = SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[layer])))
+    ctx = Context(16)
+    ctx.kv_cache = MHAKVCachePool(2, 1, 64, 8, 16, torch.bfloat16, torch.device("cuda"))
+    ctx.kv_cache._kv_buffer.fill_(7.0)
+
+    class Backend:
+        def forward(self, q, layer_id, batch):
+            return q
+
+    ctx.attn_backend = Backend()
+    clear_global_ctx()
+    set_global_ctx(ctx)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    runner = PrefillGraphRunner(model, 64, stream)
+    ctx.prefill_graph_runner = runner
+    try:
+        # Capturing pure projection/MLP pieces must not mutate persistent cache.
+        assert (ctx.kv_cache._kv_buffer == 7.0).all()
+        for tokens in (3, 17, 33, 1):
+            hidden = torch.randn(tokens, 128, device="cuda", dtype=torch.bfloat16)
+            batch = Batch([], "prefill")
+            batch.input_ids = torch.zeros(tokens, device="cuda", dtype=torch.int32)
+            batch.positions = torch.arange(tokens, device="cuda", dtype=torch.int32) + 7
+            batch.out_loc = torch.arange(tokens, device="cuda", dtype=torch.int32) + 19
+            def forward(enabled):
+                runner.enabled = enabled
+                ctx.kv_cache._kv_buffer.fill_(7.0)
+                with ctx.forward_batch(batch):
+                    output = layer.forward(hidden.clone(), None, batch.positions)
+                return tuple(x.clone() for x in output), ctx.kv_cache._kv_buffer.clone()
+            expected, expected_cache = forward(False)
+            actual, actual_cache = forward(True)
+            for tensor, reference in zip(actual, expected):
+                torch.testing.assert_close(tensor, reference, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(actual_cache, expected_cache, rtol=2e-2, atol=2e-2)
+        assert runner.replays == 8 and runner.padded_tokens > 0
     finally:
         runner.destroy_cuda_graphs()
         clear_global_ctx()

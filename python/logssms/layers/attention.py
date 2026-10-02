@@ -6,7 +6,7 @@ import torch
 
 from logssms.core import get_global_ctx
 from logssms.distributed import get_tp_info
-from logssms.kernel import sigmoid_and_mul
+from logssms.kernel import qk_norm_rope_store, sigmoid_and_mul
 from logssms.utils import div_even, nvtx_annotate
 
 from .base import BaseOP
@@ -15,7 +15,31 @@ from .linear import (
     LinearRowParallel,
 )
 from .norm import RMSNorm
-from .rotary import get_rope
+from .rotary import RotaryEmbedding, get_rope
+
+
+@nvtx_annotate("QKV::prepare")
+def _prepare_cached_query(
+    query    : torch.Tensor,
+    key      : torch.Tensor,
+    value    : torch.Tensor,
+    positions: torch.Tensor,
+    rotary   : RotaryEmbedding,
+    q_norm   : RMSNorm | None,
+    k_norm   : RMSNorm | None,
+    layer_id : int,
+) -> torch.Tensor:
+    ctx = get_global_ctx()
+    return qk_norm_rope_store(
+        query, key, value, positions, rotary._cos_sin_cache,
+        ctx.batch.out_loc, ctx.kv_cache.k_cache(layer_id), ctx.kv_cache.v_cache(layer_id),
+        q_weight=q_norm.weight if q_norm is not None else None,
+        k_weight=k_norm.weight if k_norm is not None else None,
+        q_eps=q_norm.eps if q_norm is not None else 0.0,
+        k_eps=k_norm.eps if k_norm is not None else 0.0,
+        q_zero_centered=q_norm.zero_centered if q_norm is not None else False,
+        k_zero_centered=k_norm.zero_centered if k_norm is not None else False,
+    )
 
 
 class MHAAttentionImpl(BaseOP):
@@ -29,17 +53,9 @@ class MHAAttentionImpl(BaseOP):
     def forward(
         self,
         query: torch.Tensor,
-        key  : torch.Tensor,
-        value: torch.Tensor,
     ) -> torch.Tensor:
         ctx = get_global_ctx()
-        output = ctx.attn_backend.forward(
-            query,
-            key.flatten(-2),
-            value.flatten(-2),
-            self._layer_id,
-            ctx.batch,
-        )
+        output = ctx.attn_backend.forward(query, self._layer_id, ctx.batch)
         return output.reshape(query.shape)
 
 
@@ -91,10 +107,9 @@ class RotaryAttention(BaseOP):
             has_bias=False,
         )
 
-    def proj(
+    def _project(
         self,
         x        : torch.Tensor,
-        positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         shape = x.shape[:-1]
         qkv = self.qkv_proj.forward(x)
@@ -109,6 +124,14 @@ class RotaryAttention(BaseOP):
         query = query.view(shape + (self.num_qo_heads, self.head_dim))
         key = key.view(shape + (self.num_kv_heads, self.head_dim))
         value = value.view(shape + (self.num_kv_heads, self.head_dim))
+        return query, key, value
+
+    def proj(
+        self,
+        x        : torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query, key, value = self._project(x)
         if self.q_norm is not None:
             self.q_norm.forward_inplace(query)
         if self.k_norm is not None:
@@ -116,14 +139,27 @@ class RotaryAttention(BaseOP):
         query, key = self.rotary.forward(positions, query, key)
         return query, key, value
 
+    def attend(
+        self,
+        query    : torch.Tensor,
+        key      : torch.Tensor,
+        value    : torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        query = _prepare_cached_query(
+            query, key, value, positions,
+            self.rotary, self.q_norm, self.k_norm, self._layer_id,
+        )
+        return self.attn.forward(query)
+
     @nvtx_annotate("RotaryAttention", layer_id_field="_layer_id")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        query, key, value = self.proj(x, get_global_ctx().batch.positions)
-        output = self.attn.forward(query, key, value)
+        query, key, value = self._project(x)
+        output = self.attend(query, key, value, get_global_ctx().batch.positions)
         return self.o_proj.forward(output.flatten(-2))
 
 
-class GatedRotaryAttention(BaseOP):
+class GatedRotaryAttention(RotaryAttention):
     def __init__(
         self,
         hidden_size       : int,
@@ -168,10 +204,9 @@ class GatedRotaryAttention(BaseOP):
         )
         self.attn = MHAAttentionImpl(layer_id)
 
-    def proj(
+    def _project(
         self,
         x        : torch.Tensor,
-        positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         shape = x.shape[:-1]
         qkv = self.qkv_proj.forward(x)
@@ -193,6 +228,14 @@ class GatedRotaryAttention(BaseOP):
         value = value.view(
             shape + (self.num_kv_heads, self.head_dim)
         )
+        return query, gate, key, value
+
+    def proj(
+        self,
+        x        : torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        query, gate, key, value = self._project(x)
         query = self.q_norm.forward(query)
         key = self.k_norm.forward(key)
         query, key = self.rotary.forward(positions, query, key)
@@ -200,8 +243,8 @@ class GatedRotaryAttention(BaseOP):
 
     @nvtx_annotate("GatedRotaryAttention", layer_id_field="_layer_id")
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        query, gate, key, value = self.proj(x, positions)
-        output = self.attn.forward(query, key, value)
+        query, gate, key, value = self._project(x)
+        output = self.attend(query, key, value, positions)
         return self.output(output, gate)
 
     def output(self, output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

@@ -46,11 +46,10 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.version = 4 if is_sm100_supported() else 3
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         return _fa_sgl_impl(
             q=q,
             k_cache=self.kvcache.k_cache(layer_id),

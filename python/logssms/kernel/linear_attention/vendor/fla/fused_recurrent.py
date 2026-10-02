@@ -397,8 +397,17 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     replay_counts: torch.Tensor,
     block_v      : int | None = None,
     enable_eager_state: bool = False,
+    *,
+    block_k      : int | None = None,
+    num_warps    : int | None = None,
+    num_stages   : int | None = None,
 ) -> torch.Tensor:
-    """Decode directly into noncontiguous frame-backed work and log slots."""
+    """Decode directly into frame-backed work/log slots.
+
+    Large 128x128 replay batches use K32/V64 tiles. Small batches, other head
+    dimensions and eager decode retain the full-K implementation. Explicit
+    launch overrides are available for operator tests.
+    """
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[2]
     head_v_dim = value.shape[3]
@@ -409,17 +418,54 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     assert replay_counts.shape == (batch_size,)
     assert pool.frame_bytes % pool.head_payload_bytes == 0
     output = torch.empty_like(value)
-    block_k = triton.next_power_of_2(head_k_dim)
+    full_k = triton.next_power_of_2(head_k_dim)
+    if (block_k is None and block_v is None and not enable_eager_state
+        and head_k_dim == head_v_dim == 128 and batch_size >= 32):
+        block_k = 32
+        block_v = 64
+        if num_stages is None:
+            num_stages = 1 if batch_size < 64 else 3
+    if num_stages is None:
+        num_stages = 3
     if block_v is None:
         # Wider value heads amortize the framed state lookup across more columns.
         block_v = 8 if head_v_dim < 128 else (
             16 if batch_size == 1 else 32
         )
-    assert block_v in (8, 16, 32)
+        if block_k is not None:
+            block_v = max(block_v, 16)
+    assert block_v in ((16, 32, 64) if block_k is not None else (8, 16, 32))
     block_v = min(block_v, triton.next_power_of_2(head_v_dim))
     if not enable_eager_state:
         block_v = max(block_v, 16)
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
+    if block_k is not None:
+        from .framed_replay import _framed_replay_kernel
+
+        assert not enable_eager_state, "K tiling is only supported for GEMM replay"
+        assert block_k in (16, 32, 64, 128) and block_k <= full_k
+        assert num_warps in (None, 4, 8)
+        assert num_stages in (1, 2, 3, 4)
+        _framed_replay_kernel[grid](
+            query.contiguous(), key.contiguous(), value.contiguous(),
+            gate, beta, A_log, dt_bias, pool.storage, output,
+            work_slots, log_slots, token_offsets, replay_counts,
+            pool.payload_frame_table, pool.decay_frame_table,
+            GATE_BATCH_STRIDE=gate.stride(0), GATE_HEAD_STRIDE=gate.stride(2),
+            BETA_BATCH_STRIDE=beta.stride(0), BETA_HEAD_STRIDE=beta.stride(2),
+            NUM_K_HEADS=num_k_heads, NUM_V_HEADS=num_v_heads,
+            HEAD_K_DIM=head_k_dim, HEAD_V_DIM=head_v_dim,
+            FULL_K=full_k, BLOCK_K=block_k, BLOCK_V=block_v,
+            FRAME_BYTES=pool.frame_bytes,
+            FRAMES_PER_SLOT=pool.allocator.payload_frames,
+            HEAD_PAYLOAD_BYTES=pool.head_payload_bytes,
+            DECAY_RECORD_BYTES=pool.layout.log_decay_bytes,
+            LAYER=layer, PAGE_SIZE=pool.page_size,
+            REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
+            num_warps=4 if num_warps is None else num_warps,
+            num_stages=num_stages,
+        )
+        return output
     _fused_recurrent_gated_delta_kernel[grid](
         query.contiguous(), key.contiguous(), value.contiguous(),
         gate, beta, A_log, dt_bias,
@@ -432,7 +478,7 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         NUM_V_HEADS=num_v_heads,
         HEAD_K_DIM=head_k_dim,
         HEAD_V_DIM=head_v_dim,
-        BLOCK_K=block_k,
+        BLOCK_K=full_k,
         BLOCK_V=block_v,
         STORE_LOG=True,
         DIRECT_STORE=True,
@@ -456,8 +502,8 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         PAGE_SIZE=pool.page_size,
         REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
         REPLAY_WORK=not enable_eager_state,
-        num_warps=4 if not enable_eager_state else 1,
-        num_stages=3,
+        num_warps=(4 if not enable_eager_state else 1) if num_warps is None else num_warps,
+        num_stages=num_stages,
     )
     return output
 

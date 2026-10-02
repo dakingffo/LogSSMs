@@ -17,9 +17,10 @@ logger = init_logger(__name__)
 def prefill_token_buckets(max_tokens: int) -> list[int]:
     if max_tokens < 1:
         return []
-    buckets = [1, 2, 4, 8, 16, 32, 64]
-    buckets += list(range(96, 513, 32))
-    buckets += list(range(576, max_tokens + 1, 64))
+    buckets = [1, 2, 4, 8, 16, 32]
+    buckets += list(range(64, min(max_tokens, 1024) + 1, 32))
+    buckets += list(range(1088, min(max_tokens, 4096) + 1, 64))
+    buckets += list(range(4224, max_tokens + 1, 128))
     buckets = [size for size in buckets if size <= max_tokens]
     if buckets[-1] != max_tokens:
         buckets.append(max_tokens)
