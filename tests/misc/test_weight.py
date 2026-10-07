@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from logssms.core import Batch, Context, clear_global_ctx, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.layers import GatedDeltaNet
+from logssms.models.config import AffineLogCacheSpec
 from logssms.models.weight import _get_merge_info, iter_checkpoint_weights, load_weight
 
 
@@ -60,8 +61,10 @@ def test_iter_checkpoint_weights_uses_shard_index(tmp_path):
 def test_gdn_projections_merge_after_tp_sharding(tmp_path, monkeypatch, tp_size):
     config = SimpleNamespace(
         is_hybrid=True, is_moe=False, num_kv_heads=2,
-        linear_num_key_heads=4, linear_num_value_heads=8,
-        linear_key_head_dim=8, linear_value_head_dim=4,
+        make_linear_cache_spec=lambda tp: AffineLogCacheSpec(
+            "gdn", 1, (8 // tp, 8, 4), (96 // tp, 3), num_groups=4 // tp,
+        ),
+        shard_weight=lambda *args: None,
     )
     monkeypatch.setattr("logssms.models.weight.load_model_config", lambda _: config)
     monkeypatch.setattr("logssms.models.register.make_model_config", lambda _: config)

@@ -9,7 +9,7 @@ from logssms.kernel.linear_attention.vendor.fla import (
     fused_recurrent_gated_delta_rule,
 )
 from logssms.layers import GatedDeltaNet
-from logssms.layers.linear_attention_backend.native import _l2norm
+from logssms.layers.linear_attention_backend.gdn import _l2norm
 from logssms.models.config import RotaryConfig
 from logssms.models.qwen3_next import Qwen3_5Config
 from logssms.utils import torch_dtype

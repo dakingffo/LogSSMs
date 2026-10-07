@@ -20,9 +20,9 @@ if TYPE_CHECKING:
 
 
 def _make_default_linear_attention_backend():
-    from logssms.layers.linear_attention_backend import LinearAttentionBackend
+    from logssms.layers.linear_attention_backend import GatedDeltaBackend
 
-    return LinearAttentionBackend()
+    return GatedDeltaBackend()
 
 
 @dataclass

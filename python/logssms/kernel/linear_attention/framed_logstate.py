@@ -137,7 +137,7 @@ def store_framed_log_states(
     decays         : torch.Tensor,
     layer          : int,
 ) -> None:
-    """Store normalized K, residual V and FP32 logarithmic decays."""
+    """Store rank-one update factors K/V and FP32 logarithmic decays."""
     if len(slots) == 0:
         return
     assert keys.is_cuda and keys.device == pool.device

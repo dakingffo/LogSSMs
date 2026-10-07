@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from transformers import PretrainedConfig
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,12 @@ class ModelConfig:
         return 0
 
     def make_linear_cache_spec(self, tp_size: int) -> LinearCacheSpec | None:
+        return None
+
+    def shard_weight(
+        self, name: str, tensor: torch.Tensor, rank: int, tp_size: int,
+    ) -> torch.Tensor | None:
+        """Override packed architecture-specific layouts; None uses common sharding."""
         return None
 
 

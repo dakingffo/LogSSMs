@@ -3201,10 +3201,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             dtype=config.dtype,
         )
         num_work_states = config.max_running_req + 1
-        head_bytes = max(
-            layout.head_log_key_bytes + layout.head_log_value_bytes,
-            layout.head_recurrent_state_bytes,
-        )
+        head_bytes = layout.head_payload_bytes(cache_per_page)
         payload_frames = div_ceil(
             spec.num_layers * num_v_heads * head_bytes,
             cache_per_page,

@@ -7,9 +7,9 @@ from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.core import Batch, Context, clear_global_ctx, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.layers import GatedDeltaNet
-from logssms.layers.linear_attention_backend import LogStateLinearAttentionBackend
+from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend
 from logssms.layers.linear_attention_backend.logstate import LogStateLinearAttentionMetadata
-from logssms.layers.linear_attention_backend.native import LinearAttentionMetadata
+from logssms.layers.linear_attention_backend.standard import LinearAttentionMetadata
 from logssms.utils import torch_dtype
 
 
@@ -40,7 +40,7 @@ def test_fused_gdn_graph_matches_separate_projections(cache_type):
             device=device, dtype=dtype,
         )
         assert pool.reserve(logs=2, works=2) is not None
-        ctx.linear_attn_backend = LogStateLinearAttentionBackend()
+        ctx.linear_attn_backend = GatedDeltaLogStateBackend()
         batch.linear_attn_metadata = LogStateLinearAttentionMetadata(
             phase="decode", work_slots=work_slots, log_slots=log_slots,
             token_offsets=offsets, conv_read_slots=work_slots,

@@ -1,22 +1,27 @@
 from logssms.utils import Registry
 
-from .base import BaseGatedDeltaBackend, BaseLinearAttentionBackend, BaseLinearAttentionMetadata
-from .native import (
-    LinearAttentionBackend,
+from .base import BaseGatedDeltaBackend, BaseMamba2Backend, BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from .standard import (
     LinearAttentionCaptureData,
     LinearAttentionMetadata,
 )
 from .logstate import (
-    LogStateLinearAttentionBackend,
     LogStateLinearAttentionCaptureData,
     LogStateLinearAttentionMetadata,
 )
+from .gdn import GatedDeltaBackend
+from .gdn_logstate import GatedDeltaLogStateBackend
+from .mamba2 import Mamba2Backend
+from .mamba2_logstate import Mamba2LogStateBackend
 
 
 SUPPORTED_LINEAR_ATTENTION_BACKENDS = Registry[type[BaseLinearAttentionBackend]]("linear attention backend")
 for cache_type in ("naive", "radix"):
-    SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"gdn/{cache_type}")(LinearAttentionBackend)
-SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("gdn/logstate")(LogStateLinearAttentionBackend)
+    SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"gdn/{cache_type}")(GatedDeltaBackend)
+SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("gdn/logstate")(GatedDeltaLogStateBackend)
+for cache_type in ("naive", "radix"):
+    SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"mamba2/{cache_type}")(Mamba2Backend)
+SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("mamba2/logstate")(Mamba2LogStateBackend)
 
 
 def make_linear_attention_backend(
@@ -28,12 +33,15 @@ def make_linear_attention_backend(
 __all__ = [
     "BaseLinearAttentionBackend",
     "BaseGatedDeltaBackend",
+    "BaseMamba2Backend",
     "SUPPORTED_LINEAR_ATTENTION_BACKENDS",
     "BaseLinearAttentionMetadata",
-    "LinearAttentionBackend",
+    "GatedDeltaBackend",
     "LinearAttentionCaptureData",
     "LinearAttentionMetadata",
-    "LogStateLinearAttentionBackend",
+    "GatedDeltaLogStateBackend",
+    "Mamba2Backend",
+    "Mamba2LogStateBackend",
     "LogStateLinearAttentionCaptureData",
     "LogStateLinearAttentionMetadata",
     "make_linear_attention_backend",

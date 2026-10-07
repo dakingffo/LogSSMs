@@ -1,4 +1,4 @@
-"""Decode-time depthwise convolution with direct Q/K/V and cache writes."""
+"""GDN depthwise convolution with direct Q/K/V and cache writes."""
 
 import torch
 import triton
@@ -11,7 +11,7 @@ def _frame_element_offset(frame, frame_elems: tl.constexpr):
 
 
 @triton.jit
-def _conv_decode(
+def _gdn_conv_decode(
     X, W, Q, K, V, StandardState, Storage, FrameTable,
     ReadSlots, ReadGranules, WriteSlots, WriteGranules, WorkSlots,
     C: tl.constexpr, KEY_DIM: tl.constexpr, STATE_LEN: tl.constexpr,
@@ -128,7 +128,7 @@ def conv_decode_qkv(
         read_granules = write_granules = work_slots = read_slots
         frame_elems = num_granules = 1
         num_layers = standard_state.shape[1]
-    _conv_decode[(bs, triton.cdiv(channels, 32))](
+    _gdn_conv_decode[(bs, triton.cdiv(channels, 32))](
         mixed_qkv, weight, q, k, v, state, state, table,
         read_slots, read_granules, write_slots, write_granules, work_slots,
         channels, config.key_dim, config.state_len,

@@ -5,7 +5,7 @@ from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from tests.logstate_helpers import head_view
 from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
-from logssms.layers.linear_attention_backend import LogStateLinearAttentionBackend
+from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend
 from logssms.kernel.linear_attention.framed_logstate import construct_framed_log_state_chains
 from logssms.kernel.linear_attention.framed_logstate import restore_framed_log_state_chains
 from logssms.kernel.linear_attention.vendor.fla import (
@@ -73,7 +73,7 @@ def test_logstate_decode_metadata_uses_work_and_log_slots() -> None:
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device)
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     req = _make_request(cached_len=20, device_len=21)
     batch = Batch(reqs=[req], phase="decode")
     batch.padded_reqs = batch.reqs
@@ -103,7 +103,7 @@ def test_logstate_new_request_reads_conv_from_work_slot() -> None:
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device)
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     req = _make_request(cached_len=0, device_len=1)
     batch = Batch(reqs=[req], phase="decode")
     batch.padded_reqs = batch.reqs
@@ -128,7 +128,7 @@ def test_logstate_uses_physical_offsets_after_unaligned_prefix_hit() -> None:
     ctx.page_table[0, 16:32] = 64 + torch.arange(
         16, dtype=torch.int32, device=device
     )
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     req = _make_request(cached_len=16, device_len=32)
     batch = Batch(reqs=[req], phase="prefill")
     batch.padded_reqs = batch.reqs
@@ -163,7 +163,7 @@ def test_recycled_checkpoint_prefill_metadata_skips_log_writes() -> None:
     assert reserved is not None
     checkpoint_slot = reserved[2][0]
     ctx.state_table[0].fill_(-1)
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     req = _make_request(cached_len=0, device_len=128)
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(128, dtype=torch.int32, device=device)
@@ -210,7 +210,7 @@ def test_direct_checkpoint_prefill_matches_log_prefill() -> None:
             assert reserved is not None
             checkpoint_slot = reserved[2][0]
             ctx.state_table[0].fill_(-1)
-        backend = LogStateLinearAttentionBackend()
+        backend = GatedDeltaLogStateBackend()
         batch = Batch(reqs=[_make_request(0, 128)], phase="prefill")
         batch.positions = torch.arange(128, device=device, dtype=torch.int32)
         batch.out_loc = ctx.page_table[0]
@@ -251,7 +251,7 @@ def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> N
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device)
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     req = _make_request(cached_len=16, device_len=32)
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(16, 32, dtype=torch.int32, device=device)
@@ -279,7 +279,7 @@ def test_logstate_unmapped_cached_prefix_reads_work_conv(phase: str) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device)
     ctx.state_table[0, :16].fill_(-1)
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     req = _make_request(cached_len=16, device_len=17)
     batch = Batch(reqs=[req], phase=phase)
     if phase == "decode":
@@ -302,7 +302,7 @@ def test_logstate_decode_graph_metadata_uses_int32_capture_buffers() -> None:
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device)
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     real_req = _make_request(cached_len=20, device_len=21)
     dummy_req = _make_request(cached_len=0, device_len=1)
     dummy_req.table_idx = 1
@@ -611,7 +611,7 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
     dtype = torch.bfloat16
     ctx = _make_context(device)
     pool = ctx.linear_state
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     config = GatedDeltaConfig(
         num_k_heads=2,
         num_v_heads=2,
@@ -727,7 +727,7 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
     ctx.work_state_table = torch.tensor(
         [[works[0]]], dtype=torch.int32, device=device
     )
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     pool.zero_state(works[0])
     pool.zero_work_conv(works[0])
     config = GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0)
@@ -834,7 +834,7 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
     batch.padded_reqs = batch.reqs
     batch.positions = torch.arange(35, dtype=torch.int32, device=device)
     batch.out_loc = batch.positions
-    backend = LogStateLinearAttentionBackend()
+    backend = GatedDeltaLogStateBackend()
     set_global_ctx(ctx)
     try:
         backend.prepare_metadata(batch)
@@ -960,7 +960,7 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
         )
 
     full_ctx = _make_context(device)
-    full_ctx.linear_attn_backend = LogStateLinearAttentionBackend()
+    full_ctx.linear_attn_backend = GatedDeltaLogStateBackend()
     set_global_ctx(full_ctx)
     try:
         full = run(full_ctx, 0, 81).clone()
@@ -968,7 +968,7 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
         clear_global_ctx()
 
     resumed_ctx = _make_context(device)
-    resumed_ctx.linear_attn_backend = LogStateLinearAttentionBackend()
+    resumed_ctx.linear_attn_backend = GatedDeltaLogStateBackend()
     set_global_ctx(resumed_ctx)
     try:
         first = run(resumed_ctx, 0, 64)

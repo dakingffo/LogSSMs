@@ -26,7 +26,7 @@ def _reconstruct_tile(
 
 
 @triton.jit
-def _framed_replay_kernel(
+def _gdn_replay_kernel(
     query, key, value, gate, beta, A_log, dt_bias, storage, output,
     work_slots, log_slots, token_offsets, replay_counts, payload_frames, decay_frames,
     GATE_BATCH_STRIDE: tl.constexpr, GATE_HEAD_STRIDE: tl.constexpr,

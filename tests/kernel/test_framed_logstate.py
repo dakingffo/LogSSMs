@@ -24,7 +24,7 @@ from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("dims", [(128, 128), (32, 32)])
 def test_framed_decode_selects_launch_config(monkeypatch, batch_size, eager, dims):
-    from logssms.kernel.linear_attention.vendor.fla import framed_replay, fused_recurrent
+    from logssms.kernel.linear_attention.vendor.fla import gdn_replay, fused_recurrent
 
     launches = []
 
@@ -38,7 +38,7 @@ def test_framed_decode_selects_launch_config(monkeypatch, batch_size, eager, dim
             return launch
 
     monkeypatch.setattr(fused_recurrent, "_fused_recurrent_gated_delta_kernel", Kernel("full"))
-    monkeypatch.setattr(framed_replay, "_framed_replay_kernel", Kernel("tiled"))
+    monkeypatch.setattr(gdn_replay, "_gdn_replay_kernel", Kernel("tiled"))
     K, V = dims
     q = torch.empty(batch_size, 1, 2, K, dtype=torch.bfloat16)
     v = torch.empty(batch_size, 1, 6, V, dtype=q.dtype)

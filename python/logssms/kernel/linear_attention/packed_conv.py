@@ -7,10 +7,11 @@ import triton.language as tl
 
 @triton.jit
 def _packed_conv_kernel(
-    x, weight, history, offsets, chunks, output,
+    x, weight, bias, history, offsets, chunks, output,
     C: tl.constexpr, K: tl.constexpr, S: tl.constexpr,
     X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     chunk = tl.program_id(0)
     request = tl.load(chunks + chunk * 2).to(tl.int32)
@@ -34,6 +35,8 @@ def _packed_conv_kernel(
         )
         w = tl.load(weight + c * K + tap, mask=c < C, other=0)
         result += tl.where(old[:, None], previous, current).to(tl.float32) * w[None, :].to(tl.float32)
+    if HAS_BIAS:
+        result += tl.load(bias + c, mask=c < C, other=0)[None, :].to(tl.float32)
     result = result.to(output.dtype.element_ty).to(tl.float32)
     result = result / (1.0 + tl.exp(-result))
     tl.store(output + (begin + t[:, None]) * C + c[None, :], result, mask=active)
@@ -74,6 +77,7 @@ def packed_causal_conv1d(
     history      : torch.Tensor,
     cu_seqlens   : torch.Tensor,
     chunk_indices: torch.Tensor,
+    bias         : torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Depthwise causal conv over packed requests, without per-request launches."""
     total_tokens, channels = x.shape
@@ -83,9 +87,9 @@ def packed_causal_conv1d(
     assert weight.shape == (channels, 1, kernel_size)
     output = torch.empty((total_tokens, channels), device=x.device, dtype=x.dtype)
     _packed_conv_kernel[(len(chunk_indices), triton.cdiv(channels, 32))](
-        x, weight, history, cu_seqlens, chunk_indices, output,
+        x, weight, bias, history, cu_seqlens, chunk_indices, output,
         channels, kernel_size, state_len, x.stride(0), x.stride(1),
-        64, 32, num_warps=4,
+        64, 32, bias is not None, num_warps=4,
     )
     return output
 

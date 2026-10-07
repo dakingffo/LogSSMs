@@ -58,10 +58,7 @@ class FramedMHALogStatePool(BaseKVCachePool):
             2 * num_attention_layers * page_size * num_kv_heads
             * head_dim * dtype.itemsize
         )
-        head_payload_bytes = max(
-            layout.head_log_key_bytes + layout.head_log_value_bytes,
-            layout.head_recurrent_state_bytes,
-        )
+        head_payload_bytes = layout.head_payload_bytes(frame_bytes)
         payload_bytes = num_linear_layers * num_value_heads * head_payload_bytes
         conv_snapshot_bytes = layout.conv_state_bytes // layout.num_granules
         allocator = LogStateFrameAllocator(

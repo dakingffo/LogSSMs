@@ -5,6 +5,7 @@ from transformers import PretrainedConfig
 from .config import ModelConfig
 
 _MODEL_REGISTRY = {
+    "FalconH1ForCausalLM"              : (".falcon_h1", "FalconH1Config", "FalconH1ForCausalLM"),
     "LlamaForCausalLM"                 : (".llama", "LlamaConfig", "LlamaForCausalLM"),
     "Qwen2ForCausalLM"                 : (".qwen2", "Qwen2Config", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM"                 : (".qwen3", "Qwen3Config", "Qwen3ForCausalLM"),

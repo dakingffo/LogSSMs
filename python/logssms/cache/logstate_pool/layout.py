@@ -56,6 +56,17 @@ class LogStateSlotLayout:
     def head_recurrent_state_bytes(self) -> int:
         return self.head_k_dim * self.head_v_dim * self.dtype.itemsize
 
+    def head_payload_bytes(self, frame_bytes: int) -> int:
+        """Keep each head overlay inside one frame for direct kernel addressing."""
+        size = max(self.head_log_key_bytes + self.head_log_value_bytes,
+                   self.head_recurrent_state_bytes)
+        if frame_bytes % size == 0:
+            return size
+        padded = 1 << (size - 1).bit_length()
+        if frame_bytes % padded != 0:
+            raise ValueError("Linear head payload cannot be aligned within a KV frame")
+        return padded
+
     @property
     def log_decay_bytes(self) -> int:
         return (

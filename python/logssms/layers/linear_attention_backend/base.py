@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.layers.gated_delta import GatedDeltaConfig
+    from logssms.layers.mamba2 import Mamba2Config
 
 
 @dataclass
@@ -50,4 +51,23 @@ class BaseGatedDeltaBackend(BaseLinearAttentionBackend):
     ) -> torch.Tensor: ...
 
 
-__all__ = ["BaseLinearAttentionBackend", "BaseLinearAttentionMetadata", "BaseGatedDeltaBackend"]
+class BaseMamba2Backend(BaseLinearAttentionBackend):
+    @abstractmethod
+    def forward(
+        self,
+        xbc        : torch.Tensor,
+        dt         : torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias  : torch.Tensor | None,
+        A_log      : torch.Tensor,
+        dt_bias    : torch.Tensor,
+        D          : torch.Tensor,
+        config     : Mamba2Config,
+        batch      : Batch,
+    ) -> torch.Tensor: ...
+
+
+__all__ = [
+    "BaseLinearAttentionBackend", "BaseLinearAttentionMetadata",
+    "BaseGatedDeltaBackend", "BaseMamba2Backend",
+]

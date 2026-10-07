@@ -203,30 +203,40 @@ LOGSSMS_DEVICE void prefetch_log_chunk(
   constexpr auto kBytes = 16;
   constexpr auto kKeyBlocks = kChunk * kHeadKDim * sizeof(T) / kBytes;
   constexpr auto kValueBlocks = kChunk * kHeadVDim * sizeof(T) / kBytes;
-  if (threadIdx.x < kKeyBlocks) {
-    const auto token = threadIdx.x / (kHeadKDim * sizeof(T) / kBytes);
+#pragma unroll
+  for (auto step = 0; step < div_ceil(kKeyBlocks, 256); ++step) {
+    const auto index = step * 256 + threadIdx.x;
+    if (index >= kKeyBlocks) {
+      continue;
+    }
+    const auto token = index / (kHeadKDim * sizeof(T) / kBytes);
     const auto valid = chunk + token < length;
     const auto *source = reinterpret_cast<const std::uint8_t *>(
       key_pointer<T, kHeadKDim, kHeadVDim>(
         params, slot, layer, head, begin + chunk + (valid ? token : 0)
       )
-    ) + (threadIdx.x % (kHeadKDim * sizeof(T) / kBytes)) * kBytes;
+    ) + (index % (kHeadKDim * sizeof(T) / kBytes)) * kBytes;
     const auto shared = static_cast<std::uint32_t>(__cvta_generic_to_shared(
-      reinterpret_cast<std::uint8_t *>(shared_key) + threadIdx.x * kBytes
+      reinterpret_cast<std::uint8_t *>(shared_key) + index * kBytes
     ));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
                  :: "r"(shared), "l"(source), "r"(valid ? 16 : 0));
   }
-  if (threadIdx.x < kValueBlocks) {
-    const auto token = threadIdx.x / (kHeadVDim * sizeof(T) / kBytes);
+#pragma unroll
+  for (auto step = 0; step < div_ceil(kValueBlocks, 256); ++step) {
+    const auto index = step * 256 + threadIdx.x;
+    if (index >= kValueBlocks) {
+      continue;
+    }
+    const auto token = index / (kHeadVDim * sizeof(T) / kBytes);
     const auto valid = chunk + token < length;
     const auto *source = reinterpret_cast<const std::uint8_t *>(
       value_pointer<T, kHeadKDim, kHeadVDim>(
         params, slot, layer, head, begin + chunk + (valid ? token : 0)
       )
-    ) + (threadIdx.x % (kHeadVDim * sizeof(T) / kBytes)) * kBytes;
+    ) + (index % (kHeadVDim * sizeof(T) / kBytes)) * kBytes;
     const auto shared = static_cast<std::uint32_t>(__cvta_generic_to_shared(
-      reinterpret_cast<std::uint8_t *>(shared_value) + threadIdx.x * kBytes
+      reinterpret_cast<std::uint8_t *>(shared_value) + index * kBytes
     ));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
                  :: "r"(shared), "l"(source), "r"(valid ? 16 : 0));

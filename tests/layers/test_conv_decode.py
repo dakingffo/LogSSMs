@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.conv_decode import (
+from logssms.kernel.linear_attention.gdn_conv_decode import (
     _frame_element_offset,
     conv_decode_qkv,
 )

@@ -42,5 +42,5 @@ def test_backend_lifecycle_does_not_require_gdn_compute_arguments():
 
 
 def test_missing_operator_backend_is_not_silently_treated_as_gdn():
-    with pytest.raises(KeyError, match="mamba2/logstate"):
-        make_linear_attention_backend("logstate", recurrent_type="mamba2")
+    with pytest.raises(KeyError, match="unknown/logstate"):
+        make_linear_attention_backend("logstate", recurrent_type="unknown")

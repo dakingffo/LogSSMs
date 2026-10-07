@@ -21,12 +21,13 @@ class LogStateKernels:
 
 
 SUPPORTED_LOG_STATE_KERNELS = Registry[LogStateKernels]("LogState kernels")
-GATED_DELTA_LOG_STATE_KERNELS = LogStateKernels(
+AFFINE_LOG_STATE_KERNELS = LogStateKernels(
     restore=restore_framed_log_state_chains,
     construct=construct_framed_log_state_chains,
     copy_conv=copy_framed_conv_snapshots,
 )
-SUPPORTED_LOG_STATE_KERNELS.register("gdn")(GATED_DELTA_LOG_STATE_KERNELS)
+for recurrent_type in ("gdn", "mamba2"):
+    SUPPORTED_LOG_STATE_KERNELS.register(recurrent_type)(AFFINE_LOG_STATE_KERNELS)
 
 
 __all__ = [

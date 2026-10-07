@@ -26,7 +26,7 @@ from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_c
 from logssms.engine.engine import Engine
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.layers.attention_backend.fi import FlashInferBackend
-from logssms.layers.linear_attention_backend import LogStateLinearAttentionBackend, LinearAttentionBackend
+from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend, GatedDeltaBackend
 
 torch.set_num_threads(1)
 device = torch.device("cuda")
@@ -82,7 +82,7 @@ def metadata_case(bs, phase, page_size, linear):
                             decode_wrappers=None, prefill_wrapper=None,
                             cached_ones_cpu=torch.empty(0, dtype=torch.int32, pin_memory=True)).items():
         setattr(engine.attn_backend, name, value)
-    engine.linear_attn_backend = LogStateLinearAttentionBackend() if linear == "logstate" else LinearAttentionBackend()
+    engine.linear_attn_backend = GatedDeltaLogStateBackend() if linear == "logstate" else GatedDeltaBackend()
     engine.sampler = SimpleNamespace(prepare=lambda batch: None)
     def cache_prepare(batch):
         batch.logstate_replay_counts = [i % 16 for i in range(bs)]

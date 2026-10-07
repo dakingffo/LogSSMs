@@ -212,9 +212,10 @@ def load_weight(
     # dim-0 sharding would put the tp chunk boundary inside a region. Compute the region
     # sizes so _shard_tensor can shard each by head count.
     qkv_regions = None
-    if config.is_hybrid and config.linear_num_key_heads:
-        qk = config.linear_num_key_heads * config.linear_key_head_dim
-        v = config.linear_num_value_heads * config.linear_value_head_dim
+    linear_spec = config.make_linear_cache_spec(1)
+    if linear_spec is not None and linear_spec.recurrent_type == "gdn":
+        qk = linear_spec.num_groups * linear_spec.state_shape[1]
+        v = linear_spec.state_shape[0] * linear_spec.state_shape[2]
         qkv_regions = (qk, qk, v)
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
@@ -237,9 +238,11 @@ def load_weight(
         name = name.replace("model.language_model.", "model.", 1)
         if name.startswith(skip_prefixes):
             continue
-        tensor = _shard_tensor(
-            name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, qkv_regions
-        )
+        tensor = config.shard_weight(name, raw, tp_info.rank, tp_info.size)
+        if tensor is None:
+            tensor = _shard_tensor(
+                name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, qkv_regions
+            )
         del raw
 
         info = _get_merge_info(name)

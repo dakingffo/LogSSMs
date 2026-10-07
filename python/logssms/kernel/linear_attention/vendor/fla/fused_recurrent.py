@@ -440,13 +440,13 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         block_v = max(block_v, 16)
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)
     if block_k is not None:
-        from .framed_replay import _framed_replay_kernel
+        from .gdn_replay import _gdn_replay_kernel
 
         assert not enable_eager_state, "K tiling is only supported for GEMM replay"
         assert block_k in (16, 32, 64, 128) and block_k <= full_k
         assert num_warps in (None, 4, 8)
         assert num_stages in (1, 2, 3, 4)
-        _framed_replay_kernel[grid](
+        _gdn_replay_kernel[grid](
             query.contiguous(), key.contiguous(), value.contiguous(),
             gate, beta, A_log, dt_bias, pool.storage, output,
             work_slots, log_slots, token_offsets, replay_counts,

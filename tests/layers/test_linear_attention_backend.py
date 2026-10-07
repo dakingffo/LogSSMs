@@ -6,7 +6,7 @@ import torch
 from logssms.cache.linear_pool.state_pool import LinearStatePool
 from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
-from logssms.layers.linear_attention_backend import LinearAttentionBackend
+from logssms.layers.linear_attention_backend import GatedDeltaBackend
 
 
 def _make_inputs(seq_len: int) -> dict:
@@ -61,7 +61,7 @@ def _make_request(table_idx: int, cached_len: int, device_len: int) -> Request:
 def test_decode_graph_metadata_uses_capture_buffers() -> None:
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    backend = LinearAttentionBackend()
+    backend = GatedDeltaBackend()
     ctx = Context(page_size=64)
     ctx.linear_state = SimpleNamespace(device=device)  # type: ignore
     ctx.state_table = torch.tensor(
@@ -171,7 +171,7 @@ def test_packed_causal_conv_matches_individual_requests() -> None:
 
 def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
     clear_global_ctx()
-    backend = LinearAttentionBackend()
+    backend = GatedDeltaBackend()
     ctx = Context(page_size=64)
     ctx.state_table = torch.tensor(
         [
@@ -209,7 +209,7 @@ def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_chunk_gated_delta_returns_page_checkpoints() -> None:
     from logssms.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
-    from logssms.layers.linear_attention_backend.native import PackedLinearIndices
+    from logssms.layers.linear_attention_backend.standard import PackedLinearIndices
 
     inputs = _make_inputs(seq_len=96)
     query = torch.nn.functional.normalize(inputs["query"], dim=-1)
