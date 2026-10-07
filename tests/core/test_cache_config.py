@@ -75,6 +75,7 @@ def test_server_uses_logstate_defaults(tmp_path) -> None:
     assert not args.cache_config.enable_eager_state
     assert args.cache_config.enable_memorized_evict
     assert args.cache_config.enable_merge_adjustment
+    assert args.cache_config.max_merge_intensity == 8
     assert args.cache_config.granularity == LOG_STATE_GRANULARITY == 32
     assert args.page_size == 64
 

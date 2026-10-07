@@ -30,7 +30,7 @@ class LogStateCacheConfig(BaseCacheConfig):
     enable_memorized_evict   : bool = True
     enable_merge_adjustment  : bool = True
     min_sampling_len         : int  = 1024
-    max_merge_intensity      : int  = 16
+    max_merge_intensity      : int  = 8
     default_merge_growth_rate: int = 2
 
     def __post_init__(self) -> None:

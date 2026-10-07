@@ -359,8 +359,10 @@ class OnlineAnalysisScheduler:
     With merge adjustment disabled, checkpoint coalescing remains binary. With
     it enabled, each logical chain samples branch-hit endpoints over a moving
     token window, fits their binned density in log-log space, and uses the
-    floored power-law exponent as the maximum same-level merge arity. This class
-    never allocates slots, launches kernels, or mutates persistent tree entries.
+    floored power-law exponent as the maximum merge arity. Adjacent intervals
+    may merge when their spans are nondecreasing, without crossing a protected
+    or locked boundary. This class never allocates slots, launches kernels,
+    or mutates persistent tree entries.
     """
 
     def __init__(
@@ -369,7 +371,7 @@ class OnlineAnalysisScheduler:
         granularity              : int  = LOG_STATE_GRANULARITY,
         enable_merge_adjustment  : bool = True,
         min_sampling_len         : int  = 1024,
-        max_merge_intensity      : int  = 16,
+        max_merge_intensity      : int  = 8,
         default_merge_growth_rate: int = 2,
         profile_enabled          : bool = False,
     ) -> None:
@@ -637,7 +639,6 @@ class OnlineAnalysisScheduler:
             round_info.eligible_slots,
             pending,
             materialize,
-            analysis_nodes,
             endpoints,
             diagnostics,
             path_cache,
@@ -868,7 +869,6 @@ class OnlineAnalysisScheduler:
         eligible_slots: frozenset[int],
         pending       : tuple[_PendingProtection, ...],
         materialize   : tuple[PageMaterialize, ...],
-        analysis_nodes: tuple[LogRadixTreeNode, ...],
         endpoints     : tuple[_AnalysisEndpoint, ...],
         diagnostics   : dict[str, int] | None,
         path_cache    : dict,
@@ -886,7 +886,6 @@ class OnlineAnalysisScheduler:
                 "anchors_without_eligible_entries": 0,
                 "entries_beyond_match_endpoint": 0,
                 "entries_not_eligible_this_round": 0,
-                "entries_outside_adaptive_owner": 0,
                 "logs_not_materialized": 0,
                 "checkpoint_candidates": 0,
                 "protected_entries": 0,
@@ -897,7 +896,7 @@ class OnlineAnalysisScheduler:
                 "segments_without_merge_pair": 0,
                 "candidate_groups": 0,
                 "groups_already_planned": 0,
-                "rejected_level_mismatch": 0,
+                "rejected_decreasing_span": 0,
                 "rejected_span_mismatch": 0,
                 "rejected_discontinuity": 0,
                 "rejected_lock_boundary": 0,
@@ -914,34 +913,30 @@ class OnlineAnalysisScheduler:
 
         anchor_limits: dict[int, tuple[LogRadixTreeNode, int]] = {}
         for endpoint in endpoints:
-            for node in tree.path(endpoint.node):
-                if node is not endpoint.node and (
-                    not self.enable_merge_adjustment or node.merge_stats is None
-                ):
-                    continue
-                limit = min(node.depth, endpoint.matched_len)
-                previous = anchor_limits.get(node.uuid)
-                if previous is None or limit > previous[1]:
-                    anchor_limits[node.uuid] = (node, limit)
+            node = endpoint.node
+            limit = min(node.depth, endpoint.matched_len)
+            previous = anchor_limits.get(node.uuid)
+            if previous is None or limit > previous[1]:
+                anchor_limits[node.uuid] = (node, limit)
         if not anchor_limits:
             return ()
         paths = []
         anchors = []
         for node, matched_len in anchor_limits.values():
-            stats = node.merge_stats
+            stats = node.merge_stats if self.enable_merge_adjustment else None
+            if stats is not None and stats.origin > matched_len:
+                stats = None
             paths.append(self._planning_path(tree, node, eligible_slots, pending, path_cache))
             anchors.append((
                 len(paths) - 1, matched_len,
-                -1 if stats is None else stats.origin,
-                -1 if stats is None else stats.tail,
-                stats.intensity if self.enable_merge_adjustment and stats is not None else 2,
+                stats.intensity if stats is not None else 2,
                 int(stats is not None),
             ))
         groups, native_diagnostics = planning.plan_coalesce(
             [path[1] for path in paths], [path[2] for path in paths],
             [path[3] for path in paths], anchors,
             [plan.log_slot for plan in materialize], self.page_size,
-            self.enable_merge_adjustment, diagnostics is not None,
+            diagnostics is not None,
         )
         if diagnostics is not None:
             diagnostics.update(native_diagnostics)
@@ -1022,7 +1017,7 @@ class LogStateCacheManager(BaseCacheManager):
         enable_memorized_evict   : bool = True,
         enable_merge_adjustment  : bool = True,
         min_sampling_len         : int  = 1024,
-        max_merge_intensity      : int  = 16,
+        max_merge_intensity      : int  = 8,
         default_merge_growth_rate: int = 2,
     ) -> None:
         pool = resources.linear_state
@@ -1170,11 +1165,28 @@ class LogStateCacheManager(BaseCacheManager):
             )
         usable_len = align_down(len(values), self.granularity)
         trace = self.tree.trace(values[:usable_len])
+        source_node = trace.node
+        # An interior hit can end before the leaf holding this chain's stats.
+        # Follow only an unbranched suffix; never choose an arbitrary sibling.
+        if trace.matched_len > 0:
+            while source_node.merge_stats is None and len(source_node.children) == 1:
+                source_node = next(iter(source_node.children.values()))
+        source = source_node.merge_stats
+        if source is not None and not source.origin <= trace.matched_len <= source.tail:
+            source = None
+        continues_chain = (
+            source is not None and trace.is_exact and trace.node.is_leaf()
+            and not trace.node.is_locked
+            and source.tail == trace.matched_len == handle.cached_len
+        )
         return MatchResult(
             replace(
                 handle,
-                merge_stats=self.analyzer.make_merge_stats(trace.matched_len),
-                source_merge_stats=trace.node.merge_stats,
+                merge_stats=(
+                    source if continues_chain else
+                    self.analyzer.make_merge_stats(trace.matched_len)
+                ),
+                source_merge_stats=source,
                 match_position=trace.matched_len,
                 recycle_match=recycle_match,
             ),
@@ -1191,6 +1203,19 @@ class LogStateCacheManager(BaseCacheManager):
         del request_len
         if self._profile_enabled:
             self._profile_stats["admission_attempts"] += 1
+        if self.enable_merge_adjustment:
+            assert isinstance(handle, LogStateCacheHandle)
+            stats = handle.merge_stats
+            if stats is not None and stats is handle.source_merge_stats and (
+                handle.node.merge_stats is not stats
+                or not handle.node.is_leaf() or handle.node.is_locked
+                or handle.node.depth != stats.tail
+            ):
+                # Another request claimed or extended this tail after match_req.
+                # Retry matching rather than let two continuations share an owner.
+                if self._profile_enabled:
+                    self._profile_stats["admission_rejections"] += 1
+                return False
         admitted = super().prefill_acquire(total_len, handle)
         if not admitted:
             if self._profile_enabled:

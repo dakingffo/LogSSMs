@@ -1,3 +1,5 @@
+import random
+
 import pytest
 import torch
 
@@ -45,6 +47,46 @@ def test_native_materialize_respects_fragmented_and_protected_slots():
     assert planning.plan_materialize([path], [(96,)], [(0, 1)], 64) == []
     path[8 + 6] = 1
     assert planning.plan_materialize([path], [()], [(0, 1)], 64) == []
+
+
+def test_native_coalesce_matches_nondecreasing_group_oracle():
+    rng = random.Random(744)
+    for _ in range(100):
+        spans = [rng.randint(1, 9) for _ in range(rng.randint(1, 32))]
+        intensity = rng.randint(2, 8)
+        path = []
+        tail = 0
+        for slot, span in enumerate(spans):
+            end = tail + span * 64
+            path.extend((slot, tail, end, span, tail, 1, 0, 0))
+            tail = end
+        expected = []
+        begin = 0
+        while begin < len(spans):
+            end = begin + 1
+            while (end < len(spans) and end - begin < intensity
+                   and spans[end - 1] <= spans[end]):
+                end += 1
+            if end - begin > 1:
+                expected.append(tuple(range(begin, end)))
+            begin = end
+        groups, _ = planning.plan_coalesce(
+            [path], [()], [()], [(0, tail, intensity, 1)], (), 64, False,
+        )
+        assert [tuple(group[3::2]) for group in groups] == expected
+        assert all(group[2] == sum(group[4::2]) for group in groups)
+
+
+def test_native_coalesce_obeys_protections_locks_and_unique_slot_ownership():
+    path = [value for slot in range(6) for value in (
+        slot, slot * 64, (slot + 1) * 64, 1, slot * 64, 1, int(slot == 4), 0,
+    )]
+    groups, diagnostics = planning.plan_coalesce(
+        [path], [(128,)], [(256,)], [(0, 384, 8, 1), (0, 384, 8, 1)],
+        (), 64, True,
+    )
+    assert [tuple(group[3::2]) for group in groups] == [(0, 1), (2, 3)]
+    assert diagnostics["planned_slot_releases"] == 2
 
 
 def test_native_dependency_plan_orders_old_log_reader_before_writer():

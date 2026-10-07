@@ -472,7 +472,7 @@ def test_manager_exports_online_merge_profile_and_cache_req_timing():
     online = profile["online_merge"]
     assert online["enabled"]
     assert online["min_sampling_len"] == 1024
-    assert online["aggregate"]["owners_created"] == 2
+    assert online["aggregate"]["owners_created"] == 1
     assert online["aggregate"]["hits_recorded"] == 1
     assert online["aggregate"]["advances_below_update_boundary"] == 1
     assert online["updates"] == []
@@ -498,6 +498,91 @@ def test_adaptive_sampling_owner_moves_to_the_latest_chain_node():
     assert req.cache_handle.node.merge_stats is stats
 
     manager.unlock(req.cache_handle)
+
+
+def test_continuation_preserves_statistics_and_updates_across_turns():
+    manager = make_manager(
+        num_pages=32, num_states=32, enable_merge_adjustment=True,
+        max_seq_len=2048,
+    )
+    stats = None
+    previous_node = None
+    for length in (576, 1152, 1728):
+        # Each new prompt includes the previous request's actual cached tokens.
+        req = new_req(manager, torch.arange(length, dtype=torch.int32))
+        if stats is None:
+            stats = req.cache_handle.merge_stats
+            assert stats is not None
+        else:
+            assert req.cache_handle.merge_stats is stats
+        manager.allocate([req])
+        req.cached_len = length
+        manager.cache_req(req, finished=True)
+        node = manager.tree.trace(req.input_ids).node
+        assert node.merge_stats is stats
+        if previous_node is not None:
+            assert previous_node.merge_stats is None
+        previous_node = node
+        assert stats.origin == 0
+        assert stats.tail == length
+    assert stats.intensity == 4
+    assert stats.next_update_tail == 2048
+    manager.check_integrity()
+
+
+def test_internal_fork_keeps_original_statistics_and_starts_an_empty_owner():
+    manager = make_manager(enable_merge_adjustment=True)
+    req = new_req(manager, torch.arange(258, dtype=torch.int32))
+    original = req.cache_handle.merge_stats
+    manager.allocate([req])
+    req.cached_len = 258
+    manager.cache_req(req, finished=True)
+    original.intensity = 6
+    original.hit_positions.append(192)
+
+    pending = PendingRequest(
+        uid=1,
+        input_ids=torch.cat((torch.arange(128, dtype=torch.int32),
+                             torch.arange(128, dtype=torch.int32) + 10_000)),
+        sampling_params=SamplingParams(max_tokens=16),
+    )
+    handle = manager.match_req(pending).cuda_handle
+    assert handle.merge_stats is not original
+    assert handle.merge_stats.origin == handle.merge_stats.tail == 128
+    assert handle.merge_stats.intensity == 2
+    assert not handle.merge_stats.hit_positions
+    assert original.origin == 0 and original.tail == 256
+    assert original.intensity == 6
+    assert tuple(original.hit_positions) == (192,)
+    assert manager.tree.trace(req.input_ids).node.merge_stats is original
+    assert handle.source_merge_stats is original
+    assert manager.prefill_acquire(PAGE_SIZE, handle)
+    assert tuple(original.hit_positions) == (192, 128)
+    assert not handle.merge_stats.hit_positions
+    manager.unlock(handle)
+
+
+def test_stale_continuation_retries_instead_of_sharing_a_writable_owner():
+    manager = make_manager(enable_merge_adjustment=True)
+    original = new_req(manager, torch.arange(130, dtype=torch.int32))
+    manager.allocate([original])
+    original.cached_len = 130
+    manager.cache_req(original, finished=True)
+    pending = PendingRequest(
+        uid=1, input_ids=torch.arange(194, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=16),
+    )
+    first = manager.match_req(pending).cuda_handle
+    second = manager.match_req(pending).cuda_handle
+    assert first.merge_stats is second.merge_stats
+    assert manager.prefill_acquire(PAGE_SIZE, first)
+    assert not manager.prefill_acquire(PAGE_SIZE, second)
+    retry = manager.match_req(pending).cuda_handle
+    assert retry.merge_stats is not first.merge_stats
+    assert retry.merge_stats.origin == 128
+    assert manager.prefill_acquire(PAGE_SIZE, retry)
+    manager.unlock(retry)
+    manager.unlock(first)
 
 
 def test_concurrent_same_prefix_discards_duplicate_log_pages():

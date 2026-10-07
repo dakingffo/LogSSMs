@@ -74,6 +74,22 @@ def make_sessions(
     ]
 
 
+def make_warmup_sessions(
+    tokenizer: Any, sessions: list[Session], *, concurrency: int, seed: int,
+) -> list[Session]:
+    forbidden = {session.initial[0] for session in sessions}
+    forbidden.update(tokenizer.all_special_ids)
+    first = next(token for token in range(tokenizer.vocab_size) if token not in forbidden)
+    warmup = make_sessions(
+        tokenizer, count=concurrency, turns=2, input_len=len(sessions[0].initial),
+        append_len=len(sessions[0].increments[0]), shared_len=0, seed=seed + 1_000_000,
+    )
+    return [
+        Session(f"warmup-{index}", (first, *session.initial[1:]), session.increments)
+        for index, session in enumerate(warmup)
+    ]
+
+
 @dataclass(frozen=True)
 class TokenStream:
     tics         : list[float]
@@ -116,6 +132,23 @@ async def stream_token_ids(
             "stream": True,
         }
         headers = {}
+    elif api == "vllm":
+        endpoint = "/v1/completions"
+        payload = {
+            "model": model,
+            "prompt": prompt_ids,
+            "max_tokens": output_len,
+            "temperature": 0.0,
+            "top_k": 1,
+            "n": 1,
+            "echo": False,
+            "add_special_tokens": False,
+            "stream": True,
+            "ignore_eos": True,
+            "return_token_ids": True,
+            "stream_options": {"include_usage": True},
+        }
+        headers = {}
     else:
         raise ValueError(f"Unknown generation API: {api}")
 
@@ -125,6 +158,7 @@ async def stream_token_ids(
     done_tic = None
     generated: list[int] = []
     cached_tokens = None
+    prompt_verified = False
     async with client.stream(
         "POST", f"{base.rstrip('/')}{endpoint}", json=payload, headers=headers,
     ) as resp:
@@ -145,6 +179,33 @@ async def stream_token_ids(
                 new_ids = chunk["delta"].get("token_ids") or []
                 if chunk.get("finish_reason") is not None:
                     finish_tic = now
+            elif api == "vllm":
+                usage = event.get("usage")
+                if usage is not None:
+                    details = usage.get("prompt_tokens_details") or {}
+                    cached_tokens = details.get("cached_tokens", cached_tokens)
+                # vLLM emits a final usage-only event with choices=[].
+                choices = event.get("choices") or []
+                new_ids = []
+                if choices:
+                    if len(choices) != 1 or choices[0].get("index") != 0:
+                        raise RuntimeError(f"{tag}: expected one vLLM completion choice")
+                    chunk = choices[0]
+                    echoed_prompt = chunk.get("prompt_token_ids")
+                    if echoed_prompt is not None:
+                        if echoed_prompt != prompt_ids:
+                            raise RuntimeError(f"{tag}: vLLM rewrote the token-ID prompt")
+                        prompt_verified = True
+                    new_ids = chunk.get("token_ids")
+                    if new_ids is None:
+                        raise RuntimeError(f"{tag}: vLLM response has no token_ids")
+                    if chunk.get("finish_reason") is not None:
+                        finish_tic = now
+                if usage is not None:
+                    if usage.get("prompt_tokens") != len(prompt_ids):
+                        raise RuntimeError(f"{tag}: vLLM usage prompt length differs from input")
+                    if usage.get("completion_tokens") != len(generated) + len(new_ids):
+                        raise RuntimeError(f"{tag}: vLLM usage output length differs from token IDs")
             else:
                 meta = event.get("meta_info") or {}
                 ids = event.get("output_ids")
@@ -171,6 +232,8 @@ async def stream_token_ids(
             f"{tag}: expected {output_len} generated IDs and [DONE], "
             f"got {len(generated)} IDs, finished={done_tic is not None}"
         )
+    if api == "vllm" and not prompt_verified:
+        raise RuntimeError(f"{tag}: vLLM response has no prompt_token_ids to verify")
     # summarize() expects [start, one tick per output ID, finish, DONE]. It only
     # uses the first token and DONE ticks for TTFT/TPOT; batched SSE chunks are safe.
     return TokenStream(
@@ -187,7 +250,7 @@ async def run_point(
     concurrency   : int,
     output_len    : int,
     request_timeout: float,
-    warmup        : tuple[int, ...] | None = None,
+    warmup        : list[Session] | None = None,
     api           : str = "logssms",
 ) -> tuple[dict, list[dict]]:
     import httpx
@@ -202,14 +265,17 @@ async def run_point(
     for index, session in enumerate(sessions):
         queue.put_nowait((index, session))
 
-    async def one_session(index: int, session: Session) -> None:
+    async def one_session(index: int, session: Session, *, warming: bool = False) -> None:
         prompt = list(session.initial)
         expected_len = 0
         turns = []
         for turn_index in range(len(session.increments) + 1):
             tag = f"{session.uid}/turn-{turn_index + 1}"
             result = await asyncio.wait_for(
-                stream_token_ids(client, base, model, prompt, output_len, tag, api),
+                stream_token_ids(
+                    client, base, model, prompt,
+                    min(output_len, 64) if warming else output_len, tag, api,
+                ),
                 timeout=request_timeout,
             )
             turns.append({
@@ -227,22 +293,30 @@ async def run_point(
                 prompt = prior + list(session.increments[turn_index])
                 assert prompt[:len(prior)] == prior
                 expected_len = min(len(prior), len(prompt) - 1)
-        records[index] = {"uid": session.uid, "turns": turns}
+        if not warming:
+            records[index] = {"uid": session.uid, "turns": turns}
 
     async def worker() -> None:
         while not queue.empty():
             index, session = queue.get_nowait()
             await one_session(index, session)
 
+    warmup_summary = {"requests": 0, "duration_s": 0.0, "output_tokens": 0}
     try:
-        if warmup is not None:
-            await asyncio.wait_for(
-                stream_token_ids(
-                    client, base, model, list(warmup), min(output_len, 8),
-                    "warmup/turn-1", api,
-                ),
-                timeout=request_timeout,
-            )
+        if warmup:
+            print(f"Warmup: {len(warmup)} sessions, two turns; excluded from results.", flush=True)
+            started = time.perf_counter()
+            await asyncio.gather(*[
+                one_session(index, session, warming=True)
+                for index, session in enumerate(warmup)
+            ])
+            warmup_summary = {
+                "requests": sum(len(session.increments) + 1 for session in warmup),
+                "duration_s": time.perf_counter() - started,
+                "output_tokens": sum(len(session.increments) + 1 for session in warmup)
+                * min(output_len, 64),
+            }
+            print(f"Warmup complete ({warmup_summary['duration_s']:.2f}s); starting measurement.", flush=True)
         await asyncio.gather(*[worker() for _ in range(concurrency)])
     finally:
         await client.aclose()
@@ -258,6 +332,7 @@ async def run_point(
     )
     stats.update(sessions=len(sessions), concurrency=concurrency,
                  num_turns=len(sessions[0].increments) + 1)
+    stats["warmup"] = warmup_summary
     stats["session_per_s"] = (
         len(sessions) / stats["duration_s"] if stats["duration_s"] else 0.0
     )
@@ -273,7 +348,7 @@ async def run_point(
     return stats, completed
 
 
-def summarize_response_cache(records: list[dict]) -> dict | None:
+def summarize_response_cache(records: list[dict], api: str = "sglang") -> dict | None:
     """Use request-level cache counts when the HTTP API exposes them."""
     turns = [turn for record in records for turn in record["turns"]]
     if any("cached_tokens" not in turn for turn in turns):
@@ -288,7 +363,10 @@ def summarize_response_cache(records: list[dict]) -> dict | None:
             expected_total += expected
             cached_total += min(expected, turn["cached_tokens"])
     return {
-        "source": "response.meta_info.cached_tokens",
+        "source": (
+            "response.usage.prompt_tokens_details.cached_tokens"
+            if api == "vllm" else "response.meta_info.cached_tokens"
+        ),
         "continuations": continuations,
         "expected_reusable_tokens": expected_total,
         "admitted_cached_tokens": cached_total,
@@ -319,9 +397,9 @@ def output_trace_digest(records: list[dict]) -> str:
 def _parse_args(argv: list[str]):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True, help="Already-running server URL")
-    parser.add_argument("--api", choices=("logssms", "sglang"), required=True)
+    parser.add_argument("--api", choices=("logssms", "sglang", "vllm"), required=True)
     parser.add_argument("--tokenizer", "--model-path", dest="tokenizer_path", required=True)
-    parser.add_argument("--model", help="LogSSMs request model; defaults to --tokenizer")
+    parser.add_argument("--model", help="Served model name; defaults to --tokenizer")
     parser.add_argument("--max-seq-len", type=int, help="Optional client-side length check")
     parser.add_argument("--input-len", type=int, default=256)
     parser.add_argument("--append-len", type=int, default=64)
@@ -374,10 +452,9 @@ def main(argv: list[str] | None = None) -> int:
         input_len=bench.input_len, append_len=bench.append_len,
         shared_len=bench.shared_prefix_len, seed=bench.seed,
     )
-    warmup = None if bench.no_warmup else make_sessions(
-        tokenizer, count=1, turns=1, input_len=min(bench.input_len, 32),
-        append_len=bench.append_len, shared_len=0, seed=bench.seed + 1_000_000,
-    )[0].initial
+    warmup = None if bench.no_warmup else make_warmup_sessions(
+        tokenizer, sessions, concurrency=concurrency, seed=bench.seed,
+    )
     name = bench.name or f"{datetime.now():%Y%m%d-%H%M%S}-pid{os.getpid()}"
     run_dir = Path(bench.out_dir).resolve() / name
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -405,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
     ))
     if not stats["chunks_ok"]:
         raise RuntimeError("Output token count differs from requested length")
-    cache = summarize_response_cache(history)
+    cache = summarize_response_cache(history, bench.api)
     stats["cache"] = cache
     trace_path = run_dir / f"history-c{concurrency}.json"
     save_json(str(trace_path), {"sessions": history})
@@ -425,6 +502,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print("  cache hits: unmeasured by this API")
+        if bench.api == "vllm":
+            print("  enable vLLM --enable-prompt-tokens-details to report cache hits")
     print(f"Results: {run_dir}")
     return 0
 

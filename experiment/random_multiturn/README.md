@@ -7,6 +7,15 @@ random_increment_t` as token IDs. It does not use a chat template or
 decode/re-encode model output. Generation is greedy with `ignore_eos=True`;
 initial prompts and increments are seeded random non-special IDs.
 
+Warmup is enabled by default: independent sessions at the measured concurrency
+run two token-exact turns, generating up to 64 tokens per request. This exercises
+batch planning, decode and cache-hit construction before timing starts. Their
+first token differs from every measured session, so they cannot prewarm its
+prefix. Warmup requests are excluded from metrics and history; its request count,
+elapsed time and output-token count are stored separately in `points[N].warmup`.
+Warmup can leave unrelated cache entries in the service. Use `--no-warmup` only
+for an explicitly cold-start measurement.
+
 Run one concurrency point per invocation, with a fresh server for each point.
 The service launchers are documented in `experiment/launch_server/README.md`.
 
@@ -24,6 +33,36 @@ The client uses SGLang's native `/generate` endpoint with token-ID input and
 reads actual generated `output_ids` from the SSE stream. Its
 `meta_info.cached_tokens` is recorded per request. LogSSMs cache-hit metrics
 require a separate scheduler profile; the client never enables profiling.
+
+For vLLM, use `--api vllm`. It sends integer `prompt` IDs to `/v1/completions`
+with `add_special_tokens=False`, `return_token_ids=True`, and streaming usage
+reporting. The returned `choices[].prompt_token_ids` must match the request
+exactly; `choices[].token_ids` supplies the actual output, including special
+tokens and chunks with empty text. The final usage-only event is not an output
+token. Start vLLM with `--enable-prefix-caching --enable-prompt-tokens-details`;
+then `usage.prompt_tokens_details.cached_tokens` is recorded per request and
+summarized over continuation turns. Missing cache details are **unmeasured**, not
+zero. If the server uses `--served-model-name`, pass the same name via `--model`.
+
+The TP=2, 32-session, 16-turn, 512-output-token comparison workload is:
+
+```bash
+python -m experiment.random_multiturn \
+  --api vllm --base-url http://127.0.0.1:28300 \
+  --tokenizer /root/autodl-tmp/models/Qwen3.6-27B --max-seq-len 12288 \
+  --input-len 256 --append-len 64 --output-len 512 \
+  --num-turns 16 --num-sessions 32 --num-concurrent-sessions 32 \
+  --seed 0 --name qwen36-vllm-c32-t16-o512
+```
+
+The server is launched separately (see `experiment/launch_server/README.md`);
+set its `--max-model-len 12288 --max-num-seqs 32 --max-num-batched-tokens 8192`
+for the same limits used in the LogSSMs comparison. No vLLM import or installation
+is required in the client environment. Warmup and latency/throughput calculations
+are shared by all three APIs. Always compare the trace hashes too: even with the
+same seed and greedy decoding, implementations may generate different tokens,
+so subsequent prompts can differ while remaining exact continuations within
+each implementation.
 
 Each run writes `experiment/random_multiturn/<name>/report.json` and
 `history-cN.json`. The history contains exact prompt and generated IDs for

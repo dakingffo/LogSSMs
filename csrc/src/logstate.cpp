@@ -174,7 +174,7 @@ Rows plan_materialize(const Rows& paths, const Rows& boundaries,
 
 Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& locks,
                      const Rows& anchors, const List& materialized,
-                     Int page_size, bool adaptive, bool diagnostics) {
+                     Int page_size, bool diagnostics) {
   check(paths.size() == boundaries.size() && paths.size() == locks.size()
         && page_size > 0, "Invalid coalesce metadata");
   std::unordered_set<Int> projected(materialized.begin(), materialized.end()), used;
@@ -186,8 +186,9 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
     }
   };
   for (const auto& anchor : anchors) {
-    check(anchor.size() == 6 && anchor[0] >= 0 && anchor[0] < static_cast<Int>(paths.size())
-          && anchor[4] >= 2, "Invalid coalesce anchor");
+    // Anchor: path index, matched endpoint, maximum arity, has statistics.
+    check(anchor.size() == 4 && anchor[0] >= 0 && anchor[0] < static_cast<Int>(paths.size())
+          && anchor[2] >= 2, "Invalid coalesce anchor");
     const auto index = anchor[0];
     const auto path = entries(paths[index]);
     std::vector<Entry> selected;
@@ -201,11 +202,7 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
         add("entries_not_eligible_this_round");
         continue;
       }
-      const bool in_owner = anchor[2] < 0 || (anchor[2] <= entry.begin && entry.end <= anchor[3]);
-      if (!in_owner) {
-        add("entries_outside_adaptive_owner");
-      }
-      if (used.contains(entry.slot) || !in_owner) {
+      if (used.contains(entry.slot)) {
         continue;
       }
       if (projected.contains(entry.slot)) {
@@ -223,8 +220,8 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
       add("anchors_without_eligible_entries");
       continue;
     }
-    add(anchor[5] ? "anchors_with_stats" : "anchors_without_stats");
-    add("anchors_intensity_" + std::to_string(anchor[4]));
+    add(anchor[3] ? "anchors_with_stats" : "anchors_without_stats");
+    add("anchors_intensity_" + std::to_string(anchor[2]));
     auto blocked = [&](Int begin, Int end) {
       return protected_interval(path, boundaries[index], begin, end);
     };
@@ -256,7 +253,7 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
       segments.push_back(std::move(segment));
     }
     add("segments", segments.size());
-    auto merge = [&](const std::vector<Entry>& group, bool equal) {
+    auto merge = [&](const std::vector<Entry>& group) {
       add("candidate_groups");
       for (const auto& entry : group) {
         if (used.contains(entry.slot)) {
@@ -265,14 +262,15 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
         }
       }
       std::string reason;
-      if (equal && std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.span != group[0].span; })) {
-        reason = "level_mismatch";
-      }
-      else if (std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.end - e.begin != page_size * e.span; })) {
+      if (std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.end - e.begin != page_size * e.span; })) {
         reason = "span_mismatch";
       }
       else {
         for (size_t i = 1; i < group.size(); ++i) {
+          if (group[i - 1].span > group[i].span) {
+            reason = "decreasing_span";
+            break;
+          }
           if (group[i - 1].end != group[i].begin) {
             reason = "discontinuity";
             break;
@@ -300,48 +298,23 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
       groups.push_back(List(output.begin(), output.end()));
       add("planned_groups");
       add("planned_slot_releases", group.size() - 1);
+      const bool equal = std::all_of(group.begin(), group.end(), [&](const auto& e) { return e.span == group[0].span; });
       add(equal ? "same_span_groups" : "cross_span_groups");
       add("planned_covered_tokens", group.back().end - group.front().begin);
       add("planned_arity_" + std::to_string(group.size()));
     };
     for (const auto& values : segments) {
       add("segments_without_merge_pair", values.size() < 2);
-      if (!adaptive) {
-        for (size_t i = 1; i < values.size(); ++i) {
-          merge({values[i - 1], values[i]}, true);
-        }
-        continue;
-      }
       for (size_t begin = 0; begin < values.size();) {
         size_t end = begin + 1;
-        while (end < values.size() && values[end].span == values[begin].span) {
+        while (end < values.size() && end - begin < static_cast<size_t>(anchor[2])
+               && values[end - 1].span <= values[end].span) {
           ++end;
         }
-        size_t offset = begin;
-        const auto intensity = static_cast<size_t>(anchor[4]);
-        while (end - offset >= intensity) {
-          merge(std::vector<Entry>(values.begin() + offset, values.begin() + offset + intensity), true);
-          offset += intensity;
-        }
-        if (end - offset >= 3) {
-          merge(std::vector<Entry>(values.begin() + offset, values.begin() + end - 1), true);
+        if (end - begin >= 2) {
+          merge(std::vector<Entry>(values.begin() + begin, values.begin() + end));
         }
         begin = end;
-      }
-    }
-    if (adaptive) {
-      std::vector<Entry> remaining;
-      for (const auto& entry : selected) {
-        if (!used.contains(entry.slot)) {
-          remaining.push_back(entry);
-        }
-      }
-      for (size_t i = 1; i < remaining.size(); ++i) {
-        const auto& left = remaining[i - 1];
-        const auto& right = remaining[i];
-        if (!used.contains(left.slot) && !used.contains(right.slot) && left.span < right.span) {
-          merge({left, right}, false);
-        }
       }
     }
   }
@@ -503,9 +476,9 @@ struct Planner {
 
   static Result coalesce(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
                          tvm::ffi::TensorView locks, tvm::ffi::TensorView anchors,
-                         const List& materialized, Int page_size, bool adaptive, bool diagnostics) {
+                         const List& materialized, Int page_size, bool diagnostics) {
     auto result = plan_coalesce(read_rows(paths), read_rows(boundaries), read_rows(locks),
-                                read_rows(anchors), materialized, page_size, adaptive, diagnostics);
+                                read_rows(anchors), materialized, page_size, diagnostics);
     result.Set("groups", write_rows(result.at("groups").cast<Rows>()));
     return result;
   }

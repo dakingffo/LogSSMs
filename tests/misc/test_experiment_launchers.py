@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from experiment.launch_server import launch_logssms, launch_sglang
+from experiment.launch_server import launch_logssms, launch_sglang, launch_vllm
 from experiment.random_multiturn import client, profile
 
 
@@ -54,6 +54,62 @@ def test_logssms_launcher_forwards_server_arguments(monkeypatch):
     assert received["env"]["PYTHONPATH"].split(os.pathsep)[0].endswith(
         "/LogSSMs/python"
     )
+
+
+def test_vllm_launcher_keeps_its_own_environment(tmp_path, monkeypatch):
+    python = tmp_path / "venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    monkeypatch.setenv("PYTHONPATH", "/some/logssms/checkout/python")
+    monkeypatch.setenv("CUDA_HOME", "/vllm/cuda")
+    command, env = launch_vllm.make_command([
+        "--vllm-python", str(python), "/models/model",
+        "--tensor-parallel-size", "2", "--port", "28300",
+    ])
+    assert command == [
+        str(python), "-m", "vllm.entrypoints.cli.main", "serve", "/models/model",
+        "--tensor-parallel-size", "2", "--port", "28300",
+    ]
+    assert "PYTHONPATH" not in env
+    assert env["CUDA_HOME"] == "/vllm/cuda"
+
+
+def test_vllm_launcher_preserves_venv_python_symlink(tmp_path):
+    base_python = tmp_path / "base/python"
+    base_python.parent.mkdir()
+    base_python.touch()
+    venv_python = tmp_path / "venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    command, _ = launch_vllm.make_command([
+        "--vllm-python", str(venv_python), "/models/model",
+    ])
+    assert command[0] == str(venv_python)
+
+
+def test_vllm_launcher_forwards_help_without_importing_vllm(tmp_path, monkeypatch):
+    python = tmp_path / "python"
+    python.touch()
+    received = {}
+
+    def fake_exec(path, argv, env):
+        received.update(path=path, argv=argv, env=env)
+
+    monkeypatch.setattr(os, "execvpe", fake_exec)
+    launch_vllm.main(["--vllm-python", str(python), "--help"])
+    assert received["path"] == str(python)
+    assert received["argv"][1:] == [
+        "-m", "vllm.entrypoints.cli.main", "serve", "--help",
+    ]
+
+
+def test_vllm_launcher_requires_existing_interpreter(tmp_path):
+    with pytest.raises(SystemExit):
+        launch_vllm.make_command(["/models/model"])
+    with pytest.raises(SystemExit):
+        launch_vllm.make_command([
+            "--vllm-python", str(tmp_path / "missing"), "/models/model",
+        ])
 
 
 def test_client_rejects_server_flags_and_multi_point_runs():

@@ -18,6 +18,8 @@ datasets/swe_agent/trajs/
 datasets/agentic_coding_trajectories/.cache/
 datasets/agentic_coding_trajectories/sessions.parquet
 experiment/results/
+benchmark-results/
+benchmark-result/
 experiment/random_multiturn/*/
 
 # profiling data

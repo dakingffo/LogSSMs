@@ -59,10 +59,10 @@ def plan_materialize(paths: Rows, boundaries: Rows, candidates: Rows,
 
 def plan_coalesce(paths: Rows, boundaries: Rows, locks: Rows, anchors: Rows,
                   materialized: Sequence[int], page_size: int,
-                  adaptive: bool, diagnostics: bool) -> tuple[list[list[int]], dict[str, int]]:
+                  diagnostics: bool) -> tuple[list[list[int]], dict[str, int]]:
     result = _load_logstate_module().plan_coalesce(
         _pack(paths), _pack(boundaries), _pack(locks), _pack(anchors),
-        materialized, page_size, adaptive, diagnostics,
+        materialized, page_size, diagnostics,
     )
     return _unpack(result["groups"]), dict(result["diagnostics"].items())
 
