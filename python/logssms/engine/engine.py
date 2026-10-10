@@ -23,7 +23,8 @@ from logssms.utils import (
 )
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory, mem_GB
+from .decode_graph import DecodeGraphRunner, get_free_memory, mem_GB
+from .prefill_graph import PrefillGraphRunner
 from .profile import EngineProfiler
 from .sample import BatchSamplingArgs, Sampler
 
@@ -180,7 +181,7 @@ class Engine:
         )
 
         speculative_skip_graphs = config.enable_specualtive_decoding
-        self.graph_runner = GraphRunner(
+        self.decode_graph_runner = DecodeGraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
@@ -195,12 +196,12 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
-        if self.graph_runner.max_graph_bs > 0:
-            from .prefill_graph import PrefillGraphRunner
-
-            self.ctx.prefill_graph_runner = PrefillGraphRunner(
+        self.prefill_graph_runner = self.ctx.prefill_graph_runner = (
+            PrefillGraphRunner(
                 self.model, config.max_forward_len, self.stream
             )
+            if self.decode_graph_runner.max_graph_bs > 0 else None
+        )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         torch.distributed.init_process_group(
@@ -253,7 +254,7 @@ class Engine:
     def prepare_batch(self, batch: Batch, cache_manager) -> ForwardInput:
         if self.profiler.enabled:
             return self._prepare_batch_profiled(batch, cache_manager)
-        self.graph_runner.pad_batch(batch)
+        self.decode_graph_runner.pad_batch(batch)
         cache_manager.allocate(batch.reqs, phase=batch.phase)
         cache_manager.prepare_batch(batch)
         input_mapping, write_mapping = self._prepare_indices(batch)
@@ -270,14 +271,14 @@ class Engine:
 
     def _prepare_batch_profiled(self, batch: Batch, cache_manager) -> ForwardInput:
         profiler = self.profiler
-        graph_used = self.graph_runner.can_use_cuda_graph(batch)
-        prefill_runner = getattr(self.ctx, "prefill_graph_runner", None)
+        graph_used = self.decode_graph_runner.can_use_cuda_graph(batch)
+        prefill_runner = self.prefill_graph_runner
         graph_used = graph_used or (
             prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
         )
         with profiler.record_batch(batch, "prepare", graph_used=graph_used):
             with profiler.record_stage("pad_batch"):
-                self.graph_runner.pad_batch(batch)
+                self.decode_graph_runner.pad_batch(batch)
             with profiler.record_stage("allocate"):
                 cache_manager.allocate(batch.reqs, phase=batch.phase)
             with profiler.record_stage("cache_prepare"):
@@ -316,8 +317,8 @@ class Engine:
         if self.profiler.enabled:
             return self._forward_batch_profiled(batch, args)
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
+            if self.decode_graph_runner.can_use_cuda_graph(batch):
+                logits = self.decode_graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
         if batch.is_verify:
@@ -332,8 +333,8 @@ class Engine:
 
     def _forward_batch_profiled(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         profiler = self.profiler
-        decode_graph = self.graph_runner.can_use_cuda_graph(batch)
-        prefill_runner = getattr(self.ctx, "prefill_graph_runner", None)
+        decode_graph = self.decode_graph_runner.can_use_cuda_graph(batch)
+        prefill_runner = self.prefill_graph_runner
         prefill_graph = prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
         graph_used = decode_graph or prefill_graph
         with profiler.record_batch(batch, "forward", graph_used=graph_used) as sample:
@@ -352,7 +353,7 @@ class Engine:
                 )
             with self.ctx.forward_batch(batch):
                 if decode_graph:
-                    logits = self.graph_runner.replay(batch, profiler=profiler)
+                    logits = self.decode_graph_runner.replay(batch, profiler=profiler)
                 else:
                     replays = prefill_runner.replays if prefill_graph else 0
                     padded = prefill_runner.padded_tokens if prefill_graph else 0
@@ -373,9 +374,9 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
-        if self.ctx.prefill_graph_runner is not None:
-            self.ctx.prefill_graph_runner.destroy_cuda_graphs()
-        self.graph_runner.destroy_cuda_graphs()
+        if self.prefill_graph_runner is not None:
+            self.prefill_graph_runner.destroy_cuda_graphs()
+        self.decode_graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

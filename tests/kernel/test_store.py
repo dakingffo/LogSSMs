@@ -3,10 +3,8 @@ from __future__ import annotations
 from perf import compare_memory_kernel_perf
 import torch
 from logssms.kernel import store_cache
-from logssms.utils import call_if_main
 
 
-@call_if_main(__name__)
 def test_store_cache():
     HEAD_SIZE = 128
     NUM_TOKENS = 1048576  # 1M

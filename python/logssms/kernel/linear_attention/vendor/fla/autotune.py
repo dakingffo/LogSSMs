@@ -430,20 +430,3 @@ def fla_cache_autotune(configs, key=None, prune_configs_by=None, reset_to_zero=N
                                )
 
     return decorator
-
-
-def configure_fla_cache_autotune():
-    triton.autotune = fla_cache_autotune
-    logger.info(
-        "configure_fla_cache_autotune() is enabling FLA fla_cache_autotune; "
-        "triton.autotune will be replaced with fla_cache_autotune."
-    )
-
-
-def restore_autotune_backend():
-    from triton.runtime.autotuner import autotune as original_autotune
-    triton.autotune = original_autotune
-    logger.info(
-        "restore_autotune_backend() is restoring Triton's original autotune; "
-        "triton.autotune will be replaced with triton.runtime.autotuner.autotune."
-    )

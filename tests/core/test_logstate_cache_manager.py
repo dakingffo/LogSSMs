@@ -48,36 +48,38 @@ def make_manager(
     enable_memorized_evict: bool = True,
     max_seq_len           : int = MAX_SEQ_LEN,
     granularity           : int = GRANULARITY,
+    device                : torch.device = torch.device("cpu"),
 ) -> LogStateCacheManager:
     num_work_states = MAX_RUNNING_REQ + 1
+    cuda = device.type == "cuda"
     pool = FramedMHALogStatePool(
         num_frames=(num_pages + 1) + (num_states + num_work_states + 1) * 7,
         page_size=PAGE_SIZE,
         granularity=granularity,
         num_attention_layers=1,
         num_kv_heads=2,
-        head_dim=4,
+        head_dim=64 if cuda else 4,
         num_linear_layers=1,
         num_key_heads=2,
         num_value_heads=2,
-        head_k_dim=4,
-        head_v_dim=4,
-        conv_dim=16,
+        head_k_dim=32 if cuda else 4,
+        head_v_dim=32 if cuda else 4,
+        conv_dim=192 if cuda else 16,
         state_len=3,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
+        device=device,
+        dtype=torch.bfloat16 if cuda else torch.float32,
     )
     resources = CacheResources(
         kv_pool=pool,
         page_table=torch.zeros(
-            MAX_RUNNING_REQ + 1, max_seq_len, dtype=torch.int32
+            MAX_RUNNING_REQ + 1, max_seq_len, dtype=torch.int32, device=device,
         ),
         linear_state=pool,
         state_table=torch.full(
-            (MAX_RUNNING_REQ + 1, max_seq_len), -1, dtype=torch.int32
+            (MAX_RUNNING_REQ + 1, max_seq_len), -1, dtype=torch.int32, device=device,
         ),
         work_state_table=torch.full(
-            (num_work_states, 1), -1, dtype=torch.int32,
+            (num_work_states, 1), -1, dtype=torch.int32, device=device,
         ),
     )
     return LogStateCacheManager(
@@ -95,19 +97,63 @@ def make_manager(
 def test_disable_memorized_evict_has_no_recycle_bin() -> None:
     manager = make_manager(enable_memorized_evict=False)
     assert manager.recycle_bin is None
+    slots = manager.logstate_pool.reserve(logs=2)[1]
+    manager.logstate_pool.allocator.materialize(slots[0])
     checkpoint = manager.tree.insert(
         torch.arange(PAGE_SIZE, dtype=torch.int32),
         torch.arange(PAGE_SIZE, dtype=torch.int32) + 100,
-        (LogStateEntry(1, LogStateKind.CHECKPOINT, 0, PAGE_SIZE, span_pages=1),),
+        (LogStateEntry(slots[0], LogStateKind.CHECKPOINT, 0, PAGE_SIZE, span_pages=1),),
     ).node
     log = manager.tree.insert(
         torch.arange(PAGE_SIZE, dtype=torch.int32) + 200,
         torch.arange(PAGE_SIZE, dtype=torch.int32) + 300,
-        (LogStateEntry(2, LogStateKind.LOG, 0, PAGE_SIZE),),
+        (LogStateEntry(slots[1], LogStateKind.LOG, 0, PAGE_SIZE),),
     ).node
     checkpoint.timestamp = 1
     log.timestamp = 2
     assert list(manager.tree.iter_evict_candidates()) == [log, checkpoint]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_schedule_profile_capacity_and_work_breakdown(monkeypatch, enabled):
+    from logssms.scheduler.profile import SchedulerProfiler
+
+    monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", str(int(enabled)))
+    manager = make_manager()
+    profiler = SchedulerProfiler(torch.device("cpu"), manager)
+    pending = PendingRequest(
+        7, torch.arange(PAGE_SIZE, dtype=torch.int32),
+        SamplingParams(max_tokens=PAGE_SIZE), profile_tag="session/turn-1",
+    )
+    available_before = manager.available_size
+    free_frames_before = manager._allocator.free_frames
+    with profiler.record_schedule() as sample:
+        with profiler.record_schedule_step("match_req"):
+            handle = manager.match_req(pending).cuda_handle
+        with profiler.record_schedule_step("prefill_acquire"):
+            assert manager.prefill_acquire(PAGE_SIZE, handle)
+        with profiler.record_schedule_step("init_with_handle"):
+            manager.init_with_handle(0, handle)
+        if sample is not None:
+            sample["phase"] = "prefill"
+    assert manager._schedule_profile_step is None
+    assert handle.cached_len == 0
+    assert manager.available_size <= available_before
+    assert manager._allocator.free_frames < free_frames_before
+    assert manager.work_state_table[0, 0].item() == manager._work_slots[0]
+    manager.logstate_pool.allocator.check_integrity()
+    if not enabled:
+        assert not profiler.schedule_stage_calls
+        return
+    calls = dict(profiler.schedule_stage_calls)
+    for stage in ("reclamation_poll", "kv_capacity", "state_capacity", "frame_capacity"):
+        assert calls[stage] == 2
+    for stage in ("capacity_before_lock", "capacity_after_lock", "lock_handle",
+                  "prefix_match", "recycle_match", "work_allocate", "work_mapping",
+                  "state_mapping_clear"):
+        assert calls[stage] == 1
+    # Capacity queries outside schedule must not leak into its attribution.
+    assert profiler.schedule_stage_calls == calls
 
 
 def test_admission_counts_pending_merge_frames_without_premature_reuse():
@@ -116,13 +162,205 @@ def test_admission_counts_pending_merge_frames_without_premature_reuse():
     logs = pool.reserve(logs=4)[1]
     pool.reserve(kv=len(pool.allocator._free))
     assert manager.available_size == 0
-    # Simulate outstanding GPU retirement without manufacturing a free frame.
-    pool._retiring_slots.update(logs)
+    # Exercise retirement itself, including its capacity notification, while
+    # keeping the frames unavailable until the mocked GPU event completes.
+    ready = [False]
+    event = SimpleNamespace(record=lambda _stream: None, query=lambda: ready[0])
+    with (
+        patch.object(type(pool), "device", property(lambda _pool: torch.device("cuda"))),
+        patch("torch.cuda.Event", return_value=event),
+        patch("torch.cuda.current_stream", return_value=None),
+    ):
+        pool.retire_slots(logs)
     assert manager.available_size >= PAGE_SIZE
     assert pool.allocator.free_frames == 0
     assert pool.allocator.reserve(kv=1, logs=1) is None
     assert set(logs) <= pool.allocator.allocated_slots
     pool.allocator.check_integrity()
+    ready[0] = True
+    pool.poll_reclamation()
+    assert not pool.retiring_slots
+    assert not set(logs).intersection(pool.allocator.allocated_slots)
+    pool.allocator.check_integrity()
+
+
+def test_capacity_queries_do_not_scan_tree_or_linear_slots():
+    manager = make_manager()
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    expected = manager._allocator.admissible_pages(
+        evictable_kv_frames=manager.tree.evictable_kv_frames(),
+        evictable_slots=manager.tree.evictable_slots(),
+    ) * PAGE_SIZE
+    with (
+        patch.object(manager.tree, "_iter_nodes", side_effect=AssertionError),
+        patch.object(manager.tree, "evictable_slots", side_effect=AssertionError),
+    ):
+        assert manager.available_size == expected
+        handle = manager.tree.match_prefix(history[:80]).cuda_handle
+        manager.lock(handle)
+        assert manager.available_size <= expected
+        manager.unlock(handle)
+        assert manager.available_size == expected
+    manager.check_integrity()
+
+
+def test_admission_capacity_still_rechecks_after_lock_and_rolls_back():
+    manager = make_manager()
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    handle = manager.tree.match_prefix(history).cuda_handle
+    before = manager.available_size
+    manager.lock(handle)
+    after = manager.available_size
+    manager.unlock(handle)
+    assert after < before
+    assert not manager.prefill_acquire(after + 1, handle)
+    assert manager.available_size == before
+    assert not handle.lock_node.is_locked
+    manager.check_integrity()
+
+
+def test_failed_admission_projects_locks_without_mutation():
+    manager = make_manager()
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    handle = manager.tree.match_prefix(history).cuda_handle
+    before = manager.admission_capacity
+    manager.lock(handle)
+    after = manager.admission_capacity
+    manager.unlock(handle)
+    epoch = manager.tree.lock_revision
+    with patch.object(manager.tree, "lock_handle", side_effect=AssertionError):
+        for _ in range(10):
+            assert not manager.prefill_acquire(after + 1, handle)
+    assert manager.tree.lock_revision == epoch
+    assert manager.admission_capacity == before
+    manager.check_integrity()
+
+
+def test_admission_final_capacity_check_still_rolls_back():
+    manager = make_manager()
+    req = new_req(manager, torch.arange(128, dtype=torch.int32))
+    manager.allocate([req], phase="prefill")
+    req.cached_len = 128
+    manager.cache_req(req, finished=True)
+    handle = manager.match_req(PendingRequest(
+        7, torch.arange(192, dtype=torch.int32), SamplingParams(max_tokens=16),
+    )).cuda_handle
+    from unittest.mock import PropertyMock
+
+    with patch.object(type(manager), "admission_capacity", new_callable=PropertyMock,
+                      side_effect=[1000, 0]):
+        assert not manager.prefill_acquire(1, handle)
+    assert not handle.lock_node.is_locked
+    manager.check_integrity()
+
+
+def test_lock_projection_matches_shared_frames_and_fragmented_slots():
+    import random
+
+    manager = make_manager()
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    for position in (16, 80, 144):
+        manager.tree.match_prefix(history[:position])
+    nodes = [node for node in manager.tree._iter_nodes() if not node.is_root()]
+    rng = random.Random(0)
+    locks = []
+    for _ in range(100):
+        node = rng.choice(nodes)
+        before = manager.admission_capacity
+        kv, slots = manager.tree.lock_footprint(node)
+        cost = kv + manager._allocator.lock_frame_cost(slots)
+        assert manager.tree.lock_footprint(node) == (kv, slots)
+        manager.tree.lock(node)
+        assert before - manager.admission_capacity == cost
+        locks.append(node)
+        if rng.randrange(2):
+            manager.tree.lock(locks.pop(rng.randrange(len(locks))), unlock=True)
+    for node in locks:
+        manager.tree.lock(node, unlock=True)
+    manager.check_integrity()
+
+
+def test_match_and_prefill_reuse_trace_until_tree_revision_changes():
+    manager = make_manager(enable_merge_adjustment=True)
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    tokens = torch.cat((history, history[:64] + 1000))
+    with patch.object(manager.tree, "trace", wraps=manager.tree.trace) as trace:
+        continuation = new_req(manager, tokens)
+    assert trace.call_count == 1  # Owner lookup shares the prefix match.
+    expected = manager.analyzer.analyze(manager.tree, [tokens])
+    with patch.object(manager.tree, "trace", side_effect=AssertionError):
+        actual = manager.analyzer.analyze(
+            manager.tree, [tokens], traces=manager._prefill_traces([continuation]),
+        )
+    assert actual == expected
+    owner = manager.tree.entry_owner(manager.tree.unique_slots()[-1])
+    manager.tree.protect(owner)
+    with patch.object(manager.tree, "trace", wraps=manager.tree.trace) as trace:
+        traces = manager._prefill_traces([continuation])
+    assert trace.call_count == 1
+    assert manager.analyzer.analyze(manager.tree, [tokens], traces=traces) == (
+        manager.analyzer.analyze(manager.tree, [tokens])
+    )
+
+
+def test_cache_req_uses_insert_endpoint_without_rematching_tokens():
+    manager = make_manager()
+    req = new_req(manager, torch.arange(256, dtype=torch.int32))
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(req.input_ids)
+    with patch.object(manager.tree, "match_prefix", side_effect=AssertionError):
+        manager.cache_req(req, finished=True)
+    manager.check_integrity()
+
+
+def test_prefill_trace_extends_a_match_limited_by_sampler_last_token():
+    manager = make_manager(granularity=32)
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    continuation = new_req(manager, history)
+    assert continuation.cached_len == 224  # Matching excludes the sampler row.
+    with patch.object(manager.tree, "trace", wraps=manager.tree.trace) as trace:
+        traces = manager._prefill_traces([continuation])
+    assert trace.call_count == 1
+    assert traces[0].matched_len == len(history)
+
+
+def test_prefill_trace_does_not_reuse_a_longer_pending_prompt_for_a_chunk():
+    manager = make_manager()
+    history = torch.arange(256, dtype=torch.int32)
+    req = new_req(manager, history)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(history)
+    manager.cache_req(req, finished=True)
+    continuation = new_req(manager, torch.cat((history, history[:64] + 1000)))
+    continuation.input_ids = history[:128]
+    with patch.object(manager.tree, "trace", wraps=manager.tree.trace) as trace:
+        traces = manager._prefill_traces([continuation])
+    assert trace.call_count == 1
+    assert traces[0].matched_len == 128
 
 
 def test_restore_unfused_chain_before_inplace_materialization() -> None:
@@ -143,7 +381,9 @@ def test_restore_unfused_chain_before_inplace_materialization() -> None:
     plan = PageMaterialize(4, 0, PAGE_SIZE, None, (entry,))
     order = []
     with (
-        patch.object(manager, "_make_construction_chains", return_value=(materialize, restore)),
+        patch.object(manager, "_construction_plan", return_value=(
+            (materialize, restore), ((restore,), (materialize,))
+        )),
         patch(
             "logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.restore",
             side_effect=lambda *_args: order.append("restore"),
@@ -172,8 +412,7 @@ def test_shared_log_materialization_rebases_branches_across_task_groups() -> Non
     )
     independent = LogStateEntry(8, LogStateKind.LOG, 0, PAGE_SIZE)
     plans.append(PageMaterialize(8, 0, PAGE_SIZE, None, (independent,)))
-    chains = manager._make_construction_chains((), plans)
-    waves = manager._schedule_construction_waves(chains, plans)
+    chains, waves = manager._construction_plan((), plans)
 
     assert len(waves) == 2
     assert len(waves[0]) == 2
@@ -335,11 +574,11 @@ def test_decode_allocation_skips_recycled_prefill_branch_analysis():
     manager._recycle_matches[req.table_idx] = RecycledMatch(
         RecycledBranch(tuple(req.input_ids.tolist()), (), frozenset()), 64
     )
-    with patch.object(manager.analyzer, "_batch_branch_points", return_value={}) as branches:
+    with patch.object(manager.analyzer, "_batch_branch_points", return_value=[]) as branches:
         manager.allocate([req], phase="decode")
         branches.assert_not_called()
         manager.allocate([req], phase="prefill")
-        branches.assert_called_once()
+        branches.assert_not_called()
 
 
 def test_partial_log_hit_restores_only_matched_granule():
@@ -359,7 +598,17 @@ def test_partial_log_hit_restores_only_matched_granule():
     assert len(tasks) == 1
     assert tasks[0].logs[-1].end == 16
 
-    chains = manager._make_construction_chains(tasks, ())
+    # Restore metadata must not pull a scalar from the device table. The CPU
+    # ownership map already contains the same work slot.
+    original_table = manager.resources.work_state_table
+    manager.resources.work_state_table = SimpleNamespace(shape=original_table.shape)
+    try:
+        repeated = manager._make_restore_tasks(Batch(reqs=[req], phase="prefill"))
+        assert repeated[0].output_slot == manager._work_slots[req.table_idx]
+    finally:
+        manager.resources.work_state_table = original_table
+
+    chains, _ = manager._construction_plan(tasks, ())
     assert len(chains) == 1
     assert chains[0].segments[-1].end == 16
     assert chains[0].outputs[-1] == (tasks[0].output_slot,)
@@ -372,7 +621,7 @@ def test_partial_log_hit_restores_only_matched_granule():
         base_checkpoint_slot=None,
         replay_logs=(source,),
     )
-    fused = manager._make_construction_chains(tasks, (materialize,))
+    fused, _ = manager._construction_plan(tasks, (materialize,))
     assert len(fused) == 1
     assert [(entry.begin, entry.end) for entry in fused[0].segments] == [
         (0, 16), (16, 64),
@@ -756,6 +1005,360 @@ def test_direct_recycled_checkpoint_aligns_after_granularity_hit() -> None:
     )
 
 
+def _gpu_tail_with_recycled_page(manager):
+    history = torch.arange(256, dtype=torch.int32)
+    frames, logs, states = manager.logstate_pool.reserve(kv=3, logs=1, works=1)
+    manager.logstate_pool.commit_checkpoint(states[0])
+    kv = torch.cat([frame * PAGE_SIZE + torch.arange(PAGE_SIZE, dtype=torch.int32)
+                    for frame in frames])
+    manager.tree.insert(history[:192], kv, (
+        LogStateEntry(states[0], LogStateKind.CHECKPOINT, 0, 128, span_pages=2),
+        LogStateEntry(logs[0], LogStateKind.LOG, 128, 192),
+    ))
+    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    node = ghost.insert(history, history + 1000, (
+        LogStateEntry(40, LogStateKind.CHECKPOINT, 0, 128, span_pages=2),
+        LogStateEntry(41, LogStateKind.LOG, 128, 192),
+        LogStateEntry(42, LogStateKind.LOG, 192, 256),
+    )).node
+    manager.recycle_bin.remember(ghost, node)
+    return logs[0]
+
+
+def test_pending_match_reuses_layout_but_invalidates_on_resource_ownership_changes():
+    manager = make_manager(num_pages=16, num_states=16, enable_merge_adjustment=True)
+    slot = _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(320, dtype=torch.int32), SamplingParams(max_tokens=16))
+    manager.prepare_prefill_requests([pending])
+    with (
+        patch.object(manager.tree, "trace", wraps=manager.tree.trace) as trace,
+        patch.object(manager, "_plan_recycled_restore", wraps=manager._plan_recycled_restore) as plan,
+    ):
+        first = manager.match_req(pending)
+        assert manager.match_req(pending) is first
+        assert trace.call_count == plan.call_count == 1
+        # Unrelated physical capacity changes need no new token comparisons.
+        frames, _, _ = manager.logstate_pool.reserve(kv=1)
+        assert manager.match_req(pending) is first
+        manager.logstate_pool.release_kv(frames)
+        owner = manager.tree.entry_owner(slot)
+        manager.tree.lock(owner)
+        second = manager.match_req(pending)
+        assert second is not first
+        assert trace.call_count == 1
+        assert plan.call_count == 2
+        assert not any(checkpoint.gpu_entries for checkpoint in second.cuda_handle.restore_plan.checkpoints)
+        manager.tree.lock(owner, unlock=True)
+        third = manager.match_req(pending)
+        assert third is not second
+        manager.tree.protect(owner)
+        fourth = manager.match_req(pending)
+        assert fourth is not third
+        manager.recycle_bin.remember(manager.tree, owner)
+        assert manager.match_req(pending) is not fourth
+        assert trace.call_count == 2  # Only protection changed tree layout metadata.
+        assert plan.call_count == 5
+    manager.check_integrity()
+
+
+def test_pending_branch_analysis_reuses_unchanged_inputs_and_refreshes_protection():
+    manager = make_manager(num_pages=16, num_states=16)
+    _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(320, dtype=torch.int32), SamplingParams(max_tokens=16))
+    sibling = PendingRequest(8, torch.cat((pending.input_ids[:208], torch.arange(64) + 1000)).int(),
+                             SamplingParams(max_tokens=16))
+    with patch.object(manager.analyzer, "_batch_branch_points", wraps=manager.analyzer._batch_branch_points) as branches:
+        manager.prepare_prefill_requests([pending, sibling])
+        first = manager.match_req(pending)
+        assert 208 in first.cuda_handle.restore_plan.protected_endpoints
+        manager.prepare_prefill_requests([pending, sibling])
+        assert manager.match_req(pending) is first
+        assert branches.call_count == 1
+        manager.prepare_prefill_requests([pending])
+        second = manager.match_req(pending)
+        assert second is not first
+        assert 208 not in second.cuda_handle.restore_plan.protected_endpoints
+
+
+def test_cached_recycle_match_preserves_lru_touch():
+    manager = make_manager(num_pages=16, num_states=16)
+    _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(320, dtype=torch.int32), SamplingParams(max_tokens=16))
+    first = manager.match_req(pending)
+    with patch.object(manager.recycle_bin, "touch", wraps=manager.recycle_bin.touch) as touch:
+        assert manager.match_req(pending) is first
+        touch.assert_called_once_with(first.cuda_handle.recycle_match.branch)
+
+
+def test_match_reuse_profile_keeps_logical_recycle_hit_counts(monkeypatch):
+    monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", "1")
+    manager = make_manager(num_pages=16, num_states=16)
+    _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(320, dtype=torch.int32), SamplingParams(max_tokens=16))
+    manager.prepare_prefill_requests([pending])
+    first = manager.match_req(pending)
+    assert manager.match_req(pending) is first
+    assert manager._profile_stats["pending_match_reuses"] == 1
+    assert manager._profile_stats["recycle_matches"] == 2
+    manager.tree.lock(first.cuda_handle.lock_node)
+    manager.match_req(pending)
+    assert manager._profile_stats["prefix_match_reuses"] == 1
+    assert manager._profile_stats["recycle_matches"] == 3
+    manager.tree.lock(first.cuda_handle.lock_node, unlock=True)
+    manager.prepare_prefill_requests([pending])
+    assert manager._profile_stats["prefill_branch_reuses"] == 1
+
+
+def test_pending_match_invalidates_when_input_tensor_is_replaced():
+    manager = make_manager(num_pages=16, num_states=16)
+    _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(320, dtype=torch.int32), SamplingParams(max_tokens=16))
+    first = manager.match_req(pending)
+    assert first.cuda_handle.cached_len == 192
+    pending.input_ids = pending.input_ids + 10000
+    second = manager.match_req(pending)
+    assert second.cuda_handle.cached_len == 0
+    assert second.cuda_handle.recycle_match is None
+
+
+def test_pending_match_and_branch_analysis_invalidate_on_versioned_input_edits():
+    manager = make_manager(num_pages=16, num_states=16)
+    _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(320, dtype=torch.int32), SamplingParams(max_tokens=16))
+    sibling = PendingRequest(8, pending.input_ids.clone(), SamplingParams(max_tokens=16))
+    manager.prepare_prefill_requests([pending, sibling])
+    assert manager.match_req(pending).cuda_handle.cached_len == 192
+    pending.input_ids.add_(10000)
+    with patch.object(manager.analyzer, "_batch_branch_points", wraps=manager.analyzer._batch_branch_points) as branches:
+        manager.prepare_prefill_requests([pending, sibling])
+        assert branches.call_count == 1
+    assert manager.match_req(pending).cuda_handle.cached_len == 0
+
+
+def test_recycle_merges_gpu_tail_with_missing_history_and_reuses_its_slot():
+    manager = make_manager(num_pages=20, num_states=20)
+    tail = _gpu_tail_with_recycled_page(manager)
+    req = new_req(manager, torch.arange(321, dtype=torch.int32))
+    assert req.cached_len == 192
+    checkpoint, = req.cache_handle.restore_plan.checkpoints
+    assert (checkpoint.begin, checkpoint.end) == (128, 256)
+    assert checkpoint.gpu_entries[0].slot == tail
+    before = manager._allocator.profile_usage()
+    manager.allocate([req], phase="prefill")
+    after = manager._allocator.profile_usage()
+    assert after["work_slots"] == before["work_slots"]
+    assert after["log_slots"] - before["log_slots"] == 2  # only new text, including its partial page
+    assert manager._live_pages[req.table_idx][0].state_slot == tail
+    assert torch.all(manager.state_table[req.table_idx, 192:256] == -1)
+    batch = Batch([req], "prefill")
+    with patch.object(manager, "_construct", return_value={}):
+        manager.prepare_batch(batch)
+    assert batch.logstate_checkpoint_writes == [(63, tail)]
+    assert not manager.tree.has_slot(tail)
+    assert manager.tree.match_prefix(req.input_ids[:192]).cuda_handle.cached_len == 128
+    req.cached_len = 320
+    manager.cache_req(req, finished=True)
+    entries = manager.tree.iter_entries()
+    assert [(entry.begin, entry.end, entry.kind) for entry in entries] == [
+        (0, 128, LogStateKind.CHECKPOINT),
+        (128, 256, LogStateKind.CHECKPOINT),
+        (256, 320, LogStateKind.LOG),
+    ]
+    assert entries[1].slot == tail
+    assert manager.tree.match_prefix(req.input_ids[:320]).cuda_handle.cached_len == 320
+    manager.check_integrity()
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_recycled_checkpoint_spans_prefill_chunks_without_intermediate_logs(abort):
+    manager = make_manager(num_pages=20, num_states=20)
+    history = torch.arange(256, dtype=torch.int32)
+    ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    node = ghost.insert(history, history + 1000, (
+        LogStateEntry(50, LogStateKind.CHECKPOINT, 0, 256, span_pages=4),
+    )).node
+    manager.recycle_bin.remember(ghost, node)
+    tokens = torch.arange(257, dtype=torch.int32)
+    req = new_req(manager, tokens)
+    req.input_ids = tokens[:128]
+    req.device_len = 128
+    manager.allocate([req], phase="prefill")
+    first = Batch([req], "prefill")
+    with patch.object(manager, "_construct", return_value={}):
+        manager.prepare_batch(first)
+    assert first.logstate_checkpoint_writes == []
+    assert first.logstate_checkpoint_ranges == [(0, 0, 256)]
+    assert all(page.state_slot is None for page in manager._live_pages[0])
+    req.cached_len = 128
+    if abort:
+        manager.free_to_cached(req)
+        manager.cache_req(req, finished=True)
+        assert manager.tree.size_info.total_size == 0
+        assert manager.recycle_bin.match(history, start=0, granularity=16) is not None
+    else:
+        req.input_ids = tokens
+        req.device_len = 257
+        manager.allocate([req], phase="prefill")
+        second = Batch([req], "prefill")
+        with patch.object(manager, "_construct", return_value={}):
+            manager.prepare_batch(second)
+        slot = manager._recycled_restores[0].slots[256]
+        assert second.logstate_checkpoint_writes == [(127, slot)]
+        req.cached_len = 256
+        manager.cache_req(req, finished=True)
+        assert [(entry.begin, entry.end, entry.kind) for entry in manager.tree.iter_entries()] == [
+            (0, 256, LogStateKind.CHECKPOINT),
+        ]
+    manager.check_integrity()
+
+
+def test_abort_before_reused_checkpoint_endpoint_releases_detached_slot():
+    manager = make_manager(num_pages=20, num_states=20)
+    tail = _gpu_tail_with_recycled_page(manager)
+    req = new_req(manager, torch.arange(321, dtype=torch.int32))
+    # Cancellation after prefix construction, before any missing token was evaluated.
+    req.device_len = 193
+    req.input_ids = req.input_ids[:193]
+    manager.allocate([req], phase="prefill")
+    with patch.object(manager, "_construct", return_value={}):
+        manager.prepare_batch(Batch([req], "prefill"))
+    manager.free_to_cached(req)
+    manager.cache_req(req, finished=True)
+    assert tail not in manager._allocator.allocated_slots
+    assert manager.tree.match_prefix(torch.arange(192, dtype=torch.int32)).cuda_handle.cached_len == 128
+    manager.check_integrity()
+
+
+def test_cancel_before_construction_keeps_the_original_gpu_tail():
+    manager = make_manager(num_pages=20, num_states=20)
+    tail = _gpu_tail_with_recycled_page(manager)
+    req = new_req(manager, torch.arange(321, dtype=torch.int32))
+    manager.allocate([req], phase="prefill")
+    manager.free_to_cached(req)
+    manager.cache_req(req, finished=True)
+    assert tail in manager._allocator.allocated_slots
+    assert manager.tree.entries_for_slot(tail)[0].kind is LogStateKind.LOG
+    assert manager.tree.match_prefix(torch.arange(192, dtype=torch.int32)).cuda_handle.cached_len == 192
+    manager.check_integrity()
+
+
+def test_recycle_admission_counts_the_planned_shape_not_one_log_per_page():
+    manager = make_manager(num_pages=20, num_states=20)
+    _gpu_tail_with_recycled_page(manager)
+    pending = PendingRequest(7, torch.arange(321, dtype=torch.int32), SamplingParams(max_tokens=16))
+    handle = manager.match_req(pending).cuda_handle
+    cost = manager.reservation_size(321 + 16 - 192, handle=handle)
+    # Three new KV pages, two new Log pages, one request work state. The
+    # historical checkpoint reuses a GPU slot and contributes no extra state.
+    assert cost == manager._allocator.required_frames(3, 2, 1, free_decay_records=0)
+    assert manager.prefill_acquire(cost, handle)
+    manager.unlock(handle)
+
+
+@pytest.mark.parametrize("abort_first", [False, True])
+def test_shared_gpu_tail_has_only_one_recycled_slot_writer(abort_first):
+    manager = make_manager(num_pages=20, num_states=20)
+    tail = _gpu_tail_with_recycled_page(manager)
+    tokens = torch.arange(321, dtype=torch.int32)
+    first = new_req(manager, tokens, table_idx=0)
+    second = new_req(manager, tokens, table_idx=1)
+    assert first.cache_handle.restore_plan.checkpoints[0].gpu_entries[0].slot == tail
+    assert all(not item.gpu_entries for item in second.cache_handle.restore_plan.checkpoints)
+    manager.allocate([first, second], phase="prefill")
+    batch = Batch([first, second], "prefill")
+    with patch.object(manager, "_construct", return_value={}):
+        manager.prepare_batch(batch)
+    writes = [slot for _row, slot in batch.logstate_checkpoint_writes]
+    assert len(writes) == len(set(writes)) == 2
+    if abort_first:
+        manager.free_to_cached(first)
+    else:
+        first.cached_len = 320
+    manager.cache_req(first, finished=True)
+    second.cached_len = 320
+    manager.cache_req(second, finished=True)
+    assert manager.tree.match_prefix(tokens[:320]).cuda_handle.cached_len == 320
+    manager.check_integrity()
+
+
+def test_recycled_batch_branch_preserves_the_split_physical_log_page():
+    manager = make_manager(num_pages=20, num_states=20)
+    history = torch.arange(256, dtype=torch.int32)
+    ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    leaf = ghost.insert(history, history + 1000, (
+        LogStateEntry(20, LogStateKind.CHECKPOINT, 0, 256, span_pages=4),
+    )).node
+    manager.recycle_bin.remember(ghost, leaf)
+    first = PendingRequest(1, torch.arange(257, dtype=torch.int32), SamplingParams(max_tokens=16))
+    second = PendingRequest(2, torch.cat((history[:96], history[96:] + 1000)), SamplingParams(max_tokens=16))
+    manager.prepare_prefill_requests([first, second])
+    plan = manager.match_req(first).cuda_handle.restore_plan
+    assert 96 in plan.protected_endpoints
+    assert [(entry.begin, entry.end) for entry in plan.checkpoints] == [(0, 64), (128, 256)]
+    req = new_req(manager, first.input_ids, table_idx=1)
+    manager.allocate([req], phase="prefill")
+    assert manager._live_pages[1][1].state_slot is not None
+    assert manager._live_pages[1][1].checkpoint_begin is None
+    req.cached_len = 256
+    manager.cache_req(req, finished=True)
+    node = manager.tree.trace(history[:96]).node
+    assert node.depth == 96 and node.is_protected
+    manager.check_integrity()
+
+
+def test_recycled_continuation_keeps_its_dynamic_merge_policy():
+    from collections import deque
+    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+
+    manager = make_manager(num_pages=20, num_states=20, enable_merge_adjustment=True)
+    ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    tokens = torch.arange(256, dtype=torch.int32)
+    leaf = ghost.insert(tokens, tokens + 1000, tuple(
+        LogStateEntry(index, LogStateKind.LOG, index * 64, (index + 1) * 64)
+        for index in range(4)
+    )).node
+    leaf.merge_stats = LogStateMergeStats(0, 256, 6, deque([160, 192]), 1024)
+    manager.recycle_bin.remember(ghost, leaf)
+    pending = PendingRequest(1, torch.arange(257, dtype=torch.int32), SamplingParams(max_tokens=16))
+    handle = manager.match_req(pending).cuda_handle
+    assert handle.merge_stats.intensity == 6
+    assert list(handle.merge_stats.hit_positions) == [160, 192]
+    assert [(entry.begin, entry.end) for entry in handle.restore_plan.checkpoints] == [(0, 256)]
+    assert handle.merge_stats is not leaf.merge_stats
+
+
+def test_gpu_and_cpu_groups_use_one_merge_pass_and_one_intensity():
+    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+
+    manager = make_manager(num_pages=20, num_states=20, enable_merge_adjustment=True)
+    history = torch.arange(320, dtype=torch.int32)
+    frames, logs, _ = manager.logstate_pool.reserve(kv=3, logs=3)
+    kv = torch.cat([frame * PAGE_SIZE + torch.arange(PAGE_SIZE, dtype=torch.int32) for frame in frames])
+    manager.tree.insert(history[:192], kv, tuple(
+        LogStateEntry(slot, LogStateKind.LOG, index * 64, (index + 1) * 64)
+        for index, slot in enumerate(logs)
+    ))
+    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    leaf = ghost.insert(history, history + 1000, tuple(
+        LogStateEntry(index, LogStateKind.LOG, index * 64, (index + 1) * 64)
+        for index in range(5)
+    )).node
+    leaf.merge_stats = LogStateMergeStats(0, 320, 3, next_update_tail=1024)
+    manager.recycle_bin.remember(ghost, leaf)
+    req = new_req(manager, torch.arange(321, dtype=torch.int32))
+    manager.allocate([req], phase="prefill")
+    with patch.object(manager, "_construct", return_value={}):
+        manager.prepare_batch(Batch([req], "prefill"))
+    req.cached_len = 320
+    manager.cache_req(req, finished=True)
+    assert [(entry.begin, entry.end, entry.kind) for entry in manager.tree.iter_entries()] == [
+        (0, 192, LogStateKind.CHECKPOINT), (192, 320, LogStateKind.CHECKPOINT),
+    ]
+    manager.check_integrity()
+
+
 def test_cache_boundary_carries_conv_state_into_request_work_slot():
     manager = make_manager()
     req = new_req(manager, torch.arange(PAGE_SIZE, dtype=torch.int32))
@@ -856,7 +1459,8 @@ def test_admission_reserves_capacity_without_allocating_future_pages():
         sampling_params=SamplingParams(max_tokens=127),
     )
     handle = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(128, handle, request_len=128)
+    cost = manager.reservation_size(128, handle=handle)
+    assert manager.prefill_acquire(cost, handle, request_len=cost)
     assert manager._allocator.free_frames == initial_free
     manager.init_with_handle(0, handle)
     work_units = manager._allocator.payload_frames + manager._allocator.conv_frames
@@ -940,7 +1544,7 @@ def test_logical_admission_does_not_evict_cached_prefix():
         sampling_params=SamplingParams(max_tokens=16),
     )
     handle = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(manager.available_size, handle)
+    assert manager.prefill_acquire(manager.admission_capacity, handle)
     assert manager._allocator.free_frames == free_units
     assert manager.tree.size_info.evictable_size == cached_size
     manager.unlock(handle)
@@ -971,7 +1575,7 @@ def test_allocation_evicts_only_as_many_cached_leaves_as_needed():
         sampling_params=SamplingParams(max_tokens=16),
     )
     handle = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(2 * PAGE_SIZE, handle)
+    assert manager.prefill_acquire(manager.reservation_size(2 * PAGE_SIZE, handle=handle), handle)
     manager.init_with_handle(0, handle)
     req = Request(
         input_ids=input_ids,
@@ -1030,7 +1634,9 @@ def test_admitted_requests_can_allocate_their_full_reserved_suffixes():
             sampling_params=SamplingParams(max_tokens=127),
         )
         handle = manager.match_req(pending).cuda_handle
-        assert manager.prefill_acquire((index + 1) * 2 * PAGE_SIZE, handle)
+        reserved = sum(manager.reservation_size(req.remain_len, table_idx=req.table_idx) for req in reqs)
+        cost = manager.reservation_size(2 * PAGE_SIZE, handle=handle)
+        assert manager.prefill_acquire(reserved + cost, handle)
         manager.init_with_handle(index, handle)
         reqs.append(Request(
             input_ids=pending.input_ids,

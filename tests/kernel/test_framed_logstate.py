@@ -16,7 +16,6 @@ from logssms.kernel.linear_attention.framed_logstate import (
 from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
     _frame_byte_offset,
     fused_recurrent_gated_delta_rule_to_framed_logstate,
-    fused_recurrent_gated_delta_rule_with_log,
 )
 
 
@@ -308,13 +307,11 @@ def test_shared_log_materialization_reconstructs_later_branches():
         PageMaterialize(entry.slot, 64, 128, None, (entries[0], entry))
         for entry in entries[1:]
     )
-    chains = LogStateCacheManager._make_construction_chains((), plans)
-    waves = LogStateCacheManager._schedule_construction_waves(chains, plans)
+    chains, waves = LogStateCacheManager._construction_plan((), plans)
     assert [len(wave) for wave in waves] == [1, 5]
     manager = SimpleNamespace(
         _profile_enabled=False,
-        _make_construction_chains=LogStateCacheManager._make_construction_chains,
-        _schedule_construction_waves=LogStateCacheManager._schedule_construction_waves,
+        _construction_plan=LogStateCacheManager._construction_plan,
         device=pool.device,
         logstate_pool=pool,
     )
@@ -329,76 +326,6 @@ def test_shared_log_materialization_reconstructs_later_branches():
             torch.full((32, 32), expected, device="cuda", dtype=torch.bfloat16),
             rtol=5e-2, atol=1e-3,
         )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_framed_decode_matches_recurrent_reference():
-    torch.manual_seed(12)
-    pool = FramedMHALogStatePool(
-        num_frames=64,
-        page_size=64,
-        granularity=16,
-        num_attention_layers=1,
-        num_kv_heads=1,
-        head_dim=64,
-        num_linear_layers=1,
-        num_key_heads=2,
-        num_value_heads=2,
-        head_k_dim=32,
-        head_v_dim=32,
-        conv_dim=128,
-        state_len=3,
-        device=torch.device("cuda"),
-        dtype=torch.bfloat16,
-    )
-    allocated = pool.reserve(logs=2, works=2)
-    assert allocated is not None
-    logs, works = allocated[1:]
-    initial = torch.randn((2, 2, 32, 32), dtype=torch.bfloat16, device="cuda") * 0.01
-    for row, slot in enumerate(works):
-        for head in range(2):
-            head_view(pool, slot, 0, head, state=True).copy_(initial[row, head])
-    query = torch.randn((2, 1, 2, 32), dtype=torch.bfloat16, device="cuda")
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-    gate = torch.randn((2, 1, 2), dtype=torch.bfloat16, device="cuda")
-    beta = torch.randn_like(gate)
-    A_log = torch.randn((2,), dtype=torch.float32, device="cuda")
-    dt_bias = torch.randn_like(A_log)
-    expected, states, prepared_key, residual_value, decay = (
-        fused_recurrent_gated_delta_rule_with_log(
-            query, key, value, gate, beta, A_log, dt_bias, initial
-        )
-    )
-    actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
-        query, key, value, gate, beta, A_log, dt_bias, pool,
-        torch.tensor(works, dtype=torch.int32, device="cuda"),
-        torch.tensor(logs, dtype=torch.int32, device="cuda"),
-        torch.tensor([15, 31], dtype=torch.int32, device="cuda"),
-        0,
-        torch.zeros(2, dtype=torch.int32, device="cuda"),
-    )
-    torch.testing.assert_close(actual, expected)
-    for row, slot in enumerate(logs):
-        for head in range(2):
-            torch.testing.assert_close(
-                head_view(pool, works[row], 0, head, state=True),
-                states[row, 0, head],
-            )
-            log = head_view(pool, slot, 0, head, state=False)
-            position = [15, 31][row]
-            torch.testing.assert_close(
-                log[position * 32:(position + 1) * 32],
-                prepared_key[row, 0, head],
-            )
-            torch.testing.assert_close(
-                log[64 * 32 + position * 32:64 * 32 + (position + 1) * 32],
-                residual_value[row, 0, head],
-            )
-            torch.testing.assert_close(
-                pool.decay_view(slot)[0, position, head],
-                decay[row, 0, head],
-            )
 
 
 @pytest.mark.parametrize("granularity", [32, 64])

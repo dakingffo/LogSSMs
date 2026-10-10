@@ -131,18 +131,114 @@ class SchedulerProfiler:
         self._process_stage_name = ""
         self._last_wait_ms = 0.0
         self.schedule_ns = 0
+        self.schedule_iterations = 0
+        self.schedule_no_batch = 0
+        self.schedule_stage_ns = Counter()
+        self.schedule_exclusive_ns = Counter()
+        self.schedule_stage_calls = Counter()
+        self.schedule_no_batch_samples = deque(maxlen=self.sample_limit)
+        self._schedule_sample: dict | None = None
+        self._last_schedule_sample: dict | None = None
+        self._schedule_request: dict | None = None
+        self._schedule_stack: list[list[int]] = []
+        self._schedule_stage_name = ""
 
     @contextmanager
     @nvtx_annotate("Scheduler::schedule")
     def record_schedule(self):
         if not self.enabled:
-            yield
+            yield None
             return
+        sample = {
+            "iteration": self.schedule_iterations,
+            "phase": "no_batch",
+            "stages_ms": {},
+            "exclusive_stages_ms": {},
+            "stage_calls": {},
+            "requests": [],
+            "dropped_requests": 0,
+        }
+        self._schedule_sample = sample
+        previous_recorder = getattr(self.cache_manager, "_schedule_profile_step", None)
+        self.cache_manager._schedule_profile_step = self.record_schedule_step
         tic = perf_counter_ns()
+        try:
+            yield sample
+        finally:
+            self.schedule_ns = perf_counter_ns() - tic
+            self.cache_manager._schedule_profile_step = previous_recorder
+            sample["total_ms"] = self.schedule_ns / 1e6
+            sample["unaccounted_ms"] = (
+                sample["total_ms"] - sum(sample["exclusive_stages_ms"].values())
+            )
+            self.schedule_iterations += 1
+            if sample["phase"] == "no_batch":
+                self.schedule_no_batch += 1
+                self.schedule_no_batch_samples.append(sample)
+            self._last_schedule_sample = sample
+            self._schedule_sample = None
+
+    def record_schedule_step(self, name: str):
+        if self._schedule_sample is None:
+            return nullcontext()
+        self._schedule_stage_name = name
+        return self._record_schedule_step(name)
+
+    @contextmanager
+    @nvtx_annotate("Scheduler::schedule::{}", layer_id_field="_schedule_stage_name")
+    def _record_schedule_step(self, name: str):
+        frame = [perf_counter_ns(), 0]
+        self._schedule_stack.append(frame)
         try:
             yield
         finally:
-            self.schedule_ns = perf_counter_ns() - tic
+            elapsed = perf_counter_ns() - frame[0]
+            exclusive = elapsed - frame[1]
+            self._schedule_stack.pop()
+            if self._schedule_stack:
+                self._schedule_stack[-1][1] += elapsed
+            self.schedule_stage_ns[name] += elapsed
+            self.schedule_exclusive_ns[name] += exclusive
+            self.schedule_stage_calls[name] += 1
+            for sample in (self._schedule_sample, self._schedule_request):
+                if sample is None:
+                    continue
+                for key, value in (
+                    ("stages_ms", elapsed / 1e6),
+                    ("exclusive_stages_ms", exclusive / 1e6),
+                    ("stage_calls", 1),
+                ):
+                    stages = sample[key]
+                    stages[name] = stages.get(name, 0) + value
+
+    @contextmanager
+    def record_schedule_request(self, req):
+        if self._schedule_sample is None:
+            yield {}
+            return
+        sample = {
+            "uid": req.uid,
+            "tag": req.profile_tag,
+            "input_len": req.input_len,
+            "output_len": req.output_len,
+            "chunked": req.chunked_req is not None,
+            "stages_ms": {},
+            "exclusive_stages_ms": {},
+            "stage_calls": {},
+        }
+        self._schedule_request = sample
+        tic = perf_counter_ns()
+        try:
+            yield sample
+        finally:
+            sample["total_ms"] = (perf_counter_ns() - tic) / 1e6
+            self._schedule_request = None
+            iteration = self._schedule_sample
+            if iteration is not None:
+                if len(iteration["requests"]) < self.sample_limit:
+                    iteration["requests"].append(sample)
+                else:
+                    iteration["dropped_requests"] += 1
 
     @contextmanager
     @nvtx_annotate("Scheduler::prepare_batch")
@@ -178,12 +274,16 @@ class SchedulerProfiler:
         profile.prepare_ns += prepare_ns
         profile.logical_bs[batch.size] += 1
         profile.padded_bs[batch.padded_size] += 1
-        self.batch_samples["prepare"][batch.phase].append({
+        sample = {
             **batch_snapshot(batch),
             "graph_used": graph_used,
             "schedule_ms": self.schedule_ns / 1e6,
             "prepare_ms": prepare_ns / 1e6,
-        })
+        }
+        if self._last_schedule_sample is not None:
+            self._last_schedule_sample.update(batch_identity(batch))
+            sample["schedule_detail"] = self._last_schedule_sample
+        self.batch_samples["prepare"][batch.phase].append(sample)
 
     @contextmanager
     @nvtx_annotate("Scheduler::forward(submit)")
@@ -340,6 +440,28 @@ class SchedulerProfiler:
             "process_stages_ms": {
                 phase: {name: elapsed / 1e6 for name, elapsed in stages.items()}
                 for phase, stages in self.process_stage_ns.items()
+            },
+            "schedule_profile": {
+                "iterations": self.schedule_iterations,
+                "no_batch_iterations": self.schedule_no_batch,
+                "stages_ms": {
+                    name: elapsed / 1e6
+                    for name, elapsed in self.schedule_stage_ns.items()
+                },
+                "exclusive_stages_ms": {
+                    name: elapsed / 1e6
+                    for name, elapsed in self.schedule_exclusive_ns.items()
+                },
+                "stage_calls": dict(self.schedule_stage_calls),
+                "no_batch_samples": list(self.schedule_no_batch_samples),
+                "dropped_no_batch_samples": max(
+                    0, self.schedule_no_batch - self.sample_limit
+                ),
+                "timing_semantics": (
+                    "Host wall time; stages_ms includes nested stages. "
+                    "Use exclusive_stages_ms for non-overlapping attribution. "
+                    "No CUDA events or synchronization are added by schedule profiling."
+                ),
             },
         }
         for kind, phases in self.batch_samples.items():

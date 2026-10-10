@@ -1,4 +1,6 @@
 import torch
+import random
+from unittest.mock import patch
 
 from logssms.cache.prefix_cache.logstate import (
     LogRadixTree,
@@ -16,6 +18,85 @@ def make_tree() -> LogRadixTree:
 
 def ids(length: int, begin: int = 0) -> torch.Tensor:
     return torch.arange(begin, begin + length, dtype=torch.int32)
+
+
+def test_incremental_reclamation_tracks_splits_locks_entries_eviction_and_reset():
+    rng = random.Random(0)
+    tree = make_tree()
+    history = ids(128)
+    leaf = tree.insert(history, ids(128, 1000), tuple(
+        LogStateEntry(page, LogStateKind.LOG, page * 4, (page + 1) * 4)
+        for page in range(32)
+    )).node
+    locks = []
+    for _ in range(200):
+        action = rng.randrange(4)
+        if action == 0:
+            handle = tree.match_prefix(history[:rng.randrange(1, 129)]).cuda_handle
+            tree.lock_handle(handle)
+            locks.append(handle)
+        elif action == 1 and locks:
+            tree.lock_handle(locks.pop(rng.randrange(len(locks))), unlock=True)
+        elif action == 2:
+            nodes = [node for node in tree._iter_nodes() if node.length > 1]
+            if nodes:
+                node = rng.choice(nodes)
+                tree.split_at(node, rng.randrange(1, node.length))
+        else:
+            candidates = list(tree.iter_evict_candidates())
+            if candidates:
+                tree.evict_nodes(candidates[:1])
+        tree.check_integrity()
+    for handle in locks:
+        tree.lock_handle(handle, unlock=True)
+    tree.check_integrity()
+    tree.reset()
+    assert tree.evictable_kv_frames() == 0
+    assert tree.evictable_slots() == ()
+    tree.check_integrity()
+
+
+def test_match_prefix_compares_tokens_only_once_and_preserves_raw_trace():
+    tree = LogRadixTree(64, torch.device("cpu"), granularity=16)
+    history = ids(128)
+    tree.insert(history, ids(128, 1000), (
+        LogStateEntry(0, LogStateKind.LOG, 0, 64),
+    ))
+    request = torch.cat((history[:96], ids(32, 10000)))
+    with patch.object(tree, "_tree_walk", side_effect=AssertionError):
+        result = tree.match_prefix(request)
+    assert result.tree_match_len == 96
+    assert result.cuda_handle.cached_len == 64
+    assert result.cuda_handle.match_trace == tree.trace(request)
+    assert result.cuda_handle.trace_revision == tree.revision
+    tree.check_integrity()
+
+
+def test_matched_kv_is_lazy_and_retains_parts_across_edge_splits():
+    tree = make_tree()
+    history, kv = ids(12), ids(12, 100)
+    tree.insert(history, kv, (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 12, span_pages=3),
+    ))
+    with patch("torch.cat", wraps=torch.cat) as cat:
+        handle = tree.match_prefix(history).cuda_handle
+        assert cat.call_count == 0
+        tree.lock_handle(handle)
+        tree.split_at(handle.node, 4)
+        torch.testing.assert_close(handle.kv_indices, kv)
+        assert cat.call_count == 1
+        assert handle.get_matched_indices() is handle.kv_indices
+        assert cat.call_count == 1
+        tree.lock_handle(handle, unlock=True)
+    tree.check_integrity()
+
+
+def test_empty_lazy_indices_keep_the_cache_device():
+    tree = LogRadixTree(64, torch.device("meta"), granularity=32)
+    for handle in (tree.match_prefix(ids(1)).cuda_handle, tree.make_handle(tree.root)):
+        assert handle.kv_indices.device.type == "meta"
+        assert handle.kv_indices.dtype == torch.int32
+        assert handle.kv_indices.numel() == 0
 
 
 def test_node_depth_survives_entry_splits_and_new_branches():
@@ -171,14 +252,13 @@ def test_kv_reclamation_requires_the_entire_physical_frame_to_be_evictable():
     token_ids = ids(8)
     kv = ids(8, 100)
     leaf = tree.insert(token_ids, kv).node
-    cached_page_tokens = {100: 4, 104: 4}
-    assert tree.evictable_kv_frames(cached_page_tokens) == 2
+    assert tree.evictable_kv_frames() == 2
 
     branch = tree.split_at(leaf, 2)
     tree.lock(branch)
-    assert tree.evictable_kv_frames(cached_page_tokens) == 1
+    assert tree.evictable_kv_frames() == 1
     tree.lock(branch, unlock=True)
-    assert tree.evictable_kv_frames(cached_page_tokens) == 2
+    assert tree.evictable_kv_frames() == 2
     tree.check_integrity()
 
 

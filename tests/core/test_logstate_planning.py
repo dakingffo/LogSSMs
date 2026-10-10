@@ -3,12 +3,6 @@ import random
 import pytest
 import torch
 
-from logssms.cache.logstate import (
-    LogStateCacheManager,
-    PageMaterialize,
-    _ConstructionChain,
-)
-from logssms.cache.prefix_cache.logstate import LogStateEntry, LogStateKind
 from logssms.kernel import logstate as planning
 
 
@@ -89,48 +83,6 @@ def test_native_coalesce_obeys_protections_locks_and_unique_slot_ownership():
     assert diagnostics["planned_slot_releases"] == 2
 
 
-def test_native_dependency_plan_orders_old_log_reader_before_writer():
-    full = LogStateEntry(4, LogStateKind.LOG, 0, 64)
-    partial = full.slice(0, 32)
-    chains = (
-        _ConstructionChain(None, (full,), ((4,),), True),
-        _ConstructionChain(None, (partial,), ((10,),), False),
-    )
-    plans = (PageMaterialize(4, 0, 64, None, (full,)),)
-    assert LogStateCacheManager._schedule_construction_waves(chains, plans) == (
-        (chains[1],), (chains[0],),
-    )
-
-
-def test_native_dependency_plan_rebases_only_without_an_earlier_output():
-    first = LogStateEntry(1, LogStateKind.LOG, 0, 64)
-    second = LogStateEntry(2, LogStateKind.LOG, 64, 128)
-    writer = _ConstructionChain(None, (first,), ((1,),), True)
-    reader = _ConstructionChain(None, (first, second), ((), (9,)), False)
-    plans = (PageMaterialize(1, 0, 64, None, (first,)),)
-    waves = LogStateCacheManager._schedule_construction_waves((writer, reader), plans)
-    assert waves == ((writer,), (_ConstructionChain(1, (second,), ((9,),), False),))
-
-
-def test_native_dependency_plan_rejects_duplicate_missing_and_cyclic_writers():
-    a = LogStateEntry(1, LogStateKind.LOG, 0, 64)
-    b = LogStateEntry(2, LogStateKind.LOG, 0, 64)
-    plans = (PageMaterialize(1, 0, 64, None, (a,)),)
-    writer = _ConstructionChain(None, (a,), ((1,),), True)
-    with pytest.raises(RuntimeError, match="multiple writers"):
-        LogStateCacheManager._schedule_construction_waves((writer, writer), plans)
-    with pytest.raises(RuntimeError, match="Missing Checkpoint writer"):
-        LogStateCacheManager._schedule_construction_waves(
-            (_ConstructionChain(None, (a,), ((10,),), False),), plans,
-        )
-    with pytest.raises(RuntimeError, match="Cyclic"):
-        LogStateCacheManager._schedule_construction_waves(
-            (_ConstructionChain(2, (a,), ((1,),), True),
-             _ConstructionChain(1, (b,), ((2,),), True)),
-            plans + (PageMaterialize(2, 0, 64, None, (b,)),),
-        )
-
-
 def test_native_metadata_validation_precedes_pointer_access():
     module = planning._load_logstate_module()
     bad = torch.tensor([10, 1], dtype=torch.int64)
@@ -139,3 +91,96 @@ def test_native_metadata_validation_precedes_pointer_access():
         module.plan_materialize(bad, empty, empty, 64)
     with pytest.raises(RuntimeError, match="CPU int64"):
         module.plan_materialize(bad.to(torch.int32), empty, empty, 64)
+
+
+def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
+    import heapq
+    from collections import Counter
+
+    rng = random.Random(381)
+    for _ in range(200):
+        count = rng.randrange(2, 40)
+        parents = [-1] + [rng.randrange(i) for i in range(1, count)]
+        locked = [1] + [int(rng.random() < .1) for _ in range(1, count)]
+        for i in range(count - 1, 0, -1):
+            locked[parents[i]] |= locked[i]
+        nodes = [(i, parents[i], locked[i], rng.randrange(2), rng.randrange(100))
+                 for i in range(count)]
+        children = Counter(parents[1:])
+        heap = [(row[3], row[4], row[0]) for row in nodes
+                if not locked[row[0]] and not children[row[0]]]
+        heapq.heapify(heap)
+        order = []
+        while heap:
+            _, _, i = heapq.heappop(heap)
+            order.append(i)
+            parent = parents[i]
+            if parent >= 0:
+                children[parent] -= 1
+                if not children[parent] and not locked[parent]:
+                    row = nodes[parent]
+                    heapq.heappush(heap, (row[3], row[4], row[0]))
+        assert planning.eviction_candidates(nodes) == order
+
+        page_refs = [[rng.randrange(10) for _ in range(rng.randrange(4))]
+                     for _ in nodes]
+        slot_refs = [[rng.randrange(12) for _ in range(rng.randrange(4))]
+                     for _ in nodes]
+        page_totals = Counter(frame for refs in page_refs for frame in refs)
+        slot_totals = Counter(slot for refs in slot_refs for slot in refs)
+        kv = [[value for frame, refs in Counter(row).items()
+               for value in (frame, refs, page_totals[frame])] for row in page_refs]
+        # Three partially occupied decay frames, including records owned by
+        # live requests outside this tree. Checkpoints do not own decay.
+        slots = [(slot, refs, rng.randrange(1, 8), slot // 4 if rng.random() > .25 else -1, slot % 4)
+                 for slot, refs in slot_totals.items()]
+        own_decay = Counter(row[3] for row in slots if row[3] >= 0)
+        occupied = [(frame, rng.randrange(max(1, own_decay[frame]), 5)) for frame in range(3)]
+        config = [rng.randrange(3), sum(4 - n for _, n in occupied), 2, 1, 2, 4,
+                  rng.randrange(1, 12), rng.randrange(1, 12), rng.randrange(3)]
+        selected, pages, refs, released = [], Counter(), Counter(), set()
+        expected = []
+        for i in order:
+            selected.append(i)
+            pages.update(page_refs[i])
+            refs.update(slot_refs[i])
+            released = {slot for slot in refs if refs[slot] == slot_totals[slot]}
+            free, decay = config[:2]
+            decay_counts = Counter()
+            for slot, _, frames, frame, _ in slots:
+                if slot in released:
+                    free += frames
+                    if frame >= 0:
+                        decay_counts[frame] += 1
+            for frame, n in decay_counts.items():
+                occupancy = dict(occupied)[frame]
+                if n == occupancy:
+                    free += 1
+                    decay -= 4 - occupancy
+                else:
+                    decay += n
+            free += sum(n == page_totals[frame] for frame, n in pages.items())
+            required = (config[6] + (config[7] + config[8]) * config[2]
+                        + (config[7] * config[4] + config[8]) * config[3]
+                        + (max(0, config[7] - decay) + 3) // 4)
+            if required <= free:
+                expected = [selected, [v for pair in pages.items() for v in pair],
+                            sorted(released)]
+                break
+        assert planning.plan_eviction(nodes, kv, slot_refs, slots, occupied, config) == expected
+
+
+def test_native_protections_deduplicate_forced_and_batch_branches():
+    prefix = torch.arange(64, dtype=torch.int32)
+    inputs = [torch.cat((prefix, torch.full((32,), value, dtype=torch.int32)))
+              for value in (100, 101, 102)]
+    assert planning.branch_protections(inputs, [(2, 64), (0, 32), (1, 32)], 32) == [
+        [32, 0, 1], [64, 0, 1, 2],
+    ]
+    with pytest.raises(RuntimeError, match="Invalid forced branch"):
+        planning.branch_protections(inputs, [(0, 33)], 32)
+
+
+def test_native_construction_rejects_invalid_entry_index():
+    with pytest.raises(RuntimeError, match="entry index"):
+        planning.construction_plan([(4, 0, 64, 0)], [(0, 10, 2)], [])

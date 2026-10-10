@@ -51,6 +51,15 @@ class ARManagerBase:
             for req in self.running_reqs.values()
         )
 
+    @property
+    def need_capacity(self) -> int:
+        return sum(
+            self.cache_manager.reservation_size(
+                self._reserve_remain_len(req), table_idx=req.table_idx,
+            )
+            for req in self.running_reqs.values()
+        )
+
     def _reserve_remain_len(self, req: Request) -> int:
         return req.remain_len
 

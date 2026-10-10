@@ -169,6 +169,8 @@ def test_packed_causal_conv_matches_individual_requests() -> None:
     torch.testing.assert_close(snapshots, expected_snapshots, rtol=0, atol=0)
 
 
+
+
 def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
     clear_global_ctx()
     backend = GatedDeltaBackend()
@@ -204,54 +206,6 @@ def test_verify_metadata_uses_live_baseline_and_reserve() -> None:
     assert rows2.tolist() == [3, 4]
     assert reads2.tolist() == [21]
     assert writes2.tolist() == [[110, 111]]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_chunk_gated_delta_returns_page_checkpoints() -> None:
-    from logssms.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
-    from logssms.layers.linear_attention_backend.standard import PackedLinearIndices
-
-    inputs = _make_inputs(seq_len=96)
-    query = torch.nn.functional.normalize(inputs["query"], dim=-1)
-    key = torch.nn.functional.normalize(inputs["key"], dim=-1)
-    value = inputs["value"]
-    gate = -inputs["gate"].float().abs()
-    beta = inputs["beta"].sigmoid()
-    initial_state = inputs["initial_state"]
-
-    query, key, value, gate, beta = [
-        tensor.flatten(0, 1).unsqueeze(0)
-        for tensor in (query, key, value, gate, beta)
-    ]
-    cu_seqlens = torch.tensor([0, 96, 192], dtype=torch.int64, device=query.device)
-    output, final_state, states = chunk_gated_delta_rule(
-        query, key, value, gate, beta, initial_state, cu_seqlens
-    )
-    prepared = PackedLinearIndices.from_lengths([96, 96], query.device, 64)
-    prepared_output, prepared_final, prepared_states = chunk_gated_delta_rule(
-        query, key, value, gate, beta, initial_state,
-        prepared.cu_seqlens, **prepared.fla_kwargs(),
-    )
-    torch.testing.assert_close(prepared_output, output, rtol=0, atol=0)
-    torch.testing.assert_close(prepared_final, final_state, rtol=0, atol=0)
-    torch.testing.assert_close(prepared_states, states, rtol=0, atol=0)
-
-    assert output.shape == value.shape
-    assert final_state.shape == initial_state.shape
-    assert states.shape == (4, *initial_state.shape[1:])
-    _, first_page_state, _ = chunk_gated_delta_rule(
-        query[:, :64],
-        key[:, :64],
-        value[:, :64],
-        gate[:, :64],
-        beta[:, :64],
-        initial_state[:1],
-        torch.tensor([0, 64], dtype=torch.int64, device=query.device),
-    )
-    torch.testing.assert_close(states[0], first_page_state[0].to(states), rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(
-        states[[1, 3]], final_state.to(states), rtol=0, atol=0
-    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from logssms.core import Batch
 
 from .ar import ARManagerBase

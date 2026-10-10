@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 
 
 @dataclass(init=False)
-class GraphCaptureBuffer:
+class DecodeGraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc  : torch.Tensor
     positions: torch.Tensor
@@ -38,7 +38,7 @@ class GraphCaptureBuffer:
         batch.out_loc = self.out_loc[0:batch.padded_size]
         batch.positions = self.positions[0:batch.padded_size]
 
-    @nvtx_annotate("Graph::copy_inputs")
+    @nvtx_annotate("DecodeGraph::copy_inputs")
     def copy_from(self, batch: Batch) -> None:
         self.input_ids[0:batch.padded_size] = batch.input_ids
         self.out_loc[0:batch.padded_size] = batch.out_loc
@@ -72,7 +72,7 @@ def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
 
-class GraphRunner:
+class DecodeGraphRunner:
     def __init__(
         self,
         stream             : torch.cuda.Stream,
@@ -102,7 +102,7 @@ class GraphRunner:
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
-        self.graph_map: dict[int, torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("Decode CUDA graph is disabled.")
 
@@ -120,7 +120,7 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer(self.max_graph_bs, vocab_size, self.device)
+        self.buffer = DecodeGraphCaptureBuffer(self.max_graph_bs, vocab_size, self.device)
 
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
@@ -146,7 +146,7 @@ class GraphRunner:
                     self.buffer.logits[:bs] = model.forward()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
+            self.graphs[bs] = graph
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
@@ -154,7 +154,7 @@ class GraphRunner:
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
-    @nvtx_annotate("Graph::replay")
+    @nvtx_annotate("DecodeGraph::replay")
     def replay(self, batch: Batch, *, profiler: EngineProfiler | None = None) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         if profiler is not None:
@@ -163,7 +163,7 @@ class GraphRunner:
         self.attn_backend.prepare_for_replay(batch)
         if self.linear_attn_backend is not None:
             self.linear_attn_backend.prepare_for_replay(batch)
-        self.graph_map[batch.padded_size].replay()
+        self.graphs[batch.padded_size].replay()
         return self.buffer.logits[:batch.size]
 
     def _replay_profiled(self, batch: Batch, profiler: EngineProfiler) -> torch.Tensor:
@@ -175,7 +175,7 @@ class GraphRunner:
             if self.linear_attn_backend is not None:
                 self.linear_attn_backend.prepare_for_replay(batch)
         with profiler.record_stage("graph_replay"):
-            self.graph_map[batch.padded_size].replay()
+            self.graphs[batch.padded_size].replay()
         return self.buffer.logits[:batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
@@ -190,5 +190,5 @@ class GraphRunner:
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
-        del self.graph_map
+        del self.graphs
         gc.collect()

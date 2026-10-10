@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from perf import compare_memory_kernel_perf
 from logssms.kernel import indexing
-from logssms.utils import call_if_main, init_logger
+from logssms.utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -29,7 +29,6 @@ def ref_indexing(
         return F.embedding(indices, weights)
 
 
-@call_if_main(__name__)
 def test_indexing():
     EMBED_SIZE = 4096
     NUM_TOKENS = 131072
@@ -61,7 +60,6 @@ def test_indexing():
         )
 
 
-@call_if_main(__name__)
 def test_indexing_with_mask():
     EMBED_SIZE = 4096
     NUM_TOKENS = 131072

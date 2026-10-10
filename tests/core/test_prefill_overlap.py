@@ -55,6 +55,7 @@ def test_cold_prefill_initializes_cache_handle() -> None:
     handle = SimpleNamespace(cached_len=0)
     cache_manager = SimpleNamespace(
         page_size=64,
+        reservation_size=lambda tokens, **_: (tokens + 63) // 64 * 64,
         match_req=lambda _req: SimpleNamespace(cuda_handle=handle),
         plan_prefill_chunk=lambda remain, budget: min(remain, budget),
         prefill_acquire=lambda *_args, **_kwargs: True,
@@ -143,6 +144,7 @@ def test_prefill_adder_continues_from_inflight_device_frontier():
     )
     cache_manager = SimpleNamespace(
         page_size=1,
+        reservation_size=lambda tokens, **_: tokens,
         record_prefill_wait=lambda _wait_ms: None,
         plan_prefill_chunk=lambda remain_len, token_budget: min(
             remain_len, token_budget
@@ -165,6 +167,7 @@ def test_hybrid_chunked_prefill_is_state_checkpoint_aligned():
     )
     cache_manager = SimpleNamespace(
         page_size=64,
+        reservation_size=lambda tokens, **_: (tokens + 63) // 64 * 64,
         record_prefill_wait=lambda _wait_ms: None,
         plan_prefill_chunk=lambda remain_len, token_budget: 64,
     )

@@ -20,10 +20,11 @@ def test_engine_prepare_profile(monkeypatch: pytest.MonkeyPatch, enabled: bool) 
     monkeypatch.setattr(torch.cuda, "Event", _Event)
     engine = object.__new__(Engine)
     engine.ctx = SimpleNamespace(prefill_graph_runner=None)
+    engine.prefill_graph_runner = None
     engine.profiler = EngineProfiler()
     engine.device = torch.device("cpu")
     engine.config = SimpleNamespace(model_config=SimpleNamespace(is_hybrid=False))
-    engine.graph_runner = SimpleNamespace(
+    engine.decode_graph_runner = SimpleNamespace(
         pad_batch=lambda batch: None, can_use_cuda_graph=lambda batch: False,
     )
     engine.attn_backend = SimpleNamespace(prepare_metadata=lambda batch: None)

@@ -155,17 +155,20 @@ def test_scheduler_cache_profile_sampling_is_opt_in(enabled: bool) -> None:
     scheduler.profiler = SimpleNamespace(
         enabled=enabled,
         record_schedule=lambda: nullcontext(),
+        record_schedule_step=lambda _name: nullcontext(),
     )
     scheduler.prefill_manager = SimpleNamespace(
         pending_list=[],
         runnable=False,
         need_tokens=0,
+        need_capacity=0,
         schedule_next_batch=lambda _adder: None,
     )
     scheduler.ar_manager = SimpleNamespace(
         running_reqs={},
         runnable=False,
         need_tokens=0,
+        need_capacity=0,
         schedule_next_batch=lambda: None,
     )
     scheduler.cache_manager = SimpleNamespace(

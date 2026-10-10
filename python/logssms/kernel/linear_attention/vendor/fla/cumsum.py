@@ -11,7 +11,7 @@ import triton.language as tl
 
 from .runtime import fla_cache_autotune
 from .index import prepare_chunk_indices
-from .runtime import autotune_cache_kwargs, check_shared_mem, input_guard
+from .runtime import autotune_cache_kwargs, check_shared_mem
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

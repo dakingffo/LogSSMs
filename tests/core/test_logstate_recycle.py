@@ -1,12 +1,8 @@
 import torch
-from types import SimpleNamespace
-from unittest.mock import patch
 import random
 
 from logssms.cache.logstate import LogStateRecycleBin
-from logssms.cache.logstate import RecycledBranch, RecycledEntry, RecycledMatch
-from logssms.cache.logstate import LogStateCacheManager, OnlineAnalysisScheduler, _LivePage
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate import RecycledBranch
 from logssms.cache.prefix_cache.logstate import LogRadixTree, LogStateEntry, LogStateKind
 
 
@@ -67,6 +63,62 @@ def test_discard_does_not_remove_a_newer_shape_for_same_prefix() -> None:
     new = recycle.match(tokens, start=0, granularity=1)
     assert new is not None
     assert new.branch.entries[0].kind is LogStateKind.CHECKPOINT
+
+
+def test_native_recycle_hit_updates_lru_and_zero_capacity_stays_empty() -> None:
+    tree = make_tree()
+    inputs = [torch.arange(4, dtype=torch.int32) + i * 10 for i in range(3)]
+    size = RecycledBranch(tuple(inputs[0].tolist()), (), frozenset()).bytes
+    recycle = LogStateRecycleBin(2 * size)
+    disabled = LogStateRecycleBin(0)
+    for values in inputs[:2]:
+        node = tree.insert(values, values + 100).node
+        recycle.remember(tree, node)
+        disabled.remember(tree, node)
+    assert recycle.match(inputs[0].to(torch.int64), start=0, granularity=1) is not None
+    recycle.remember(tree, tree.insert(inputs[2], inputs[2] + 100).node)
+    assert recycle.match(inputs[1], start=0, granularity=1) is None
+    assert recycle.match(inputs[0], start=0, granularity=1) is not None
+    assert recycle.match(inputs[2], start=0, granularity=1) is not None
+    assert recycle.used_bytes == 2 * size and len(recycle) == 2
+    assert disabled.used_bytes == 0 and len(disabled) == 0
+    assert disabled.match(inputs[0], start=0, granularity=1) is None
+
+
+def test_reusing_a_recycled_match_touches_native_lru_without_rematching():
+    tree = make_tree()
+    inputs = [torch.arange(4, dtype=torch.int32) + i * 10 for i in range(3)]
+    size = RecycledBranch(tuple(inputs[0].tolist()), (), frozenset()).bytes
+    recycle = LogStateRecycleBin(2 * size)
+    for values in inputs[:2]:
+        recycle.remember(tree, tree.insert(values, values + 100).node)
+    first = recycle.match(inputs[0], start=0, granularity=1)
+    recycle.match(inputs[1], start=0, granularity=1)
+    recycle.touch(first.branch)
+    recycle.remember(tree, tree.insert(inputs[2], inputs[2] + 100).node)
+    assert recycle.match(inputs[0], start=0, granularity=1) is not None
+    assert recycle.match(inputs[1], start=0, granularity=1) is None
+
+
+def test_stale_child_handle_cannot_discard_a_refreshed_record() -> None:
+    tree = make_tree()
+    tokens = torch.arange(8, dtype=torch.int32)
+    leaf = tree.insert(tokens, tokens + 100, (
+        LogStateEntry(1, LogStateKind.LOG, 0, 4),
+        LogStateEntry(2, LogStateKind.LOG, 4, 8),
+    )).node
+    recycle = LogStateRecycleBin(4096)
+    recycle.remember(tree, leaf)
+    old = recycle.match(tokens, start=0, granularity=1)
+    parent = tree.entry_owner(1)
+    tree.detach_entry(1)
+    tree.attach_entry(parent, LogStateEntry(1, LogStateKind.CHECKPOINT, 0, 4, span_pages=1))
+    recycle.remember(tree, parent)
+    recycle.discard(old.branch)
+    new = recycle.match(tokens, start=0, granularity=1)
+    assert new.matched_len == 8 and new.branch is not old.branch
+    assert new.branch.entries[0].kind is LogStateKind.CHECKPOINT
+    assert len(recycle) == 2
 
 
 def test_evicted_parent_refreshes_older_ghost_child_prefix() -> None:
@@ -130,10 +182,12 @@ def test_parent_refreshes_only_its_recycled_descendants() -> None:
             (LogStateKind.LOG, 4, 8),
         ]
     assert recycle.match(other, start=0, granularity=1).branch is other_before.branch
-    assert recycle.used_bytes == sum(branch.bytes for branch in recycle._branches.values())
+    records = [recycle.match(tokens, start=0, granularity=1).branch
+               for tokens in (first, second, other, prefix)]
+    assert recycle.used_bytes == sum(branch.bytes for branch in records)
 
 
-def test_parent_refresh_discards_descendant_spanning_its_boundary() -> None:
+def test_short_parent_snapshot_preserves_a_complete_checkpoint_branch() -> None:
     tokens = torch.arange(8, dtype=torch.int32)
     old_tree = make_tree()
     leaf = old_tree.insert(tokens, tokens + 100, (
@@ -148,8 +202,10 @@ def test_parent_refresh_discards_descendant_spanning_its_boundary() -> None:
     )).node
     recycle.remember(new_tree, parent)
 
-    assert tuple(tokens.tolist()) not in recycle._branches
-    assert recycle.used_bytes == sum(branch.bytes for branch in recycle._branches.values())
+    hit = recycle.match(tokens, start=0, granularity=1)
+    assert hit is not None and hit.matched_len == 8
+    assert hit.branch.entries[0].end == 8
+    assert len(recycle) == 2
 
 
 def test_sorted_recycle_index_finds_longest_prefix() -> None:
@@ -175,105 +231,32 @@ def test_sorted_recycle_index_finds_longest_prefix() -> None:
         assert (0 if hit is None else hit.matched_len) == expected
 
 
-def test_recycled_checkpoint_shape_is_restored_from_new_logs() -> None:
-    tree = make_tree()
+def test_kv_only_snapshot_does_not_erase_a_remembered_layout():
     tokens = torch.arange(8, dtype=torch.int32)
-    original = tree.make_handle(tree.root, 0)
+    tree = make_tree()
     leaf = tree.insert(tokens, tokens + 100, (
-        LogStateEntry(11, LogStateKind.LOG, 0, 4),
-        LogStateEntry(12, LogStateKind.LOG, 4, 8),
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),
     )).node
-    manager = LogStateCacheManager.__new__(LogStateCacheManager)
-    manager.prefix_cache = tree
-    manager.device = torch.device("cpu")
-    manager.page_size = 4
-    manager.granularity = 1
-    manager.analyzer = OnlineAnalysisScheduler(4, 1)
-    manager.resources = SimpleNamespace(
-        linear_state=FramedMHALogStatePool.__new__(FramedMHALogStatePool)
-    )
-    manager._recycle_matches = {0: RecycledMatch(
-        RecycledBranch(
-            tuple(tokens.tolist()),
-            (RecycledEntry(LogStateKind.CHECKPOINT, 0, 8, 2),),
-            frozenset(),
-        ),
-        8,
-    )}
-    manager._recycle_starts = {0: 0}
-    manager._recycle_rebuilt_slots = {0: set()}
-    submitted = []
-    released = []
-    manager._construct = lambda restores, plans: submitted.extend(plans)
-    manager._return_slots = lambda pages, states: released.extend(states.tolist())
-    req = SimpleNamespace(table_idx=0, cache_handle=original, input_ids=tokens)
-    pages = (_LivePage(0, 4, 100, 11), _LivePage(4, 8, 104, 12))
-
-    with patch.object(FramedMHALogStatePool, "materialize") as materialize:
-        manager._restore_recycled_layout(req, leaf, 0, 8, 0, pages)
-
-    assert len(submitted) == 1
-    assert tuple(entry.slot for entry in submitted[0].replay_logs) == (11, 12)
-    assert released == [11]
-    materialize.assert_called_once_with(12)
-    assert tree.matched_entries(leaf) == (
-        LogStateEntry(12, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),
-    )
-    tree.check_integrity()
+    recycle = LogStateRecycleBin(4096)
+    recycle.remember(tree, leaf)
+    tree.detach_entry(1)
+    recycle.remember(tree, leaf)
+    hit = recycle.match(tokens, start=0, granularity=1)
+    assert hit is not None and hit.branch.entries[0].span_pages == 2
 
 
-def test_recycled_checkpoint_waits_for_later_prefill_chunk() -> None:
-    tree = make_tree()
+def test_recycled_owner_statistics_are_immutable_cpu_metadata():
+    from collections import deque
+    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+
     tokens = torch.arange(8, dtype=torch.int32)
-    first = tree.insert(tokens[:4], tokens[:4] + 100, (
-        LogStateEntry(11, LogStateKind.LOG, 0, 4),
-    )).node
-    manager = LogStateCacheManager.__new__(LogStateCacheManager)
-    manager.prefix_cache = tree
-    manager.device = torch.device("cpu")
-    manager.page_size = 4
-    manager.granularity = 1
-    manager.analyzer = OnlineAnalysisScheduler(4, 1)
-    manager.resources = SimpleNamespace(
-        linear_state=FramedMHALogStatePool.__new__(FramedMHALogStatePool)
-    )
-    manager._recycle_matches = {0: RecycledMatch(
-        RecycledBranch(
-            tuple(tokens.tolist()),
-            (RecycledEntry(LogStateKind.CHECKPOINT, 0, 8, 2),),
-            frozenset(),
-        ),
-        8,
-    )}
-    manager._recycle_starts = {0: 0}
-    manager._recycle_rebuilt_slots = {0: set()}
-    submitted = []
-    manager._construct = lambda restores, plans: submitted.extend(plans)
-    manager._return_slots = lambda pages, states: None
-    first_req = SimpleNamespace(
-        table_idx=0, cache_handle=tree.make_handle(tree.root, 0),
-        input_ids=tokens[:4],
-    )
-    with patch.object(FramedMHALogStatePool, "materialize") as materialize:
-        manager._restore_recycled_layout(
-            first_req, first, 0, 4, 0, (_LivePage(0, 4, 100, 11),)
-        )
-        assert not submitted
-        assert not materialize.called
-        assert manager._unmaterialized_recycle_slots() == frozenset({11})
-        second_handle = tree.make_handle(first, 4)
-        second = tree.insert(tokens, tokens + 100, (
-            LogStateEntry(12, LogStateKind.LOG, 4, 8),
-        ), cache_len=8).node
-        second_req = SimpleNamespace(
-            table_idx=0, cache_handle=second_handle, input_ids=tokens,
-        )
-        manager._restore_recycled_layout(
-            second_req, second, 4, 8, 4, (_LivePage(4, 8, 104, 12),)
-        )
-    assert len(submitted) == 1
-    assert tuple(entry.slot for entry in submitted[0].replay_logs) == (11, 12)
-    assert tree.matched_entries(second) == (
-        LogStateEntry(12, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),
-    )
-    assert not manager._unmaterialized_recycle_slots()
+    tree = make_tree()
+    leaf = tree.insert(tokens, tokens + 100).node
+    leaf.merge_stats = LogStateMergeStats(0, 8, 6, deque([2, 4]), 12)
+    recycle = LogStateRecycleBin(4096)
+    recycle.remember(tree, leaf)
+    leaf.merge_stats.hit_positions.clear()
+    leaf.merge_stats.intensity = 2
+    hit = recycle.match(tokens, start=0, granularity=1)
+    assert hit.branch.merge_stats == (0, 8, 6, 12, 2, 4)
+    assert recycle.used_bytes == hit.branch.bytes

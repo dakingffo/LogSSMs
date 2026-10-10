@@ -12,7 +12,7 @@ import triton.language as tl
 from .index import prepare_chunk_indices
 from .runtime import fla_cache_autotune
 from .op import exp2
-from .runtime import autotune_cache_kwargs, check_shared_mem
+from .runtime import autotune_cache_kwargs
 
 
 @triton.heuristics({

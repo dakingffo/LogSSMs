@@ -3,6 +3,118 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
+
+
+@triton.jit(do_not_specialize=["TOKENS", "ROWS", "Q_BATCH_STRIDE", "K_BATCH_STRIDE",
+                             "V_BATCH_STRIDE", "G_BATCH_STRIDE", "B_BATCH_STRIDE"])
+def _prepare_gdn_kernel(
+    query, key, value, gate, beta, A_log, dt_bias,
+    q_out, k_out, v_out, gate_out, beta_out,
+    Q_BATCH_STRIDE, Q_TOKEN_STRIDE: tl.constexpr,
+    Q_HEAD_STRIDE: tl.constexpr, Q_DIM_STRIDE: tl.constexpr,
+    K_BATCH_STRIDE, K_TOKEN_STRIDE: tl.constexpr,
+    K_HEAD_STRIDE: tl.constexpr, K_DIM_STRIDE: tl.constexpr,
+    V_BATCH_STRIDE, V_TOKEN_STRIDE: tl.constexpr,
+    V_HEAD_STRIDE: tl.constexpr, V_DIM_STRIDE: tl.constexpr,
+    G_BATCH_STRIDE, G_TOKEN_STRIDE: tl.constexpr, G_HEAD_STRIDE: tl.constexpr,
+    B_BATCH_STRIDE, B_TOKEN_STRIDE: tl.constexpr, B_HEAD_STRIDE: tl.constexpr,
+    A_STRIDE: tl.constexpr, DT_STRIDE: tl.constexpr,
+    TOKENS, KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr,
+    KEY_DIM: tl.constexpr, VALUE_DIM: tl.constexpr, ROWS,
+    PACKED: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_DIM: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    columns = tl.arange(0, BLOCK_DIM)
+    head = rows % VALUE_HEADS
+    key_head = head // (VALUE_HEADS // KEY_HEADS)
+    if PACKED:
+        token = rows // VALUE_HEADS
+        batch = tl.full((BLOCK_ROWS,), 0, tl.int64)
+    else:
+        token = (rows // VALUE_HEADS) % TOKENS
+        batch = (rows // (VALUE_HEADS * TOKENS)).to(tl.int64)
+    active = rows < ROWS
+    key_mask = active[:, None] & (columns[None, :] < KEY_DIM)
+    q = tl.load(
+        query + batch[:, None] * Q_BATCH_STRIDE + token[:, None] * Q_TOKEN_STRIDE
+        + key_head[:, None] * Q_HEAD_STRIDE + columns[None, :] * Q_DIM_STRIDE,
+        key_mask, other=0,
+    ).to(tl.float32)
+    k = tl.load(
+        key + batch[:, None] * K_BATCH_STRIDE + token[:, None] * K_TOKEN_STRIDE
+        + key_head[:, None] * K_HEAD_STRIDE + columns[None, :] * K_DIM_STRIDE,
+        key_mask, other=0,
+    ).to(tl.float32)
+    q *= tl.rsqrt(tl.sum(q * q, 1) + 1e-6)[:, None]
+    k *= tl.rsqrt(tl.sum(k * k, 1) + 1e-6)[:, None]
+    tl.store(q_out + rows[:, None].to(tl.int64) * KEY_DIM + columns[None, :], q, key_mask)
+    tl.store(k_out + rows[:, None].to(tl.int64) * KEY_DIM + columns[None, :], k, key_mask)
+    value_mask = active[:, None] & (columns[None, :] < VALUE_DIM)
+    v = tl.load(
+        value + batch[:, None] * V_BATCH_STRIDE + token[:, None] * V_TOKEN_STRIDE
+        + head[:, None] * V_HEAD_STRIDE + columns[None, :] * V_DIM_STRIDE,
+        value_mask, other=0,
+    )
+    tl.store(v_out + rows[:, None].to(tl.int64) * VALUE_DIM + columns[None, :], v, value_mask)
+    g = tl.load(gate + batch * G_BATCH_STRIDE + token * G_TOKEN_STRIDE + head * G_HEAD_STRIDE,
+                active, other=0).to(tl.float32)
+    b = tl.load(beta + batch * B_BATCH_STRIDE + token * B_TOKEN_STRIDE + head * B_HEAD_STRIDE,
+                active, other=0).to(tl.float32)
+    a = tl.load(A_log + head * A_STRIDE, active, other=0).to(tl.float32)
+    bias = tl.load(dt_bias + head * DT_STRIDE, active, other=0).to(tl.float32)
+    g += bias
+    # Match Torch softplus's threshold and preserve small negative-tail values.
+    softplus = tl.where(g > 20.0, g, libdevice.log1p(tl.exp(tl.minimum(g, 20.0))))
+    tl.store(gate_out + rows, -tl.exp(a) * softplus, active)
+    tl.store(beta_out + rows, tl.sigmoid(b), active)
+
+
+def prepare_gdn(
+    query  : torch.Tensor,
+    key    : torch.Tensor,
+    value  : torch.Tensor,
+    gate   : torch.Tensor,
+    beta   : torch.Tensor,
+    A_log  : torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare strided [B, T, H, D] GDN views in one launch.
+
+    Outputs are contiguous, Q/K heads are expanded to V heads, and Q/K keep
+    their input dtype. Gate is per-token FP32 log-decay; beta is FP32 sigmoid.
+    """
+    assert query.is_cuda and query.ndim == key.ndim == value.ndim == 4
+    batch_size, tokens, key_heads, key_dim = query.shape
+    value_heads, value_dim = value.shape[2:]
+    assert key.shape == query.shape and value.shape[:2] == query.shape[:2]
+    assert key_heads > 0 and value_heads % key_heads == 0
+    assert gate.shape == beta.shape == (batch_size, tokens, value_heads)
+    assert A_log.shape == dt_bias.shape == (value_heads,)
+    assert query.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    for tensor in (key, value):
+        assert tensor.dtype == query.dtype and tensor.device == query.device
+    for tensor in (gate, beta, A_log, dt_bias):
+        assert tensor.device == query.device
+        assert tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    q_out = torch.empty((batch_size, tokens, value_heads, key_dim), device=query.device, dtype=query.dtype)
+    k_out = torch.empty_like(q_out)
+    v_out = torch.empty(value.shape, device=value.device, dtype=value.dtype)
+    gate_out = torch.empty(gate.shape, device=gate.device, dtype=torch.float32)
+    beta_out = torch.empty_like(gate_out)
+    rows = batch_size * tokens * value_heads
+    if rows:
+        block_dim = triton.next_power_of_2(max(key_dim, value_dim))
+        _prepare_gdn_kernel[(triton.cdiv(rows, 4),)](
+            query, key, value, gate, beta, A_log, dt_bias,
+            q_out, k_out, v_out, gate_out, beta_out,
+            *query.stride(), *key.stride(), *value.stride(), *gate.stride(), *beta.stride(),
+            A_log.stride(0), dt_bias.stride(0), tokens, key_heads, value_heads,
+            key_dim, value_dim, rows, batch_size == 1, 4, block_dim,
+            num_warps=4, enable_fp_fusion=False,
+        )
+    return q_out, k_out, v_out, gate_out, beta_out
 
 
 @triton.jit

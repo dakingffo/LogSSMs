@@ -6,7 +6,7 @@ import torch
 
 from logssms.utils import torch_dtype
 from logssms.engine import Sampler
-from logssms.models.drafters import BaseDrafterModel, Qwen3_5MTPDrafter
+from logssms.models.drafters import Qwen3_5MTPDrafter
 
 from ...base import EngineBase
 from ..attention import DraftAttentionBackend

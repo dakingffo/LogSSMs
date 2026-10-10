@@ -34,9 +34,14 @@ class LogStateLinearAttentionMetadata(BaseLinearAttentionMetadata):
     conv_write_granules: torch.Tensor | None = None
     log_row_indices    : torch.Tensor | None = None
     checkpoint_slots   : torch.Tensor | None = None
+    checkpoint_conv_granules: torch.Tensor | None = None
     checkpoint_state_indices: torch.Tensor | None = None
+    chunk_write_slots: torch.Tensor | None = None
     checkpoint_snapshot_indices: torch.Tensor | None = None
     conv_write_snapshot_indices: torch.Tensor | None = None
+    log_write_slots    : torch.Tensor | None = None
+    conv_token_slots   : torch.Tensor | None = None
+    conv_token_granules: torch.Tensor | None = None
 
 
 @dataclass
@@ -229,7 +234,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                     position = req.cached_len + index
                     return any(begin <= position < end for begin, end in checkpoint_ranges)
 
-                if checkpoint_by_row:
+                if ranges_by_req:
                     log_rows.extend(
                         offsets[-1] + index for index in range(seq_len)
                         if not is_checkpoint_row(index)
@@ -244,7 +249,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                         item_cpu_ns += perf_counter_ns() - item_start
                 else:
                     first_offset = first_offsets[req_idx]
-                if checkpoint_by_row:
+                if ranges_by_req:
                     selected = [
                         index for index in range(seq_len)
                         if (first_offset + index + 1) % pool.layout.granularity == 0
@@ -260,7 +265,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                     ]
                 if not selected or selected[-1] != seq_len - 1:
                     selected.append(seq_len - 1)
-                if checkpoint_by_row:
+                if ranges_by_req:
                     for row in selected:
                         global_row = row + offsets[-1]
                         snapshot_rows.append(global_row)
@@ -285,6 +290,9 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             metadata.prefill_indices = PackedLinearIndices.from_lengths(
                 [req.extend_len for req in reqs], pool.device, pool.layout.granularity
             )
+            metadata.chunk_write_slots = torch.full(
+                (chunk_offset,), -1, dtype=torch.int32, device=pool.device
+            )
             metadata.cu_seqlens = metadata.prefill_indices.cu_seqlens
             metadata.conv_snapshot_rows = torch.tensor(
                 snapshot_rows, dtype=torch.int64, device=pool.device
@@ -305,21 +313,53 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 metadata.token_offsets.index_select(0, write_rows_tensor)
                 // pool.layout.granularity
             )
-            if checkpoint_slots:
+            if ranges_by_req:
                 metadata.conv_write_snapshot_indices = torch.tensor(
                     write_snapshot_indices, dtype=torch.int64, device=pool.device
                 )
                 metadata.log_row_indices = torch.tensor(
                     log_rows, dtype=torch.int64, device=pool.device
                 )
+            if checkpoint_slots:
                 metadata.checkpoint_slots = torch.tensor(
                     checkpoint_slots, dtype=torch.int32, device=pool.device
                 )
                 metadata.checkpoint_state_indices = torch.tensor(
                     checkpoint_state_indices, dtype=torch.int64, device=pool.device
                 )
+                metadata.chunk_write_slots.index_copy_(
+                    0, metadata.checkpoint_state_indices, metadata.checkpoint_slots
+                )
                 metadata.checkpoint_snapshot_indices = torch.tensor(
                     checkpoint_snapshot_indices, dtype=torch.int64, device=pool.device
+                )
+                metadata.checkpoint_conv_granules = torch.tensor(
+                    [0 if pool.allocator.slot(slot).kind == "work"
+                     else pool.layout.num_granules - 1 for slot in checkpoint_slots],
+                    dtype=torch.int32, device=pool.device,
+                )
+            metadata.log_write_slots = log_slots
+            if metadata.log_row_indices is not None:
+                metadata.log_write_slots = torch.full_like(log_slots, -1)
+                metadata.log_write_slots.index_copy_(
+                    0, metadata.log_row_indices,
+                    log_slots.index_select(0, metadata.log_row_indices),
+                )
+            metadata.conv_token_slots = torch.full_like(log_slots, -1)
+            metadata.conv_token_granules = torch.zeros_like(log_slots)
+            metadata.conv_token_slots.index_copy_(
+                0, write_rows_tensor, metadata.conv_write_slots
+            )
+            metadata.conv_token_granules.index_copy_(
+                0, write_rows_tensor, metadata.conv_write_granules
+            )
+            if metadata.checkpoint_slots is not None:
+                rows = metadata.conv_snapshot_rows.index_select(
+                    0, metadata.checkpoint_snapshot_indices
+                )
+                metadata.conv_token_slots.index_copy_(0, rows, metadata.checkpoint_slots)
+                metadata.conv_token_granules.index_copy_(
+                    0, rows, metadata.checkpoint_conv_granules,
                 )
         batch.linear_attn_metadata = metadata
         if profile:

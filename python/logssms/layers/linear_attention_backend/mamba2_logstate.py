@@ -56,7 +56,7 @@ class Mamba2LogStateBackend(LogStateLinearAttentionBackend, BaseMamba2Backend):
                 states.index_select(0, metadata.checkpoint_state_indices).to(pool.dtype),
             )
             pool.write_conv(
-                metadata.checkpoint_slots, torch.zeros_like(metadata.checkpoint_slots), config.layer_idx,
+                metadata.checkpoint_slots, metadata.checkpoint_conv_granules, config.layer_idx,
                 snapshots.index_select(0, metadata.checkpoint_snapshot_indices),
             )
         pool.write_conv(

@@ -14,7 +14,6 @@ from logssms.message import (
     make_init_message,
 )
 from logssms.speculator import DraftState, HiddenCaptorBase
-from logssms.utils import div_ceil
 
 from .ar import ARManagerBase, ForwardInput
 

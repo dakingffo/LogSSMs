@@ -24,8 +24,10 @@ class LinearAttentionMetadata(BaseLinearAttentionMetadata):
     baseline_slots  : torch.Tensor | None = None
     checkpoint_slots: torch.Tensor | None = None
     checkpoint_chunks: torch.Tensor | None = None
+    chunk_write_slots: torch.Tensor | None = None
     snapshot_rows   : torch.Tensor | None = None
     snapshot_reqs   : torch.Tensor | None = None
+    conv_token_slots: torch.Tensor | None = None
 
 
 @dataclass
@@ -33,9 +35,7 @@ class PackedLinearIndices:
     cu_seqlens      : torch.Tensor
     chunk_indices   : torch.Tensor
     chunk_offsets   : torch.Tensor
-    continuing      : torch.Tensor
     endings         : torch.Tensor
-    ending_sequences: torch.Tensor
     conv_chunks     : torch.Tensor
 
     @classmethod
@@ -46,7 +46,6 @@ class PackedLinearIndices:
         chunk_offsets = [0]
         chunks: list[tuple[int, int]] = []
         conv_chunks: list[tuple[int, int]] = []
-        continuing = []
         endings = []
         for req_idx, length in enumerate(lengths):
             assert length > 0
@@ -55,7 +54,6 @@ class PackedLinearIndices:
             chunk_offsets.append(chunk_offsets[-1] + n_chunks)
             chunks.extend((req_idx, chunk) for chunk in range(n_chunks))
             conv_chunks.extend((req_idx, chunk) for chunk in range((length + 63) // 64))
-            continuing.extend(range(chunk_offsets[-2], chunk_offsets[-1] - 1))
             endings.append(chunk_offsets[-1] - 1)
 
         def tensor(values) -> torch.Tensor:
@@ -65,9 +63,7 @@ class PackedLinearIndices:
             cu_seqlens=tensor(offsets),
             chunk_indices=tensor(chunks),
             chunk_offsets=tensor(chunk_offsets),
-            continuing=tensor(continuing),
             endings=tensor(endings),
-            ending_sequences=tensor(list(range(len(lengths)))),
             conv_chunks=tensor(conv_chunks),
         )
 
@@ -75,9 +71,6 @@ class PackedLinearIndices:
         return {
             "chunk_indices": self.chunk_indices,
             "chunk_offsets": self.chunk_offsets,
-            "continuing": self.continuing,
-            "endings": self.endings,
-            "ending_sequences": self.ending_sequences,
         }
 
 
@@ -180,11 +173,23 @@ class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
             metadata.checkpoint_chunks = torch.tensor(
                 checkpoint_chunks, dtype=torch.int64, device=state_table.device
             )
+            metadata.chunk_write_slots = torch.full(
+                (chunk_offset,), -1, dtype=torch.int64, device=state_table.device
+            )
+            metadata.chunk_write_slots.index_copy_(
+                0, metadata.checkpoint_chunks, metadata.checkpoint_slots
+            )
             metadata.snapshot_rows = torch.tensor(
                 snapshot_rows, dtype=torch.int64, device=state_table.device
             )
             metadata.snapshot_reqs = torch.tensor(
                 snapshot_reqs, dtype=torch.int64, device=state_table.device
+            )
+            metadata.conv_token_slots = torch.full(
+                (token_offset,), -1, dtype=torch.int64, device=state_table.device
+            )
+            metadata.conv_token_slots.index_copy_(
+                0, metadata.snapshot_rows, metadata.checkpoint_slots
             )
         elif batch.is_verify:
             work_state_table = ctx.work_state_table

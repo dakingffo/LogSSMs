@@ -7,7 +7,6 @@
 
 import os
 
-FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv('FLA_CACHE_RESULTS', '1') == '1'
 
 FLA_DISABLE_TENSOR_CACHE = os.getenv('FLA_DISABLE_TENSOR_CACHE', '0') == '1'

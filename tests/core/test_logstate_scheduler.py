@@ -45,7 +45,11 @@ def test_batch_branch_points_match_granule_trie_oracle():
             if len(children) + int(terminals > 0) >= 2 or terminals >= 2:
                 tokens = tuple(value for value in prefix for _ in range(GRANULARITY))
                 expected[tokens] = indices
-        assert scheduler._batch_branch_points(inputs) == expected
+        actual = {
+            tuple(inputs[indices[0]][:position].tolist()): set(indices)
+            for position, *indices in scheduler._batch_branch_points(inputs)
+        }
+        assert actual == expected
 
 
 def ids(length: int, begin: int = 0) -> torch.Tensor:
@@ -85,6 +89,27 @@ def test_branch_inside_log_page_restores_work_state_and_protects_page():
     assert recovery.base_checkpoint_slot == 0
     assert recovery.log_slots == (1,)
     assert plan.materialize == ()
+
+
+def test_protection_planning_reuses_the_known_token_match():
+    tree, history = make_history()
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    inputs = [torch.cat((history[:80], ids(32, 1000))),
+              torch.cat((history[:80], ids(32, 2000)))]
+    traces = [tree.trace(values) for values in inputs]
+    with patch.object(tree, "trace", side_effect=AssertionError("duplicate token walk")):
+        protections = scheduler._find_protections(tree, inputs, traces=traces)
+    assert len(protections) == 1
+    assert protections[0].position == 80
+    assert protections[0].request_indices == (0, 1)
+    assert protections[0].trace.matched_len == 80
+
+
+def test_trace_prefix_matches_a_fresh_walk_at_all_recovery_boundaries():
+    tree, history = make_history()
+    trace = tree.trace(history)
+    for position in range(0, len(history) + 1, GRANULARITY):
+        assert tree.trace_prefix(trace, position) == tree.trace(history[:position])
 
 
 def test_branch_at_checkpoint_uses_checkpoint_and_blocks_crossing_coalesce():

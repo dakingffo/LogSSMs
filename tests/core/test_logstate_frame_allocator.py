@@ -1,5 +1,7 @@
 from logssms.cache.logstate_pool.frame_allocator import LogStateFrameAllocator
 from logssms.cache.logstate_pool.layout import LogStateSlotLayout
+import random
+import pytest
 import torch
 
 
@@ -12,6 +14,64 @@ def make_allocator(num_frames: int = 80) -> LogStateFrameAllocator:
         decay_bytes=20,
         num_granules=4,
     )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_lock_frame_cost_matches_bitmap_projection_without_mutation(seed):
+    rng = random.Random(seed)
+    allocator = make_allocator(200)
+    _, logs, states = allocator.reserve(logs=12, states=3)
+    for slot in logs[:3]:
+        allocator.materialize(slot)
+    slots = logs + states
+    for _ in range(100):
+        for slot in slots:
+            allocator.set_reclaimable(slot, bool(rng.randrange(2)))
+        selected = rng.sample(slots, rng.randrange(len(slots) + 1))
+        reclaimable = allocator._reclaimable_slots.copy()
+        before = allocator.projected_free_capacity()[0]
+        cost = allocator.lock_frame_cost(selected)
+        assert allocator._reclaimable_slots == reclaimable
+        assert allocator.projected_free_capacity()[0] == before
+        for slot in selected:
+            allocator.set_reclaimable(slot, False)
+        assert before - allocator.projected_free_capacity()[0] == cost
+        allocator.check_integrity()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("records_per_frame", [1, 2, 5])
+def test_incremental_capacity_matches_full_projection_through_lifecycle(seed, records_per_frame):
+    rng = random.Random(seed)
+    allocator = LogStateFrameAllocator(
+        num_frames=80, frame_bytes=100, payload_bytes=300,
+        conv_snapshot_bytes=80, decay_bytes=100 // records_per_frame,
+        num_granules=4,
+    )
+    for _ in range(500):
+        slots = list(allocator.allocated_slots)
+        action = rng.randrange(6)
+        if action == 0:
+            allocator.reserve(logs=rng.randrange(1, 4))
+        elif action == 1:
+            allocator.reserve(states=1, kv=1)
+        elif action == 2 and slots:
+            slot = rng.choice(slots)
+            allocator.set_reclaimable(slot, slot not in allocator._reclaimable_slots)
+        elif action == 3 and slots:
+            slot = rng.choice(slots)
+            if allocator.slot(slot).kind == "log":
+                allocator.materialize(slot)
+        elif action == 4 and slots:
+            allocator.release_slot(rng.choice(slots))
+        elif action == 5 and allocator.allocated_kv:
+            allocator.release_kv([rng.choice(tuple(allocator.allocated_kv))])
+        projected = allocator.projected_free_capacity(allocator._reclaimable_slots)
+        assert allocator.projected_free_capacity() == projected
+        assert allocator.admissible_pages(evictable_kv_frames=0) == allocator.admissible_pages(
+            evictable_kv_frames=0, evictable_slots=allocator._reclaimable_slots,
+        )
+        allocator.check_integrity()
 
 
 def test_one_frame_pool_with_independent_log_frames():

@@ -437,6 +437,8 @@ class FramedMHALogStatePool(BaseKVCachePool):
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self.device))
         self._retiring_slots.update(slots)
+        for slot in slots:
+            self.allocator.set_reclaimable(slot, True)
         self._retired_releases.append((event, tuple(slots)))
 
     @property

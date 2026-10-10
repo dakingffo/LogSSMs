@@ -75,7 +75,7 @@ def metadata_case(bs, phase, page_size, linear):
     engine.page_table = ctx.page_table
     engine.profiler = SimpleNamespace(enabled=False)
     engine.config = SimpleNamespace(model_config=SimpleNamespace(is_hybrid=True))
-    engine.graph_runner = SimpleNamespace(pad_batch=lambda batch: setattr(batch, "padded_reqs", batch.reqs))
+    engine.decode_graph_runner = SimpleNamespace(pad_batch=lambda batch: setattr(batch, "padded_reqs", batch.reqs))
     engine.attn_backend = object.__new__(FlashInferBackend)
     for name, value in dict(device=device, kvcache=ctx.kv_cache, qo_head_local=4,
                             kv_head_local=1, config=SimpleNamespace(head_dim=32),

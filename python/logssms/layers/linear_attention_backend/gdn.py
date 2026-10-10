@@ -6,60 +6,13 @@ import torch
 import torch.nn.functional as F
 
 from logssms.core import get_global_ctx
-from logssms.kernel import store_state
+from logssms.kernel import prepare_gdn, store_state
 from .base import BaseGatedDeltaBackend
 from .standard import StandardLinearAttentionBackend, LinearAttentionMetadata
 
 if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.layers.gated_delta import GatedDeltaConfig
-
-
-def _causal_conv1d_update(
-    hidden_states: torch.Tensor,
-    conv_state   : torch.Tensor,
-    weight       : torch.Tensor,
-) -> torch.Tensor:
-    _, hidden_size, seq_len = hidden_states.shape
-    state_len = conv_state.shape[-1]
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
-    conv_state.copy_(hidden_states_new[:, :, -state_len:])
-    output = F.conv1d(hidden_states_new, weight, groups=hidden_size)
-    return F.silu(output[:, :, -seq_len:]).to(hidden_states.dtype)
-
-
-def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    x_float = x.float()
-    output = x_float * torch.rsqrt(
-        (x_float * x_float).sum(dim=dim, keepdim=True) + eps
-    )
-    return output.to(x.dtype)
-
-
-def _prepare_gdn(
-    query  : torch.Tensor,
-    key    : torch.Tensor,
-    value  : torch.Tensor,
-    gate   : torch.Tensor,
-    beta   : torch.Tensor,
-    A_log  : torch.Tensor,
-    dt_bias: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    repeats = value.shape[2] // query.shape[2]
-    if repeats > 1:
-        query = query.repeat_interleave(repeats, dim=2)
-        key = key.repeat_interleave(repeats, dim=2)
-    query = _l2norm(query)
-    key = _l2norm(key)
-    gate = -A_log.float().exp() * F.softplus(gate.float() + dt_bias)
-    return (
-        query.contiguous(),
-        key.contiguous(),
-        value.contiguous(),
-        gate.contiguous(),
-        beta.float().sigmoid().contiguous(),
-    )
-
 
 
 class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
@@ -103,13 +56,13 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         return (
             query.reshape(
                 mixed_qkv.shape[0], seq_len, -1, config.head_k_dim
-            ).contiguous(),
+            ),
             key.reshape(
                 mixed_qkv.shape[0], seq_len, -1, config.head_k_dim
-            ).contiguous(),
+            ),
             value.reshape(
                 mixed_qkv.shape[0], seq_len, -1, config.head_v_dim
-            ).contiguous(),
+            ),
         )
 
     def _forward_prefill(
@@ -123,9 +76,11 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         config     : GatedDeltaConfig,
         batch      : Batch,
     ) -> torch.Tensor:
-        from logssms.kernel.linear_attention.vendor.fla import chunk_gated_delta_rule
+        from logssms.kernel.linear_attention.vendor.fla import (
+            ChunkStateIO, chunk_gated_delta_rule_to_cache,
+        )
         from logssms.kernel.linear_attention.packed_conv import (
-            packed_causal_conv1d, packed_conv_snapshots,
+            PackedConvStateIO, packed_causal_conv1d,
         )
 
         ctx = get_global_ctx()
@@ -138,6 +93,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         assert indices is not None and slots is not None
         assert metadata.checkpoint_slots is not None
         assert metadata.checkpoint_chunks is not None
+        assert metadata.chunk_write_slots is not None
         assert metadata.snapshot_rows is not None
         assert metadata.snapshot_reqs is not None
         live = slots >= 0
@@ -147,22 +103,17 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         conv_history = torch.where(
             live[:, None, None], conv_history, 0
         )
-        initial_states = pool.recurrent_state[:, layer_idx].index_select(
-            0, slots.clamp_min(0)
-        )
-        initial_states = torch.where(
-            live[:, None, None, None], initial_states, 0
-        )
-        conv_snapshots = packed_conv_snapshots(
-            mixed_qkv, conv_history, indices.cu_seqlens,
-            metadata.snapshot_rows, metadata.snapshot_reqs,
-        )
+        assert metadata.conv_token_slots is not None
         mixed_qkv = packed_causal_conv1d(
             mixed_qkv, conv_weight, conv_history,
             indices.cu_seqlens, indices.conv_chunks,
+            state_io=PackedConvStateIO(
+                storage=pool.conv_state, slots=metadata.conv_token_slots,
+                layer=layer_idx,
+            ),
         ).unsqueeze(0)
         query, key, value = self._split_qkv(mixed_qkv, config)
-        query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
+        query, key, value, prepared_gate, prepared_beta = prepare_gdn(
             query,
             key,
             value,
@@ -171,26 +122,20 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
             A_log,
             dt_bias,
         )
-        output, _final_state, chunk_states = chunk_gated_delta_rule(
+        output, _ = chunk_gated_delta_rule_to_cache(
             query,
             key,
             value,
             prepared_gate,
             prepared_beta,
-            initial_states,
+            ChunkStateIO(
+                storage=pool.recurrent_state,
+                read_slots=slots,
+                chunk_write_slots=metadata.chunk_write_slots,
+                layer=layer_idx,
+            ),
             indices.cu_seqlens,
             **indices.fla_kwargs(),
-        )
-
-        store_state(
-            pool.conv_state[:, layer_idx],
-            metadata.checkpoint_slots,
-            conv_snapshots,
-        )
-        store_state(
-            pool.recurrent_state[:, layer_idx],
-            metadata.checkpoint_slots,
-            chunk_states.index_select(0, metadata.checkpoint_chunks).to(pool.recurrent_state.dtype),
         )
         return output.squeeze(0)
 

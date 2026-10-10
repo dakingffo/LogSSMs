@@ -1,4 +1,4 @@
-from .fused import qk_norm_rope_store, sigmoid_and_mul
+from .fused import prepare_gdn, qk_norm_rope_store, sigmoid_and_mul
 from .index import indexing
 from .moe import fused_moe_kernel_triton, moe_sum_reduce_triton
 from .norm import rms_norm_gated
@@ -15,4 +15,5 @@ __all__ = [
     "rms_norm_gated",
     "sigmoid_and_mul",
     "qk_norm_rope_store",
+    "prepare_gdn",
 ]

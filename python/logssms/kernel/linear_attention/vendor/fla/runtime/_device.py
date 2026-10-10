@@ -6,7 +6,6 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import contextlib
-import functools
 import logging
 import os
 import platform
@@ -79,20 +78,6 @@ def check_pytorch_version(version_s: str = '2.4') -> bool:
 
 
 @cache
-def get_multiprocessor_count(tensor_idx: int = 0) -> int:
-    try:
-        return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['multiprocessor_count']
-    except Exception:
-        # Maybe we use a NPU device.
-        try:
-            if triton.runtime.driver.active.get_current_target().backend == 'npu':
-                return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['num_vectorcore']
-        except Exception:
-            logger.debug('Failed to get NPU multiprocessor count, falling back to 1.', exc_info=True)
-        return 1
-
-
-@cache
 def get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
@@ -135,7 +120,6 @@ IS_NVIDIA_BLACKWELL = (IS_NVIDIA and torch.cuda.get_device_capability()[0] in (1
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 IS_TF32_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8)
-IS_GATHER_SUPPORTED = hasattr(triton.language, 'gather')
 IS_TMA_SUPPORTED = (
     IS_NVIDIA
     and torch.cuda.get_device_capability(0)[0] >= 9
@@ -206,8 +190,6 @@ if check_pytorch_version('2.4'):
     if device == 'cpu':
         device = 'cuda'
         device_torch_lib = getattr(torch, device)
-    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
-    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
 
     def custom_device_ctx(index: int):
         if index is None:
@@ -218,8 +200,6 @@ if check_pytorch_version('2.4'):
             return contextlib.nullcontext()
 else:
     assert device == 'cuda', 'Only cuda device is supported for PyTorch version < 2.4.0.'
-    autocast_custom_fwd = device_torch_lib.amp.custom_fwd
-    autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 
     def custom_device_ctx(index: int):
         if index is None:

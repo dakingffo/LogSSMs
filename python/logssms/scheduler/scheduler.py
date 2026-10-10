@@ -82,7 +82,9 @@ class Scheduler(SchedulerIOMixin):
 
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
-        self.prefill_manager = PrefillManager(self.token_pool, config.page_size)
+        self.prefill_manager = PrefillManager(
+            self.token_pool, config.page_size, self.cache_manager,
+        )
         self.prefill_budget = config.max_prefill_tokens
         self.profiler = SchedulerProfiler(
             self.device, self.cache_manager,
@@ -262,18 +264,23 @@ class Scheduler(SchedulerIOMixin):
         adder = PrefillAdder(
             token_budget=self.prefill_budget,
             reserved_size=(
-                self.ar_manager.need_tokens
-                + self.prefill_manager.need_tokens
+                self.ar_manager.need_capacity
+                + self.prefill_manager.need_capacity
             ),
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            profiler=self.profiler if self.profiler.enabled else None,
         )
-        with self.profiler.record_schedule():
-            batch = self.prefill_manager.schedule_next_batch(adder)
+        with self.profiler.record_schedule() as schedule:
+            with self.profiler.record_schedule_step("prefill_select"):
+                batch = self.prefill_manager.schedule_next_batch(adder)
             if batch is not None:
                 self.ar_manager.on_prefill_scheduled()
             else:
-                batch = self.ar_manager.schedule_next_batch()
+                with self.profiler.record_schedule_step("ar_select"):
+                    batch = self.ar_manager.schedule_next_batch()
+            if schedule is not None and batch is not None:
+                schedule["phase"] = batch.phase
         if batch is None:
             if self.ar_manager.runnable and not self.prefill_manager.runnable:
                 self.profiler.record_ar_no_batch()
@@ -281,7 +288,7 @@ class Scheduler(SchedulerIOMixin):
                 self._report_stall(adder)
             return None
 
-        graph_used = batch.is_decode and self.engine.graph_runner.can_use_cuda_graph(batch)
+        graph_used = batch.is_decode and self.engine.decode_graph_runner.can_use_cuda_graph(batch)
         with self.profiler.record_prepare(batch, graph_used=graph_used):
             forward_input = self.engine.prepare_batch(batch, self.cache_manager)
         return forward_input

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 import os
 from time import perf_counter_ns
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Sequence
 import torch
 
 from logssms.core import Request
+from logssms.utils import align_ceil
 
 from .kv_pool.base import BaseKVCachePool
 from .linear_pool.base import LinearCachePool
@@ -59,6 +61,12 @@ class BaseCacheManager(ABC):
         self._profile_lifecycle_events: list[dict] = []
         self._profile_arrivals: dict[int, dict] = {}
         self._profile_completed_sessions: dict[str, dict] = {}
+        self._schedule_profile_step = None
+
+    def record_schedule_step(self, name: str):
+        if self._schedule_profile_step is None:
+            return nullcontext()
+        return self._schedule_profile_step(name)
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -87,16 +95,46 @@ class BaseCacheManager(ABC):
     def unlock(self, handle: BaseCacheHandle) -> None:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
+    def prepare_prefill_requests(self, reqs: Sequence[PendingRequest]) -> None:
+        return None
+
+    def reservation_size(
+        self,
+        token_len: int,
+        *,
+        handle   : BaseCacheHandle | None = None,
+        table_idx: int | None = None,
+    ) -> int:
+        return align_ceil(token_len, self.page_size)
+
+    @property
+    def admission_capacity(self) -> int:
+        return self.available_size
+
     def prefill_acquire(
         self,
         total_len  : int,
         handle     : BaseCacheHandle,
         request_len: int | None = None,
     ) -> bool:
-        if total_len > self.available_size:
+        if self._schedule_profile_step is not None:
+            with self.record_schedule_step("capacity_before_lock"):
+                available = self.admission_capacity
+            if total_len > available:
+                return False
+            with self.record_schedule_step("lock_handle"):
+                self.lock(handle)
+            with self.record_schedule_step("capacity_after_lock"):
+                available = self.admission_capacity
+            if total_len > available:
+                with self.record_schedule_step("unlock_rejected_handle"):
+                    self.unlock(handle)
+                return False
+            return True
+        if total_len > self.admission_capacity:
             return False
         self.lock(handle)
-        if total_len > self.available_size:
+        if total_len > self.admission_capacity:
             self.unlock(handle)
             return False
         return True

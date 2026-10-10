@@ -9,7 +9,6 @@ from logssms.kernel.linear_attention.vendor.fla import (
     fused_recurrent_gated_delta_rule,
 )
 from logssms.layers import GatedDeltaNet
-from logssms.layers.linear_attention_backend.gdn import _l2norm
 from logssms.models.config import RotaryConfig
 from logssms.models.qwen3_next import Qwen3_5Config
 from logssms.utils import torch_dtype
@@ -69,8 +68,8 @@ def test_batched_kernel_matches_torch(shape, fused_gates):
     state_pool = torch.empty(B * S, H, K, V, device=device, dtype=torch.bfloat16)
 
     expected_output, expected_states = _recurrent_gated_delta_rule_with_snapshots(
-        _l2norm(query),
-        _l2norm(key),
+        (query.float() * torch.rsqrt(query.float().square().sum(-1, keepdim=True) + 1e-6)).to(query),
+        (key.float() * torch.rsqrt(key.float().square().sum(-1, keepdim=True) + 1e-6)).to(key),
         value,
         -torch.nn.functional.softplus(gate.float()),
         beta.sigmoid(),

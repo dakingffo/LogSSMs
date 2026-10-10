@@ -6,9 +6,8 @@ import torch
 
 from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
 from logssms.core import get_global_ctx
-from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
+from logssms.kernel import prepare_gdn
 from .base import BaseGatedDeltaBackend
-from .gdn import _prepare_gdn
 from .logstate import LogStateLinearAttentionBackend, LogStateLinearAttentionMetadata
 
 if TYPE_CHECKING:
@@ -72,13 +71,13 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         return (
             query.reshape(
                 mixed_qkv.shape[0], seq_len, -1, config.head_k_dim
-            ).contiguous(),
+            ),
             key.reshape(
                 mixed_qkv.shape[0], seq_len, -1, config.head_k_dim
-            ).contiguous(),
+            ),
             value.reshape(
                 mixed_qkv.shape[0], seq_len, -1, config.head_v_dim
-            ).contiguous(),
+            ),
         )
 
     def _forward_prefill(
@@ -94,10 +93,10 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         metadata   : LogStateLinearAttentionMetadata,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
-            chunk_gated_delta_rule_with_log,
+            ChunkLogIO, ChunkStateIO, chunk_gated_delta_rule_to_cache,
         )
         from logssms.kernel.linear_attention.packed_conv import (
-            packed_causal_conv1d, packed_conv_snapshots,
+            PackedConvStateIO, packed_causal_conv1d,
         )
 
         pool = get_global_ctx().linear_state
@@ -105,24 +104,28 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         layer_idx = config.layer_idx
         assert metadata.cu_seqlens is not None
         assert metadata.prefill_indices is not None
-        assert metadata.conv_snapshot_rows is not None
-        assert metadata.conv_snapshot_reqs is not None
-        assert metadata.conv_final_rows is not None
-        assert metadata.conv_write_slots is not None
-        assert metadata.conv_write_granules is not None
+        assert metadata.chunk_write_slots is not None
+        # Snapshot input history before any conv program updates the work slot.
         conv_history = pool.read_conv(
             metadata.conv_read_slots, metadata.conv_read_granules, layer_idx
         )
-        conv_snapshots = packed_conv_snapshots(
-            mixed_qkv, conv_history, metadata.cu_seqlens,
-            metadata.conv_snapshot_rows, metadata.conv_snapshot_reqs,
-        )
+        assert metadata.conv_token_slots is not None
+        assert metadata.conv_token_granules is not None
+        assert metadata.log_write_slots is not None
         mixed_qkv = packed_causal_conv1d(
             mixed_qkv, conv_weight, conv_history,
             metadata.cu_seqlens, metadata.prefill_indices.conv_chunks,
+            state_io=PackedConvStateIO(
+                storage=pool.storage.view(pool.dtype),
+                slots=metadata.conv_token_slots,
+                granules=metadata.conv_token_granules,
+                final_slots=metadata.work_slots,
+                frame_table=pool.conv_frame_table, frame_bytes=pool.frame_bytes,
+                layer=layer_idx,
+            ),
         ).unsqueeze(0)
         query, key, value = self._split_qkv(mixed_qkv, config)
-        query, key, value, prepared_gate, prepared_beta = _prepare_gdn(
+        query, key, value, prepared_gate, prepared_beta = prepare_gdn(
             query,
             key,
             value,
@@ -131,64 +134,35 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
             A_log,
             dt_bias,
         )
-        output, final_state, chunk_states, residual_value = (
-            chunk_gated_delta_rule_with_log(
+        output, _ = (
+            chunk_gated_delta_rule_to_cache(
                 query,
                 key,
                 value,
                 prepared_gate,
                 prepared_beta,
-                pool.read_states(metadata.work_slots, layer_idx),
+                ChunkStateIO(
+                    storage=pool.storage.view(pool.dtype),
+                    read_slots=metadata.work_slots,
+                    chunk_write_slots=metadata.chunk_write_slots,
+                    final_write_slots=metadata.work_slots,
+                    payload_frames=pool.payload_frame_table,
+                    frame_bytes=pool.frame_bytes,
+                    head_payload_bytes=pool.head_payload_bytes,
+                    layer=layer_idx,
+                ),
                 metadata.cu_seqlens,
                 chunk_size=pool.layout.granularity,
+                log_io=ChunkLogIO(
+                    slots=metadata.log_write_slots,
+                    token_offsets=metadata.token_offsets,
+                    decay_frames=pool.decay_frame_table,
+                    gate=prepared_gate,
+                    page_size=pool.page_size,
+                    decay_record_bytes=pool.layout.log_decay_bytes,
+                ),
                 **metadata.prefill_indices.fla_kwargs(),
             )
-        )
-        log_rows = metadata.log_row_indices
-        log_decays = prepared_gate.squeeze(0)
-        if log_rows is None:
-            log_slots = metadata.log_slots
-            token_offsets = metadata.token_offsets
-            log_keys = key.squeeze(0)
-            log_values = residual_value.squeeze(0)
-        else:
-            log_slots = metadata.log_slots.index_select(0, log_rows)
-            token_offsets = metadata.token_offsets.index_select(0, log_rows)
-            log_keys = key.squeeze(0).index_select(0, log_rows)
-            log_values = residual_value.squeeze(0).index_select(0, log_rows)
-            log_decays = log_decays.index_select(0, log_rows)
-        store_framed_log_states(
-            pool,
-            log_slots, token_offsets, log_keys, log_values, log_decays,
-            layer_idx,
-        )
-        pool.write_states(metadata.work_slots, layer_idx, final_state.to(pool.dtype))
-        if metadata.checkpoint_slots is not None:
-            assert metadata.checkpoint_state_indices is not None
-            pool.write_states(
-                metadata.checkpoint_slots, layer_idx,
-                chunk_states.index_select(0, metadata.checkpoint_state_indices).to(pool.dtype),
-            )
-        pool.write_conv(
-            metadata.conv_write_slots,
-            metadata.conv_write_granules,
-            layer_idx,
-            conv_snapshots if metadata.conv_write_snapshot_indices is None
-            else conv_snapshots.index_select(0, metadata.conv_write_snapshot_indices),
-        )
-        if metadata.checkpoint_slots is not None:
-            assert metadata.checkpoint_snapshot_indices is not None
-            pool.write_conv(
-                metadata.checkpoint_slots,
-                torch.zeros_like(metadata.checkpoint_slots),
-                layer_idx,
-                conv_snapshots.index_select(0, metadata.checkpoint_snapshot_indices),
-            )
-        pool.write_conv(
-            metadata.work_slots,
-            torch.zeros_like(metadata.work_slots),
-            layer_idx,
-            conv_snapshots.index_select(0, metadata.conv_final_rows),
         )
         return output.squeeze(0)
 

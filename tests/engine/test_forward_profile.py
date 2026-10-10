@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from logssms.engine.engine import Engine
-from logssms.engine.graph import GraphCaptureBuffer, GraphRunner
+from logssms.engine.decode_graph import DecodeGraphCaptureBuffer, DecodeGraphRunner
 from logssms.engine.profile import EngineProfiler
 
 
@@ -95,7 +95,8 @@ def test_piecewise_prefill_profile_does_not_use_decode_runner(monkeypatch, profi
     @contextmanager
     def forward_batch(batch): yield
     engine.ctx = SimpleNamespace(forward_batch=forward_batch, prefill_graph_runner=runner)
-    engine.graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
+    engine.prefill_graph_runner = runner
+    engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
     def forward():
         runner.replays += 4
         runner.padded_tokens += 12
@@ -136,7 +137,8 @@ def test_forward_profile_does_not_change_sampling(monkeypatch, phase, enabled):
         calls.append(("reject", logits.shape))
         return torch.tensor([[3, 2]])
     engine.sampler = SimpleNamespace(sample=sample, reject_sample=reject)
-    engine.graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
+    engine.prefill_graph_runner = None
+    engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
     result = engine.forward_batch(_batch(phase), None)
     assert result.next_tokens_gpu.dtype == torch.int32
     assert result.next_tokens_cpu.tolist() == ([[3, 2]] if phase == "verify" else [3])
@@ -148,9 +150,9 @@ def test_forward_profile_does_not_change_sampling(monkeypatch, phase, enabled):
 def test_graph_replay_timings_use_fresh_events_and_do_not_change_output(monkeypatch):
     monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", "1")
     device = torch.device("cuda")
-    runner = object.__new__(GraphRunner)
+    runner = object.__new__(DecodeGraphRunner)
     runner.max_graph_bs = 2
-    runner.buffer = GraphCaptureBuffer(2, 4, device)
+    runner.buffer = DecodeGraphCaptureBuffer(2, 4, device)
     runner.attn_backend = SimpleNamespace(prepare_for_replay=lambda batch: None)
     runner.linear_attn_backend = None
     graph = torch.cuda.CUDAGraph()
@@ -159,7 +161,7 @@ def test_graph_replay_timings_use_fresh_events_and_do_not_change_output(monkeypa
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
         runner.buffer.logits.copy_(runner.buffer.input_ids[:, None].expand(2, 4))
-    runner.graph_map = {2: graph}
+    runner.graphs = {2: graph}
     profiler = EngineProfiler()
     outputs = []
     for value in (7, 11):
