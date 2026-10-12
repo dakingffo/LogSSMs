@@ -16,5 +16,5 @@ def _load_radix_module() -> Module:
 
 
 def fast_compare_key(x: torch.Tensor, y: torch.Tensor) -> int:
-    # compare 2 1-D int cpu tensors for equality
+
     return _load_radix_module().fast_compare_key(x, y)

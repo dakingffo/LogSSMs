@@ -1,6 +1,6 @@
 """Microbenchmark a full LogState decode window's recurrent work traffic.
 
-Runs the production framed recurrent entry point for every token in a window.
+Runs the production logstate recurrent entry point for every token in a window.
 The reported time is CUDA-Graph GPU time per token, excluding conv and model layers.
 """
 
@@ -9,10 +9,10 @@ import argparse
 import torch
 import triton.testing
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
 from logssms.kernel.linear_attention.vendor.fla import (
-    fused_recurrent_gated_delta_rule_to_framed_logstate,
+    fused_recurrent_gated_delta_rule_to_logstate,
 )
 
 
@@ -27,7 +27,7 @@ def main() -> None:
     modes = args.modes.split(",")
     assert all(mode in ("eager", "gemm") for mode in modes)
     for batch_size in map(int, args.batch_sizes.split(",")):
-        pool = FramedMHALogStatePool(
+        pool = MHALogStatePool(
             num_frames=max(256, batch_size * 16), page_size=64,
             granularity=args.granularity,
             num_attention_layers=1, num_kv_heads=1, head_dim=128,
@@ -63,7 +63,7 @@ def main() -> None:
 
             def window() -> None:
                 for token_offsets, counts in zip(offsets, replay_counts):
-                    fused_recurrent_gated_delta_rule_to_framed_logstate(
+                    fused_recurrent_gated_delta_rule_to_logstate(
                         q, k, v, gate, beta, A_log, dt_bias,
                         pool, work, logs, token_offsets, 0, counts,
                         enable_eager_state=mode == "eager",

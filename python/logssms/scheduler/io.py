@@ -118,7 +118,7 @@ class SchedulerIOMixin:
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
-        # broadcast the number of raw messages to all ranks
+
         shutdown = self._shutdown_requested()
         src_tensor = torch.tensor(-1 if shutdown else len(pending_raw_msgs))
         self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
@@ -136,7 +136,7 @@ class SchedulerIOMixin:
         if blocking:
             self._enter_idle()
 
-        # ensure all ranks have the same number of raw messages
+
         dst_tensor = torch.tensor(-1)
         self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
         dst_length = int(dst_tensor.item())
@@ -164,14 +164,6 @@ class SchedulerIOMixin:
         reply: SpeculatorReplyMsg,
         probs: torch.Tensor | None,
     ) -> None:
-        """Rank0 broadcasts a step's draft results to the other TP ranks.
-
-        Only rank0 talks to the drafter (zmq + NCCL); every rank's VerifyManager schedules
-        the same requests, so rank>0 needs the identical SpeculatorReplyMsg + draft_probs to
-        backfill its own DraftState. Mirror of ``_recv_msg_multi_rank0/1``: rank0 PUBs the
-        raw messages and gloo-broadcasts the count; the probs tensor crosses as raw fp32
-        bytes (the drafter side already did the GPU→CPU trip).
-        """
         n = 2 if probs is not None else 1
         src = torch.tensor(n)
         self.tp_cpu_group.broadcast(src, root=0).wait()
@@ -183,7 +175,6 @@ class SchedulerIOMixin:
         self,
         vocab_size: int,
     ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
-        """Non-primary-rank receive side of ``_send_draft_to_ranks``."""
         dst = torch.tensor(-1)
         self.tp_cpu_group.broadcast(dst, root=0).wait()
         n = int(dst.item())

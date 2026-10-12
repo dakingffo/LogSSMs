@@ -2,8 +2,10 @@
 
 namespace logssms {
 
-template <std::size_t page_size, std::size_t head_k_dim, std::size_t head_v_dim>
-struct FramedConstructionKernel {
+template <std::size_t page_size, std::size_t head_k_dim, std::size_t head_v_dim,
+          std::size_t granularity>
+struct LogStateConstructionKernel {
+  static_assert(granularity > 0 && page_size % granularity == 0);
 private:
   struct Views {
     LogStateKernelParams params;
@@ -17,7 +19,8 @@ private:
     std::int64_t num_layers,
     std::int64_t num_heads,
     std::int64_t head_payload_bytes,
-    std::int64_t decay_record_bytes
+    std::int64_t decay_record_bytes,
+    std::int64_t num_key_heads
   ) {
     using namespace host;
     auto num_frames = SymbolicSize{"num_frames"};
@@ -60,8 +63,10 @@ private:
         .head_payload_bytes = head_payload_bytes,
         .decay_record_bytes = decay_record_bytes,
         .page_size = page_size,
+        .granularity = granularity,
         .num_layers = num_layers,
         .num_heads = num_heads,
+        .num_key_heads = num_key_heads,
       },
       .device = device.unwrap(),
     };
@@ -91,12 +96,13 @@ public:
     std::int64_t num_heads,
     std::int64_t head_payload_bytes,
     std::int64_t decay_record_bytes,
+    std::int64_t num_key_heads,
     bool is_bfloat16
   ) {
     using namespace host;
     auto views = verify_views(
       storage, payload_frames, decay_frames,
-      num_layers, num_heads, head_payload_bytes, decay_record_bytes
+      num_layers, num_heads, head_payload_bytes, decay_record_bytes, num_key_heads
     );
     for (const auto tensor : {
            base_slots, task_segment_offsets, log_slots, log_begins,
@@ -151,12 +157,13 @@ public:
     std::int64_t num_heads,
     std::int64_t head_payload_bytes,
     std::int64_t decay_record_bytes,
+    std::int64_t num_key_heads,
     bool is_bfloat16
   ) {
     using namespace host;
     auto views = verify_views(
       storage, payload_frames, decay_frames,
-      num_layers, num_heads, head_payload_bytes, decay_record_bytes
+      num_layers, num_heads, head_payload_bytes, decay_record_bytes, num_key_heads
     );
     for (const auto tensor : {
            base_slots, task_segment_offsets, log_slots, log_begins,
@@ -196,6 +203,39 @@ public:
       );
     }
   }
+
+  static void copy(
+    const tvm::ffi::TensorView storage,
+    const tvm::ffi::TensorView payload_frames,
+    const tvm::ffi::TensorView decay_frames,
+    const tvm::ffi::TensorView sources,
+    const tvm::ffi::TensorView destinations,
+    std::int64_t num_layers, std::int64_t num_heads,
+    std::int64_t head_payload_bytes, std::int64_t decay_record_bytes,
+    std::int64_t num_key_heads, bool is_bfloat16
+  ) {
+    auto views = verify_views(storage, payload_frames, decay_frames,
+      num_layers, num_heads, head_payload_bytes, decay_record_bytes, num_key_heads);
+    verify_vector(sources, views.device);
+    verify_vector(destinations, views.device);
+    host::runtime_assert(sources.size(0) == destinations.size(0));
+    if (sources.size(0) == 0) {
+      return;
+    }
+    LogStateRestoreParams params{};
+    static_cast<LogStateKernelParams&>(params) = views.params;
+    params.base_slots = static_cast<const std::int32_t *>(sources.data_ptr());
+    params.output_slots = static_cast<const std::int32_t *>(destinations.data_ptr());
+    params.num_tasks = sources.size(0);
+    const auto blocks = params.num_tasks * num_layers * num_heads;
+    if (is_bfloat16) {
+      host::LaunchKernel(blocks, 256, views.device)(
+        copy_log_state_kernel<__nv_bfloat16, head_k_dim, head_v_dim>, params);
+    } else {
+      host::LaunchKernel(blocks, 256, views.device)(
+        copy_log_state_kernel<__half, head_k_dim, head_v_dim>, params);
+    }
+  }
 };
 
-} // namespace logssms
+}

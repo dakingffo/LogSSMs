@@ -41,10 +41,10 @@ inline constexpr std::size_t resolve_unit_size(std::size_t x) {
   if (x % (4 * kWarpThreads) == 0) {
     return 4;
   }
-  return 0; // trigger static assert in _get_mem_package
+  return 0;
 }
 
-} // namespace detail
+}
 
 namespace warp {
 
@@ -94,6 +94,6 @@ LOGSSMS_DEVICE void reset(void* __restrict__ dst) {
   }
 }
 
-} // namespace warp
+}
 
-} // namespace logssms::device
+}

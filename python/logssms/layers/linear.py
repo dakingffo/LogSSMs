@@ -9,7 +9,6 @@ from .base import BaseOP
 
 
 class LinearTPImpl(BaseOP):
-    """Real implementation of a linear layer with tensor parallelism."""
 
     def __init__(
         self,
@@ -22,16 +21,12 @@ class LinearTPImpl(BaseOP):
 
     def forward(
         self, 
-        x: torch.Tensor # [N, D]
-    ) -> torch.Tensor: # [N, D']
-        return F.linear(x, self.weight, self.bias) # [N, D] @ [D, D']
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        return F.linear(x, self.weight, self.bias)
 
 
 class LinearReplicated(LinearTPImpl):
-    """
-    Linear layer where weights are replicated (not sharded) across all TP ranks.
-    Each GPU holds the full weight matrix.
-    """
 
     def __init__(
         self,
@@ -49,7 +44,7 @@ class LinearColParallelMerged(LinearTPImpl):
         output_sizes: list[int],
         has_bias    : bool,
     ):
-        # check that all output sizes are divisible by tp_size
+
         tp_info = get_tp_info()
         tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
         tp_output_size = sum(tp_output_sizes)

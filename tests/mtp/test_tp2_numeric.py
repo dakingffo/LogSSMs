@@ -32,6 +32,7 @@ from logssms.distributed import DistributedInfo, set_tp_info
 from logssms.distributed.impl import DistributedCommunicator, DistributedImpl, NoopDistributedImpl
 from logssms.models.config import RotaryConfig
 from logssms.models.qwen3_next import Qwen3_5Config
+from tests.utils import clear_global_ctx
 
 
 # -------------------------------------------------------------------------------------
@@ -313,7 +314,7 @@ def run():
     print("=" * 60)
     print("GatedDeltaNet prefill (out_proj all_reduce)")
     from logssms.cache.linear_pool.state_pool import LinearStatePool
-    from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+    from logssms.core import Batch, Context, Request, set_global_ctx
     from logssms.layers import GatedDeltaNet
 
     def make_gated_delta_net():

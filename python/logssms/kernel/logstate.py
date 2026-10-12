@@ -1,5 +1,3 @@
-"""Batch CPU planning primitives; tree and device resource ownership stay in Python."""
-
 from __future__ import annotations
 
 import functools
@@ -29,7 +27,7 @@ def _pack(rows: Rows) -> torch.Tensor:
         values.extend(row)
     if not values:
         return torch.empty(0, dtype=torch.int64, device="cpu")
-    # frombuffer keeps the array alive; avoid torch.tensor's per-scalar conversion.
+
     return torch.frombuffer(array("q", values), dtype=torch.int64)
 
 
@@ -66,9 +64,10 @@ def eviction_candidates(nodes: Rows) -> list[int]:
 
 
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
-                  occupied: Rows, config: Sequence[int]) -> list[list[int]]:
+                  occupied: Rows, config: Sequence[int], checkpoint_pairs: Rows) -> list[list[int]]:
     return _unpack(_load_logstate_module().plan_eviction(
         _pack(nodes), _pack(kv), _pack(node_slots), _pack(slots), _pack(occupied), config,
+        _pack(checkpoint_pairs),
     ))
 
 

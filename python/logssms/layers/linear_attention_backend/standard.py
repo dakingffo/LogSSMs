@@ -93,7 +93,6 @@ class LinearAttentionCaptureData:
         )
 
 
-
 class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
     def __init__(self) -> None:
         self.capture: LinearAttentionCaptureData | None = None

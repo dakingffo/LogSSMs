@@ -10,12 +10,6 @@ logger = init_logger(__name__)
 
 
 class DraftAttentionBackend:
-    """One-query paged attention over ``DraftKVPool``.
-
-    The FlashInfer adapter deliberately consumes only Q, physical page indices and the
-    drafter pool. It does not construct a fake target ``Batch`` or touch global ``Context``.
-    Non-FlashInfer configurations retain the numerically equivalent eager implementation.
-    """
 
     def __init__(
         self,
@@ -96,8 +90,7 @@ class DraftAttentionBackend:
             [indices[i, :length] for i, length in enumerate(cache_lens)]
         ).contiguous()
 
-        # FlashInfer reuses pinned staging storage internally.  Do not let the next plan
-        # mutate it before this plan's asynchronous H2D transfer has completed.
+
         self.last_event.synchronize()
         self._plan_inputs = (seq_lens, indptr, last_page_len, flat_indices)
         self.wrapper.plan(
@@ -150,11 +143,6 @@ class DraftAttentionBackend:
         valid_mask: torch.Tensor,
         cache_lens: list[int],
     ) -> torch.Tensor:
-        """Non-causal attention for a parallel DFlash block.
-
-        Every query in a block sees the complete committed context and every noisy token
-        in the current block, matching DFlash's bidirectional block attention.
-        """
         assert query.ndim == 4
         if self.block_wrapper is None:
             return self._forward_block_eager(query, pool, indices, valid_mask)

@@ -85,7 +85,7 @@ struct PrintAbleSpan {
   std::span<const T> data;
 };
 
-// define DLDataType comparison and printing in root namespace
+
 inline constexpr auto kDeviceStringMap = [] {
   constexpr auto map =
       std::array<std::pair<DLDeviceType, std::string_view>, 16>{
@@ -146,7 +146,7 @@ inline std::ostream& operator<<(std::ostream &os, PrintAbleSpan<T> span) {
   os << "]";
   return os;
 }
-} // namespace detail
+}
 
 inline bool operator==(DLDevice lhs, DLDevice rhs) noexcept {
   return lhs.device_type == rhs.device_type && (
@@ -434,7 +434,7 @@ struct SizeRef : BaseRef<SymbolicSize> {
     if (value != kAnySize) {
       ref_->set_value(value);
     }
-    // otherwise, match any size
+
   }
 };
 
@@ -470,7 +470,7 @@ struct DeviceRef : BaseRef<SymbolicDevice> {
   }
 };
 
-} // namespace detail
+}
 
 struct TensorMatcher {
 private:
@@ -603,7 +603,7 @@ private:
     if (this->_has_strides()) {
       for (std::size_t i = 0; i < dim; i++) {
         if (view.size(i) != 1 || !strides_[i]->has_value()) {
-          // skip stride check for size 1 dimension
+
           strides_[i]->verify(view.stride(i), "stride", i);
         }
       }
@@ -614,7 +614,7 @@ private:
         "Tensor is not contiguous as expected"
       );
     }
-    // since we may double verify, we will force to check
+
     dtype_->verify(view.dtype());
     device_->verify(view.device());
   }
@@ -641,4 +641,4 @@ private:
   bool                 has_device_ = false;
 };
 
-} // namespace logssms::host
+}

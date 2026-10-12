@@ -86,8 +86,8 @@ def _linear_slots_kernel(
         tl.store(output + 2 * count + req, offset, mask=mask)
         tl.store(output + 3 * count + req, 0, mask=mask)
     else:
-        # Dummy decode rows have cached_len=0. Preserve Torch's negative-index
-        # wraparound within the row, never read the preceding request's memory.
+
+
         previous = tl.where(pos > 0, pos - 1, table_width - 1)
         read = tl.load(state_table + row * table_stride + previous, mask=mask, other=0)
         write = tl.load(state_table + row * table_stride + pos, mask=mask, other=0)

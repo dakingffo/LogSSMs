@@ -1,5 +1,3 @@
-"""Inference-only Gated DeltaNet chunk forward derived from FLA 0.5.2."""
-
 from __future__ import annotations
 
 import torch
@@ -29,7 +27,6 @@ def chunk_gated_delta_rule_to_cache(
     *,
     log_io: ChunkLogIO | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read/write persistent states and optional logs, retaining attention workspace."""
     assert query.shape[0] == key.shape[0] == value.shape[0] == 1
     assert chunk_size in (16, 32, 64)
     assert cu_seqlens.ndim == 1
@@ -78,7 +75,7 @@ def chunk_gated_delta_rule_to_cache(
         chunk_size=chunk_size,
     )
 
-    # Keep intra-chunk inputs alive until their dependent launches are enqueued.
+
     del inverse
     return output, value_new
 

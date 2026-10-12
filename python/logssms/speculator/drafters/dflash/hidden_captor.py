@@ -10,7 +10,6 @@ from .config import DFlashSpeculatorConfig
 
 
 class DFlashHiddenCaptor(HiddenCaptorBase):
-    """Capture target layer outputs through the following decoder's input hook."""
 
     def __init__(
         self,

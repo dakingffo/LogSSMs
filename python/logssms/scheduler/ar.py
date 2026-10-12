@@ -33,7 +33,7 @@ class ARManagerBase:
         self.device = device
         self.token_budget = config.decode_batch_budget
         self.running_reqs: dict[int, Request] = {}
-        self.inflight_uids: list[set[int], set[int]] = [set(), set()] # (last, next)
+        self.inflight_uids: list[set[int], set[int]] = [set(), set()]
         self.finished_reqs: set[Request] = set()
 
     @property
@@ -78,15 +78,12 @@ class ARManagerBase:
         req       : Request,
         req_captor: HiddenCaptorBase,
     ) -> None:
-        """Prefill -> AR handoff hook. Decode does not need speculator features."""
         return None
 
     def advance_for_overlap(self, batch: Batch) -> None:
-        """Decode -> decode overlap hook. Verify can not advance for overlap."""
         return None
 
     def on_prefill_scheduled(self) -> None:
-        """Close the AR overlap window when the next submitted batch is prefill."""
         self.inflight_uids[0] = self.inflight_uids[1]
         self.inflight_uids[1] = set()
 
@@ -114,7 +111,7 @@ class ARManagerBase:
                     req.complete_n(1)
 
                 finished = req.max_device_len - (req.device_len - (req.uid in self.inflight_uids[1])) <= 0
-                                                # real device len = devel_len - 1 if inflight
+
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(

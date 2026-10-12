@@ -30,8 +30,8 @@ if source_args.source_root is not None:
 source_paths = [
     "python/logssms/cache/logstate.py",
     "python/logssms/cache/prefix_cache/logstate.py",
-    "python/logssms/cache/logstate_pool/frame_pool.py",
-    "python/logssms/kernel/linear_attention/framed_logstate.py",
+    "python/logssms/cache/logstate_pool/mha_pool.py",
+    "python/logssms/kernel/linear_attention/logstate.py",
     "python/logssms/utils/torch_utils.py",
 ]
 source_blobs = {
@@ -59,7 +59,7 @@ if revision:
 
 from logssms.cache.logstate import LogStateCacheManager, OnlineAnalysisScheduler
 from logssms.cache.prefix_cache.logstate import LogRadixTree, LogStateEntry, LogStateKind
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 
 
 class TreeManager(LogStateCacheManager):
@@ -123,7 +123,7 @@ def run(history, batch_size):
 
 
 def pool_benchmark(device, slots, repeats):
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=2048, page_size=64, granularity=32,
         num_attention_layers=2, num_kv_heads=1, head_dim=32,
         num_linear_layers=2, num_key_heads=2, num_value_heads=2,

@@ -44,13 +44,13 @@ class Scheduler(SchedulerIOMixin):
     ):
         self.engine = Engine(config, speculator_start_event, speculator_ready_event)
         super().__init__(config, self.engine.tp_cpu_group, shutdown_event)
-        # use another stream to overlap metadata processing with computation
+
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
 
-        # initialize other managers
+
         self.config = config
         self.speculator_data_plane = speculator_data_plane
         self.cache_resources = self.engine.cache_resources
@@ -101,7 +101,7 @@ class Scheduler(SchedulerIOMixin):
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         self.profiler.poll()
         blocking = not (
-            last_data is not None  # don't block if we have a batch to be processed
+            last_data is not None
             or self.prefill_manager.runnable
             or self.ar_manager.runnable
         )
@@ -113,7 +113,7 @@ class Scheduler(SchedulerIOMixin):
         )
         ongoing_data = None
         if forward_input is not None:
-            with self.engine_stream_ctx:  # run the batch in the engine's stream
+            with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 batch = forward_input.batch
                 with self.profiler.record_submit(batch):
@@ -159,14 +159,14 @@ class Scheduler(SchedulerIOMixin):
             with self.profiler.record_process_step(phase, "send_result"):
                 self.send_result(reply)
             with self.profiler.record_process_step(phase, "release"):
-                # finished_reqs is a set of identity-hashed Requests. TP ranks must
-                # release them in the same order to keep cache allocation aligned.
+
+
                 for req in sorted(finished_reqs, key=lambda req: req.uid):
                     if ongoing_data is not None and any(
                         candidate is req for candidate in ongoing_data[0].batch.reqs
                     ):
-                        # The next forward was submitted before this result was
-                        # processed. Its graph can still access this request's frames.
+
+
                         self._deferred_req_frees.append((ongoing_data[1], req, False))
                     else:
                         self._free_req_resources(req)
@@ -228,8 +228,8 @@ class Scheduler(SchedulerIOMixin):
                     assert last_data is not None
                     assert submitted_req.table_idx == req.table_idx
                     submitted_req.aborted = True
-                    # The result is discarded, but the submitted forward can
-                    # still read or write these slots until its event completes.
+
+
                     self._deferred_req_frees.append((last_data[1], req, True))
                 else:
                     self._free_req_resources(req, inflight)
@@ -238,7 +238,7 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Request, inflight: bool = False) -> None:
-        if inflight: # The inflight aborted req has been allocated at [cached_len, device_len)
+        if inflight:
             self.cache_manager.free_to_cached(req)
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)

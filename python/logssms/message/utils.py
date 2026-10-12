@@ -18,7 +18,7 @@ def _serialize_any(value: Any) -> Any:
 
 
 def serialize_type(self) -> dict:
-    # find all member variables
+
     serialized = {}
 
     if isinstance(self, torch.Tensor):
@@ -28,7 +28,7 @@ def serialize_type(self) -> dict:
         serialized["dtype"] = str(self.dtype)
         return serialized
 
-    # normal type
+
     serialized["__type__"] = self.__class__.__name__
     for k, v in self.__dict__.items():
         serialized[k] = _serialize_any(v)
@@ -51,7 +51,7 @@ def _deserialize_any(cls_map: dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: dict[str, Type], data: dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
+
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")

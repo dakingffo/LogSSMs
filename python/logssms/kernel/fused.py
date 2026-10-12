@@ -65,7 +65,7 @@ def _prepare_gdn_kernel(
     a = tl.load(A_log + head * A_STRIDE, active, other=0).to(tl.float32)
     bias = tl.load(dt_bias + head * DT_STRIDE, active, other=0).to(tl.float32)
     g += bias
-    # Match Torch softplus's threshold and preserve small negative-tail values.
+
     softplus = tl.where(g > 20.0, g, libdevice.log1p(tl.exp(tl.minimum(g, 20.0))))
     tl.store(gate_out + rows, -tl.exp(a) * softplus, active)
     tl.store(beta_out + rows, tl.sigmoid(b), active)
@@ -80,11 +80,6 @@ def prepare_gdn(
     A_log  : torch.Tensor,
     dt_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare strided [B, T, H, D] GDN views in one launch.
-
-    Outputs are contiguous, Q/K heads are expanded to V heads, and Q/K keep
-    their input dtype. Gate is per-token FP32 log-decay; beta is FP32 sigmoid.
-    """
     assert query.is_cuda and query.ndim == key.ndim == value.ndim == 4
     batch_size, tokens, key_heads, key_dim = query.shape
     value_heads, value_dim = value.shape[2:]
@@ -137,7 +132,7 @@ def _norm_rope(
         weights = tl.load(weight + columns, columns < HEAD_DIM, other=0).to(tl.float32)
         if ZERO_CENTERED:
             weights += 1.0
-        # Preserve the rounding boundary of RMSNorm followed by in-place RoPE.
+
         values = (values * scale * weights).to(source.dtype.element_ty).to(tl.float32)
     half = ROTARY_DIM // 2
     partner = tl.where(columns < half, columns + half, columns - half)
@@ -227,12 +222,6 @@ def qk_norm_rope_store(
     q_zero_centered: bool = False,
     k_zero_centered: bool = False,
 ) -> torch.Tensor:
-    """Normalize/rotate QK and scatter final KV to NHD paged cache in one launch.
-
-    Inputs are strided [T, H, D] projection views; caches are [P, S, Hkv, D],
-    including frame-backed views. Q is returned contiguous, source QKV is unchanged.
-    Negative output locations suppress KV writes (e.g. graph padding).
-    """
     assert query.ndim == key.ndim == value.ndim == 3
     tokens, q_heads, head_dim = query.shape
     assert key.shape == value.shape and key.shape[0] == tokens and key.shape[2] == head_dim

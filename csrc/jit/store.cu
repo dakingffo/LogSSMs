@@ -58,18 +58,18 @@ void store_kv_kernel(
 }
 
 template <
-  std::size_t element_size,          // depends on data type and embedding dim
-  std::size_t num_threads     = 128, // number of threads per block
-  std::size_t max_concurrency = 1,   // max blocks per SM
+  std::size_t element_size,
+  std::size_t num_threads     = 128,
+  std::size_t max_concurrency = 1,
   bool        use_pdl         = false
 >
 struct KVStoreKernel {
   static void run(
-    const tvm::ffi::TensorView k_cache, // [N, H, D]
-    const tvm::ffi::TensorView v_cache, // [N, H, D]
-    const tvm::ffi::TensorView indices, // [T]
-    const tvm::ffi::TensorView k,       // [T, H, D]
-    const tvm::ffi::TensorView v        // [T, H, D]
+    const tvm::ffi::TensorView k_cache,
+    const tvm::ffi::TensorView v_cache,
+    const tvm::ffi::TensorView indices,
+    const tvm::ffi::TensorView k,
+    const tvm::ffi::TensorView v
   ) {
     using namespace host;
 
@@ -186,9 +186,9 @@ template <
 >
 struct StateStoreKernel {
   static void run(
-    const tvm::ffi::TensorView pool,    // [N, ...]
-    const tvm::ffi::TensorView indices, // [T]
-    const tvm::ffi::TensorView states   // [T, ...]
+    const tvm::ffi::TensorView pool,
+    const tvm::ffi::TensorView indices,
+    const tvm::ffi::TensorView states
   ) {
     using namespace host;
 
@@ -248,4 +248,4 @@ struct StateStoreKernel {
   }
 };
 
-} // namespace logssms
+}

@@ -10,33 +10,34 @@ from logssms.tvm import call_cuda_ffi, load_jit, make_cpp_args
 from logssms.utils.torch_utils import make_device_vectors
 
 if TYPE_CHECKING:
-    from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+    from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 
 
 @functools.cache
-def _framed_module(page_size: int, head_k_dim: int, head_v_dim: int):
-    args = make_cpp_args(page_size, head_k_dim, head_v_dim)
+def _load_logstate_module(page_size: int, head_k_dim: int, head_v_dim: int, granularity: int):
+    args = make_cpp_args(page_size, head_k_dim, head_v_dim, granularity)
     return load_jit(
-        "framed_logstate", *args,
-        cuda_files=["framed_logstate.cu"],
-        cuda_wrappers=[("store", f"FramedLogStateKernel<{args}>::store")],
+        "logstate", *args,
+        cuda_files=["logstate.cu"],
+        cuda_wrappers=[("store", f"LogStateKernel<{args}>::store")],
     )
 
 
 @functools.cache
-def _construction_module(page_size: int, head_k_dim: int, head_v_dim: int):
-    args = make_cpp_args(page_size, head_k_dim, head_v_dim)
+def _load_construction_module(page_size: int, head_k_dim: int, head_v_dim: int, granularity: int):
+    args = make_cpp_args(page_size, head_k_dim, head_v_dim, granularity)
     return load_jit(
-        "framed_construction", *args,
-        cuda_files=["framed_construction.cu"],
+        "logstate_construction", *args,
+        cuda_files=["logstate_construction.cu"],
         cuda_wrappers=[
-            ("restore", f"FramedConstructionKernel<{args}>::restore"),
-            ("construct", f"FramedConstructionKernel<{args}>::construct"),
+            ("restore", f"LogStateConstructionKernel<{args}>::restore"),
+            ("construct", f"LogStateConstructionKernel<{args}>::construct"),
+            ("copy", f"LogStateConstructionKernel<{args}>::copy"),
         ],
     )
 
 
-def _construction_args(pool: FramedMHALogStatePool) -> tuple:
+def _construction_args(pool: MHALogStatePool) -> tuple:
     return (
         pool.storage,
         pool.payload_frame_table,
@@ -44,24 +45,25 @@ def _construction_args(pool: FramedMHALogStatePool) -> tuple:
     )
 
 
-def _construction_dims(pool: FramedMHALogStatePool) -> tuple:
+def _construction_dims(pool: MHALogStatePool) -> tuple:
     return (
         pool.layout.num_linear_layers,
         pool.layout.num_value_heads,
         pool.head_payload_bytes,
         pool.layout.log_decay_bytes,
+        pool.layout.num_key_heads,
         pool.dtype == torch.bfloat16,
     )
 
 
-def restore_framed_log_state_chains(
-    pool  : FramedMHALogStatePool,
+def restore_log_state_chains(
+    pool  : MHALogStatePool,
     chains: Sequence[tuple[int | None, Sequence[tuple[int, int, int]], int]],
 ) -> None:
     if not chains:
         return
-    module = _construction_module(
-        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim
+    module = _load_construction_module(
+        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim, pool.layout.granularity
     )
     segments = [entry for _base, logs, _out in chains for entry in logs]
     offsets = [0]
@@ -82,8 +84,8 @@ def restore_framed_log_state_chains(
     )
 
 
-def construct_framed_log_state_chains(
-    pool  : FramedMHALogStatePool,
+def construct_log_state_chains(
+    pool  : MHALogStatePool,
     chains: Sequence[
         tuple[int | None, Sequence[tuple[int, int, int]], Sequence[Sequence[int]]]
     ],
@@ -92,11 +94,16 @@ def construct_framed_log_state_chains(
 ) -> int:
     if not chains:
         return 0
+    if pool.shared_keys:
+        assert all(
+            pool.allocator.slot(slot).kind != "log"
+            for _base, _logs, outputs in chains for slots in outputs for slot in slots
+        ), "Checkpoint output required"
     if max_tasks is None:
         max_tasks = torch.cuda.get_device_properties(pool.device).multi_processor_count
     assert max_tasks > 0
-    module = _construction_module(
-        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim
+    module = _load_construction_module(
+        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim, pool.layout.granularity
     )
     for task_begin in range(0, len(chains), max_tasks):
         group = chains[task_begin:task_begin + max_tasks]
@@ -128,8 +135,8 @@ def construct_framed_log_state_chains(
     return 0
 
 
-def store_framed_log_states(
-    pool           : FramedMHALogStatePool,
+def store_log_states(
+    pool           : MHALogStatePool,
     slots          : torch.Tensor,
     token_offsets  : torch.Tensor,
     keys           : torch.Tensor,
@@ -137,12 +144,11 @@ def store_framed_log_states(
     decays         : torch.Tensor,
     layer          : int,
 ) -> None:
-    """Store rank-one update factors K/V and FP32 logarithmic decays."""
     if len(slots) == 0:
         return
     assert keys.is_cuda and keys.device == pool.device
-    module = _framed_module(
-        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim
+    module = _load_logstate_module(
+        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim, pool.layout.granularity
     )
     call_cuda_ffi(module.store,
         pool.storage,
@@ -156,4 +162,16 @@ def store_framed_log_states(
         layer,
         pool.head_payload_bytes,
         pool.layout.log_decay_bytes,
+        pool.layout.num_linear_layers,
+        pool.layout.num_key_heads,
     )
+
+
+def copy_states(pool: MHALogStatePool, sources: Sequence[int], destinations: Sequence[int]) -> None:
+    if not sources:
+        return
+    assert pool.device.type == "cuda"
+    module = _load_construction_module(pool.page_size, pool.layout.head_k_dim,
+                                  pool.layout.head_v_dim, pool.layout.granularity)
+    vectors = make_device_vectors([sources, destinations], pool.device)
+    call_cuda_ffi(module.copy, *_construction_args(pool), *vectors, *_construction_dims(pool))

@@ -25,17 +25,6 @@ TRITON_ABOVE_3_4_0 = version.parse(triton.__version__) >= version.parse("3.4.0")
 
 
 class FlaCacheMode(enum.Enum):
-    """Controls how FLA loads kernel configs from its config cache (FLA_CACHE_MODE env var).
-
-    DISABLED    — skip all cache lookups, always fall back to Triton autotune (default when FLA_CACHE_MODE is unset)
-    STRICT      — exact key match only; falls back to Triton autotune if no match
-    FUZZY       — exact key match → fuzzy key match; falls back to Triton autotune if no match
-    FULL        — exact key match → fuzzy key match → default_config fallback
-    DEFAULT     — use only the top-level default_config field, skip key-based lookup
-    ALWAYS      — like DEFAULT, but re-reads config files on every kernel call;
-                  useful for debugging: edit default_config in a JSON file and the next
-                  kernel call picks it up without restarting the process
-    """
     DISABLED = "disabled"
     STRICT = "strict"
     FUZZY = "fuzzy"
@@ -43,9 +32,6 @@ class FlaCacheMode(enum.Enum):
     DEFAULT = "default"
     ALWAYS = "always"
 
-    def uses_default_config(self) -> bool:
-        """Return True for modes that may fall back to default_config (FULL, DEFAULT, ALWAYS)."""
-        return self in (FlaCacheMode.FULL, FlaCacheMode.DEFAULT, FlaCacheMode.ALWAYS)
 
     @classmethod
     def from_env(cls) -> "FlaCacheMode":
@@ -71,20 +57,14 @@ def sanitize_gpu_name(gpu_name: str) -> str:
 
 @lru_cache(maxsize=1)
 def get_gpu_info():
-    """Get GPU model information.
 
-    This function detects the GPU model and returns a sanitized string identifier.
-    It prioritizes FLA_GPU_NAME environment variable if set, then detects from
-    available hardware (CUDA, ROCm, Intel GPU, or CPU).
-    """
-    # Check if GPU name is overridden via environment variable
     gpu_name = None
-    # Check if GPU name is overridden via environment variable
+
     if "FLA_GPU_NAME" in os.environ:
         gpu_name = os.environ["FLA_GPU_NAME"]
-    # Try to get device name based on availability
+
     elif torch.cuda.is_available():
-        # Works for both NVIDIA and AMD GPUs (ROCm)
+
         gpu_name = torch.cuda.get_device_name(0)
     elif hasattr(torch, 'xpu') and torch.xpu.is_available():
         gpu_name = torch.xpu.get_device_name(0)
@@ -92,29 +72,22 @@ def get_gpu_info():
     if gpu_name:
         return sanitize_gpu_name(gpu_name)
 
-    # Default to CPU if no GPU available
+
     return "cpu"
 
 
 def get_fla_config_dir() -> Path:
-    """Get FLA's configs directory.
 
-    The directory can be overridden by setting the FLA_CONFIG_DIR environment variable.
-    If set, configs will be loaded directly from $FLA_CONFIG_DIR/. Otherwise FLA
-    falls back to the default fla/configs/{GPU}/ directory in the project.
-    """
-    # Check if custom config dir is set via environment variable
     if "FLA_CONFIG_DIR" in os.environ:
         return Path(os.environ["FLA_CONFIG_DIR"])
 
-    # Default: project_dir/fla/configs/{GPU}/
+
     project_dir = Path(__file__).parent.parent.parent
     return project_dir / "configs" / get_gpu_info()
 
 
 @dataclasses.dataclass(frozen=True)
 class AutotuneKey:
-    """Autotune key with exact/fuzzy matching, serialization, and construction helpers."""
     autotune_key: tuple[Any, ...]
 
     @staticmethod
@@ -140,9 +113,8 @@ class AutotuneKey:
 
     @staticmethod
     def keys_fuzzy_match(cached_key: Any, requested_key: Any) -> bool:
-        # Fuzzy match: numeric leaves are compatible regardless of their actual numeric values
-        # (e.g. a config tuned for seq_len=1024 can apply to seq_len=2048).
-        # Structure (type, length, dict keys) must still match exactly.
+
+
         if AutotuneKey.is_numeric(cached_key) and AutotuneKey.is_numeric(requested_key):
             return True
         if isinstance(cached_key, (list, tuple)) and isinstance(requested_key, (list, tuple)):
@@ -172,8 +144,6 @@ class AutotuneKey:
                 tuning_key.append(str(arg.dtype))
         return cls(autotune_key=tuple(tuning_key))
 
-    def exact_matches(self, entry_key: Any) -> bool:
-        return self.serialize(self.autotune_key) == self.serialize(entry_key)
 
     def fuzzy_matches(self, entry_key: Any) -> bool:
         self_normalized = self.normalize_autotune_key(self.autotune_key)
@@ -188,7 +158,6 @@ class AutotuneKey:
 
 @dataclasses.dataclass(frozen=True)
 class KernelConfigFile:
-    """Validated in-memory representation of a {kernel_name}.json config file."""
     kernel_name: str | None
     triton_version: str | None
     autotune_entries: dict[str, dict[str, Any]] | None
@@ -196,7 +165,6 @@ class KernelConfigFile:
 
     @classmethod
     def from_dict(cls, config_file: Path, data: Any) -> "KernelConfigFile | None":
-        """Parse and validate a raw JSON dict. Returns None (with a warning) if malformed."""
         def fail(msg, *args):
             logger.warning(msg, *args)
             raise ValueError
@@ -229,13 +197,6 @@ class KernelConfigFile:
         except ValueError:
             return None
 
-    @classmethod
-    def from_file(cls, config_file: Path) -> "KernelConfigFile | None":
-        """Read and validate a config file. Returns None if the file is missing or malformed."""
-        config_data = read_config_file(config_file)
-        if config_data is None:
-            return None
-        return cls.from_dict(config_file, config_data)
 
     def lookup_exact(self, key: AutotuneKey) -> dict[str, Any] | None:
         if self.autotune_entries is None:
@@ -262,34 +223,12 @@ def load_config_file(config_file: Path) -> dict[str, Any] | None:
 
 
 def read_config_file(config_file: Path) -> dict[str, Any] | None:
-    """Read a config file, bypassing the in-process cache in ALWAYS mode."""
     if FLA_CACHE_MODE is FlaCacheMode.ALWAYS:
         return load_config_file.__wrapped__(config_file)
     return load_config_file(config_file)
 
 
 def load_cached_config(kernel_name: str, autotune_key: AutotuneKey | None = None) -> dict[str, Any] | None:
-    """
-    Load cached best config for a kernel from FLA configs directory.
-
-    This function loads the cached best configuration for a given kernel name
-    from get_fla_config_dir()/{kernel_name}.json.
-
-    Cache files may contain multiple autotune entries keyed by Triton's
-    runtime tuning key plus a top-level default config.
-
-    If the config file is not found or cannot be loaded, a warning is printed
-    and None is returned, allowing fallback to Triton's autotune.
-
-    The lookup mode is controlled by the FLA_CACHE_MODE environment variable (see FlaCacheMode).
-
-    Args:
-        kernel_name: Name of the kernel (e.g., "causal_conv1d_fwd_kernel")
-        autotune_key: Triton autotune key for the current invocation
-
-    Returns:
-        Best config dictionary or None if not found or disabled
-    """
     if FLA_CACHE_MODE is FlaCacheMode.DISABLED:
         return None
 
@@ -309,7 +248,7 @@ def load_cached_config(kernel_name: str, autotune_key: AutotuneKey | None = None
     if FLA_CACHE_MODE is FlaCacheMode.DEFAULT or FLA_CACHE_MODE is FlaCacheMode.ALWAYS:
         return config.default_config
 
-    # STRICT mode: exact match only, no fuzzy fallback
+
     if FLA_CACHE_MODE is FlaCacheMode.STRICT:
         if autotune_key is not None:
             entry = config.lookup_exact(autotune_key)
@@ -317,7 +256,7 @@ def load_cached_config(kernel_name: str, autotune_key: AutotuneKey | None = None
                 return entry["config"]
         return None
 
-    # FULL and FUZZY modes: try exact key match first, then fuzzy match
+
     if autotune_key is not None:
         entry = config.lookup_exact(autotune_key) or config.lookup_fuzzy(autotune_key)
         if entry is not None:
@@ -326,7 +265,7 @@ def load_cached_config(kernel_name: str, autotune_key: AutotuneKey | None = None
     if FLA_CACHE_MODE is FlaCacheMode.FUZZY:
         return None
 
-    # FULL mode: fall back to default_config, then legacy raw config (no autotune_entries)
+
     if config.default_config is not None:
         return config.default_config
     if config.autotune_entries is not None:
@@ -335,20 +274,12 @@ def load_cached_config(kernel_name: str, autotune_key: AutotuneKey | None = None
 
 
 class CachedAutotuner(Autotuner):
-    """
-    A modified autotuner that loads best config from FLA's config directory.
-
-    This class extends Triton's Autotuner but overrides the run method to
-    try loading cached configuration first before falling back to autotune.
-    """
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, **kwargs):
         super().__init__(fn, arg_names, configs, key, reset_to_zero, restore_value, **kwargs)
         self.kernel_name = fn.fn.__name__ if hasattr(fn, 'fn') else fn.__name__
 
-        # None-safe pre/post hooks: Triton's defaults crash when a restore_value / reset_to_zero arg
-        # is None (idiomatic for optional pointers gated by a tl.constexpr flag).
-        # Fixed upstream in triton-lang/triton#10295 — remove this override once FLA's minimum Triton version has it.
+
         if not self.user_defined_pre_hook and (self.reset_to_zero or self.restore_value):
             def _pre_hook(kw, reset_only=False):
                 for n in self.reset_to_zero:
@@ -405,15 +336,7 @@ class CachedAutotuner(Autotuner):
 def fla_cache_autotune(configs, key=None, prune_configs_by=None, reset_to_zero=None, restore_value=None,
                        pre_hook=None, post_hook=None, warmup=None, rep=None, use_cuda_graph=False,
                        do_bench=None, cache_results=False):
-    """
-    Decorator for auto-tuning a :code:`triton.jit`'d function with FLA config support.
 
-    Extends Triton's autotune to load best configurations from FLA's config directory
-    (default: fla/configs/{GPU}/, or FLA_CONFIG_DIR/ when overridden), keyed by kernel
-    name from {kernel_name}.json. Lookup behaviour is controlled by FLA_CACHE_MODE.
-    Falls back to normal Triton autotuning when no cached config is found.
-    """
-    # key can be None when we want to use cache only (no fallback autotune)
     if key is None:
         key = []
 

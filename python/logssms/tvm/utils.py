@@ -9,8 +9,8 @@ if TYPE_CHECKING:
 
 _TVM_FILE = pathlib.Path(__file__).resolve()
 _CSRC_CANDIDATES = (
-    _TVM_FILE.parents[3] / "csrc",  # source checkout
-    _TVM_FILE.parents[1] / "csrc",  # installed wheel
+    _TVM_FILE.parents[3] / "csrc",
+    _TVM_FILE.parents[1] / "csrc",
 )
 CPPIMPL_PATH = next((path for path in _CSRC_CANDIDATES if path.is_dir()), _CSRC_CANDIDATES[0])
 DEFAULT_INCLUDE = [str(CPPIMPL_PATH / "include")]
@@ -27,7 +27,6 @@ R = TypeVar("R")
 
 
 def call_cuda_ffi(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-    """Launch FFI CUDA work on the current PyTorch stream."""
     from tvm_ffi import use_torch_stream
 
     with use_torch_stream():

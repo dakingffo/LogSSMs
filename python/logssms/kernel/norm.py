@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -54,21 +53,13 @@ def rms_norm_gated(
     assert hidden_states.shape == gate.shape
     assert hidden_states.shape[-1] == weight.numel()
 
-    if not hidden_states.is_cuda:
-        hidden = hidden_states.float()
-        variance = hidden.pow(2).mean(-1, keepdim=True)
-        hidden *= torch.rsqrt(variance + eps)
-        hidden *= weight.float()
-        hidden *= F.silu(gate.float())
-        return hidden.to(hidden_states.dtype)
-
-    assert gate.is_cuda and weight.is_cuda
+    assert hidden_states.is_cuda and gate.is_cuda and weight.is_cuda
     num_cols = hidden_states.shape[-1]
     block_size = triton.next_power_of_2(num_cols)
     assert block_size <= 65536, f"RMSNorm width is too large for one Triton block: {num_cols}"
 
     hidden = hidden_states.reshape(-1, num_cols).contiguous()
-    # Keep the token/head strides of a Z view into a fused QKVZ projection.
+
     gate = (
         gate.reshape(-1, gate.shape[-2], num_cols)
         if gate.ndim > 1 else gate.view(1, 1, num_cols)

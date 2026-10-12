@@ -3,10 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from logssms.core import Batch, Context, clear_global_ctx, set_global_ctx
+from logssms.core import Batch, Context, set_global_ctx
 from logssms.engine.prefill_graph import PrefillGraphRunner, prefill_token_buckets
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.layers.piecewise import prefill_piece
+from tests.utils import clear_global_ctx
 
 
 @pytest.fixture(autouse=True)

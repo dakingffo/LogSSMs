@@ -7,13 +7,14 @@ from transformers import FalconH1Config as HFConfig, FalconH1ForCausalLM as HFMo
 
 from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
 from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.core import Batch, Context, Request, SamplingParams, clear_global_ctx, set_global_ctx
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.core import Batch, Context, Request, SamplingParams, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.engine.prefill_graph import PrefillGraphRunner
 from logssms.layers.linear_attention_backend import make_linear_attention_backend
 from logssms.models import make_model, make_model_config, load_target_weight
 from logssms.utils import torch_dtype
+from tests.utils import clear_global_ctx
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -65,7 +66,7 @@ def test_falcon_h1_matches_transformers_and_prefill_graph(tmp_path, cache_type, 
             ctx.kv_cache = MHAKVCachePool(2, 4, 64, 2, 64, torch.bfloat16, torch.device("cuda"))
             ctx.state_table = (torch.arange(256, device="cuda", dtype=torch.int32) // 64)[None]
         else:
-            pool = FramedMHALogStatePool(
+            pool = MHALogStatePool(
                 num_frames=128, page_size=64, granularity=32,
                 num_attention_layers=2, num_kv_heads=2, head_dim=64,
                 num_linear_layers=2, num_key_heads=1, num_value_heads=4,
@@ -104,7 +105,7 @@ def test_falcon_h1_matches_transformers_and_prefill_graph(tmp_path, cache_type, 
                     # Use contiguous physical KV frames for the oracle's lookup.
                     batch.out_loc = torch.tensor(kv, device="cuda", dtype=torch.int32).repeat_interleave(64)[:length] * 64 + batch.positions % 64
                     ctx.page_table[0, :length] = batch.out_loc
-                    ctx.attn_backend.forward = _framed_attention(pool)
+                    ctx.attn_backend.forward = _logstate_attention(pool)
                 batch.attn_metadata = SimpleNamespace(get_last_indices=lambda bs: torch.tensor([length-1], device="cuda"))
                 ctx.linear_attn_backend.prepare_metadata(batch)
                 with ctx.forward_batch(batch):
@@ -146,7 +147,7 @@ def test_falcon_h1_matches_transformers_and_prefill_graph(tmp_path, cache_type, 
             clear_global_ctx()
 
 
-def _framed_attention(pool):
+def _logstate_attention(pool):
     def forward(query, layer, batch):
         from logssms.core import get_global_ctx
 

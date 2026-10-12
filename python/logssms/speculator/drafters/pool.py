@@ -4,16 +4,6 @@ import torch
 
 
 class DraftKVPool:
-    """Fixed-capacity KV storage for a single-layer autoregressive drafter.
-
-    Every target request owns ``window_size`` persistent slots.  Draft batches share a
-    second region with ``num_spec_tokens`` slots per batch row; that region is ephemeral
-    and may be overwritten as soon as the current draft call returns.
-
-    ``persistent_table`` and ``scratch_table`` contain physical token-slot indices.  The
-    persistent rows are circular buffers, so advancing a full carry window never moves
-    K/V data.
-    """
 
     def __init__(
         self,
@@ -59,8 +49,7 @@ class DraftKVPool:
         )
         self.v = torch.empty_like(self.k)
 
-        # Metadata is scheduler-side state.  Keeping these tiny counters on the host
-        # avoids a synchronization merely to decide which fixed slots an append owns.
+
         self._heads   = [0] * max_running_req
         self._lengths = [0] * max_running_req
 
@@ -69,23 +58,12 @@ class DraftKVPool:
         self._heads[table_idx]   = 0
         self._lengths[table_idx] = 0
 
-    def append_persistent(self, table_idx: int, count: int) -> torch.Tensor:
-        """Reserve ``count`` chronological slots and advance the request's ring."""
-        self._check_table_idx(table_idx)
-        assert 0 <= count <= self.window_size
-        if count == 0:
-            return self.persistent_table[table_idx, :0]
-
-        columns = self._append_columns(table_idx, count)
-        column_tensor = torch.tensor(columns, dtype=torch.int64, device=self.device)
-        return self.persistent_table[table_idx].index_select(0, column_tensor)
 
     def append_persistent_batch(
         self,
         table_indices: list[int],
         counts       : list[int],
     ) -> torch.Tensor:
-        """Reserve canonical slots for a batch in flattened request-major order."""
         assert len(table_indices) == len(counts)
         rows: list[int] = []
         columns: list[int] = []
@@ -100,7 +78,6 @@ class DraftKVPool:
         return self.persistent_table[row_tensor, column_tensor]
 
     def _append_columns(self, table_idx: int, count: int) -> list[int]:
-        """Advance one ring and return its reserved logical columns."""
         if count == 0:
             return []
 
@@ -120,25 +97,14 @@ class DraftKVPool:
         self._lengths[table_idx] = length
         return columns
 
-    def persistent_indices(self, table_idx: int) -> torch.Tensor:
-        """Return one request's valid persistent slots in chronological order."""
-        self._check_table_idx(table_idx)
-        head   = self._heads[table_idx]
-        length = self._lengths[table_idx]
-        if length == 0:
-            return self.persistent_table[table_idx, :0]
-        columns = (torch.arange(length, device=self.device) + head) % self.window_size
-        return self.persistent_table[table_idx].index_select(0, columns)
 
     def scratch_slots(self, batch_rows: torch.Tensor, depth: int) -> torch.Tensor:
-        """Return the physical slot at ``depth`` for each current draft-batch row."""
         assert batch_rows.ndim == 1
         assert 0 <= depth < self.num_spec_tokens
         assert batch_rows.numel() <= self.max_batch_size
         return self.scratch_table[batch_rows, depth]
 
     def scratch_block(self, batch_rows: torch.Tensor, block_size: int) -> torch.Tensor:
-        """Return request-major scratch slots for a whole parallel draft block."""
         assert batch_rows.ndim == 1
         assert 0 < block_size <= self.num_spec_tokens
         assert batch_rows.numel() <= self.max_batch_size
@@ -150,11 +116,6 @@ class DraftKVPool:
         batch_rows    : torch.Tensor,
         scratch_depth: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build right-padded chronological KV indices for one attention call.
-
-        ``scratch_depth`` is the number of already-materialized speculative rows to
-        append after each request's persistent window.
-        """
         batch_size = len(table_indices)
         assert batch_rows.shape == (batch_size,)
         assert batch_size <= self.max_batch_size

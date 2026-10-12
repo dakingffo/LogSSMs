@@ -4,12 +4,13 @@ from types import SimpleNamespace
 
 import torch
 
-from logssms.core import Batch, clear_global_ctx, set_global_ctx
+from logssms.core import Batch, set_global_ctx
 from logssms.speculator.hidden_captor import (
     HiddenCaptorBase,
     HiddenCapturePoint,
     with_speculator,
 )
+from tests.utils import clear_global_ctx
 
 
 class RecordingCaptor(HiddenCaptorBase):

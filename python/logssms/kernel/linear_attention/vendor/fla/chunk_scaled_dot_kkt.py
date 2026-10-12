@@ -88,29 +88,6 @@ def chunk_scaled_dot_kkt_fwd(
     output_dtype: torch.dtype = torch.float32,
     chunk_indices: torch.LongTensor | None = None,
 ) -> torch.Tensor:
-    r"""
-    Compute beta * K * K^T.
-
-    Args:
-        k (torch.Tensor):
-            The key tensor of shape `[B, T, H, K]` where `H` is the number of query/key heads.
-        g (torch.Tensor):
-            The cumulative sum of the gate tensor of shape `[B, T, HV]`. Default: `None`.
-        beta (torch.Tensor):
-            The beta tensor of shape `[B, T, HV]` where `HV` is the number of value/output heads.
-        cu_seqlens (torch.LongTensor):
-            The cumulative sequence lengths of the input tensor.
-            Default: None
-        chunk_size (int):
-            The chunk size. Default: 64.
-        output_dtype (torch.dtype):
-            The dtype of the output tensor. Default: `torch.float32`
-        chunk_indices (torch.LongTensor):
-            The chunk indices of the input tensor. Default: None.
-    Returns:
-        beta * K * K^T of shape `[B, T, HV, BT]` where `BT` is the chunk size.
-        For GVA, H < HV and HV % H == 0. For standard attention, H == HV.
-    """
     B, T, H, K, HV = *k.shape, beta.shape[2]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:

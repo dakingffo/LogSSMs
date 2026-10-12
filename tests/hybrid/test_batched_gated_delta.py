@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.kernel import store_state
 from logssms.kernel.linear_attention.vendor.fla import (
@@ -12,6 +12,7 @@ from logssms.layers import GatedDeltaNet
 from logssms.models.config import RotaryConfig
 from logssms.models.qwen3_next import Qwen3_5Config
 from logssms.utils import torch_dtype
+from tests.utils import clear_global_ctx
 
 
 def _recurrent_gated_delta_rule_with_snapshots(

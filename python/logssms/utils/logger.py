@@ -15,7 +15,6 @@ def init_logger(
     use_pid    : bool | None = None,
     use_tp_rank: bool | None = None,
 ):
-    """Initialize the logger for the module with colors and pretty formatting."""
     import logging
     import os
     import sys
@@ -48,17 +47,16 @@ def init_logger(
 
     tp_info = None
 
-    # Color formatter class
-    class ColorFormatter(logging.Formatter):
-        """Formatter with colors and pretty output"""
 
-        # ANSI color codes
+    class ColorFormatter(logging.Formatter):
+
+
         COLORS = {
-            "DEBUG": "\033[36m",  # Cyan
-            "INFO": "\033[32m",  # Green
-            "WARNING": "\033[33m",  # Yellow
-            "ERROR": "\033[31m",  # Red
-            "CRITICAL": "\033[35m",  # Magenta
+            "DEBUG": "\033[36m",
+            "INFO": "\033[32m",
+            "WARNING": "\033[33m",
+            "ERROR": "\033[31m",
+            "CRITICAL": "\033[35m",
         }
         RESET = "\033[0m"
         BOLD = "\033[1m"
@@ -66,7 +64,7 @@ def init_logger(
         def format(self, record):
             from logssms.distributed import try_get_tp_info
 
-            # Format timestamp like SGLang: [YYYY-MM-DD|HH:MM:SS|pid=1234]
+
             timestamp = self.formatTime(record, "[%Y-%m-%d|%H:%M:%S{suffix}]")
             nonlocal tp_info
             tp_info = tp_info or try_get_tp_info()
@@ -76,20 +74,20 @@ def init_logger(
                 real_suffix = suffix
             timestamp = timestamp.format(suffix=real_suffix)
 
-            # Get color for log level
+
             level_color = self.COLORS.get(record.levelname, "")
 
-            # Format the message
+
             colored_level = f"{level_color}{record.levelname:<8}{self.RESET}"
             message = record.getMessage()
 
-            # Pretty format: [timestamp] LEVEL message
+
             return f"{self.BOLD}{timestamp}{self.RESET} {colored_level} {message}"
 
     logger = logging.getLogger(name)
     logger.setLevel(_LOG_LEVEL)
 
-    # Clear existing handlers to avoid duplicates
+
     logger.handlers.clear()
 
     handler = logging.StreamHandler(sys.stdout)
@@ -97,7 +95,7 @@ def init_logger(
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-    # Prevent propagation to root logger
+
     logger.propagate = False
 
     def _call_rank0(msg, *args, _which, **kwargs):
@@ -112,7 +110,6 @@ def init_logger(
     if TYPE_CHECKING:
 
         class WrapperLogger(logging.Logger):
-            """Custom logger to handle the color formatter."""
 
             def info_rank0(self, msg, *args, **kwargs): ...
             def warning_rank0(self, msg, *args, **kwargs): ...

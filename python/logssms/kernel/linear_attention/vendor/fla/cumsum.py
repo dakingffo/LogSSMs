@@ -61,7 +61,7 @@ def chunk_local_cumsum_scalar_kernel(
     else:
         p_s = s + bos*H + i_h + o_t * H
         p_o = o + bos*H + i_h + o_t * H
-    # [BT]
+
     b_s = tl.load(p_s, mask=m_t, other=0.0).to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
@@ -121,7 +121,7 @@ def chunk_local_cumsum_vector_kernel(
     else:
         p_s = s + (bos * H + i_h) * S + o_t[:, None] * (H*S) + o_s[None, :]
         p_o = o + (bos * H + i_h) * S + o_t[:, None] * (H*S) + o_s[None, :]
-    # [BT, BS]
+
     b_s = tl.load(p_s, mask=m_s, other=0.0).to(tl.float32)
     if REVERSE:
         b_o = tl.cumsum(b_s, axis=0, reverse=True)
@@ -191,9 +191,8 @@ def chunk_local_cumsum_vector(
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
-    # keep cummulative normalizer in fp32
-    # this kernel is equivalent to
-    # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
+
+
     chunk_local_cumsum_vector_kernel[grid](
         s=g_org,
         o=g,

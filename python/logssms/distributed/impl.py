@@ -75,8 +75,7 @@ def enable_pynccl_distributed(
 ) -> None:
     from .pynccl import init_pynccl
 
-    # Wrap the raw PyNCCL FFI object so its all_reduce(x, "sum") signature matches the
-    # DistributedImpl protocol (callers invoke impl.all_reduce(x)).
+
     wrapper = init_pynccl(
         tp_rank=tp_info.rank,
         tp_size=tp_info.size,

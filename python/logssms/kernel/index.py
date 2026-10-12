@@ -36,11 +36,11 @@ def _jit_index_module(
 
 
 def indexing(
-    weights    : torch.Tensor, # [V_tp, D]
-    indices    : torch.Tensor, # [L]
+    weights    : torch.Tensor,
+    indices    : torch.Tensor,
     *,
-    output     : torch.Tensor    | None = None,  # [L, D]
-    vocab_range: tuple[int, int] | None = None,  # (start, length)
+    output     : torch.Tensor    | None = None,
+    vocab_range: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])

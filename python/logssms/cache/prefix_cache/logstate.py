@@ -94,6 +94,7 @@ class LogRadixTreeNode:
         self._depth = 0
         self.ref_count = 0
         self.is_protected = False
+
         self.timestamp = time.monotonic_ns() if tic is None else tic
         self._key = torch.empty(0, dtype=torch.int32)
         self._kv = torch.empty(0, dtype=torch.int32)
@@ -220,8 +221,8 @@ class LogStateCacheHandle(BaseCacheHandle):
 
     @cached_property
     def kv_indices(self) -> torch.Tensor:
-        # Handles are locked before their indices are consumed. Rejected
-        # admission attempts never need to concatenate the device-side history.
+
+
         return torch.cat(self.kv_parts) if self.kv_parts else self.node.kv[:0]
 
     def get_matched_indices(self) -> torch.Tensor:
@@ -240,13 +241,6 @@ class LogRadixEviction(NamedTuple):
 
 
 class LogRadixTree(BasePrefixCache):
-    """Radix tree for KV pages and heterogeneous linear-cache representations.
-
-    The tree owns prefix topology and the logical association between token
-    intervals and LogState slots. It does not allocate or free physical pages.
-    ``LogStateCacheManager`` consumes insertion/eviction results and performs
-    the corresponding resource operations.
-    """
 
     def __init__(
         self,
@@ -272,10 +266,14 @@ class LogRadixTree(BasePrefixCache):
         self._lock_footprints: dict[int, tuple[int, tuple[int, ...]]] = {}
         self._entry_owners: dict[int, LogRadixTreeNode] = {}
         self._slot_entries: dict[int, list[LogStateEntry]] = {}
+        self._checkpoint_timestamps: dict[int, int] = {}
         self._kv_frame_refs: dict[int, int] = {}
         self._locked_kv_refs: dict[int, int] = {}
         self._evictable_kv_count = 0
-        self._locked_slot_refs: dict[int, int] = {}
+
+
+        self._unprunable_log_refs: dict[int, int] = {}
+        self._recovery_slot_refs: dict[int, int] = {}
         self._evictable_slots: dict[int, None] = {}
         self._on_slot_reclaimable = on_slot_reclaimable
 
@@ -290,16 +288,13 @@ class LogRadixTree(BasePrefixCache):
             node = self.root
         else:
             node = self._node_at_depth(trace.node, recovery.position)
-            tic = time.monotonic_ns()
             if node is not trace.node or revision != self.revision:
                 path = self.path(node)
                 entries = tuple(entry for part in path for entry in part.entries)
-            for path_node in path:
-                path_node.timestamp = tic
         if recovery.position == 0:
             path, entries = (), ()
-        # Splitting the recovery endpoint may have shortened the original
-        # trace's edge. Retain the raw token-match endpoint in the new topology.
+
+
         trace_node = trace.node
         while not trace_node.is_root() and trace.matched_len <= trace_node.begin:
             trace_node = trace_node.parent
@@ -307,22 +302,35 @@ class LogRadixTree(BasePrefixCache):
             trace_node, trace.matched_len,
             trace.matched_len - trace_node.begin,
         )
+        handle = LogStateCacheHandle(
+            cached_len=recovery.position,
+            node=node,
+            lock_node=lock_node,
+            recovery=recovery,
+            match_trace=matched_trace,
+            trace_revision=self.revision,
+            trace_input_len=usable_len,
+            match_path=path,
+            match_entries=entries,
+            kv_parts=tuple(part.kv for part in path) if path else (self.empty_tensor,),
+        )
+        self.touch_handle(handle)
         return MatchResult(
-            LogStateCacheHandle(
-                cached_len=recovery.position,
-                node=node,
-                lock_node=lock_node,
-                recovery=recovery,
-                match_trace=matched_trace,
-                trace_revision=self.revision,
-                trace_input_len=usable_len,
-                match_path=path,
-                match_entries=entries,
-                kv_parts=tuple(part.kv for part in path) if path else (self.empty_tensor,),
-            ),
+            handle,
             tree_match_len=trace.matched_len,
             recoverable_len=recovery.position,
         )
+
+    def touch_handle(self, handle: LogStateCacheHandle) -> None:
+        tic = time.monotonic_ns()
+        for node in handle.match_path:
+            node.timestamp = tic
+        slot = handle.recovery.base_checkpoint_slot
+        if slot is not None:
+            self._checkpoint_timestamps[slot] = tic
+
+    def checkpoint_timestamp(self, slot: int) -> int:
+        return self._checkpoint_timestamps[slot]
 
     def lock_handle(
         self,
@@ -342,21 +350,17 @@ class LogRadixTree(BasePrefixCache):
         self.locked_size = 0
         self._entry_owners.clear()
         self._slot_entries.clear()
+        self._checkpoint_timestamps.clear()
         self._kv_frame_refs.clear()
         self._locked_kv_refs.clear()
         self._evictable_kv_count = 0
-        self._locked_slot_refs.clear()
+        self._unprunable_log_refs.clear()
+        self._recovery_slot_refs.clear()
         self._evictable_slots.clear()
         self.revision += 1
         self._lock_footprints.clear()
 
     def trace(self, input_ids: torch.Tensor) -> LogRadixTrace:
-        """Read-only prefix walk at the recovery granularity.
-
-        Unlike :meth:`match`, tracing never splits an existing edge. When the
-        match ends inside an edge, ``node`` is that edge's node and
-        ``matched_in_node`` identifies the prospective split position.
-        """
         matched_len = 0
         node = self.root
         while matched_len < len(input_ids):
@@ -373,7 +377,6 @@ class LogRadixTree(BasePrefixCache):
         return LogRadixTrace(node, matched_len, node.length)
 
     def trace_prefix(self, trace: LogRadixTrace, position: int) -> LogRadixTrace:
-        """Shorten a known token match without comparing the prefix again."""
         assert 0 <= position <= trace.matched_len
         node = trace.node
         while not node.is_root() and position <= node.begin:
@@ -414,6 +417,7 @@ class LogRadixTree(BasePrefixCache):
                 self.page_size,
             )
             new_node.set_parent(node)
+            self._refresh_checkpoint_neighbors(node)
             self._update_kv_refs(new_node, 1)
             self.evictable_size += new_node.length
             self.revision += 1
@@ -428,6 +432,8 @@ class LogRadixTree(BasePrefixCache):
         self,
         leaf : LogRadixTreeNode,
         entry: LogStateEntry,
+        *,
+        checkpoint_timestamp: int | None = None,
     ) -> None:
         assert entry.end <= leaf.depth
         assert entry.begin % self.granularity == 0
@@ -449,7 +455,7 @@ class LogRadixTree(BasePrefixCache):
         owner = self._find_owner(leaf, entry.end)
         if entry.end < owner.depth:
             owner = self.split_at(owner, entry.end - owner.begin)
-        self._register_entry(owner, entry)
+        self._register_entry(owner, entry, checkpoint_timestamp)
         self.revision += 1
 
     def detach_entry(self, slot: int) -> LogStateEntry:
@@ -489,9 +495,10 @@ class LogRadixTree(BasePrefixCache):
         old_entries = node._entries
         node._entries = []
         for entry in old_entries:
+            checkpoint_timestamp = self._checkpoint_timestamps.get(entry.slot)
             self._unregister_entry(entry)
             if entry.end <= split_depth:
-                self._register_entry(prefix, entry)
+                self._register_entry(prefix, entry, checkpoint_timestamp)
             elif (
                 entry.kind is LogStateKind.LOG
                 and entry.begin < split_depth
@@ -503,11 +510,13 @@ class LogRadixTree(BasePrefixCache):
                     node, entry.slice(split_depth, entry.end)
                 )
             else:
-                self._register_entry(node, entry)
+                self._register_entry(node, entry, checkpoint_timestamp)
 
         node.set(pos, node.length, node.key, node.kv, self.page_size, kv_pages)
         node.set_parent(prefix)
         self._update_kv_refs(node, 1)
+        for part in (parent, prefix, node):
+            self._refresh_checkpoint_neighbors(part)
         self.revision += 1
         return prefix
 
@@ -524,7 +533,6 @@ class LogRadixTree(BasePrefixCache):
             node = node.parent
 
     def lock_footprint(self, node: LogRadixTreeNode) -> tuple[int, tuple[int, ...]]:
-        """Resources which cease to be reclaimable if this path is locked."""
         epoch = self.revision, self.lock_revision
         if self._lock_footprint_epoch != epoch:
             self._lock_footprints.clear()
@@ -539,11 +547,27 @@ class LogRadixTree(BasePrefixCache):
                 frames.update(frame for frame in current._kv_page_counts
                               if frame not in self._locked_kv_refs)
                 slots.update(entry.slot for entry in current._entries
-                             if entry.slot in self._evictable_slots)
+                             if (entry.kind is LogStateKind.LOG
+                                 or self._checkpoint_successor(entry) is None)
+                             and entry.slot in self._evictable_slots)
             current = current.parent
         result = len(frames), tuple(slots)
         self._lock_footprints[node.uuid] = result
         return result
+
+    def pin_recovery(self, slots: tuple[int, ...], release: bool = False) -> None:
+        self.lock_revision += 1
+        for slot in slots:
+            refs = self._recovery_slot_refs.get(slot, 0) + (-1 if release else 1)
+            assert refs >= 0
+            if refs:
+                assert self.has_slot(slot)
+                self._recovery_slot_refs[slot] = refs
+            else:
+                self._recovery_slot_refs.pop(slot, None)
+            self._update_slot_reclaimability(slot)
+            for entry in self._slot_entries.get(slot, ()):
+                self._refresh_checkpoint_neighbors(self.entry_owner(entry))
 
     def protect(
         self,
@@ -554,6 +578,7 @@ class LogRadixTree(BasePrefixCache):
         if node.is_protected != protected:
             node.is_protected = protected
             self.revision += 1
+            self._refresh_checkpoint_neighbors(node)
 
     def protect_entry(self, slot: int, protected: bool = True) -> None:
         for entry in self._slot_entries[slot]:
@@ -580,7 +605,6 @@ class LogRadixTree(BasePrefixCache):
         return self.evict_nodes(selected, evicted_nodes)
 
     def iter_evict_candidates(self) -> Iterator[LogRadixTreeNode]:
-        """Prefer Log-only leaves; use LRU within each representation class."""
         from logssms.kernel import logstate as planning
 
         nodes, rows = self.eviction_snapshot()
@@ -588,18 +612,65 @@ class LogRadixTree(BasePrefixCache):
             yield nodes[index]
 
     def eviction_snapshot(self) -> tuple[list[LogRadixTreeNode], list[tuple[int, ...]]]:
-        """Borrow topology/priority metadata for one native planning call."""
         nodes = self._iter_nodes()
         rows = [(
             node.uuid, -1 if node.is_root() else node.parent.uuid,
             int(node.is_root() or node.is_locked),
             int(any(entry.kind is LogStateKind.CHECKPOINT for entry in node.entries)),
-            node.timestamp,
+            min((self._checkpoint_timestamps[entry.slot] for entry in node.entries
+                 if entry.kind is LogStateKind.CHECKPOINT), default=node.timestamp),
         ) for node in nodes]
         return nodes, rows
 
     def slot_entry_count(self, slot: int) -> int:
         return len(self._slot_entries[slot])
+
+    def checkpoint_eviction_pairs(self) -> list[tuple[int, int, int, int]]:
+        pairs = []
+        stack = [(self.root, None)]
+        while stack:
+            node, previous = stack.pop()
+            for entry in node.entries:
+                if entry.kind is LogStateKind.LOG or self.slot_is_fragmented(entry.slot):
+                    previous = None
+                    continue
+                if (previous is not None and previous.end == entry.begin
+                    and previous.slot not in self._recovery_slot_refs
+                    and entry.slot not in self._recovery_slot_refs
+                    and not self.entry_owner(previous).is_protected):
+                    pairs.append((previous.slot, entry.slot, previous.end,
+                                  self._checkpoint_timestamps[previous.slot]))
+                previous = entry
+            if node.is_protected or len(node.children) != 1:
+                previous = None
+            stack.extend((child, previous) for child in node.children.values())
+        return pairs
+
+    def drop_checkpoint(self, left_slot: int, right_slot: int) -> LogStateEntry:
+        left, = self.entries_for_slot(left_slot)
+        right, = self.entries_for_slot(right_slot)
+        assert left.kind is right.kind is LogStateKind.CHECKPOINT
+        assert left.end == right.begin
+        owner = self.entry_owner(right)
+        left_owner = self.entry_owner(left)
+        assert not left_owner.is_protected
+        assert left_slot not in self._recovery_slot_refs
+        assert right_slot not in self._recovery_slot_refs
+        current = owner
+        while current is not left_owner:
+            current = current.parent
+            assert not current.is_protected
+            assert len(current.children) == 1
+        checkpoint_timestamp = self._checkpoint_timestamps[right_slot]
+        self.detach_entry(left_slot)
+        self.detach_entry(right_slot)
+        self.attach_entry(
+            owner, replace(
+                right, begin=left.begin, span_pages=left.span_pages + right.span_pages,
+            ),
+            checkpoint_timestamp=checkpoint_timestamp,
+        )
+        return left
 
     def evict_nodes(
         self,
@@ -616,11 +687,14 @@ class LogRadixTree(BasePrefixCache):
             self._update_kv_refs(node, -1)
             evicted_kv.append(node.kv)
             evicted_entries.extend(node.entries)
-            for entry in node.entries:
+            entries = node.entries
+            node._entries = []
+            for entry in entries:
                 self._unregister_entry(entry)
 
             parent = node.parent
             del parent.children[self.key_fn(node.key)]
+            self._refresh_checkpoint_neighbors(parent)
         if not evicted_kv:
             return LogRadixEviction(self.empty_tensor, ())
         self.revision += 1
@@ -628,9 +702,6 @@ class LogRadixTree(BasePrefixCache):
             torch.cat(evicted_kv), tuple(evicted_entries)
         )
 
-    def matched_kv(self, node: LogRadixTreeNode) -> torch.Tensor:
-        values = [path_node.kv for path_node in self._path(node)]
-        return torch.cat(values) if values else self.empty_tensor
 
     def matched_entries(
         self,
@@ -680,7 +751,6 @@ class LogRadixTree(BasePrefixCache):
         node    : LogRadixTreeNode,
         position: int,
     ) -> LogStateRecovery:
-        """Recover an already located prefix without comparing its tokens again."""
         assert 0 <= position <= node.depth
         endpoint = node
         while not endpoint.is_root() and position <= endpoint.begin:
@@ -716,7 +786,6 @@ class LogRadixTree(BasePrefixCache):
         return tuple(self._evictable_slots)
 
     def evictable_kv_frames(self) -> int:
-        """Count physical KV frames whose entire cached contents can be evicted."""
         return self._evictable_kv_count
 
     def iter_entries(self) -> tuple[LogStateEntry, ...]:
@@ -752,25 +821,11 @@ class LogRadixTree(BasePrefixCache):
             for entry in self._slot_entries[slot]
         )
 
-    def is_lock_boundary(
-        self,
-        leaf    : LogRadixTreeNode,
-        position: int,
-    ) -> bool:
-        for node in self._path(leaf):
-            if node.depth != position:
-                continue
-            descendant_refs = sum(
-                child.ref_count for child in node.children.values()
-            )
-            return node.ref_count > descendant_refs
-        return False
 
     @property
     def size_info(self) -> SizeInfo:
-        # ``SizeInfo`` keeps the legacy name ``protected_size`` for request-held
-        # cache. In Log-Radix-Tree this is strictly the live-lock size and is
-        # unrelated to ``node.is_protected`` compression policy.
+
+
         return SizeInfo(self.evictable_size, self.locked_size)
 
     def check_integrity(self) -> None:
@@ -781,7 +836,7 @@ class LogRadixTree(BasePrefixCache):
         seen_slots: dict[int, list[LogStateEntry]] = {}
         kv_refs: Counter[int] = Counter()
         locked_kv_refs: Counter[int] = Counter()
-        locked_slot_refs: Counter[int] = Counter()
+        unprunable_log_refs: Counter[int] = Counter()
         stack = [self.root]
 
         while stack:
@@ -819,7 +874,8 @@ class LogRadixTree(BasePrefixCache):
                 kv_refs.update(node._kv_page_counts.keys())
                 if node.is_locked:
                     locked_kv_refs.update(node._kv_page_counts.keys())
-                    locked_slot_refs.update(entry.slot for entry in node._entries)
+                    unprunable_log_refs.update(entry.slot for entry in node._entries
+                                               if entry.kind is LogStateKind.LOG)
                 for entry in node.entries:
                     if not (0 <= entry.begin < entry.end):
                         raise RuntimeError(
@@ -853,13 +909,20 @@ class LogRadixTree(BasePrefixCache):
         if (
             dict(kv_refs) != self._kv_frame_refs
             or dict(locked_kv_refs) != self._locked_kv_refs
-            or dict(locked_slot_refs) != self._locked_slot_refs
+            or dict(unprunable_log_refs) != self._unprunable_log_refs
             or self._evictable_kv_count != sum(frame not in locked_kv_refs for frame in kv_refs)
-            or set(self._evictable_slots) != set(seen_slots) - set(locked_slot_refs)
+            or set(self._evictable_slots) != {
+                slot for slot in seen_slots if self._slot_reclaimable(slot)
+            }
         ):
             raise RuntimeError("Log-Radix-Tree reclaimable capacity index is stale.")
         if set(seen_slots) != set(self._slot_entries):
             raise RuntimeError("Log-Radix-Tree slot reference index is stale.")
+        if set(self._checkpoint_timestamps) != {
+            slot for slot, entries in seen_slots.items()
+            if entries[0].kind is LogStateKind.CHECKPOINT
+        }:
+            raise RuntimeError("Log-Radix-Tree Checkpoint access index is stale.")
         for slot, entries in seen_slots.items():
             indexed = self._slot_entries[slot]
             if {id(entry) for entry in entries} != {
@@ -1025,11 +1088,14 @@ class LogRadixTree(BasePrefixCache):
         for frame in node._kv_page_counts:
             self._update_kv_frame(frame, 0, delta)
         for entry in node._entries:
-            locked = self._locked_slot_refs.get(entry.slot, 0) + delta
+            if entry.kind is not LogStateKind.LOG:
+                self._update_slot_reclaimability(entry.slot)
+                continue
+            locked = self._unprunable_log_refs.get(entry.slot, 0) + delta
             if locked:
-                self._locked_slot_refs[entry.slot] = locked
+                self._unprunable_log_refs[entry.slot] = locked
             else:
-                self._locked_slot_refs.pop(entry.slot, None)
+                self._unprunable_log_refs.pop(entry.slot, None)
             self._update_slot_reclaimability(entry.slot)
         if node.is_locked:
             self.evictable_size -= node.length
@@ -1042,33 +1108,94 @@ class LogRadixTree(BasePrefixCache):
         self,
         owner: LogRadixTreeNode,
         entry: LogStateEntry,
+        checkpoint_timestamp: int | None = None,
     ) -> None:
         owner._entries.append(entry)
         owner._entries.sort(key=lambda value: (value.end, value.begin, value.slot))
         self._entry_owners[id(entry)] = owner
         self._slot_entries.setdefault(entry.slot, []).append(entry)
-        if owner.is_locked:
-            self._locked_slot_refs[entry.slot] = (
-                self._locked_slot_refs.get(entry.slot, 0) + 1
+        if entry.kind is LogStateKind.CHECKPOINT:
+            self._checkpoint_timestamps[entry.slot] = (
+                time.monotonic_ns() if checkpoint_timestamp is None else checkpoint_timestamp
+            )
+        if owner.is_locked and entry.kind is LogStateKind.LOG:
+            self._unprunable_log_refs[entry.slot] = (
+                self._unprunable_log_refs.get(entry.slot, 0) + 1
             )
         self._update_slot_reclaimability(entry.slot)
+        self._refresh_checkpoint_neighbors(owner)
 
     def _unregister_entry(self, entry: LogStateEntry) -> None:
-        if self._entry_owners[id(entry)].is_locked:
-            locked = self._locked_slot_refs[entry.slot] - 1
+        owner = self._entry_owners[id(entry)]
+        if owner.is_locked and entry.kind is LogStateKind.LOG:
+            locked = self._unprunable_log_refs[entry.slot] - 1
             if locked:
-                self._locked_slot_refs[entry.slot] = locked
+                self._unprunable_log_refs[entry.slot] = locked
             else:
-                del self._locked_slot_refs[entry.slot]
+                del self._unprunable_log_refs[entry.slot]
         del self._entry_owners[id(entry)]
         entries = self._slot_entries[entry.slot]
         entries.remove(entry)
         if not entries:
             del self._slot_entries[entry.slot]
+            self._checkpoint_timestamps.pop(entry.slot, None)
         self._update_slot_reclaimability(entry.slot)
+        self._refresh_checkpoint_neighbors(owner)
+
+    def _checkpoint_successor(self, entry: LogStateEntry) -> LogStateEntry | None:
+        if entry.kind is not LogStateKind.CHECKPOINT or self.slot_is_fragmented(entry.slot):
+            return None
+        node = self.entry_owner(entry)
+        if node.is_protected:
+            return None
+        for candidate in node.entries:
+            if candidate.end > entry.end:
+                return candidate if (
+                    candidate.kind is LogStateKind.CHECKPOINT
+                    and candidate.begin == entry.end
+                    and not self.slot_is_fragmented(candidate.slot)
+                    and candidate.slot not in self._recovery_slot_refs
+                ) else None
+        while not node.is_protected and len(node.children) == 1:
+            node = next(iter(node.children.values()))
+            if node.entries:
+                candidate = node.entries[0]
+                return candidate if (
+                    candidate.kind is LogStateKind.CHECKPOINT
+                    and candidate.begin == entry.end
+                    and not self.slot_is_fragmented(candidate.slot)
+                    and candidate.slot not in self._recovery_slot_refs
+                ) else None
+        return None
+
+    def _refresh_checkpoint_neighbors(self, node: LogRadixTreeNode) -> None:
+        for entry in node.entries:
+            if entry.kind is LogStateKind.CHECKPOINT:
+                self._update_slot_reclaimability(entry.slot)
+        node = node.parent if not node.is_root() else node
+        while not node.is_root():
+            if node.entries:
+                entry = node.entries[-1]
+                if entry.kind is LogStateKind.CHECKPOINT:
+                    self._update_slot_reclaimability(entry.slot)
+                break
+            node = node.parent
+
+    def _slot_reclaimable(self, slot: int) -> bool:
+        if (slot not in self._slot_entries or slot in self._unprunable_log_refs
+            or slot in self._recovery_slot_refs):
+            return False
+        entries = self._slot_entries[slot]
+        if entries[0].kind is LogStateKind.CHECKPOINT:
+            entry, = entries
+            if self.entry_owner(entry).is_locked:
+
+
+                return self._checkpoint_successor(entry) is not None
+        return True
 
     def _update_slot_reclaimability(self, slot: int) -> None:
-        reclaimable = slot in self._slot_entries and slot not in self._locked_slot_refs
+        reclaimable = self._slot_reclaimable(slot)
         if reclaimable == (slot in self._evictable_slots):
             return
         if reclaimable:

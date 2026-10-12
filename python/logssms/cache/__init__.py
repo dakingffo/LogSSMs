@@ -1,5 +1,5 @@
 from .kv_pool.base import BaseKVCachePool
-from .logstate_pool.frame_pool import FramedMHALogStatePool
+from .logstate_pool.mha_pool import MHALogStatePool
 from .linear_pool.state_pool import LinearStatePool
 from .prefix_cache import make_prefix_cache
 from .prefix_cache.base import (
@@ -57,7 +57,7 @@ __all__ = [
     "make_linear_state_pool",
     "make_prefix_cache",
     "linear_state_slot_bytes_for_config",
-    "FramedMHALogStatePool",
+    "MHALogStatePool",
     "BaseKVCachePool",
     "BaseCacheHandle",
     "BasePrefixCache",

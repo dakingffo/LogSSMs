@@ -20,28 +20,6 @@ from ._device import custom_device_ctx
 def tensor_cache(
     fn: Callable[..., torch.Tensor],
 ) -> Callable[..., torch.Tensor]:
-    """
-    A decorator that memoizes the most recent results of a function call by argument identity.
-
-    The decorator keeps a bounded queue of up to ``FLA_TENSOR_CACHE_SIZE`` (default 4)
-    recent ``(args, kwargs, result)`` triples. On each call, every cached entry is checked
-    in order; an entry is considered a hit when the positional arg count and kwarg key set
-    match and every argument is the *same object* (``is`` identity) as the cached one. On a
-    hit the cached result is returned and ``fn`` is skipped; on a miss ``fn`` is invoked and
-    the new triple is appended (evicting the oldest when the queue is full).
-
-    Caching is fully bypassed when the ``FLA_DISABLE_TENSOR_CACHE`` environment variable is
-    set to ``'1'``.
-
-    Args:
-        fn (Callable[..., torch.Tensor]):
-            The function to be decorated. Intended for functions whose inputs are tensors
-            (or other objects compared by identity) and whose output is a tensor.
-
-    Returns:
-        Callable[..., torch.Tensor]:
-            A wrapped version of ``fn`` backed by an identity-based bounded cache.
-    """
     cached: deque = deque(maxlen=FLA_TENSOR_CACHE_SIZE)
 
     @functools.wraps(fn)
@@ -64,7 +42,6 @@ def tensor_cache(
 
 
 def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
-    """Make kernel inputs contiguous and select their device."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         processed_args = tuple(arg.contiguous() if isinstance(arg, torch.Tensor) else arg for arg in args)

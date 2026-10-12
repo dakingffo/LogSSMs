@@ -1,13 +1,13 @@
 import pytest
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.conv_copy import copy_framed_conv_snapshots
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.kernel.linear_attention.conv_copy import copy_conv_snapshots
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_copy_framed_conv_snapshots_multiple_layers_and_granules():
-    pool = FramedMHALogStatePool(
+def test_copy_conv_snapshots_multiple_layers_and_granules():
+    pool = MHALogStatePool(
         num_frames=64,
         page_size=64,
         granularity=16,
@@ -42,7 +42,7 @@ def test_copy_framed_conv_snapshots_multiple_layers_and_granules():
     def vector(values):
         return torch.tensor(values, dtype=torch.int32, device="cuda")
 
-    copy_framed_conv_snapshots(
+    copy_conv_snapshots(
         pool,
         vector([slot for slot, _ in sources]),
         vector([granule for _, granule in sources]),

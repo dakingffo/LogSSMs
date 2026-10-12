@@ -21,10 +21,10 @@ class Mamba2Backend(StandardLinearAttentionBackend, BaseMamba2Backend):
             raise NotImplementedError("Mamba2 speculative verify is not implemented")
         if batch.is_decode:
             convolved = mamba2_conv_decode(
-                xbc, conv_weight, conv_bias, config, metadata, pool, framed=False,
+                xbc, conv_weight, conv_bias, config, metadata, pool, logstate=False,
             )
             return mamba2_decode(
-                convolved, dt, A_log, dt_bias, D, config, metadata, pool, framed=False,
+                convolved, dt, A_log, dt_bias, D, config, metadata, pool, logstate=False,
             )
         indices = metadata.prefill_indices
         slots = metadata.baseline_slots

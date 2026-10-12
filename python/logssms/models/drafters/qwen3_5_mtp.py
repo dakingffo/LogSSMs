@@ -23,16 +23,6 @@ if TYPE_CHECKING:
 
 
 class Qwen3_5MTPDrafter(BaseDrafterModel):
-    """Standalone MTP drafter with its own embedding and LM head.
-
-    The checkpoint stores no ``mtp.*`` embed/lm_head keys; those are the target's
-    ``model.embed_tokens.weight``, loaded by ``load_weights``.
-
-    Weight keys keep the ``mtp.*`` prefix so the drafter loads exactly the ``mtp.*``
-    slice of a Qwen3.5 checkpoint (``load_state_dict(..., prefix="mtp")``). It runs at
-    tp=1 in the speculator process and exposes projection/finalization primitives to the
-    batched MTP engine.
-    """
 
     def __init__(self, config: Qwen3_5Config):
         self._hidden_size = config.hidden_size
@@ -55,9 +45,8 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
         self.norm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, zero_centered=True
         )
-        # Own embedding + LM head. Underscore-named: excluded from BaseOP.state_dict, so
-        # the drafter's state_dict is exactly the mtp.* checkpoint slice; embed/lm_head
-        # are filled by load_weights (a tied lm_head aliases the embedding).
+
+
         self._embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self._lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -69,7 +58,6 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
         )
 
     def load_weights(self, model_path: str, device: torch.device) -> None:
-        """Load the ``mtp.*`` weights plus the target's embed/lm_head into this drafter."""
         mtp_sd: dict[str, torch.Tensor] = {}
         embed: torch.Tensor | None = None
         lm_head: torch.Tensor | None = None
@@ -91,13 +79,6 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
             self._lm_head.weight = lm_head.to(self._lm_head.weight.dtype)
 
     def get_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project MTP output to vocab logits via the drafter's own lm_head.
-
-        The lm_head is vocab-parallel (each rank holds vocab/tp rows), so the per-rank
-        logits must be all-gathered into full-vocab logits before the draft argmax /
-        p_draft (draft_probs is sized to the full vocab). Mirrors ParallelLMHead.forward
-        but standalone: draft runs outside a forward batch, so it must not read ctx.batch.
-        """
         module = self._lm_head.tied_embedding or self._lm_head
         logits = F.linear(hidden_states, module.weight, self._lm_head.bias)
         if self._lm_head.tp_size > 1:
@@ -116,7 +97,6 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
         positions    : torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare arbitrary canonical or speculative rows for pooled MTP attention."""
         assert input_ids.ndim == positions.ndim == 1
         assert hidden_states.shape == (input_ids.shape[0], self._hidden_size)
         emb = self._embed_tokens.forward(input_ids)
@@ -136,7 +116,6 @@ class Qwen3_5MTPDrafter(BaseDrafterModel):
         gate            : torch.Tensor,
         attention_output: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Finish one predicting row per request after its K/V has entered the pool."""
         layer = self.layers.op_list[0]
         h = sigmoid_and_mul(attention_output, gate, out=attention_output)
         h = layer.self_attn.o_proj.forward(

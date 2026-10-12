@@ -3,14 +3,15 @@ import torch
 import torch.nn.functional as F
 
 from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.core import Batch, Context, clear_global_ctx, set_global_ctx
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.core import Batch, Context, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.layers import GatedDeltaNet
 from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend
 from logssms.layers.linear_attention_backend.logstate import LogStateLinearAttentionMetadata
 from logssms.layers.linear_attention_backend.standard import LinearAttentionMetadata
 from logssms.utils import torch_dtype
+from tests.utils import clear_global_ctx
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -32,7 +33,7 @@ def test_fused_gdn_graph_matches_separate_projections(cache_type):
     offsets = torch.tensor([0, 15], device=device, dtype=torch.int32)
     config = layer._config
     if cache_type == "logstate":
-        pool = FramedMHALogStatePool(
+        pool = MHALogStatePool(
             num_frames=64, page_size=64, granularity=32,
             num_attention_layers=1, num_kv_heads=1, head_dim=64,
             num_linear_layers=1, num_key_heads=2, num_value_heads=4,

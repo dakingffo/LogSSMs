@@ -42,7 +42,6 @@ class SpeculatorClientBase(ABC):
         msg   : SpeculatorInitMsg,
         hidden: torch.Tensor,
     ) -> None:
-        """Seed the drafter's per-request state with a prefill terminal window."""
         ...
 
     @abstractmethod
@@ -51,13 +50,10 @@ class SpeculatorClientBase(ABC):
         msg   : SpeculatorStepMsg,
         tensor: torch.Tensor | None,
     ) -> tuple[SpeculatorReplyMsg, torch.Tensor | None]:
-        """Blocking draft round. Returns the reply and the drafter's draft_probs rows
-        (None if no request sampled this round)."""
         ...
 
     @abstractmethod
     def remove(self, uid: int) -> None:
-        """Drop the drafter's per-request state (finish / abort)."""
         ...
 
     @abstractmethod
@@ -95,8 +91,8 @@ class MainSpeculatorClient(SpeculatorClientBase):
             handshake.max_prob_rows,
             handshake.vocab_size,
         )
-        # Connection metadata must go out before transport initialization, which blocks
-        # until the worker consumes the same handshake.
+
+
         self.sender.put(handshake)
         self.data_plane.init_rank0(handshake.connection_id, sizes)
         ack = self.receiver.get()
@@ -141,13 +137,6 @@ class MainSpeculatorClient(SpeculatorClientBase):
 
 
 class BroadcastSpeculatorClient(SpeculatorClientBase):
-    """Non-primary-rank stand-in for ``SpeculatorClientBase``.
-
-    Only rank0 has the ZMQ/data-plane client; other TP ranks receive the draft results rank0
-    broadcasts (``scheduler.io``) and present the same ``step`` interface so
-    ``VerifyManager`` is rank-agnostic. ``init``/``remove`` are no-ops — no drafter state
-    lives on non-primary ranks.
-    """
 
     def __init__(
         self,

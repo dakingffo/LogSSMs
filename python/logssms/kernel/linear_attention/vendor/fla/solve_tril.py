@@ -66,7 +66,7 @@ def solve_tril_16x16_kernel(
     m_t = o_t < T
     if not USE_TMA:
         p_A = A + o_t[:, None] * (H*BT) + (o_i + offset)[None, :]
-        # [16, 16]
+
         b_A = tl.load(p_A, mask=m_t[:, None], other=0.0).to(tl.float32)
         b_A = tl.where(m_A, b_A, 0)
     else:
@@ -77,7 +77,7 @@ def solve_tril_16x16_kernel(
     b_A = -b_A
 
     for i in range(2, min(16, T - i_t * 16)):
-        # [16]
+
         b_a = -tl.load(A + (i_t * 16 + i) * H*BT + o_i + offset)
         b_a = tl.where(o_i < i, b_a, 0.)
         b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
@@ -143,7 +143,7 @@ def merge_16x16_to_32x32_inverse_kernel(
         b_Ai_11 = desc.load([i_t * BT + 0, 0]).to(tl.float32)
         b_Ai_22 = desc.load([i_t * BT + 16, 16]).to(tl.float32)
 
-    # [16, 16]
+
     b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
     b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
 
@@ -239,7 +239,7 @@ def merge_16x16_to_64x64_inverse_kernel(
         b_Ai_33 = desc.load([i_t * BT + 32, 32]).to(tl.float32)
         b_Ai_44 = desc.load([i_t * BT + 48, 48]).to(tl.float32)
 
-    # [16, 16]
+
     b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
     b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
     b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
@@ -356,22 +356,6 @@ def solve_tril(
     chunk_indices: torch.LongTensor | None = None,
     output_dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
-    """
-    Compute the inverse of the matrix I + A
-    A should be strictly lower triangular, i.e., A.triu() == 0.
-
-    Args:
-        A (torch.Tensor):
-            [B, T, H, BT], where BT should only be 16, 32, or 64.
-        cu_seqlens (torch.Tensor):
-            The cumulative sequence lengths of the input tensor. Default: `None`.
-        output_dtype (torch.dtype):
-            The dtype of the output tensor. Default: `torch.float`.
-            If `None`, the output dtype will be the same as the input dtype.
-
-    Returns:
-        (I + A)^-1 with the same shape as A
-    """
     assert A.shape[-1] in [16, 32, 64]
     output_dtype = A.dtype if output_dtype is None else output_dtype
 

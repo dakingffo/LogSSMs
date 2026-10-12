@@ -5,8 +5,8 @@ import time
 
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.conv_copy import copy_framed_conv_snapshots
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.kernel.linear_attention.conv_copy import copy_conv_snapshots
 
 
 def main() -> None:
@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=20)
     args = parser.parse_args()
 
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=256,
         page_size=64,
         granularity=32,
@@ -48,7 +48,7 @@ def main() -> None:
             )
 
     def fused() -> None:
-        copy_framed_conv_snapshots(
+        copy_conv_snapshots(
             pool, source, source_granule, destination, zero,
         )
 

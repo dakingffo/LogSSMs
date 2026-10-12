@@ -45,8 +45,8 @@ const Int* cpu_ints(tvm::ffi::TensorView tensor) {
 }
 
 struct Entry {
-  // Flat path row: slot, begin, end, span (-1 for Log), physical begin,
-  // round eligibility, slot protection, physical-slot fragmentation.
+
+
   Int slot, begin, end, span, physical;
   bool eligible = true, protected_entry = false, fragmented = false;
 };
@@ -196,7 +196,7 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
     }
   };
   for (const auto& anchor : anchors) {
-    // Anchor: path index, matched endpoint, maximum arity, has statistics.
+
     check(anchor.size() == 4 && anchor[0] >= 0 && anchor[0] < static_cast<Int>(paths.size())
           && anchor[2] >= 2, "Invalid coalesce anchor");
     const auto index = anchor[0];
@@ -349,8 +349,8 @@ struct Chain {
 };
 
 Rows schedule_construction_waves(tvm::ffi::TensorView chain_rows, tvm::ffi::TensorView plans) {
-  // Borrow packed CPU buffers only for this call. No Node/device ownership.
-  // A row is [base, (Log slot, end, output count, outputs...)...].
+
+
   std::vector<Chain> chains;
   std::unordered_map<Int, Int> ends, writers;
   const auto plan_data = cpu_ints(plans);
@@ -407,7 +407,7 @@ Rows schedule_construction_waves(tvm::ffi::TensorView chain_rows, tvm::ffi::Tens
     }
   };
   for (Int i = 0; i < static_cast<Int>(chains.size()); ++i) {
-    // New-checkpoint consumers follow its writer; old-Log consumers precede it.
+
     if (writers.contains(chains[i].base)) {
       depend(writers[chains[i].base], i);
     }
@@ -486,7 +486,7 @@ tvm::ffi::Tensor write_vector(const Vector& values) {
 
 Rows branch_protections(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs,
                         const Rows& forced, Int granularity) {
-  // Tokens remain borrowed CPU buffers, never boxed Python prefix tuples.
+
   std::map<Vector, std::set<Int>> candidates;
   auto prefix = [&](Int request, Int position) {
     check(request >= 0 && request < static_cast<Int>(inputs.size()), "Invalid branch request");
@@ -565,8 +565,8 @@ Rows construction_plan(tvm::ffi::TensorView entry_rows, tvm::ffi::TensorView res
   std::stable_sort(order.begin(), order.end(), [&](Int a, Int b) {
     return materials[a][2] > materials[b][2];
   });
-  // Match interval coverage by physical slot rather than scanning every source
-  // segment for every restore segment.
+
+
   auto covered = [&](const Vector& a, const Vector& b) {
     std::unordered_map<Int, std::vector<std::pair<Int, Int>>> by_slot;
     for (const auto i : b) {
@@ -711,6 +711,10 @@ public:
     return index;
   }
 
+  bool next_is_log() const {
+    return !heap_.empty() && !std::get<0>(heap_.top());
+  }
+
 private:
   void push(Int index) {
     const auto& row = nodes_[index];
@@ -734,12 +738,12 @@ Rows eviction_order(const Rows& nodes) {
 }
 
 Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
-                   const Rows& slots, const Rows& occupied, const List& config) {
-  // config: free frames/records, payload/conv frames, granules, records/frame,
-  // required KV/Log/work counts. This function borrows a single CPU snapshot;
-  // it never mutates allocator state or tree ownership.
+                   const Rows& slots, const Rows& occupied, const List& config,
+                   const Rows& checkpoint_pairs) {
+
+
   check(nodes.size() == kv.size() && nodes.size() == node_slots.size()
-        && config.size() == 9 && config[5] > 0, "Invalid eviction capacity metadata");
+        && config.size() == 10 && config[5] > 0, "Invalid eviction capacity metadata");
   std::unordered_map<Int, List> slot_info;
   for (const auto& row : slots) {
     check(row.size() == 5 && row[1] > 0, "Invalid eviction slot");
@@ -753,12 +757,31 @@ Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
   Int free = config[0], decay = config[1], kv_free = 0;
   auto fits = [&]() {
     const auto required_decay = (std::max(Int{0}, config[7] - decay) + config[5] - 1) / config[5];
-    return config[6] + (config[7] + config[8]) * config[2]
+    const auto log_frames = config[9];
+    return config[6] + config[7] * log_frames + config[8] * config[2]
            + (config[7] * config[4] + config[8]) * config[3] + required_decay <= free + kv_free;
   };
   EvictionQueue queue(nodes);
-  Vector selected, released, page_order;
-  for (Int index; (index = queue.pop()) >= 0;) {
+  Vector selected, released, page_order, compressed;
+  std::unordered_set<Int> released_set;
+  auto release = [&](Int slot) {
+    check(slot_info.contains(slot), "Missing eviction slot");
+    check(released_set.insert(slot).second, "Duplicate eviction slot release");
+    const auto& record = slot_info.at(slot);
+    released.push_back(slot);
+    free += record[2];
+    if (record[3] >= 0) {
+      check(decay_occupied.contains(record[3]), "Missing decay frame occupancy");
+      if (++decay_released[record[3]] == decay_occupied.at(record[3])) {
+        ++free;
+        decay -= config[5] - 1;
+      }
+      else {
+        ++decay;
+      }
+    }
+  };
+  auto prune = [&](Int index) {
     selected.push_back(index);
     check(kv[index].size() % 3 == 0, "Invalid eviction KV references");
     for (size_t i = 0; i < kv[index].size(); i += 3) {
@@ -773,6 +796,9 @@ Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
       kv_free += count == kv[index][i + 2];
     }
     for (const auto slot : node_slots[index]) {
+      if (released_set.contains(slot)) {
+        continue;
+      }
       check(slot_info.contains(slot), "Missing eviction slot");
       const auto& record = slot_info.at(slot);
       const auto refs = ++references[slot];
@@ -780,28 +806,85 @@ Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
       if (refs != record[1]) {
         continue;
       }
-      released.push_back(slot);
-      free += record[2];
-      if (record[3] >= 0) {
-        check(decay_occupied.contains(record[3]), "Missing decay frame occupancy");
-        if (++decay_released[record[3]] == decay_occupied.at(record[3])) {
-          ++free;
-          decay -= config[5] - 1;
-        }
-        else {
-          ++decay;
-        }
+      release(slot);
+    }
+  };
+  auto result = [&]() {
+    Vector page_counts;
+    for (const auto frame : page_order) {
+      page_counts.insert(page_counts.end(), {frame, pages.at(frame)});
+    }
+    std::sort(released.begin(), released.end());
+    return Rows({List(selected.begin(), selected.end()),
+                 List(page_counts.begin(), page_counts.end()),
+                 List(released.begin(), released.end()),
+                 List(compressed.begin(), compressed.end())});
+  };
+
+
+  while (queue.next_is_log()) {
+    prune(queue.pop());
+    if (fits()) {
+      return result();
+    }
+  }
+  std::vector<Vector> pairs;
+  for (const auto& row : checkpoint_pairs) {
+    check(row.size() == 4 && row[0] != row[1], "Invalid checkpoint eviction pair");
+    pairs.emplace_back(row.begin(), row.end());
+  }
+  std::sort(pairs.begin(), pairs.end(), [](const Vector& left, const Vector& right) {
+    return std::tie(left[3], left[2], left[0]) < std::tie(right[3], right[2], right[0]);
+  });
+
+
+  std::vector<Vector> ordered;
+  ordered.reserve(pairs.size());
+  while (!pairs.empty()) {
+    if (pairs.size() == 1) {
+      ordered.push_back(std::move(pairs.front()));
+      break;
+    }
+    std::vector<Vector> retained;
+    retained.reserve((pairs.size() + 1) / 2);
+    for (size_t i = 0; i < pairs.size(); ++i) {
+      if (i % 2) {
+        ordered.push_back(std::move(pairs[i]));
+      }
+      else {
+        retained.push_back(std::move(pairs[i]));
       }
     }
+    pairs = std::move(retained);
+  }
+  std::unordered_map<Int, Int> successors;
+  for (const auto& pair : ordered) {
+    if (released_set.contains(pair[0])) {
+      continue;
+    }
+    auto right = pair[1];
+
+
+    while (successors.contains(right)) {
+      right = successors.at(right);
+    }
+    check(slot_info.contains(pair[0]) && slot_info.contains(right),
+          "Missing checkpoint eviction slot");
+    check(slot_info.at(pair[0])[1] == 1 && slot_info.at(right)[1] == 1,
+          "Cannot compress shared checkpoint slots");
+    compressed.insert(compressed.end(), {pair[0], right});
+    successors.emplace(pair[0], right);
+    release(pair[0]);
     if (fits()) {
-      Vector page_counts;
-      for (const auto frame : page_order) {
-        page_counts.insert(page_counts.end(), {frame, pages.at(frame)});
-      }
-      std::sort(released.begin(), released.end());
-      return Rows({List(selected.begin(), selected.end()),
-                   List(page_counts.begin(), page_counts.end()),
-                   List(released.begin(), released.end())});
+      return result();
+    }
+  }
+
+
+  for (Int index; (index = queue.pop()) >= 0;) {
+    prune(index);
+    if (fits()) {
+      return result();
     }
   }
   return {};
@@ -818,28 +901,19 @@ public:
     if (!capacity_) {
       return 0;
     }
-    Vector tokens;
-    for (const auto& part : parts) {
-      check(part.ndim() == 1 && part.is_contiguous() && part.device().device_type == kDLCPU
-            && part.dtype().code == kDLInt && (part.dtype().bits == 32 || part.dtype().bits == 64),
-            "Recycle tokens must be contiguous CPU int32/int64");
-      for (Int i = 0; i < part.size(0); ++i) {
-        tokens.push_back(part.dtype().bits == 32 ? static_cast<const int32_t*>(part.data_ptr())[i]
-                                               : static_cast<const Int*>(part.data_ptr())[i]);
-      }
-    }
-    std::vector<std::array<Int, 3>> entries;
+    auto tokens = read_prefix(parts);
+    std::vector<std::array<Int, 2>> logs;
     for (const auto& row : read_rows(entry_rows)) {
-      check(row.size() == 3 && row[0] < row[1], "Invalid recycled entry");
-      entries.push_back({row[0], row[1], row[2]});
+      check(row.size() == 2 && row[0] >= 0 && row[0] < row[1]
+            && row[1] <= static_cast<Int>(tokens.size()), "Invalid recycled Log range");
+      logs.push_back({row[0], row[1]});
+    }
+    if (logs.empty()) {
+      return 0;
     }
     Vector protected_values(protected_ends.begin(), protected_ends.end());
     std::sort(protected_values.begin(), protected_values.end());
-    bool complete = !entries.empty() && entries.front()[0] == 0
-                    && entries.back()[1] == static_cast<Int>(tokens.size());
-    for (size_t i = 1; i < entries.size(); ++i) {
-      complete &= entries[i - 1][1] == entries[i][0];
-    }
+    logs = merge_logs({}, logs);
     auto it = records_.lower_bound(tokens);
     while (it != records_.end() && it->first.size() >= tokens.size()
            && std::equal(tokens.begin(), tokens.end(), it->first.begin())) {
@@ -847,30 +921,17 @@ public:
         ++it;
         continue;
       }
-      const auto cut = static_cast<Int>(tokens.size());
       auto& record = it->second;
-      if (!complete || std::any_of(record.entries.begin(), record.entries.end(), [&](const auto& row) {
-          return row[0] < cut && cut < row[1]; })) {
-        // A shorter snapshot cannot describe the missing half of a checkpoint.
-        // Keep the complete branch; GPU layout takes precedence during restore.
-        ++it;
-        continue;
-      }
-      auto refreshed = entries;
-      for (const auto& row : record.entries) {
-        if (row[1] > cut) {
-          refreshed.push_back(row);
-        }
-      }
-      Vector ends = protected_values;
-      for (const auto end : record.protected_ends) {
-        if (end > cut) {
-          ends.push_back(end);
-        }
-      }
+
+
+      auto refreshed = merge_logs(record.logs, logs);
+      Vector ends = record.protected_ends;
+      ends.insert(ends.end(), protected_values.begin(), protected_values.end());
+      std::sort(ends.begin(), ends.end());
+      ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
       used_ -= bytes(it->first, record);
       ids_.erase(record.id);
-      record.entries = std::move(refreshed);
+      record.logs = std::move(refreshed);
       record.protected_ends = std::move(ends);
       record.id = ++serial_;
       *record.lru = record.id;
@@ -878,11 +939,9 @@ public:
       used_ += bytes(it->first, record);
       ++it;
     }
-    Record record{++serial_, entries, protected_values, Vector(stats.begin(), stats.end()), {}};
-    if (const auto old = records_.find(tokens); old != records_.end() && !complete) {
-      // KV-only ancestors can survive an earlier state eviction. They do not
-      // carry a replacement description for the remembered missing history.
-      record.entries = old->second.entries;
+    Record record{++serial_, logs, protected_values, Vector(stats.begin(), stats.end()), {}};
+    if (const auto old = records_.find(tokens); old != records_.end()) {
+      record.logs = merge_logs(old->second.logs, logs);
       record.protected_ends.insert(record.protected_ends.end(),
                                   old->second.protected_ends.begin(), old->second.protected_ends.end());
       std::sort(record.protected_ends.begin(), record.protected_ends.end());
@@ -925,16 +984,29 @@ public:
       const auto limit = std::min(tokens.size(), candidate->first.size());
       const auto pair = std::mismatch(tokens.begin(), tokens.begin() + limit, candidate->first.begin());
       const auto length = (pair.first - tokens.begin()) / granularity * granularity;
-      if (length > matched) {
-        matched = length;
-        best = candidate;
+      for (const auto& log : candidate->second.logs) {
+        const auto end = std::min(length, log[1]) / granularity * granularity;
+        if (end > matched && end > log[0]) {
+          matched = end;
+          best = candidate;
+        }
       }
+      return length;
     };
-    if (right != records_.begin()) {
-      consider(std::prev(right));
+
+
+    auto left = right;
+    while (left != records_.begin()) {
+      --left;
+      if (consider(left) <= matched) {
+        break;
+      }
     }
-    if (right != records_.end()) {
-      consider(right);
+    while (right != records_.end()) {
+      if (consider(right) <= matched) {
+        break;
+      }
+      ++right;
     }
     if (best == records_.end()) {
       return {};
@@ -949,8 +1021,8 @@ public:
     Rows result({List(it->first.begin(), it->first.end()),
                  List(it->second.protected_ends.begin(), it->second.protected_ends.end()),
                  List(it->second.stats.begin(), it->second.stats.end())});
-    for (const auto& entry : it->second.entries) {
-      result.push_back(List(entry.begin(), entry.end()));
+    for (const auto& log : it->second.logs) {
+      result.push_back(List(log.begin(), log.end()));
     }
     return result;
   }
@@ -970,9 +1042,39 @@ public:
   Vector usage() const { return {used_, static_cast<Int>(records_.size())}; }
 
 private:
+  static std::vector<std::array<Int, 2>> merge_logs(
+      std::vector<std::array<Int, 2>> logs, const std::vector<std::array<Int, 2>>& added) {
+    logs.insert(logs.end(), added.begin(), added.end());
+    std::sort(logs.begin(), logs.end());
+    std::vector<std::array<Int, 2>> result;
+    for (const auto& log : logs) {
+      if (!result.empty() && log[0] < result.back()[1]) {
+        result.back()[1] = std::max(result.back()[1], log[1]);
+      }
+      else {
+        result.push_back(log);
+      }
+    }
+    return result;
+  }
+
+  static Vector read_prefix(const tvm::ffi::Array<tvm::ffi::Tensor>& parts) {
+    Vector tokens;
+    for (const auto& part : parts) {
+      check(part.ndim() == 1 && part.is_contiguous() && part.device().device_type == kDLCPU
+            && part.dtype().code == kDLInt && (part.dtype().bits == 32 || part.dtype().bits == 64),
+            "Recycle tokens must be contiguous CPU int32/int64");
+      for (Int i = 0; i < part.size(0); ++i) {
+        tokens.push_back(part.dtype().bits == 32 ? static_cast<const int32_t*>(part.data_ptr())[i]
+                                               : static_cast<const Int*>(part.data_ptr())[i]);
+      }
+    }
+    return tokens;
+  }
+
   struct Record {
     Int id;
-    std::vector<std::array<Int, 3>> entries;
+    std::vector<std::array<Int, 2>> logs;
     Vector protected_ends;
     Vector stats;
     std::list<Int>::iterator lru;
@@ -980,8 +1082,8 @@ private:
   using Records = std::map<Vector, Record>;
 
   static Int bytes(const Vector& tokens, const Record& record) {
-    // Account for the compact payload and a fixed per-record index overhead.
-    return 256 + 8 * tokens.size() + 32 * record.entries.size()
+
+    return 256 + 8 * tokens.size() + 16 * record.logs.size()
            + 8 * (record.protected_ends.size() + record.stats.size());
   }
 
@@ -1005,8 +1107,8 @@ private:
 };
 
 Result make_recycle_bin(Int capacity) {
-  // Captured shared ownership follows the FFI functions' lifetime. There are
-  // no global handles, raw pointer IDs or device allocations in this index.
+
+
   auto bin = std::make_shared<RecycleBin>(capacity);
   Result result;
   result.Set("remember", tvm::ffi::Function::FromTyped(
@@ -1019,8 +1121,8 @@ Result make_recycle_bin(Int capacity) {
       const auto values = bin->match(query, start, granularity);
       return List(values.begin(), values.end());
     }));
-  // The borrowed query also supplies Torch's allocator context for the
-  // returned CPU tensor; calls containing only integer IDs have no allocator.
+
+
   result.Set("get", tvm::ffi::Function::FromTyped(
     [bin](Int id, tvm::ffi::TensorView) { return write_rows(bin->get(id)); }));
   result.Set("discard", tvm::ffi::Function::FromTyped(
@@ -1052,9 +1154,11 @@ struct Planner {
 
   static tvm::ffi::Tensor eviction(tvm::ffi::TensorView nodes, tvm::ffi::TensorView kv,
                                  tvm::ffi::TensorView node_slots, tvm::ffi::TensorView slots,
-                                 tvm::ffi::TensorView occupied, const List& config) {
+                                 tvm::ffi::TensorView occupied, const List& config,
+                                 tvm::ffi::TensorView checkpoint_pairs) {
     return write_rows(plan_eviction(read_rows(nodes), read_rows(kv), read_rows(node_slots),
-                                    read_rows(slots), read_rows(occupied), config));
+                                    read_rows(slots), read_rows(occupied), config,
+                                    read_rows(checkpoint_pairs)));
   }
 
   static tvm::ffi::Tensor eviction_candidates(tvm::ffi::TensorView nodes) {
@@ -1106,8 +1210,8 @@ struct Planner {
   }
 };
 
-} // namespace
-} // namespace logssms
+}
+}
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_branch_points, logssms::Planner::branches);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);

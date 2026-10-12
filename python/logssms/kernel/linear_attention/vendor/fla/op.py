@@ -25,10 +25,10 @@ else:
 
 
 if hasattr(triton.language, '_experimental_make_tensor_descriptor'):
-    # For Triton 3.3.x
+
     make_tensor_descriptor = triton.language._experimental_make_tensor_descriptor
 elif hasattr(triton.language, 'make_tensor_descriptor'):
-    # For Triton 3.4.x and later
+
     make_tensor_descriptor = triton.language.make_tensor_descriptor
 else:
     """

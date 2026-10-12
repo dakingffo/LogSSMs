@@ -59,7 +59,7 @@ const auto kNCCLDtypeMap =
     std::unordered_map<DLDataType, ncclDataType_t, DLDataTypeHash>{
         {{DLDataTypeCode::kDLFloat, 16, 1}, ncclFloat16},
         {{DLDataTypeCode::kDLBfloat, 16, 1}, ncclBfloat16},
-        {{DLDataTypeCode::kDLFloat, 32, 1}, ncclFloat},  // draft_probs are fp32
+        {{DLDataTypeCode::kDLFloat, 32, 1}, ncclFloat},
     };
 
 template <typename T>
@@ -104,8 +104,7 @@ public:
     const auto reduce_op = kNCCLReduceOPMap.at(op);
     const auto stream = LaunchKernel::resolve_device(t.device());
 
-    // Copying through registered symmetric memory pays off for large messages,
-    // but the two device copies dominate small decode collectives.
+
     constexpr size_t kDirectAllReduceMaxBytes = 256 * 1024;
     if (size_bytes > kDirectAllReduceMaxBytes && size_bytes <= max_bytes_) {
       const auto buf_ptr = sym_mem_.get();
@@ -115,13 +114,13 @@ public:
                                      ::cudaMemcpyDeviceToDevice, stream));
       }
       NCCL_CHECK(::ncclAllReduce(
-          /*sendbuff=*/buf_ptr,
-          /*recvbuff=*/buf_ptr,
-          /*count=*/size_dim,
-          /*datatype=*/dtype,
-          /*op=*/reduce_op,
-          /*comm=*/comm_.get(),
-          /*stream=*/stream));
+           buf_ptr,
+           buf_ptr,
+           size_dim,
+           dtype,
+           reduce_op,
+           comm_.get(),
+           stream));
       if (need_memcpy) {
         CUDA_CHECK(::cudaMemcpyAsync(data_ptr, buf_ptr, size_bytes,
                                      ::cudaMemcpyDeviceToDevice, stream));
@@ -129,13 +128,13 @@ public:
     }
     else {
       NCCL_CHECK(::ncclAllReduce(
-          /*sendbuff=*/data_ptr,
-          /*recvbuff=*/data_ptr,
-          /*count=*/size_dim,
-          /*datatype=*/dtype,
-          /*op=*/reduce_op,
-          /*comm=*/comm_.get(),
-          /*stream=*/stream));
+           data_ptr,
+           data_ptr,
+           size_dim,
+           dtype,
+           reduce_op,
+           comm_.get(),
+           stream));
     }
   }
 
@@ -167,16 +166,16 @@ public:
     const auto src_ptr = src.data_ptr();
     const auto dst_ptr = dst.data_ptr();
     const auto stream = LaunchKernel::resolve_device(src.device());
-    // do not use internal buffer for all_gather, directly gather to output
-    // tensor
+
+
     NCCL_CHECK(
       ::ncclAllGather(
-        /*sendbuff=*/src_ptr,
-        /*recvbuff=*/dst_ptr,
-        /*sendcount=*/size_dim,
-        /*datatype=*/dtype,
-        /*comm=*/comm_.get(),
-        /*stream=*/stream
+         src_ptr,
+         dst_ptr,
+         size_dim,
+         dtype,
+         comm_.get(),
+         stream
       )
     );
   }
@@ -209,4 +208,4 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create_nccl_uid, &create_uid);
 
-} // namespace logssms
+}

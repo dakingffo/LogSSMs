@@ -22,9 +22,10 @@ sys.path.insert(0, str(args.source_root.resolve()))
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
-from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+from logssms import core
+from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.engine.engine import Engine
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from logssms.layers.attention_backend.fi import FlashInferBackend
 from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend, GatedDeltaBackend
 
@@ -49,7 +50,7 @@ class TransferCounter(TorchDispatchMode):
 
 
 def make_pool():
-    return FramedMHALogStatePool(
+    return MHALogStatePool(
         num_frames=2048, page_size=64, granularity=32,
         num_attention_layers=2, num_kv_heads=1, head_dim=32,
         num_linear_layers=2, num_key_heads=2, num_value_heads=2,
@@ -132,7 +133,7 @@ def metadata_case(bs, phase, page_size, linear):
                     cpu_submit_p50_ms=statistics.median(cpu),
                     stream_span_p50_ms=statistics.median(gpu))
     finally:
-        clear_global_ctx()
+        core._GLOBAL_CTX = None
 
 
 def reclamation_case():

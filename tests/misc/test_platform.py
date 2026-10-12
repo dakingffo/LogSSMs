@@ -137,8 +137,8 @@ def test_local_qwen35_chat_template_token_prefix():
     ]
     manager = TokenizeManager(tokenizer)
     first_ids, second_ids = manager.tokenize([
-        type("Msg", (), {"text": first})(),
-        type("Msg", (), {"text": second})(),
+        type("Msg", (), {"text": first, "input_ids": None})(),
+        type("Msg", (), {"text": second, "input_ids": None})(),
     ])
     assert second_ids[:len(first_ids)].tolist() == first_ids.tolist()
     assert _chat_prompt_len(tokenizer, second) == len(second_ids)

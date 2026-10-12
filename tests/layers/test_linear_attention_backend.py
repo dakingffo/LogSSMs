@@ -4,9 +4,10 @@ import pytest
 import torch
 
 from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import GatedDeltaBackend
+from tests.utils import clear_global_ctx
 
 
 def _make_inputs(seq_len: int) -> dict:

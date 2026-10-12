@@ -39,17 +39,17 @@ class FICaptureData(BaseCaptureData):
 @dataclass
 class FIMetadata(BaseAttnMetadata):
     # fmt: off
-    cu_seqlens_q_cpu:   torch.Tensor  # on cpu
-    cu_seqlens_k_cpu:   torch.Tensor  # on cpu
-    cu_seqlens_q_gpu:   torch.Tensor  # on gpu
-    indices:            torch.Tensor  # on gpu
-    last_page_len_cpu:  torch.Tensor  # on cpu
+    cu_seqlens_q_cpu:   torch.Tensor
+    cu_seqlens_k_cpu:   torch.Tensor
+    cu_seqlens_q_gpu:   torch.Tensor
+    indices:            torch.Tensor
+    last_page_len_cpu:  torch.Tensor
     num_qo_heads:       int
     num_kv_heads:       int
     head_dim:           int
     page_size:          int
     pos_encoding_mode:  str
-    seq_lens_cpu:       torch.Tensor  # on cpu
+    seq_lens_cpu:       torch.Tensor
     dtype:              torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
@@ -86,25 +86,25 @@ class FlashInferBackend(BaseAttnBackend):
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
+            backend="fa2",
         )
         self.decode_wrappers = BatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             use_tensor_cores=self.use_tensor_cores,
             kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
+            backend="fa2",
         )
 
-        # NOTE: some hack to reuse the int_workspace_buffer
+
         self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
         self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
 
-        # initialize some data members
+
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
 
-        # for cuda graph
+
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
@@ -120,8 +120,8 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
-        # FlashInfer planning reuses a pinned host staging buffer and launches an
-        # async H2D copy. Wait here before the next plan mutates that host buffer.
+
+
         self.last_event.synchronize()
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
@@ -179,7 +179,7 @@ class FlashInferBackend(BaseAttnBackend):
 
         page_size = getattr(self.kvcache, "kv_page_size", 1)
         packet = batch.prepared_indices
-        if packet is None:  # Graph capture has no Engine.prepare_batch stage.
+        if packet is None:
             packet = BatchIndices.make(batch, self.device, page_size)
         assert packet.page_size == page_size
         indices = gather_paged_indices(packet, get_global_ctx().page_table)
@@ -203,7 +203,7 @@ class FlashInferBackend(BaseAttnBackend):
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = FICaptureData.make(max_bs, max_seq_len, self.kvcache.device)
-        capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
+        capture.page_table = capture.page_table.view(-1)
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)

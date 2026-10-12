@@ -54,24 +54,12 @@ class BaseSpeculatorConfig(ABC):
 
 @dataclass
 class DraftState:
-    """Polymorphic per-request spec-decode state held by the target-side VerifyManager.
-
-    Only these two fields are visible across the target/drafter boundary; drafter engines
-    keep their richer per-request state in subclasses (e.g. ``MTPState``). The VerifyManager
-    allocates a ``DraftState`` per table_idx, the drafter fills it in via ``client.step``.
-    """
 
     draft_tokens: list[int]           = field(default_factory=list)
     draft_probs : torch.Tensor | None = None
 
 
 class EngineBase(ABC):
-    """Drafter-side engine: fills ``DraftState.draft_tokens`` / ``draft_probs`` for a batch.
-
-    Lives in the speculator process, drives the standalone drafter model on its own device /
-    stream. Drafter runs are blocking on the target side (VerifyManager waits for the reply),
-    so ``stream`` is for the engine's own internal overlap, not target-side pipelining.
-    """
 
     device          : torch.device
     stream          : torch.cuda.Stream
@@ -85,21 +73,20 @@ class EngineBase(ABC):
         device: torch.device,
         config: SchedulerConfig,
     ) -> EngineBase:
-        """Build an algorithm engine and load its standalone drafter model."""
+        pass
 
     @staticmethod
     @abstractmethod
     def load_drafter(
         device: torch.device, config: EngineConfig
     ) -> BaseDrafterModel:
-        """Load the algorithm's standalone drafter model."""
+        pass
 
     @abstractmethod
     def draft(self, states: list[DraftState]) -> None:
-        """Fill each state's draft_tokens / draft_probs for this round."""
+        pass
 
     def destroy(self) -> None:
-        """Release engine-side resources (CUDA graph pools etc.) on shutdown."""
         pass
 
 

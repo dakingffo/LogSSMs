@@ -1,5 +1,3 @@
-"""Mamba2 SSD prefill and direct-slot decode, with frame-backed affine logs."""
-
 from __future__ import annotations
 
 import torch
@@ -7,6 +5,7 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
+from .layout import log_pointer, payload_pointer
 
 
 @triton.jit
@@ -123,7 +122,7 @@ def _mamba2_conv_decode_kernel(
     WriteGranules, Work, Output,
     C: tl.constexpr, S: tl.constexpr, LAYERS: tl.constexpr, LAYER: tl.constexpr,
     XS0: tl.constexpr, XS1: tl.constexpr, RS: tl.constexpr, WS: tl.constexpr,
-    FRAMED: tl.constexpr, HAS_BIAS: tl.constexpr,
+    LOGSTATE: tl.constexpr, HAS_BIAS: tl.constexpr,
     FRAME_ELEMS: tl.constexpr, GRANULES: tl.constexpr,
     BC: tl.constexpr, BS: tl.constexpr,
 ):
@@ -132,7 +131,7 @@ def _mamba2_conv_decode_kernel(
     s = tl.arange(0, BS)
     read = tl.load(Read + req * RS)
     write = tl.load(Write + req * WS)
-    if FRAMED:
+    if LOGSTATE:
         rg = tl.load(ReadGranules + req)
         wg = tl.load(WriteGranules + req)
         work = tl.load(Work + req)
@@ -163,14 +162,14 @@ def _mamba2_conv_decode_kernel(
     shifted = tl.where(s[None, :] == S - 1, x[:, None], shifted)
     mask = (c[:, None] < C) & (s[None, :] < S)
     tl.store(ptr + new_base + c[:, None] * S + s[None, :], shifted, mask)
-    if FRAMED:
+    if LOGSTATE:
         tl.store(ptr + work_base + c[:, None] * S + s[None, :], shifted, mask)
     tl.store(Output + req * C + c, y, c < C)
 
 
-def mamba2_conv_decode(xbc, weight, bias, config, metadata, pool, *, framed):
+def mamba2_conv_decode(xbc, weight, bias, config, metadata, pool, *, logstate):
     output = torch.empty_like(xbc, memory_format=torch.contiguous_format)
-    if framed:
+    if logstate:
         assert pool.allocator.conv_frames == 1
         read, write = metadata.conv_read_slots, metadata.log_slots
         rg = metadata.conv_read_granules
@@ -189,7 +188,7 @@ def mamba2_conv_decode(xbc, weight, bias, config, metadata, pool, *, framed):
         xbc, weight, bias, state, storage, frames, read, write, rg, wg, work, output,
         config.conv_dim, config.state_len, layers, config.layer_idx,
         xbc.stride(0), xbc.stride(1), read.stride(0), write.stride(0),
-        framed, bias is not None, frame_elems, granules, 32,
+        logstate, bias is not None, frame_elems, granules, 32,
         triton.next_power_of_2(config.state_len), num_warps=4,
     )
     return output
@@ -201,10 +200,11 @@ def _mamba2_decode_kernel(
     Read, Write, LogSlots, Positions, Counts, Output,
     H: tl.constexpr, G: tl.constexpr, K: tl.constexpr, V: tl.constexpr, C: tl.constexpr,
     DS0: tl.constexpr, DS1: tl.constexpr, RS: tl.constexpr, WS: tl.constexpr,
-    LAYERS: tl.constexpr, LAYER: tl.constexpr, FRAMED: tl.constexpr, EAGER: tl.constexpr,
+    LAYERS: tl.constexpr, LAYER: tl.constexpr, LOGSTATE: tl.constexpr, EAGER: tl.constexpr,
     FRAME_BYTES: tl.constexpr, PAYLOAD_FRAMES: tl.constexpr, HEAD_BYTES: tl.constexpr,
     DECAY_BYTES: tl.constexpr, PAGE: tl.constexpr, WINDOW: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr,
+    GRANULARITY: tl.constexpr = 64,
 ):
     req = tl.program_id(0)
     head = tl.program_id(1)
@@ -213,21 +213,22 @@ def _mamba2_decode_kernel(
     v = tl.program_id(2) * BV + tl.arange(0, BV)
     mask = (k[:, None] < K) & (v[None, :] < V)
     read = tl.load(Read + req * RS)
-    if FRAMED:
-        head_offset = (LAYER * H + head) * HEAD_BYTES
-        frame = tl.load(Payload + read * PAYLOAD_FRAMES + head_offset // FRAME_BYTES)
-        state_head = (Storage + frame.to(tl.int64) * FRAME_BYTES + head_offset % FRAME_BYTES).to(tl.pointer_type(XBC.dtype.element_ty))
+    if LOGSTATE:
+        payload = Storage.to(tl.pointer_type(XBC.dtype.element_ty))
+        state_ptr = payload_pointer(
+            payload, Payload, read, LAYER, head, k[:, None] * V + v[None, :],
+            LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES,
+        )
         log_slot = tl.load(LogSlots + req)
-        frame = tl.load(Payload + log_slot * PAYLOAD_FRAMES + head_offset // FRAME_BYTES)
-        log_head = (Storage + frame.to(tl.int64) * FRAME_BYTES + head_offset % FRAME_BYTES).to(tl.pointer_type(XBC.dtype.element_ty))
         decay_frame = tl.load(DecayFrames + log_slot * 2)
         decay_index = tl.load(DecayFrames + log_slot * 2 + 1)
         decay_head = (Storage + decay_frame.to(tl.int64) * FRAME_BYTES + decay_index * DECAY_BYTES).to(tl.pointer_type(tl.float32))
         position = tl.load(Positions + req)
     else:
         state_head = State + (read.to(tl.int64) * LAYERS + LAYER) * H * K * V + head * K * V
-    state = tl.load(state_head + k[:, None] * V + v[None, :], mask, other=0).to(tl.float32)
-    if FRAMED and not EAGER:
+        state_ptr = state_head + k[:, None] * V + v[None, :]
+    state = tl.load(state_ptr, mask, other=0).to(tl.float32)
+    if LOGSTATE and not EAGER:
         count = tl.load(Counts + req)
         t = tl.arange(0, WINDOW)
         previous = position - count + t
@@ -235,9 +236,15 @@ def _mamba2_decode_kernel(
         decays = tl.load(decay_head + (LAYER * PAGE + previous) * H + head, valid, other=0)
         total = tl.sum(decays)
         suffix = tl.exp(total - tl.cumsum(decays))
-        keys = tl.load(log_head + previous[None, :] * K + k[:, None],
+        keys = tl.load(log_pointer(
+            payload, Payload, log_slot, LAYER, head, previous[None, :], k[:, None],
+            LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES, False, G,
+        ),
                        (k[:, None] < K) & valid[None, :], other=0)
-        values = tl.load(log_head + PAGE * K + previous[:, None] * V + v[None, :],
+        values = tl.load(log_pointer(
+            payload, Payload, log_slot, LAYER, head, previous[:, None], v[None, :],
+            LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES, True, G,
+        ),
                          valid[:, None] & (v[None, :] < V), other=0)
         scaled = (values.to(tl.float32) * suffix[:, None]).to(XBC.dtype.element_ty)
         state = state * tl.exp(total) + tl.dot(keys, scaled)
@@ -251,22 +258,29 @@ def _mamba2_decode_kernel(
     state = state * tl.exp(log_decay) + key[:, None] * update[None, :]
     y = tl.sum(state * query[:, None], 0) + x * tl.load(D + head).to(tl.float32)
     tl.store(Output + (req * H + head) * V + v, y, v < V)
-    if FRAMED:
+    if LOGSTATE:
         if tl.program_id(2) == 0:
-            tl.store(log_head + position * K + k, key, k < K)
+            if head % (H // G) == 0:
+                tl.store(log_pointer(
+                    payload, Payload, log_slot, LAYER, head, position, k,
+                    LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES, False, G,
+                ), key, k < K)
             tl.store(decay_head + (LAYER * PAGE + position) * H + head, log_decay)
-        tl.store(log_head + PAGE * K + position * V + v, update, v < V)
+        tl.store(log_pointer(
+            payload, Payload, log_slot, LAYER, head, position, v,
+            LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES, True, G,
+        ), update, v < V)
         if EAGER or (position + 1) % WINDOW == 0:
-            tl.store(state_head + k[:, None] * V + v[None, :], state, mask)
+            tl.store(state_ptr, state, mask)
     else:
         write = tl.load(Write + req * WS)
         destination = State + (write.to(tl.int64) * LAYERS + LAYER) * H * K * V + head * K * V
         tl.store(destination + k[:, None] * V + v[None, :], state, mask)
 
 
-def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, framed, eager=False):
+def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, logstate, eager=False):
     output = torch.empty((len(xbc), config.num_heads, config.head_dim), dtype=xbc.dtype, device=xbc.device)
-    if framed:
+    if logstate:
         read = write = metadata.work_slots
         log_slots, offsets, counts = metadata.log_slots, metadata.token_offsets, metadata.replay_counts
         state, storage, payload, decay = pool.storage, pool.storage, pool.payload_frame_table, pool.decay_frame_table
@@ -283,8 +297,9 @@ def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, framed,
         read, write, log_slots, offsets, counts, output,
         config.num_heads, config.num_groups, config.state_dim, config.head_dim, config.conv_dim,
         dt.stride(0), dt.stride(1), read.stride(0), write.stride(0),
-        layers, config.layer_idx, framed, eager,
+        layers, config.layer_idx, logstate, eager,
         frame_bytes, frames, head_bytes, decay_bytes, page, LOG_STATE_REPLAY_WINDOW,
         triton.next_power_of_2(config.state_dim), 32, num_warps=8,
+        GRANULARITY=pool.layout.granularity if logstate else 64,
     )
     return output

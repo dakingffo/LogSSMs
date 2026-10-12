@@ -63,7 +63,6 @@ class Message(pydantic.BaseModel):
 
 
 class OpenAICompletionRequest(pydantic.BaseModel):
-    """Unified request model for OpenAI-style completions and chat-completions."""
 
     model           : str
     prompt          : str | None           = None
@@ -178,7 +177,7 @@ class FrontendManager:
             if ack.finished:
                 break
 
-        # send final finish_reason
+
         end_chunk = {
             "id": f"cmpl-{uid}",
             "object": "text_completion.chunk",
@@ -191,7 +190,7 @@ class FrontendManager:
     async def stream_with_cancellation(self, generator, request: fastapi.Request, uid: int):
         try:
             async for chunk in generator:
-                # detect if the client has disconnected
+
                 if await request.is_disconnected():
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
@@ -218,7 +217,7 @@ class FrontendManager:
 @asynccontextmanager
 async def lifespan(_: fastapi.FastAPI):
     yield
-    # shutdown code here
+
     global _GLOBAL_STATE
     if _GLOBAL_STATE is not None:
         _GLOBAL_STATE.shutdown()
@@ -274,7 +273,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
     else:
         prompt = req.prompt
 
-    # TODO: support more sampling parameters
+
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -343,14 +342,6 @@ async def available_models():
 
 
 def run_api_server(config: ServerArgs, start_backend: Callable[[], None]) -> None:
-    """
-    Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
-
-    Args:
-        config: Server configuration (host/port, ZMQ IPC addresses, etc).
-        start_backend: Callback that launches the backend worker processes (TP schedulers +
-            tokenizer/detokenizer).
-    """
 
     global _GLOBAL_STATE
 
@@ -372,7 +363,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None]) -> Non
         ),
     )
 
-    # start the backend here
+
     start_backend()
 
     logger.info(f"API server is ready to serve on {host}:{port}")

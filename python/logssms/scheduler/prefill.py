@@ -70,7 +70,7 @@ class PrefillAdder:
             self.rejection_reason = "no free request table slot"
             return None
 
-        # TODO: consider host cache match case
+
         with self._profile_step("match_req"):
             match = self.cache_manager.match_req(req)
         handle = match.cuda_handle
@@ -86,7 +86,7 @@ class PrefillAdder:
             )
             return None
 
-        # TODO: better estimate policy
+
         estimated_len = self.cache_manager.reservation_size(
             remain_len + req.output_len, handle=handle,
         )
@@ -112,7 +112,7 @@ class PrefillAdder:
 
         with self._profile_step("table_allocate"):
             table_idx = self.table_manager.allocate()
-        if cached_len > 0:  # NOTE: set the cached part
+        if cached_len > 0:
             with self._profile_step("cached_token_copy"):
                 device_ids = self.table_manager.token_pool[table_idx][:cached_len]
                 device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
@@ -142,7 +142,7 @@ class PrefillAdder:
         self.reserved_size += self.cache_manager.reservation_size(
             remain_len + pending_req.output_len, table_idx=table_idx,
         )
-        # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
+
         with self._profile_step("input_token_copy"):
             device_ids = self.table_manager.token_pool[table_idx, cached_len: cached_len + chunk_size]
             device_ids.copy_(
@@ -269,14 +269,14 @@ class PrefillManager:
                 reqs.append(req)
                 self.inflight_reqs[req.uid] = req
             else:
-                break  # We cannot add more requests
+                break
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> tuple[Request | None, bool]:
-        # check ChunkedRequest
+
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
@@ -285,7 +285,7 @@ class PrefillManager:
                     inflight_req.aborted = True
                 return req.chunked_req, inflight_req is not None
             
-        # check Request
+
         inflight_req = self.inflight_reqs.pop(uid, None)
         if inflight_req is not None:
             inflight_req.aborted = True

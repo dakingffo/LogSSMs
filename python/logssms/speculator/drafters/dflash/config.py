@@ -21,7 +21,7 @@ class DFlashSpeculatorConfig(BaseSpeculatorConfig):
 
     @property
     def num_draft_tokens(self) -> int:
-        # A DFlash block contains the already accepted anchor followed by predictions.
+
         return self.block_size - 1
 
     @property
@@ -55,7 +55,7 @@ class DFlashSpeculatorConfig(BaseSpeculatorConfig):
         assert self.window_size >= 1
         assert len(set(self.target_layer_ids)) == len(self.target_layer_ids)
         assert min(self.target_layer_ids) >= 0
-        # Capturing layer i's output through decoder-input i+1 requires a following layer.
+
         assert max(self.target_layer_ids) + 1 < config.model_config.num_layers
         assert config.decode_batch_budget >= self.num_draft_tokens
 

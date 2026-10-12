@@ -3,7 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in this directory.
 
-"""Inference-only fused recurrent Gated DeltaNet kernel derived from FLA 0.5.2."""
 
 from __future__ import annotations
 
@@ -12,6 +11,7 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
+from ...layout import log_pointer, payload_pointer
 
 from .op import exp
 
@@ -23,7 +23,7 @@ def _softplus(x):
 
 @triton.jit
 def _frame_byte_offset(frame, frame_bytes: tl.constexpr):
-    # A 786432-byte frame overflows int32 arithmetic beyond frame 2730.
+
     return frame.to(tl.int64) * frame_bytes
 
 
@@ -76,6 +76,8 @@ def _fused_recurrent_gated_delta_kernel(
     PAGE_SIZE: tl.constexpr,
     REPLAY_WINDOW: tl.constexpr,
     REPLAY_WORK: tl.constexpr,
+    LAYERS: tl.constexpr = 1,
+    GRANULARITY: tl.constexpr = 64,
 ):
     value_block = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -110,17 +112,11 @@ def _fused_recurrent_gated_delta_kernel(
         )
     elif DIRECT_STORE:
         work_slot = tl.load(work_slots + batch_idx)
-        head_offset = (LAYER * NUM_V_HEADS + value_head) * HEAD_PAYLOAD_BYTES
-        head_frame = tl.load(
-            key_log_pool + work_slot * FRAMES_PER_SLOT
-            + head_offset // FRAME_BYTES
-        )
-        state_head = (initial_state
-            + _frame_byte_offset(head_frame, FRAME_BYTES)
-            + head_offset % FRAME_BYTES
-        ).to(tl.pointer_type(query.dtype.element_ty))
-        state_ptr = (
-            state_head + k_offset[:, None] * HEAD_V_DIM + v_offset[None, :]
+        state_ptr = payload_pointer(
+            initial_state.to(tl.pointer_type(query.dtype.element_ty)), key_log_pool,
+            work_slot, LAYER, value_head, k_offset[:, None] * HEAD_V_DIM + v_offset[None, :],
+            LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+            HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
         )
     else:
         state_ptr = (
@@ -134,15 +130,6 @@ def _fused_recurrent_gated_delta_kernel(
         count = tl.load(replay_counts + batch_idx)
         log_slot = tl.load(log_slots + batch_idx)
         current_offset = tl.load(token_offsets + batch_idx)
-        head_offset = (LAYER * NUM_V_HEADS + value_head) * HEAD_PAYLOAD_BYTES
-        log_frame = tl.load(
-            key_log_pool + log_slot * FRAMES_PER_SLOT
-            + head_offset // FRAME_BYTES
-        )
-        log_head = (initial_state
-            + _frame_byte_offset(log_frame, FRAME_BYTES)
-            + head_offset % FRAME_BYTES
-        ).to(tl.pointer_type(query.dtype.element_ty))
         decay_frame = tl.load(value_log_pool + log_slot * 2)
         decay_index = tl.load(value_log_pool + log_slot * 2 + 1)
         decay_head = (initial_state
@@ -160,14 +147,21 @@ def _fused_recurrent_gated_delta_kernel(
         total_decay = tl.sum(log_decays, axis=0)
         suffix_decay = tl.exp(total_decay - tl.cumsum(log_decays))
         logged_keys = tl.load(
-            log_head + prior_offsets[None, :] * HEAD_K_DIM
-            + k_offset[:, None],
+            log_pointer(
+                initial_state.to(tl.pointer_type(query.dtype.element_ty)), key_log_pool,
+                log_slot, LAYER, value_head, prior_offsets[None, :], k_offset[:, None],
+                LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+                HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
+            ),
             mask=k_mask[:, None] & valid[None, :], other=0.0,
         )
         logged_values = tl.load(
-            log_head + PAGE_SIZE * HEAD_K_DIM
-            + prior_offsets[:, None] * HEAD_V_DIM
-            + v_offset[None, :],
+            log_pointer(
+                initial_state.to(tl.pointer_type(query.dtype.element_ty)), key_log_pool,
+                log_slot, LAYER, value_head, prior_offsets[:, None], v_offset[None, :],
+                LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+                HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, NUM_K_HEADS,
+            ),
             mask=valid[:, None] & v_mask[None, :], other=0.0,
         )
         scaled_values = (
@@ -218,7 +212,7 @@ def _fused_recurrent_gated_delta_kernel(
                     decay_head + (LAYER * PAGE_SIZE + current_offset) * NUM_V_HEADS
                     + value_head, log_decay,
                 )
-            # Compute the output without applying the full current-token update.
+
             state_k = tl.sum(state * k[:, None], axis=0) * decay
             state_q = tl.sum(state * q[:, None], axis=0) * decay
             delta = (v - state_k) * beta_value
@@ -234,21 +228,17 @@ def _fused_recurrent_gated_delta_kernel(
             token_row = batch_idx * SEQ_LEN + seq_idx
             log_slot = tl.load(log_slots + token_row)
             token_offset = tl.load(token_offsets + token_row)
-            log_head_offset = (
-                LAYER * NUM_V_HEADS + value_head
-            ) * HEAD_PAYLOAD_BYTES
-            log_frame = tl.load(
-                key_log_pool + log_slot * FRAMES_PER_SLOT
-                + log_head_offset // FRAME_BYTES
+            prepared_key_ptr = log_pointer(
+                initial_state.to(tl.pointer_type(query.dtype.element_ty)), key_log_pool,
+                log_slot, LAYER, value_head, token_offset, k_offset,
+                LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+                HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
             )
-            log_head = (initial_state
-                + _frame_byte_offset(log_frame, FRAME_BYTES)
-                + log_head_offset % FRAME_BYTES
-            ).to(tl.pointer_type(query.dtype.element_ty))
-            prepared_key_ptr = log_head + token_offset * HEAD_K_DIM + k_offset
-            residual_value_ptr = (
-                log_head + PAGE_SIZE * HEAD_K_DIM
-                + token_offset * HEAD_V_DIM + v_offset
+            residual_value_ptr = log_pointer(
+                initial_state.to(tl.pointer_type(query.dtype.element_ty)), key_log_pool,
+                log_slot, LAYER, value_head, token_offset, v_offset,
+                LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+                HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, NUM_K_HEADS,
             )
             decay_frame = tl.load(value_log_pool + log_slot * 2)
             decay_index = tl.load(value_log_pool + log_slot * 2 + 1)
@@ -261,7 +251,8 @@ def _fused_recurrent_gated_delta_kernel(
             )
             tl.store(residual_value_ptr, delta, mask=v_mask)
             if value_block == 0:
-                tl.store(prepared_key_ptr, k, mask=k_mask)
+                if value_head % (NUM_V_HEADS // NUM_K_HEADS) == 0:
+                    tl.store(prepared_key_ptr, k, mask=k_mask)
                 if not REPLAY_WORK:
                     tl.store(decay_ptr, log_decay)
 
@@ -295,7 +286,7 @@ def _fused_recurrent_gated_delta_kernel(
 
 
 @torch.compiler.disable
-def fused_recurrent_gated_delta_rule_to_framed_logstate(
+def fused_recurrent_gated_delta_rule_to_logstate(
     query        : torch.Tensor,
     key          : torch.Tensor,
     value        : torch.Tensor,
@@ -309,19 +300,8 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     token_offsets: torch.Tensor,
     layer        : int,
     replay_counts: torch.Tensor,
-    block_v      : int | None = None,
     enable_eager_state: bool = False,
-    *,
-    block_k      : int | None = None,
-    num_warps    : int | None = None,
-    num_stages   : int | None = None,
 ) -> torch.Tensor:
-    """Decode directly into frame-backed work/log slots.
-
-    Large 128x128 replay batches use K32/V64 tiles. Small batches, other head
-    dimensions and eager decode retain the full-K implementation. Explicit
-    launch overrides are available for operator tests.
-    """
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[2]
     head_v_dim = value.shape[3]
@@ -333,22 +313,10 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     assert pool.frame_bytes % pool.head_payload_bytes == 0
     output = torch.empty_like(value)
     full_k = triton.next_power_of_2(head_k_dim)
-    if (block_k is None and block_v is None and not enable_eager_state
-        and head_k_dim == head_v_dim == 128 and batch_size >= 32):
-        block_k = 32
-        block_v = 64
-        if num_stages is None:
-            num_stages = 1 if batch_size < 64 else 3
-    if num_stages is None:
-        num_stages = 3
-    if block_v is None:
-        # Wider value heads amortize the framed state lookup across more columns.
-        block_v = 8 if head_v_dim < 128 else (
-            16 if batch_size == 1 else 32
-        )
-        if block_k is not None:
-            block_v = max(block_v, 16)
-    assert block_v in ((16, 32, 64) if block_k is not None else (8, 16, 32))
+    tiled = not enable_eager_state and head_k_dim == head_v_dim == 128 and batch_size >= 32
+    block_k = 32 if tiled else None
+    block_v = 64 if tiled else (8 if head_v_dim < 128 else (16 if batch_size == 1 else 32))
+    num_stages = 1 if tiled and batch_size < 64 else 3
     block_v = min(block_v, triton.next_power_of_2(head_v_dim))
     if not enable_eager_state:
         block_v = max(block_v, 16)
@@ -356,10 +324,6 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
     if block_k is not None:
         from .gdn_replay import _gdn_replay_kernel
 
-        assert not enable_eager_state, "K tiling is only supported for GEMM replay"
-        assert block_k in (16, 32, 64, 128) and block_k <= full_k
-        assert num_warps in (None, 4, 8)
-        assert num_stages in (1, 2, 3, 4)
         _gdn_replay_kernel[grid](
             query.contiguous(), key.contiguous(), value.contiguous(),
             gate, beta, A_log, dt_bias, pool.storage, output,
@@ -375,8 +339,9 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
             HEAD_PAYLOAD_BYTES=pool.head_payload_bytes,
             DECAY_RECORD_BYTES=pool.layout.log_decay_bytes,
             LAYER=layer, PAGE_SIZE=pool.page_size,
+            LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
             REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
-            num_warps=4 if num_warps is None else num_warps,
+            num_warps=4,
             num_stages=num_stages,
         )
         return output
@@ -411,9 +376,10 @@ def fused_recurrent_gated_delta_rule_to_framed_logstate(
         HEAD_PAYLOAD_BYTES=pool.head_payload_bytes,
         DECAY_RECORD_BYTES=pool.layout.log_decay_bytes,
         PAGE_SIZE=pool.page_size,
+        LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
         REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
         REPLAY_WORK=not enable_eager_state,
-        num_warps=(4 if not enable_eager_state else 1) if num_warps is None else num_warps,
+        num_warps=4 if not enable_eager_state else 1,
         num_stages=num_stages,
     )
     return output
@@ -433,7 +399,6 @@ def fused_recurrent_gated_delta_rule_to_slots(
     write_slots : torch.Tensor,
     layer       : int,
 ) -> torch.Tensor:
-    """Decode from one page state into another, or update a page in place."""
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads, head_v_dim = value.shape[2:]
     assert seq_len == 1 and state_pool.ndim == 5
@@ -494,7 +459,6 @@ def fused_recurrent_gated_delta_rule(
     dt_bias      : torch.Tensor,
     initial_state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run a short GDN recurrence and return every post-token state."""
     assert query.is_cuda and key.is_cuda and value.is_cuda
     assert query.ndim == key.ndim == value.ndim == 4
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
@@ -578,6 +542,6 @@ def fused_recurrent_gated_delta_rule(
 
 __all__ = [
     "fused_recurrent_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule_to_framed_logstate",
+    "fused_recurrent_gated_delta_rule_to_logstate",
     "fused_recurrent_gated_delta_rule_to_slots",
 ]

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from logssms.kernel.linear_attention.gdn_conv_decode import (
     _frame_element_offset,
     conv_decode_qkv,
@@ -19,7 +19,7 @@ def _large_frame_offset_kernel(frame, result):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_framed_decode_conv_uses_64_bit_frame_offsets():
+def test_logstate_decode_conv_uses_64_bit_frame_offsets():
     frame = torch.tensor([2048], device="cuda", dtype=torch.int32)
     result = torch.empty(1, device="cuda", dtype=torch.int64)
     _large_frame_offset_kernel[(1,)](frame, result)
@@ -70,9 +70,9 @@ def test_standard_decode_conv_matches_reference(read_slots, write_slots, fused_i
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fused_input", [False, True])
-def test_framed_decode_conv_writes_log_and_work_and_replays_graph(fused_input):
+def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input):
     config = _config()
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=64, page_size=64, granularity=16,
         num_attention_layers=1, num_kv_heads=1, head_dim=64,
         num_linear_layers=2, num_key_heads=2, num_value_heads=2,

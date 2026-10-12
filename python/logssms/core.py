@@ -40,7 +40,7 @@ class SamplingParams:
 
 @dataclass(eq=False)
 class Request:
-    input_ids      : torch.Tensor  # assert is_cpu
+    input_ids      : torch.Tensor
     table_idx      : int
     cached_len     : int
     output_len     : int
@@ -103,7 +103,7 @@ class ChunkedRequest(Request):
 
     @property
     def can_decode(self) -> bool:
-        return False  # avoid being added to ar manager
+        return False
 
 
 @dataclass
@@ -111,17 +111,16 @@ class Batch:
     reqs     : list[Request]
     phase    : Literal["prefill", "decode", "verify"]
     profile_id: int | None = field(init=False, default=None)
-    # these fields should be set by scheduler
+
     input_ids  : torch.Tensor  = field(init=False)
     positions  : torch.Tensor  = field(init=False)
     out_loc    : torch.Tensor  = field(init=False)
     padded_reqs: list[Request] = field(init=False)
     prepared_indices: BatchIndices | None = field(init=False, default=None)
-    # this field should be set by attention backend
+
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # spec-decode: drafts the MTP head produced for this verify batch. draft_tokens is
-    # (bs, K) int32; draft_probs is (bs, K, vocab) fp32 = the MTP head's softmax per draft
-    # step, used for the residual rejection sampling (needs the full distribution).
+
+
     draft_tokens: torch.Tensor | None = field(init=False, default=None)
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
@@ -162,8 +161,8 @@ class Context:
         init=False,
     )
     moe_backend        : BaseMoeBackend             = field(init=False)
-    kv_cache           : BaseKVCachePool            = field(init=False)   # full attention
-    linear_state       : LinearCachePool            = field(init=False)   # linear attention
+    kv_cache           : BaseKVCachePool            = field(init=False)
+    linear_state       : LinearCachePool            = field(init=False)
 
     state_table        : torch.Tensor | None = field(default=None, init=False)
     work_state_table   : torch.Tensor | None = field(default=None, init=False)
@@ -212,17 +211,6 @@ def get_global_ctx(key: str | None = None) -> Context:
         return _GLOBAL_CTX
 
 
-def clear_global_ctx(key: str | None = None) -> None:
-    global _GLOBAL_CTX
-    if key is not None:
-        assert isinstance(_GLOBAL_CTX, dict), "Global context is not a dict"
-        value = _GLOBAL_CTX.get(key, -1)
-        assert value != -1, f"Global context does not have '{key=}'"
-        _GLOBAL_CTX[key] = None
-    else:
-        _GLOBAL_CTX = None
-
-
 __all__ = [
     "SamplingParams",
     "Request",
@@ -230,5 +218,4 @@ __all__ = [
     "Context",
     "set_global_ctx",
     "get_global_ctx",
-    "clear_global_ctx",
 ]

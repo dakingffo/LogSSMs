@@ -35,13 +35,6 @@ class PrefillGraphPiece:
 
 
 class PrefillGraphRunner:
-    """Capture pure pieces; dynamic attention and all cache mutations stay eager.
-
-    Inputs and durable outputs live outside the graph's shared allocation pool.
-    This makes pool reuse safe: a later replay may overwrite only intermediates,
-    never the inputs/outputs shared between pieces. Returned views are ephemeral,
-    just like the decode graph output; callers must not retain them across replay.
-    """
     def __init__(self, model, max_tokens: int, stream: torch.cuda.Stream):
         self.enabled = True
         self.stream = stream
@@ -68,8 +61,8 @@ class PrefillGraphRunner:
         )
         start = perf_counter()
         allocated_before = torch.cuda.memory_allocated(stream.device)
-        # torch.cuda.graph() collects garbage and empties the allocator before
-        # EVERY capture. Do that once for the whole set, not thousands of times.
+
+
         torch.cuda.synchronize(stream.device)
         gc.collect()
         torch.cuda.empty_cache()
@@ -149,8 +142,8 @@ class PrefillGraphRunner:
             view = target[:tokens]
             if source.data_ptr() != view.data_ptr() or source.stride() != view.stride():
                 view.copy_(source)
-            # These pieces contain no reduction across token rows. Only valid
-            # rows reach attention/cache; stale padded rows cannot affect them.
+
+
         piece.graph.replay()
         self.replays += 1
         self.padded_tokens += bucket - tokens

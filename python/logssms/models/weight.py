@@ -15,15 +15,15 @@ from tqdm import tqdm
 
 _SPLIT_DIM_0 = [
     ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".gate_up_proj",
-    # Hybrid gated-delta attention / MTP
+
     ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
     ".conv1d.weight",
-    ".A_log", ".dt_bias",  # per-value-head vectors, column-parallel like in_proj_b/a
+    ".A_log", ".dt_bias",
     ".fc",
 ]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj", ".out_proj"]
 
-# Merge groups: individual projections -> fused projection
+
 _MERGE_GROUPS = {
     ".q_proj": (".qkv_proj", ("q", "k", "v")),
     ".k_proj": (".qkv_proj", ("q", "k", "v")),
@@ -50,7 +50,6 @@ _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>
 
 
 def _checkpoint_files(model_folder: str) -> tuple[str, list[str]]:
-    """Return the preferred checkpoint format and its ordered shard paths."""
     candidates = (
         ("safetensors", "model.safetensors.index.json", "model.safetensors"),
         ("pytorch", "pytorch_model.bin.index.json", "pytorch_model.bin"),
@@ -78,8 +77,7 @@ def _checkpoint_files(model_folder: str) -> tuple[str, list[str]]:
         if paths:
             return checkpoint_format, paths
 
-    # Some converted checkpoints use non-standard safetensors names. Preserve support
-    # for them, but prefer the standard model files above and ignore auxiliary exports.
+
     paths = sorted(glob.glob(os.path.join(model_folder, "*.safetensors")))
     filtered = [path for path in paths if not path.endswith("consolidated.safetensors")]
     if filtered or paths:
@@ -97,11 +95,6 @@ def iter_checkpoint_weights(
     names        : Collection[str] | None = None,
     show_progress: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Yield raw checkpoint tensors without model-specific name or layout changes.
-
-    Safetensors and PyTorch ``pytorch_model*.bin`` checkpoints, including their sharded
-    index formats, share this interface. Safetensors is preferred when both are present.
-    """
     model_folder = resolve_model_path(model_path)
     checkpoint_format, files = _checkpoint_files(model_folder)
     selected_names = set(names) if names is not None else None
@@ -141,13 +134,6 @@ def _shard_tensor(
     num_kv_heads: int,
     qkv_regions: tuple[int, int, int] | None = None,
 ):
-    """Extract rank r's shard from a single tensor. Returns a contiguous copy.
-
-    ``qkv_regions`` = (q_rows, k_rows, v_rows) for the fused linear-attention
-    ``in_proj_qkv`` = [q; k; v] (regions of different sizes). A naive dim-0 chunk puts the
-    chunk boundary inside a region and makes the layer's local [q;k;v] split mix regions,
-    so each region is chunked by head count independently and the local halves re-concat.
-    """
     if qkv_regions is not None and (key.count(".in_proj_qkv") or key.count(".conv1d.weight")):
         q_rows, k_rows, v_rows = qkv_regions
         q, k, v = torch.split(value, [q_rows, k_rows, v_rows], dim=0)
@@ -174,7 +160,6 @@ def _shard_tensor(
 
 
 def _get_merge_info(key: str):
-    """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
         if f"{suffix}." in key or key.endswith(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
@@ -182,7 +167,6 @@ def _get_merge_info(key: str):
 
 
 def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
-    """Map an expert-scoped checkpoint key to the packed runtime key."""
     match = _EXPERT_PATTERN.match(key)
     if match is None:
         return None
@@ -199,18 +183,13 @@ def load_weight(
     *,
     skip_prefixes: tuple[str, ...] = (),
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
-    and on device. Peak CPU memory is one tensor for safetensors or one PyTorch shard,
-    plus the model-specific merge buffers."""
     from .register import make_model_config
 
     model_folder = resolve_model_path(model_path)
     config = make_model_config(load_model_config(model_folder))
     tp_info = get_tp_info()
 
-    # Fused linear-attention in_proj_qkv = [q; k; v] with different region sizes; naive
-    # dim-0 sharding would put the tp chunk boundary inside a region. Compute the region
-    # sizes so _shard_tensor can shard each by head count.
+
     qkv_regions = None
     linear_spec = config.make_linear_cache_spec(1)
     if linear_spec is not None and linear_spec.recurrent_type == "gdn":
@@ -218,7 +197,7 @@ def load_weight(
         v = linear_spec.state_shape[0] * linear_spec.state_shape[2]
         qkv_regions = (qk, qk, v)
 
-    # Buffer for merge groups: merged_key -> {slot: tensor}
+
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     weights = iter_checkpoint_weights(
@@ -227,14 +206,14 @@ def load_weight(
         show_progress=tp_info.is_primary(),
     )
     for checkpoint_name, raw in weights:
-        # Skip vision/projector weights from multimodal wrappers.
+
         if checkpoint_name.startswith(
             ("vision_tower.", "multi_modal_projector.", "model.visual.")
         ):
             continue
         name = checkpoint_name
         name = name.removeprefix("language_model.")
-        # Qwen3.5: text weights live under model.language_model.*.
+
         name = name.replace("model.language_model.", "model.", 1)
         if name.startswith(skip_prefixes):
             continue
@@ -266,7 +245,7 @@ def load_weight(
             experts = [slots[idx] for idx in range(config.num_experts)]
             del expert_buf[packed_key]
             yield packed_key, torch.stack(experts, dim=0)
-        else:  # Normal dense model
+        else:
             yield out[0], out[1]
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"

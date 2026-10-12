@@ -55,7 +55,7 @@ def _determine_cuda_graph_bs(
 
     if cuda_graph_max_bs is None:
         free_memory_gb = free_memory / (1024**3)
-        if free_memory_gb > 80:  # H200
+        if free_memory_gb > 80:
             cuda_graph_max_bs = 256
         else:
             cuda_graph_max_bs = 160
@@ -126,7 +126,7 @@ class DecodeGraphRunner:
             sorted(self.graph_bs_list, reverse=True),
             desc="Preparing for capturing CUDA graphs...",
             unit="batch",
-            disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
+            disable=not get_tp_info().is_primary(),
         )
         pool = None
         for bs in pbar:
@@ -141,11 +141,11 @@ class DecodeGraphRunner:
             if self.linear_attn_backend is not None:
                 self.linear_attn_backend.prepare_for_capture(batch)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward() # trigger JIT
+                self.buffer.logits[:bs] = model.forward()
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
             if pool is None:
-                pool = graph.pool()  # reuse cuda graph handle to reduce memory
+                pool = graph.pool()
             self.graphs[bs] = graph
 
         free_memory = get_free_memory(self.device)
@@ -182,13 +182,13 @@ class DecodeGraphRunner:
         if batch.is_verify:
             batch.padded_reqs = batch.reqs
         else:
-            padded_size = (  # choose the first available batch size
+            padded_size = (
                 next(bs for bs in self.graph_bs_list if bs >= batch.size)
                 if self.can_use_cuda_graph(batch) else batch.size
             )
             batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
-    # NOTE: This must be called before freeing NCCL resources to prevent program hang
+
     def destroy_cuda_graphs(self) -> None:
         del self.graphs
         gc.collect()

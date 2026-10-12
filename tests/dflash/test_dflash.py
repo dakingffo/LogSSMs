@@ -135,7 +135,7 @@ def test_dflash_block_attention_is_non_causal() -> None:
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
-    persistent = pool.append_persistent(0, 1)
+    persistent = pool.append_persistent_batch([0], [1])
     pool.store(
         persistent,
         torch.tensor([[[1.0, 0.0]]]),

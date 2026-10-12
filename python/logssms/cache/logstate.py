@@ -5,7 +5,7 @@ import os
 from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from time import monotonic_ns, perf_counter_ns
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, Sequence
 from weakref import WeakValueDictionary
 
@@ -22,7 +22,7 @@ from .logstate_pool.layout import (
     LOG_STATE_REPLAY_WINDOW,
     LogStateSlotLayout,
 )
-from .logstate_pool.frame_pool import FramedMHALogStatePool
+from .logstate_pool.mha_pool import MHALogStatePool
 from .prefix_cache.base import BaseCacheHandle, MatchResult
 from .prefix_cache.logstate import (
     LogStateCacheHandle,
@@ -48,27 +48,25 @@ logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
-class RecycledEntry:
-    kind      : LogStateKind
-    begin     : int
-    end       : int
-    span_pages: int | None
+class RecycledLog:
+    begin: int
+    end  : int
 
 
 @dataclass(frozen=True)
 class RecycledBranch:
     tokens            : tuple[int, ...]
-    entries           : tuple[RecycledEntry, ...]
+    logs              : tuple[RecycledLog, ...]
     protected_endpoints: frozenset[int]
     _serial           : int = field(default=0, compare=False, repr=False)
     merge_stats       : tuple[int, ...] = ()
 
     @property
     def bytes(self) -> int:
-        # Same compact-payload accounting as the native recycle index. It is
-        # a bounded cache budget, not a measurement of the process's RSS.
+
+
         return (
-            256 + 8 * len(self.tokens) + 32 * len(self.entries)
+            256 + 8 * len(self.tokens) + 16 * len(self.logs)
             + 8 * len(self.protected_endpoints)
             + 8 * len(self.merge_stats)
         )
@@ -78,6 +76,14 @@ class RecycledBranch:
 class RecycledMatch:
     branch     : RecycledBranch
     matched_len: int
+
+    def matched_tokens(self, start: int) -> int:
+
+
+        return sum(
+            max(0, min(log.end, self.matched_len) - max(log.begin, start))
+            for log in self.branch.logs
+        )
 
 
 @dataclass(frozen=True)
@@ -89,7 +95,6 @@ class RecycledCheckpoint:
 
 @dataclass(frozen=True)
 class RecycledRestorePlan:
-    """Final historical layout, fixed before admission; no device values."""
 
     cached_len         : int
     matched_len        : int
@@ -109,7 +114,6 @@ class _RecycledRestore:
 
 
 class LogStateRecycleBin:
-    """Bounded CPU-only prefix/layout history; never owns device buffers."""
 
     def __init__(self, capacity_bytes: int) -> None:
         from logssms.kernel import logstate as planning
@@ -120,25 +124,28 @@ class LogStateRecycleBin:
         self._matches: WeakValueDictionary[int, RecycledBranch] = WeakValueDictionary()
         self.revision = 0
 
-    @property
-    def used_bytes(self) -> int:
-        return self._native["usage"]()[0]
 
-    def remember(self, tree: LogRadixTree, node: LogRadixTreeNode) -> None:
+    def remember(
+        self,
+        tree: LogRadixTree,
+        node: LogRadixTreeNode,
+    ) -> None:
         from logssms.kernel import logstate as planning
 
-        if self.capacity_bytes == 0:
+        logs = [
+            (max(node.begin, entry.begin), min(node.depth, entry.end))
+            for entry in node.entries if entry.kind is LogStateKind.LOG
+        ]
+        if self.capacity_bytes == 0 or not logs:
             return
         self.revision += 1
         path = tree.path(node)
         stats = node.merge_stats
         self._native["remember"](
             [part.key for part in path],
-            planning._pack([
-                (entry.begin, entry.end, -1 if entry.span_pages is None else entry.span_pages)
-                for part in path for entry in part.entries
-            ]),
-            [part.depth for part in path if part.is_protected],
+            planning._pack(logs),
+            [part.depth for part in path if part.is_protected
+             and any(begin <= part.depth <= end for begin, end in logs)],
             [] if stats is None else [
                 stats.origin, stats.tail, stats.intensity,
                 -1 if stats.next_update_tail is None else stats.next_update_tail,
@@ -158,10 +165,8 @@ class LogStateRecycleBin:
         if branch is None:
             rows = planning._unpack(self._native["get"](serial, tokens))
             branch = RecycledBranch(
-                tuple(rows[0]), tuple(RecycledEntry(
-                    LogStateKind.LOG if span < 0 else LogStateKind.CHECKPOINT,
-                    begin, end, None if span < 0 else span,
-                ) for begin, end, span in rows[3:]), frozenset(rows[1]), serial,
+                tuple(rows[0]), tuple(RecycledLog(begin, end)
+                                      for begin, end in rows[3:]), frozenset(rows[1]), serial,
                 tuple(rows[2]),
             )
             self._matches[serial] = branch
@@ -322,16 +327,6 @@ class _ConstructionChain:
 
 
 class OnlineAnalysisScheduler:
-    """Generate LogState protection, reconstruction, and merge plans.
-
-    With merge adjustment disabled, checkpoint coalescing remains binary. With
-    it enabled, each logical chain samples branch-hit endpoints over a moving
-    token window, fits their binned density in log-log space, and uses the
-    floored power-law exponent as the maximum merge arity. Adjacent intervals
-    may merge when their spans are nondecreasing, without crossing a protected
-    or locked boundary. This class never allocates slots, launches kernels,
-    or mutates persistent tree entries.
-    """
 
     def __init__(
         self,
@@ -636,15 +631,6 @@ class OnlineAnalysisScheduler:
         tuple[LogRadixTreeNode, ...],
         tuple[_AnalysisEndpoint, ...],
     ]:
-        """Return reached path nodes and the exact matched endpoints.
-
-        Only the matched path is part of the current analysis.  Descendant and
-        sibling continuations are not maintained until a later prefill request
-        actually reaches them.  An entirely new request reaches only the root
-        and must not trigger unrelated cache work.  Keep each endpoint's
-        matched length separately: a trace can end inside a compressed edge,
-        and maintenance must not inspect entries beyond that hit.
-        """
         nodes: dict[int, LogRadixTreeNode] = {}
         endpoints: dict[tuple[int, int], _AnalysisEndpoint] = {}
         for trace in traces:
@@ -700,7 +686,7 @@ class OnlineAnalysisScheduler:
         pending = []
         for position, *request_indices in candidates:
             request_index = request_indices[0]
-            # A batch-only branch may lie beyond this request's GPU hit.
+
             trace = traces[request_index]
             if position <= trace.matched_len:
                 trace = tree.trace_prefix(trace, position)
@@ -727,7 +713,7 @@ class OnlineAnalysisScheduler:
         node   : LogRadixTreeNode,
         cache  : dict,
     ) -> tuple[tuple[LogRadixTreeNode, ...], list[LogStateEntry]]:
-        # Scoped to one analysis call; never retain stale tree paths across batches.
+
         if node.uuid not in cache:
             path = tree.path(node)
             entries = sorted(
@@ -745,7 +731,7 @@ class OnlineAnalysisScheduler:
         pending       : tuple[_PendingProtection, ...],
         path_cache    : dict,
     ) -> tuple[list[LogStateEntry], list[int], tuple[int, ...], tuple[int, ...]]:
-        # This is a per-analysis snapshot, never a second persistent tree.
+
         key = ("native", node.uuid)
         if key not in path_cache:
             path, entries = self._cached_path_entries(tree, node, path_cache)
@@ -784,8 +770,8 @@ class OnlineAnalysisScheduler:
         entry_indices = []
         source_entries = []
         entries = {entry.slot: entry for node in analysis_nodes for entry in node.entries}
-        # Pack a reached path once, not each of its progressively longer
-        # prefixes. Later entries cannot affect a candidate ending earlier.
+
+
         parent_ids = {node.parent.uuid for node in analysis_nodes}
         owner_paths = {}
         for node in analysis_nodes:
@@ -958,13 +944,6 @@ class OnlineAnalysisScheduler:
 
 
 class LogStateCacheManager(BaseCacheManager):
-    """Own LogState cache allocation and request/tree ownership transitions.
-
-    ``CacheResources`` owns the device buffers. This class owns their allocation
-    state, the Log-Radix-Tree, and the online maintenance policy. Branch recovery
-    writes request work states, while private Log chains are materialized in
-    place by the CUDA construction kernel.
-    """
 
     def __init__(
         self,
@@ -983,7 +962,7 @@ class LogStateCacheManager(BaseCacheManager):
         pool = resources.linear_state
         state_table = resources.state_table
         work_state_table = resources.work_state_table
-        assert isinstance(pool, FramedMHALogStatePool)
+        assert isinstance(pool, MHALogStatePool)
         assert state_table is not None
         assert work_state_table is not None
         assert pool.page_size == page_size
@@ -1050,6 +1029,7 @@ class LogStateCacheManager(BaseCacheManager):
 
         self.pending_recoveries: dict[int, LogStateRecovery] = {}
         self._pending_matches: dict[int, LogStateCacheHandle] = {}
+        self._recovery_pins: dict[int, tuple[LogStateCacheHandle, tuple[int, ...]]] = {}
         self.last_plan: LogStatePlan | None = None
         self._live_pages: dict[int, list[_LivePage]] = {}
         self._cached_page_tokens: dict[int, int] = {}
@@ -1067,6 +1047,7 @@ class LogStateCacheManager(BaseCacheManager):
             "total_admission_wait_ms": 0.0,
             "max_admission_wait_ms": 0.0,
             "eviction_rounds": 0,
+            "pressure_dropped_checkpoints": 0,
             "evicted_kv_tokens": 0,
             "recycle_matches": 0,
             "recycle_matched_tokens": 0,
@@ -1097,9 +1078,9 @@ class LogStateCacheManager(BaseCacheManager):
         return self.prefix_cache
 
     @property
-    def logstate_pool(self) -> FramedMHALogStatePool:
+    def logstate_pool(self) -> MHALogStatePool:
         pool = self.linear_pool
-        assert isinstance(pool, FramedMHALogStatePool)
+        assert isinstance(pool, MHALogStatePool)
         return pool
 
     @property
@@ -1115,8 +1096,8 @@ class LogStateCacheManager(BaseCacheManager):
         )
 
     def match_req(self, req: PendingRequest) -> MatchResult:
-        # Tokenizer/IPC input is immutable while pending. Normal tensors also
-        # expose a version counter, so edits by direct callers invalidate reuse.
+
+
         version = None if req.input_ids.is_inference() else req.input_ids._version
         epoch = (
             self.tree.revision, self.tree.lock_revision,
@@ -1131,9 +1112,7 @@ class LogStateCacheManager(BaseCacheManager):
             with self.record_schedule_step("match_reuse"):
                 result = cached[3]
                 handle = result.cuda_handle
-                tic = monotonic_ns()
-                for node in handle.match_path:
-                    node.timestamp = tic
+                self.tree.touch_handle(handle)
                 if self._profile_enabled:
                     self._profile_stats["pending_match_reuses"] += 1
                 if handle.recycle_match is not None:
@@ -1141,12 +1120,12 @@ class LogStateCacheManager(BaseCacheManager):
                     if self._profile_enabled:
                         self._profile_stats["recycle_matches"] += 1
                         self._profile_stats["recycle_matched_tokens"] += (
-                            handle.recycle_match.matched_len - handle.cached_len
+                            handle.recycle_match.matched_tokens(handle.cached_len)
                         )
                 return result
         result = self._match_req(req, version)
-        # Matching can split a recovery edge. Do not retain earlier candidates
-        # across that topology change, nor across admission lock transitions.
+
+
         epoch = (
             self.tree.revision, self.tree.lock_revision,
             -1 if self.recycle_bin is None else self.recycle_bin.revision,
@@ -1170,9 +1149,7 @@ class LogStateCacheManager(BaseCacheManager):
             if (cached is not None and cached[0] is req and cached[1] is req.input_ids
                     and cached[2] == version):
                 result = cached[3]
-                tic = monotonic_ns()
-                for node in result.cuda_handle.match_path:
-                    node.timestamp = tic
+                self.tree.touch_handle(result.cuda_handle)
                 if self._profile_enabled:
                     self._profile_stats["prefix_match_reuses"] += 1
             else:
@@ -1199,7 +1176,7 @@ class LogStateCacheManager(BaseCacheManager):
         if self._profile_enabled and recycle_match is not None:
             self._profile_stats["recycle_matches"] += 1
             self._profile_stats["recycle_matched_tokens"] += (
-                recycle_match.matched_len - handle.cached_len
+                recycle_match.matched_tokens(handle.cached_len)
             )
         if not self.enable_merge_adjustment:
             return MatchResult(
@@ -1217,8 +1194,8 @@ class LogStateCacheManager(BaseCacheManager):
             trace = handle.match_trace
             assert trace is not None and handle.trace_revision == self.tree.revision
             source_node = trace.node
-            # An interior hit can end before the leaf holding this chain's stats.
-            # Follow only an unbranched suffix; never choose an arbitrary sibling.
+
+
             if trace.matched_len > 0:
                 while source_node.merge_stats is None and len(source_node.children) == 1:
                     source_node = next(iter(source_node.children.values()))
@@ -1239,8 +1216,8 @@ class LogStateCacheManager(BaseCacheManager):
             if recycle_match is not None and recycle_match.branch.merge_stats:
                 origin, tail, intensity, next_update, *hits = recycle_match.branch.merge_stats
                 if recycle_match.matched_len == tail == len(recycle_match.branch.tokens):
-                    # Resume the evicted chain's policy, not a new per-request owner.
-                    # The snapshot is immutable; each admitted continuation owns its copy.
+
+
                     stats = LogStateMergeStats(
                         origin, tail, intensity, deque(hits),
                         None if next_update < 0 else next_update,
@@ -1314,8 +1291,8 @@ class LogStateCacheManager(BaseCacheManager):
         )
         context = _MergePathContext.build(self.tree, path, gpu, ())
         protected_slots = {entry.slot for entry in context.protected_entries}
-        # The physical page containing an internal branch stays Log. Other
-        # historical intervals can be written directly as full checkpoints.
+
+
         protected_pages = {
             position // self.page_size for position in protected
             if position % self.page_size
@@ -1332,7 +1309,7 @@ class LogStateCacheManager(BaseCacheManager):
                 and not (entry.kind is LogStateKind.LOG and entry.end in protected)
             )
             pieces.append((entry.begin, entry.end, entry, eligible))
-        for entry in match.branch.entries:
+        for entry in match.branch.logs:
             begin = max(cached_len, entry.begin)
             end = min(match.matched_len, entry.end)
             begin = align_ceil(begin, self.page_size)
@@ -1344,10 +1321,9 @@ class LogStateCacheManager(BaseCacheManager):
             for page in protected_pages:
                 cuts.update(pos for pos in (page * self.page_size, (page + 1) * self.page_size)
                             if begin < pos < end)
-            # A Log page is one candidate, whereas a remembered checkpoint
-            # retains its span. A cut checkpoint is recomputed at the new cut.
-            if entry.kind is LogStateKind.LOG:
-                cuts.update(range(begin, end, self.page_size))
+
+
+            cuts.update(range(begin, end, self.page_size))
             boundaries = sorted(cuts)
             for left, right in zip(boundaries, boundaries[1:]):
                 if left // self.page_size in protected_pages:
@@ -1447,12 +1423,14 @@ class LogStateCacheManager(BaseCacheManager):
         )
         states = int(new_request) + sum(
             checkpoint.end > begin and checkpoint.begin < end
-            and not checkpoint.gpu_entries and checkpoint.end not in slots
+            and (not checkpoint.gpu_entries or (
+                self.logstate_pool.shared_keys
+                and self._allocator.slot(checkpoint.gpu_entries[-1].slot).kind == "log"
+            )) and checkpoint.end not in slots
             for checkpoint in checkpoints
         )
-        # A reservation must not promise the same bitmap hole to every request.
-        # Count future decay frames independently; allocation itself first uses
-        # the live bitmap's holes and can therefore only need fewer frames.
+
+
         return self._allocator.required_frames(
             kv, kv - covered, states, free_decay_records=0,
         )
@@ -1467,6 +1445,9 @@ class LogStateCacheManager(BaseCacheManager):
         if self._profile_enabled:
             self._profile_stats["admission_attempts"] += 1
         assert isinstance(handle, LogStateCacheHandle)
+        sources = self._recovery_sources(handle)
+        if any(not self.tree.has_slot(slot) for slot in sources):
+            return False
         if handle.restore_plan is not None and any(
             not self.tree.has_slot(entry.slot)
             or self.tree.entries_for_slot(entry.slot) != (entry,)
@@ -1483,8 +1464,8 @@ class LogStateCacheManager(BaseCacheManager):
                 or not handle.node.is_leaf() or handle.node.is_locked
                 or handle.node.depth != stats.tail
             ):
-                # Another request claimed or extended this tail after match_req.
-                # Retry matching rather than let two continuations share an owner.
+
+
                 if self._profile_enabled:
                     self._profile_stats["admission_rejections"] += 1
                 return False
@@ -1493,12 +1474,16 @@ class LogStateCacheManager(BaseCacheManager):
         if self._allocator.free_frames < total_len <= available:
             with self.record_schedule_step("lock_capacity_projection"):
                 kv_frames, slots = self.tree.lock_footprint(handle.lock_node)
-                available -= kv_frames + self._allocator.lock_frame_cost(slots)
+                unavailable = set(slots) | {
+                    slot for slot in sources if slot in self.tree._evictable_slots
+                }
+                available -= kv_frames + self._allocator.lock_frame_cost(unavailable)
         if total_len > available:
             if self._profile_enabled:
                 self._profile_stats["admission_rejections"] += 1
             return False
         with self.record_schedule_step("lock_handle"):
+            self._pin_recovery(handle, sources)
             self.lock(handle)
         with self.record_schedule_step("capacity_after_lock"):
             admitted = total_len <= self.admission_capacity
@@ -1515,6 +1500,35 @@ class LogStateCacheManager(BaseCacheManager):
             handle.source_merge_stats, handle.match_position
         )
         return True
+
+    @staticmethod
+    def _recovery_sources(handle: LogStateCacheHandle) -> tuple[int, ...]:
+        recovery = handle.recovery
+        slots = set(recovery.log_slots)
+        if recovery.base_checkpoint_slot is not None:
+            slots.add(recovery.base_checkpoint_slot)
+        if recovery.conv_slot is not None:
+            slots.add(recovery.conv_slot)
+        if handle.restore_plan is not None:
+            slots.update(entry.slot for checkpoint in handle.restore_plan.checkpoints
+                         for entry in checkpoint.gpu_entries)
+            slots.update(item.log_slot for item in handle.restore_plan.gpu_materialize)
+            slots.update(slot for item in handle.restore_plan.gpu_coalesce for slot in item.slots)
+        return tuple(sorted(slots))
+
+    def _pin_recovery(self, handle: LogStateCacheHandle, slots: tuple[int, ...]) -> None:
+        if slots and id(handle) not in self._recovery_pins:
+            self.tree.pin_recovery(slots)
+            self._recovery_pins[id(handle)] = handle, slots
+
+    def _release_recovery(self, handle_id: int) -> None:
+        pinned = self._recovery_pins.pop(handle_id, None)
+        if pinned is not None:
+            self.tree.pin_recovery(pinned[1], release=True)
+
+    def unlock(self, handle: BaseCacheHandle) -> None:
+        self._release_recovery(id(handle))
+        super().unlock(handle)
 
     def record_prefill_queue(
         self,
@@ -1659,7 +1673,10 @@ class LogStateCacheManager(BaseCacheManager):
                 "timing_ms": {}, "counts": {},
             })
             phase["calls"] += 1
-            phase["eviction_calls"] += int(sample["evicted_nodes"] > 0)
+            phase["eviction_calls"] += int(
+                sample["evicted_nodes"] > 0
+                or sample.get("counts", {}).get("dropped_checkpoints", 0) > 0
+            )
             phase["evicted_nodes"] += sample["evicted_nodes"]
             for name, value in sample["timing_ms"].items():
                 phase["timing_ms"][name] = (
@@ -1673,6 +1690,7 @@ class LogStateCacheManager(BaseCacheManager):
                 "total_frames": self._allocator.num_frames,
                 "frame_bytes": self._allocator.frame_bytes,
                 "payload_frames_per_slot": self._allocator.payload_frames,
+                "log_payload_frames_per_slot": self._allocator.log_payload_frames,
                 "conv_frames_per_snapshot": self._allocator.conv_frames,
                 "granules_per_log": self._allocator.num_granules,
                 "decay_records_per_frame": self._allocator.decay_records_per_frame,
@@ -1703,9 +1721,8 @@ class LogStateCacheManager(BaseCacheManager):
                     evictable_kv_frames=evictable_kv_frames,
                     free_capacity=free_capacity,
                 ) * self.page_size
-        # Retirement is logically reclaimable, but reserve() still waits for
-        # its event before reusing the frames. The allocator tracks both tree
-        # eligibility and retirement, including shared decay records.
+
+
         self.logstate_pool.poll_reclamation()
         return self._allocator.admissible_pages(
             evictable_kv_frames=self.tree.evictable_kv_frames(),
@@ -1720,6 +1737,7 @@ class LogStateCacheManager(BaseCacheManager):
     def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None:
         assert isinstance(handle, LogStateCacheHandle)
         assert table_idx not in self._work_slots
+        self._pin_recovery(handle, self._recovery_sources(handle))
         with self.record_schedule_step("work_allocate"):
             work_slot = self._allocate_work()
         self._work_slots[table_idx] = work_slot
@@ -1747,7 +1765,11 @@ class LogStateCacheManager(BaseCacheManager):
             restore = _RecycledRestore(handle.restore_plan)
             restore.slots.update({
                 checkpoint.end: checkpoint.gpu_entries[-1].slot
-                for checkpoint in restore.plan.checkpoints if checkpoint.gpu_entries
+                for checkpoint in restore.plan.checkpoints
+                if checkpoint.gpu_entries and not (
+                    self.logstate_pool.shared_keys
+                    and self._allocator.slot(checkpoint.gpu_entries[-1].slot).kind == "log"
+                )
             })
             self._recycled_restores[table_idx] = restore
 
@@ -1954,6 +1976,8 @@ class LogStateCacheManager(BaseCacheManager):
                 self.tree.size_info.evictable_size / self.page_size
             ),
             "evictable_state_slots": len(evictable_slots),
+            "pending_recovery_state_slots": len(self.tree._recovery_slot_refs),
+            "evictable_checkpoint_slots": len(checkpoint_slots & set(evictable_slots)),
             "tree_log_entries": sum(
                 entry.kind is LogStateKind.LOG for entry in entries
             ),
@@ -2059,8 +2083,8 @@ class LogStateCacheManager(BaseCacheManager):
                 ]
             return
         profile_start = perf_counter_ns() if self._profile_enabled else 0
-        # The first physical offset is known from allocation. Pass it to the
-        # linear backend instead of synchronizing out_loc from GPU per request.
+
+
         first_offsets = []
         for req in batch.reqs:
             page = next(
@@ -2069,8 +2093,8 @@ class LogStateCacheManager(BaseCacheManager):
                 None,
             )
             if page is None:
-                # Planning-only callers may invoke prepare_batch before allocate.
-                # The backend retains its physical-offset fallback for these.
+
+
                 break
             first_offsets.append(req.cached_len - page.begin)
         batch.logstate_first_offsets = (
@@ -2125,6 +2149,16 @@ class LogStateCacheManager(BaseCacheManager):
              for checkpoint in restore.plan.checkpoints for entry in checkpoint.gpu_entries]
             + [item.log_slot for restore in recycled for item in restore.plan.gpu_materialize]
             + [slot for restore in recycled for item in restore.plan.gpu_coalesce for slot in item.slots]
+        )
+        current_pins = Counter(
+            slot for req in batch.reqs
+            for slot in self._recovery_pins.get(
+                id(self._pending_matches.get(req.table_idx)), (None, ())
+            )[1]
+        )
+        blocked |= frozenset(
+            slot for slot, refs in self.tree._recovery_slot_refs.items()
+            if refs > current_pins[slot]
         )
         if analysis_step_timing_ms is not None:
             analysis_step_timing_ms["recycle_filter_ms"] = (
@@ -2213,7 +2247,17 @@ class LogStateCacheManager(BaseCacheManager):
                 perf_counter_ns() - profile_before_start
             ) / 1e6
         construction_start = perf_counter_ns() if self._profile_enabled else 0
-        construction = self._construct(tasks, plan.materialize)
+        shared_commit = None
+        if self.logstate_pool.shared_keys:
+            construction, shared_commit = self._construct_shared(batch, tasks, plan)
+        else:
+            construction = self._construct(tasks, plan.materialize)
+        handles = tuple(id(self._pending_matches[req.table_idx]) for req in batch.reqs
+                        if req.table_idx in self._pending_matches
+                        and id(self._pending_matches[req.table_idx]) in self._recovery_pins)
+        if handles:
+            for handle_id in handles:
+                self._release_recovery(handle_id)
         self._detach_recycled_sources(batch)
         construction_submit_cpu_ms = (
             (perf_counter_ns() - construction_start) / 1e6
@@ -2224,8 +2268,11 @@ class LogStateCacheManager(BaseCacheManager):
         for req in batch.reqs:
             self.pending_recoveries.pop(req.table_idx, None)
             self._pending_matches.pop(req.table_idx, None)
-        self._commit_materialize(plan.materialize)
-        released, released_frames, commit_skips = self._commit_coalesce(plan.coalesce)
+        if shared_commit is None:
+            self._commit_materialize(plan.materialize)
+            released, released_frames, commit_skips = self._commit_coalesce(plan.coalesce)
+        else:
+            released, released_frames, commit_skips = shared_commit
         commit_cpu_ms = (
             (perf_counter_ns() - commit_start) / 1e6
             if self._profile_enabled else 0.0
@@ -2248,7 +2295,7 @@ class LogStateCacheManager(BaseCacheManager):
             assert sample is not None
             profile_after_start = perf_counter_ns()
             sample["construction"] = construction
-            sample["materialized_slots"] = len(plan.materialize)
+            sample["materialized_slots"] = construction.get("materialized_slots", len(plan.materialize))
             sample["released_state_slots"] = released
             sample["scheduled_payload_conv_frames"] = released_frames
             outcome = self._merge_batch_outcome(plan, released)
@@ -2300,7 +2347,7 @@ class LogStateCacheManager(BaseCacheManager):
                         retired.append(entry.slot)
             restore.prepared = True
         if retired:
-            # Reconstruction has consumed these states on the scheduler stream.
+
             self.logstate_pool.retire_slots(retired)
 
     def _prefill_traces(self, reqs: Sequence[Request]) -> tuple[LogRadixTrace, ...]:
@@ -2340,8 +2387,8 @@ class LogStateCacheManager(BaseCacheManager):
                     insert_len > old_handle.cached_len
                     or any(entry.slot in restore.detached for entry in checkpoint.gpu_entries)
                 ):
-                    # An interrupted chunk has no full state at its intermediate
-                    # endpoint. Keep only the last recoverable historical prefix.
+
+
                     insert_len = checkpoint.begin
                     break
         assert insert_len % self.granularity == 0
@@ -2527,8 +2574,8 @@ class LogStateCacheManager(BaseCacheManager):
                 and insert.inserted_len >= recycled.matched_len
                 and self.recycle_bin is not None
             ):
-                # A completed GPU route supersedes the remembered CPU shape.
-                # Keep it until commit: a pending match can still fail admission.
+
+
                 self.recycle_bin.discard(recycled.branch)
             self._release_live_pages(req.table_idx, remaining)
             restore = self._recycled_restores.pop(req.table_idx, None)
@@ -2628,14 +2675,14 @@ class LogStateCacheManager(BaseCacheManager):
             if page.state_slot is not None
         } | work_slots
         self.logstate_pool.poll_reclamation()
-        # CPU tree ownership is gone, but in-flight construction still owns
-        # merged slots until their retirement event completes.
+
+
         expected_state.update(self.logstate_pool.retiring_slots)
         self._allocator.check_integrity()
         if self._allocator._reclaimable_slots != (
             set(self.tree.evictable_slots()) | self.logstate_pool.retiring_slots
         ):
-            raise RuntimeError("LogState reclaimable slots disagree with tree locks and retirement.")
+            raise RuntimeError("LogState reclaimable slots disagree with tree eligibility and retirement.")
         if (self._allocator.allocated_kv != expected_kv
             or self._allocator.allocated_slots != expected_state):
             raise RuntimeError(
@@ -2696,15 +2743,24 @@ class LogStateCacheManager(BaseCacheManager):
             )
             stage = now
         if reserved is None:
-            selected, page_counts, released_slots = self._plan_eviction(
+            selected, page_counts, released_slots, checkpoint_pairs = self._plan_eviction(
                 needed_pages, needed_states, needed_works
             )
             if profile is not None:
                 now = perf_counter_ns()
                 profile["timing_ms"]["eviction_plan_ms"] = (now - stage) / 1e6
                 profile["evicted_nodes"] = len(selected)
+                profile.setdefault("counts", {})["dropped_checkpoints"] = len(checkpoint_pairs)
                 stage = now
 
+            dropped_checkpoints = []
+            for left_slot, right_slot in checkpoint_pairs:
+                entry = self.tree.drop_checkpoint(left_slot, right_slot)
+                if self._profile_enabled:
+                    dropped_checkpoints.append({
+                        "slot": entry.slot, "begin": entry.begin, "end": entry.end,
+                        "retained_slot": right_slot,
+                    })
             evicted_entry_spans = (
                 [
                     {
@@ -2722,11 +2778,7 @@ class LogStateCacheManager(BaseCacheManager):
             free_frames_before = self._allocator.free_frames if self._profile_enabled else 0
             if self.recycle_bin is not None:
                 for node in selected:
-                    # Snapshot the maximal removed branches before pruning.
-                    # Ancestor-only snapshots lose checkpoints owned by their
-                    # descendants and must not replace this complete shape.
-                    if node.is_leaf():
-                        self.recycle_bin.remember(self.tree, node)
+                    self.recycle_bin.remember(self.tree, node)
             eviction = self.tree.evict_nodes(selected, evicted_nodes)
             if profile is not None:
                 now = perf_counter_ns()
@@ -2737,18 +2789,14 @@ class LogStateCacheManager(BaseCacheManager):
                 now = perf_counter_ns()
                 profile["timing_ms"]["release_kv_ms"] = (now - stage) / 1e6
                 stage = now
-            release_pool_timings = {} if profile is not None else None
             for slot in released_slots:
                 assert not self.tree.has_slot(slot)
-            self.logstate_pool.release_slots(
-                sorted(released_slots), timings=release_pool_timings
-            )
+
+
+            self.logstate_pool.retire_slots(sorted(released_slots))
             if profile is not None:
                 now = perf_counter_ns()
                 profile["timing_ms"]["release_states_ms"] = (now - stage) / 1e6
-                self._record_pool_timings(
-                    profile, "release_pool", release_pool_timings
-                )
                 stage = now
             free_frames_after_evict = (
                 self._allocator.free_frames if self._profile_enabled else 0
@@ -2776,6 +2824,7 @@ class LogStateCacheManager(BaseCacheManager):
                         for uuid, begin, end in evicted_nodes
                     ],
                     "entries": evicted_entry_spans,
+                    "dropped_checkpoints": dropped_checkpoints,
                     "kv_tokens": len(eviction.kv_indices),
                     "state_slots": len(released_slots),
                     "free_frames_before": free_frames_before,
@@ -2785,6 +2834,7 @@ class LogStateCacheManager(BaseCacheManager):
                     "need_work_slots": needed_works,
                 })
                 self._profile_stats["eviction_rounds"] += 1
+                self._profile_stats["pressure_dropped_checkpoints"] += len(checkpoint_pairs)
                 self._profile_stats["evicted_kv_tokens"] += len(
                     eviction.kv_indices
                 )
@@ -2814,7 +2864,7 @@ class LogStateCacheManager(BaseCacheManager):
 
     def _plan_eviction(
         self, needed_pages: int, needed_states: int, needed_works: int,
-    ) -> tuple[list[LogRadixTreeNode], dict[int, int], set[int]]:
+    ) -> tuple[list[LogRadixTreeNode], dict[int, int], set[int], list[tuple[int, int]]]:
         from logssms.kernel import logstate as planning
 
         nodes, topology = self.tree.eviction_snapshot()
@@ -2839,7 +2889,9 @@ class LogStateCacheManager(BaseCacheManager):
             [(frame, mask.bit_count()) for frame, mask in allocator._decay_masks.items()],
             (allocator.free_frames, allocator._free_decay_records,
              allocator.payload_frames, allocator.conv_frames, allocator.num_granules,
-             allocator.decay_records_per_frame, needed_pages, needed_states, needed_works),
+             allocator.decay_records_per_frame, needed_pages, needed_states, needed_works,
+             allocator.log_payload_frames),
+            self.tree.checkpoint_eviction_pairs(),
         )
         if not rows:
             raise LogStateCapacityError(
@@ -2847,9 +2899,10 @@ class LogStateCacheManager(BaseCacheManager):
                 f"need_pages={needed_pages}, need_states={needed_states}, "
                 f"free_frames={allocator.free_frames}."
             )
-        selected, pages, released = rows
+        selected, pages, released, compressed = rows
         return ([nodes[index] for index in selected],
-                dict(zip(pages[::2], pages[1::2], strict=True)), set(released))
+                dict(zip(pages[::2], pages[1::2], strict=True)), set(released),
+                list(zip(compressed[::2], compressed[1::2], strict=True)))
 
     @staticmethod
     def _record_pool_timings(
@@ -2898,6 +2951,7 @@ class LogStateCacheManager(BaseCacheManager):
         self,
         restores   : Sequence[_ReconstructionTask],
         materialize: Sequence[PageMaterialize],
+        *, record_cuda: bool = True,
     ) -> dict:
         submit_timing_ms: dict[str, float] | None = (
             {} if self._profile_enabled else None
@@ -2905,7 +2959,7 @@ class LogStateCacheManager(BaseCacheManager):
         step_start = perf_counter_ns() if submit_timing_ms is not None else 0
         events = None
         event_setup_cpu_ms = 0.0
-        if self._profile_enabled and (restores or materialize):
+        if self._profile_enabled and record_cuda and (restores or materialize):
             event_setup_start = perf_counter_ns()
             events = (
                 torch.cuda.Event(enable_timing=True),
@@ -2920,9 +2974,10 @@ class LogStateCacheManager(BaseCacheManager):
         if direct:
             pool = self.logstate_pool
             assert all(task.base_slot is not None for task in direct)
-            for task in direct:
-                assert task.base_slot is not None
-                pool.copy_state(task.base_slot, task.output_slot)
+            from logssms.kernel.linear_attention.logstate import copy_states
+
+            copy_states(pool, [task.base_slot for task in direct],
+                               [task.output_slot for task in direct])
         if submit_timing_ms is not None:
             submit_timing_ms["direct_state_copy_ms"] = (
                 perf_counter_ns() - step_start
@@ -2938,8 +2993,8 @@ class LogStateCacheManager(BaseCacheManager):
         pool = self.logstate_pool
 
         step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-        # Stage conv metadata before launching construction. In particular, do
-        # not insert blocking H2D tensor constructors after the reconstruction.
+
+
         conv_vectors = make_device_vectors([
             [task.source_conv_slot for task in conv_restores],
             [task.source_conv_granule for task in conv_restores],
@@ -3059,6 +3114,106 @@ class LogStateCacheManager(BaseCacheManager):
             construction["submit_timing_ms"] = submit_timing_ms
         return construction
 
+    def _construct_shared(
+        self, batch: Batch, tasks: Sequence[_ReconstructionTask], plan: LogStatePlan,
+    ) -> tuple[dict, tuple[int, int, dict[str, int]]]:
+        pool = self.logstate_pool
+        released = released_frames = merged = segments = materialized = 0
+        skips: Counter[str] = Counter()
+        events = None
+        if self._profile_enabled and (tasks or plan.coalesce):
+            events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            events[0].record()
+
+
+        for req in batch.reqs:
+            self._release_recovery(id(self._pending_matches.get(req.table_idx)))
+        works = tuple(dict.fromkeys(task.output_slot for task in tasks))
+        groups = iter(plan.coalesce)
+        wave_count = 0
+        while True:
+            wave, chains, frame_counts = [], [], []
+            for group in groups:
+                if any(not self.tree.has_slot(slot) or self.tree.slot_is_fragmented(slot)
+                       or slot in self.tree._recovery_slot_refs for slot in group.slots):
+                    skips["pending_or_fragmented_source"] += 1
+                    continue
+                right = self.tree.entries_for_slot(group.right_slot)[0]
+                if right.kind is LogStateKind.CHECKPOINT:
+                    count, frames, reasons = self._commit_coalesce((group,), allow_logs=True)
+                    released += count
+                    released_frames += frames
+                    merged += bool(count)
+                    skips.update(reasons)
+                    continue
+                if not works:
+                    skips["no_restore_work"] += 1
+                    continue
+                if self._allocator.checkpoint_frame_capacity(group.slots) < self._allocator.payload_frames:
+                    skips["insufficient_group_frames"] += 1
+                    continue
+                if self._allocator.checkpoint_frame_savings(group.slots) <= 0:
+                    skips["no_memory_gain"] += 1
+                    continue
+                recovery = self.tree.recovery_at(self.tree.entry_owner(right), right.end)
+                assert recovery.position == right.end
+                logs = [(entry.slot, entry.begin - entry.physical_begin, entry.end - entry.physical_begin)
+                        for entry in recovery.logs]
+                wave.append(group)
+                chains.append((recovery.base_checkpoint_slot, logs, works[len(wave) - 1]))
+                frame_counts.append(sum(len(self._allocator.slot(slot).payload)
+                                        + sum(map(len, self._allocator.slot(slot).conv)) for slot in group.slots))
+                segments += len(logs)
+                if len(wave) == len(works):
+                    break
+            if not wave:
+                break
+
+
+            pool.kernels.restore(pool, chains)
+            committed, committed_works = [], []
+            count, _frames, reasons = self._commit_coalesce(tuple(wave), allow_logs=True)
+            released += count
+            skips.update(reasons)
+            for index, group in enumerate(wave):
+                right_entries = self.tree.entries_for_slot(group.right_slot)
+                if (len(right_entries) == 1 and right_entries[0].kind is LogStateKind.CHECKPOINT
+                    and right_entries[0].begin == group.begin and right_entries[0].end == group.end):
+                    committed.append(group.slots)
+                    committed_works.append(works[index])
+                    released_frames += frame_counts[index] - self._allocator.payload_frames - self._allocator.conv_frames
+            if committed:
+                pool.coalesce_groups(committed, committed_works)
+            merged += len(committed)
+            materialized += len(committed)
+            wave_count += 1
+
+
+        refreshed = []
+        for req in batch.reqs:
+            original = self.pending_recoveries.get(req.table_idx)
+            handle = self._pending_matches.get(req.table_idx)
+            if original is None or original.position == 0 or handle is None:
+                continue
+            recovery = self.tree.recovery_at(handle.node, original.position)
+            assert recovery.position == original.position
+            refreshed.append(_ReconstructionTask(
+                self._work_slots[req.table_idx], recovery.base_checkpoint_slot, recovery.logs,
+                recovery.conv_slot, recovery.conv_granule, 0,
+            ))
+        construction = self._construct(refreshed, (), record_cuda=False)
+        construction["chains"] += materialized
+        construction["segments"] += segments
+        construction["outputs"] += materialized
+        construction["waves"] += wave_count
+        construction["merged_checkpoint_groups"] = merged
+        construction["materialized_slots"] = materialized
+        if events is not None:
+            events[1].record()
+            construction["cuda_ms"] = None
+            self._profile_cuda_events.append((construction, *events))
+        return construction, (released, released_frames, dict(skips))
+
     @staticmethod
     def _construction_plan(
         restores   : Sequence[_ReconstructionTask],
@@ -3159,11 +3314,15 @@ class LogStateCacheManager(BaseCacheManager):
     def _commit_coalesce(
         self,
         plans: Sequence[CheckpointCoalesce],
+        *, allow_logs: bool = False,
     ) -> tuple[int, int, dict[str, int]]:
         released = []
         released_frames = 0
         skips: dict[str, int] = {}
         for plan in plans:
+            if any(slot in self.tree._recovery_slot_refs for slot in plan.slots):
+                skips["pending_work_recovery"] = skips.get("pending_work_recovery", 0) + 1
+                continue
             if any(
                 not self.tree.has_slot(slot)
                 or self.tree.slot_is_fragmented(slot)
@@ -3178,9 +3337,11 @@ class LogStateCacheManager(BaseCacheManager):
                 for slot in plan.slots
             ]
             if any(
-                entry.kind is not LogStateKind.CHECKPOINT
+                (entry.kind is not LogStateKind.CHECKPOINT and not (
+                    allow_logs and entry.kind is LogStateKind.LOG and level == 1
+                ))
                 or entry.slot != slot
-                or entry.span_pages != level
+                or (entry.span_pages if entry.kind is LogStateKind.CHECKPOINT else 1) != level
                 for entry, slot, level in zip(
                     entries,
                     plan.slots,
@@ -3204,12 +3365,16 @@ class LogStateCacheManager(BaseCacheManager):
                 )
                 continue
             owner = self.tree.entry_owner(entries[-1])
+            checkpoint_timestamp = (self.tree.checkpoint_timestamp(plan.right_slot)
+                                    if entries[-1].kind is LogStateKind.CHECKPOINT else None)
             if self._profile_enabled:
                 for slot in plan.slots[:-1]:
                     record = self._allocator.slot(slot)
-                    # Materialization may still be pending on CUDA. Count the
-                    # eventual checkpoint layout, not Log-only conv frames.
-                    released_frames += len(record.payload) + len(record.conv[-1])
+
+
+                    released_frames += len(record.payload) + (
+                        sum(map(len, record.conv)) if allow_logs else len(record.conv[-1])
+                    )
             for slot in plan.slots:
                 self.tree.detach_entry(slot)
             self.tree.attach_entry(
@@ -3221,11 +3386,12 @@ class LogStateCacheManager(BaseCacheManager):
                     end=plan.end,
                     span_pages=plan.next_span,
                 ),
+                checkpoint_timestamp=checkpoint_timestamp,
             )
             released.extend(plan.slots[:-1])
         if released:
-            # Construction reads can still be in flight on the scheduler stream.
-            # Retain physical frames/descriptors without blocking CPU preparation.
+
+
             self.logstate_pool.retire_slots(released)
         return len(released), released_frames, skips
 
@@ -3247,7 +3413,7 @@ class LogStateCacheManager(BaseCacheManager):
             if restore is not None and page.checkpoint_begin is not None:
                 checkpoint = next(value for value in restore.plan.checkpoints if value.end == page.end)
                 if checkpoint.gpu_entries and page.state_slot not in restore.detached:
-                    continue  # A cancellation before construction still leaves this slot in the tree.
+                    continue
                 restore.slots.pop(page.end, None)
             released_states.append(page.state_slot)
         self._return_slots(
@@ -3295,7 +3461,6 @@ class LogStateCacheManager(BaseCacheManager):
 
 
 class LogStateCacheFactory(BaseCacheFactory):
-    """Allocate one arena of KV granules shared by KV, log and checkpoints."""
 
     def plan(
         self,
@@ -3362,9 +3527,11 @@ class LogStateCacheFactory(BaseCacheFactory):
             layout.conv_state_bytes // layout.num_granules, cache_per_page
         )
         assert layout.log_decay_bytes <= cache_per_page
-        state_units = payload_frames + layout.num_granules * conv_frames + 1
+        log_payload_frames = (payload_frames if layout.num_key_heads == layout.num_value_heads
+                              else div_ceil(layout.log_payload_bytes, cache_per_page))
+        state_units = log_payload_frames + layout.num_granules * conv_frames + 1
         work_units = payload_frames + conv_frames
-        # The manager also allocates one dummy KV frame, log slot and work slot.
+
         num_pages = available_memory // cache_per_page - 1
         if config.num_page_override is not None:
             num_pages = min(num_pages, config.num_page_override)
@@ -3413,7 +3580,7 @@ class LogStateCacheFactory(BaseCacheFactory):
         conv_dim, state_len = spec.conv_shape
         tp_info = try_get_tp_info()
         assert tp_info is not None
-        shared_pool = FramedMHALogStatePool(
+        shared_pool = MHALogStatePool(
             num_frames=plan.num_pages + 1,
             page_size=config.page_size,
             num_attention_layers=model.num_attention_layers,
@@ -3432,7 +3599,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             recurrent_type=spec.recurrent_type,
         )
         assert (
-            shared_pool.allocator.payload_frames
+            shared_pool.allocator.log_payload_frames
             + shared_pool.layout.num_granules * shared_pool.allocator.conv_frames
             + 1
         ) == plan.state_units

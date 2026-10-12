@@ -1,4 +1,4 @@
-"""Isolated framed GDN decode microbenchmark; not a prefix-cache benchmark."""
+"""Isolated logstate GDN decode microbenchmark; not a prefix-cache benchmark."""
 
 import argparse
 import hashlib
@@ -12,10 +12,10 @@ from pathlib import Path
 
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.kernel.linear_attention.logstate import store_log_states
 from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_to_framed_logstate,
+    fused_recurrent_gated_delta_rule_to_logstate,
 )
 
 
@@ -43,7 +43,7 @@ def benchmark(fn, batch_size, num_key_heads, num_value_heads, count, eager, log_
     probe = globals_[name]
     torch.manual_seed(511)
     device, dtype = torch.device("cuda"), torch.bfloat16
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=batch_size * 12 + 32, page_size=64, granularity=32,
         num_attention_layers=1, num_kv_heads=8, head_dim=128,
         num_linear_layers=1, num_key_heads=num_key_heads, num_value_heads=num_value_heads,
@@ -60,7 +60,7 @@ def benchmark(fn, batch_size, num_key_heads, num_value_heads, count, eager, log_
     keys = torch.randn(batch_size, 64, num_value_heads, 128, device=device, dtype=dtype) * 0.01
     updates = torch.randn_like(keys) * 0.01
     alpha = torch.empty(batch_size, 64, num_value_heads, device=device).uniform_(0.95, 0.999)
-    store_framed_log_states(
+    store_log_states(
         pool, logs.repeat_interleave(64), torch.arange(64, device=device, dtype=torch.int32).repeat(batch_size),
         keys.flatten(0, 1), updates.flatten(0, 1),
         (alpha.log() if log_decay else alpha).flatten(0, 1), 0,
@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--warmup-ms", type=float, default=200,
                         help="Warm each captured variant before GPU event timing")
     args = parser.parse_args()
-    fn = fused_recurrent_gated_delta_rule_to_framed_logstate
+    fn = fused_recurrent_gated_delta_rule_to_logstate
     source = Path("python/logssms/kernel/linear_attention/vendor/fla/fused_recurrent.py")
     if args.source:
         source = args.source
@@ -150,7 +150,7 @@ def main():
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-        fn = module.fused_recurrent_gated_delta_rule_to_framed_logstate
+        fn = module.fused_recurrent_gated_delta_rule_to_logstate
     results = []
     reference = None
     if args.compare_source:
@@ -159,7 +159,7 @@ def main():
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-        reference = module.fused_recurrent_gated_delta_rule_to_framed_logstate
+        reference = module.fused_recurrent_gated_delta_rule_to_logstate
     for batch in map(int, args.batches.split(",")):
         for count in map(int, args.replay_counts.split(",")):
             if reference:

@@ -54,8 +54,8 @@ class StandardCacheManager(BaseCacheManager):
         num_draft_states : int                 = 0,
     ):
         super().__init__(page_size, resources, prefix_cache_type)
-        # The `_free_pages` follows a page-aligned manner. For example, if page_size = 2,
-        # the `_free_pages` may look like [0, 2, 4, 6, ...], and each slot represents a page.
+
+
         self.free_pages = torch.arange(
             num_pages, dtype=torch.int32, device=self.device
         ) * page_size
@@ -186,7 +186,7 @@ class StandardCacheManager(BaseCacheManager):
 
         value = StandardPrefixValue(page_indices, state_indices)
         prefix_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, value)
-        # unlock until all operations on handle is done
+
         self.unlock(old_handle)
         self._free(
             page_indices[old_handle.cached_len: prefix_len],
@@ -195,7 +195,7 @@ class StandardCacheManager(BaseCacheManager):
                 if state_indices is not None else None
             ),
         )
-        if finished:  # this tail part should be freed
+        if finished:
             self._free(
                 page_indices[new_handle.cached_len:],
                 state_indices=(
@@ -205,7 +205,7 @@ class StandardCacheManager(BaseCacheManager):
             )
             if self.state_table is not None:
                 self.state_table[req.table_idx] = -1
-        else:  # keep the tail part, update the handle
+        else:
             req.cache_handle = new_handle
             self.lock(new_handle)
             matched = new_handle.get_matched_indices()
@@ -286,8 +286,8 @@ class StandardCacheManager(BaseCacheManager):
         if self.page_size > 1:
             assert torch.all(self.free_pages % self.page_size == 0)
         if self.linear_pool is not None and self.state_table is not None:
-            # Idle (the only time this runs): live rows have no request-owned refs.
-            # The last row belongs to CUDA Graph padding; work slots remain populated.
+
+
             free_state = len(self.free_states)
             live_state = int(
                 (self.state_table[:-1, ::self.page_size] >= 0).sum().item()
@@ -356,8 +356,8 @@ class StandardCacheManager(BaseCacheManager):
         free_pages = len(self.free_pages)
         free_states = len(self.free_states)
         if needed_pages > free_pages or needed_states > free_states:
-            # Each evicted radix node frees page_size KV tokens AND one state slot per
-            # page, so the shortfall (in pages/slots) is the unit to evict in tokens.
+
+
             needed_evict = max(
                 0, needed_pages - free_pages, needed_states - free_states
             ) * self.page_size
@@ -422,7 +422,7 @@ class StandardCacheManager(BaseCacheManager):
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:
             return pages
-        # [X * page_size] -> [X * page_size, ..., X * page_size + page_size - 1]
+
         offsets = torch.arange(self.page_size, dtype=torch.int32, device=self.device)
         return (pages.unsqueeze(1) + offsets).flatten()
 

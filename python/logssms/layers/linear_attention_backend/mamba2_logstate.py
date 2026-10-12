@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from logssms.core import get_global_ctx
-from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
+from logssms.kernel.linear_attention.logstate import store_log_states
 from logssms.kernel.linear_attention.mamba2 import (
     mamba2_conv_decode, mamba2_decode, mamba2_prefill, prepare_mamba2,
 )
@@ -21,11 +21,11 @@ class Mamba2LogStateBackend(LogStateLinearAttentionBackend, BaseMamba2Backend):
             raise NotImplementedError("Mamba2 LogState speculative verify is not implemented")
         if batch.is_decode:
             convolved = mamba2_conv_decode(
-                xbc, conv_weight, conv_bias, config, metadata, pool, framed=True,
+                xbc, conv_weight, conv_bias, config, metadata, pool, logstate=True,
             )
             return mamba2_decode(
                 convolved, dt, A_log, dt_bias, D, config, metadata, pool,
-                framed=True, eager=self.enable_eager_state,
+                logstate=True, eager=self.enable_eager_state,
             )
         history = pool.read_conv(metadata.conv_read_slots, metadata.conv_read_granules, config.layer_idx)
         snapshots = packed_conv_snapshots(
@@ -48,7 +48,7 @@ class Mamba2LogStateBackend(LogStateLinearAttentionBackend, BaseMamba2Backend):
             slots = metadata.log_slots.index_select(0, rows)
             offsets = metadata.token_offsets.index_select(0, rows)
             keys, values, decay = (tensor.index_select(0, rows) for tensor in (keys, values, decay))
-        store_framed_log_states(pool, slots, offsets, keys, values, decay, config.layer_idx)
+        store_log_states(pool, slots, offsets, keys, values, decay, config.layer_idx)
         pool.write_states(metadata.work_slots, config.layer_idx, final.to(pool.dtype))
         if metadata.checkpoint_slots is not None:
             pool.write_states(

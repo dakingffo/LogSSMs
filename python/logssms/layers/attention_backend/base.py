@@ -20,7 +20,6 @@ class BaseAttnBackend(ABC):
     def forward(
         self, q: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
-        """Attend to the persistent KV cache, already populated by QKV preparation."""
         ...
 
     @abstractmethod

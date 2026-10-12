@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class DistributedInfo:  # should not export from here
+class DistributedInfo:
     rank: int
     size: int
 

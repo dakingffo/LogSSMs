@@ -35,9 +35,8 @@ class DFlashState(DraftState):
     ) -> None:
         assert len(output_positions) == len(output_tokens) == hidden.shape[0]
         assert output_positions
-        # Target logits at position p predict the output token at p+1. Therefore the
-        # captured verify rows become DFlash context at output_position - 1, while the
-        # final output token becomes the next noisy block's anchor.
+
+
         self.pending_positions.extend(position - 1 for position in output_positions)
         self.pending_hidden = torch.cat([self.pending_hidden, hidden], dim=0)
         self.anchor_position = output_positions[-1]

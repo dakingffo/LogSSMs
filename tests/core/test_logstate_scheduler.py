@@ -16,6 +16,7 @@ from logssms.cache.prefix_cache.logstate import (
     LogStateKind,
     LogStateMergeStats,
 )
+from tests.logstate_helpers import is_lock_boundary
 
 
 PAGE_SIZE = 64
@@ -443,7 +444,7 @@ def test_native_merge_path_metadata_matches_tree_checks():
         value.position for value in pending if value.trace.node in path
     ))
     for position in range(0, 6 * PAGE_SIZE + 1, GRANULARITY):
-        assert (position in context.lock_boundaries) == tree.is_lock_boundary(
+        assert (position in context.lock_boundaries) == is_lock_boundary(tree,
             leaf, position,
         )
 

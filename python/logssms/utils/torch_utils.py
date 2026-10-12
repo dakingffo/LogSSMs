@@ -10,11 +10,6 @@ if TYPE_CHECKING:
 
 
 def make_device_vectors(vectors, device, *, dtype=None):
-    """Pack small integer metadata into one transfer on the current stream.
-
-    Each call owns fresh pinned storage; it is never overwritten while its
-    asynchronous copy is pending (PyTorch tracks the pinned allocation).
-    """
     import torch
 
     device = torch.device(device)
@@ -33,7 +28,7 @@ def make_device_vectors(vectors, device, *, dtype=None):
 
 @contextmanager
 def torch_dtype(dtype: torch.dtype):
-    import torch  # real import when used
+    import torch
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)

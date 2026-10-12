@@ -83,7 +83,7 @@ def test_qk_norm_rope_store_matches_reference(dtype, norm, dims, layout):
 @pytest.mark.parametrize("page_size", [1, 16, 32, 64, 128])
 def test_qk_norm_rope_store_graph_replay_updates_mapping(layout, page_size):
     from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
-    from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+    from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
     from logssms.distributed import DistributedInfo, tp_override
     from logssms.layers.norm import RMSNorm
     from logssms.layers.rotary import RotaryEmbedding
@@ -93,7 +93,7 @@ def test_qk_norm_rope_store_graph_replay_updates_mapping(layout, page_size):
     dtype, device = torch.bfloat16, torch.device("cuda")
     torch.manual_seed(7)
     if layout == "frame":
-        pool = FramedMHALogStatePool(
+        pool = MHALogStatePool(
             num_frames=32, page_size=64, granularity=page_size,
             num_attention_layers=2, num_kv_heads=2, head_dim=256,
             num_linear_layers=2, num_key_heads=2, num_value_heads=2,
@@ -206,14 +206,14 @@ def test_fused_qkv_with_flashinfer_prefill_decode_verify(monkeypatch, layout):
     import logssms.layers.attention as attention
     import logssms.layers.attention_backend.fi as fi
     from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
-    from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+    from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
     from logssms.core import Batch, Request, SamplingParams
     from logssms.distributed import DistributedInfo, tp_override
 
     torch.manual_seed(23)
     device, dtype = torch.device("cuda"), torch.bfloat16
     if layout == "frame":
-        pool = FramedMHALogStatePool(
+        pool = MHALogStatePool(
             num_frames=32, page_size=64, granularity=32,
             num_attention_layers=2, num_kv_heads=2, head_dim=256,
             num_linear_layers=2, num_key_heads=2, num_value_heads=2,

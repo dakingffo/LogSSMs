@@ -1,15 +1,15 @@
-"""Measure framed LogState construction GPU time without a model forward."""
+"""Measure LogState construction GPU time without a model forward."""
 
 import argparse
 
 import torch
 import triton.testing
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.framed_logstate import (
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.kernel.linear_attention.logstate import (
     _construction_args,
     _construction_dims,
-    _construction_module,
+    _load_construction_module,
 )
 from logssms.tvm import call_cuda_ffi
 
@@ -26,7 +26,7 @@ def main() -> None:
     assert args.layers > 0 and args.heads > 0
 
     count = args.tasks * args.segments
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=8 * count + 32,
         page_size=64,
         granularity=16,
@@ -48,7 +48,10 @@ def main() -> None:
     logs, works = allocated[1:]
     pool.storage.view(torch.bfloat16).normal_(mean=0.0, std=0.01)
     for slot in logs:
-        pool.decay_view(slot).fill_(1)
+        record = pool.allocator.slot(slot).decay
+        size = pool.layout.log_decay_bytes
+        begin = record.index * size
+        pool.storage[record.frame, begin:begin + size].zero_()
 
     chains = [
         (
@@ -61,7 +64,7 @@ def main() -> None:
         for row in range(args.tasks)
     ]
 
-    module = _construction_module(64, 128, 128)
+    module = _load_construction_module(64, 128, 128, pool.layout.granularity)
     prepared = []
     max_tasks = torch.cuda.get_device_properties(pool.device).multi_processor_count
 

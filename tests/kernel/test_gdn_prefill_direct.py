@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.kernel.linear_attention.logstate import store_log_states
 from logssms.kernel.linear_attention.packed_conv import (
     PackedConvStateIO, packed_causal_conv1d, packed_conv_snapshots,
 )
@@ -15,12 +15,12 @@ from logssms.layers.linear_attention_backend.standard import PackedLinearIndices
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _pool(granularity, dim, dtype):
-    return FramedMHALogStatePool(
+def _pool(granularity, dim, dtype, head_ratio=1):
+    return MHALogStatePool(
         num_frames=128, page_size=64, granularity=granularity,
         num_attention_layers=1, num_kv_heads=2, head_dim=256,
-        num_linear_layers=2, num_key_heads=2, num_value_heads=2,
-        head_k_dim=dim, head_v_dim=dim, conv_dim=6 * dim, state_len=3,
+        num_linear_layers=2, num_key_heads=2, num_value_heads=2 * head_ratio,
+        head_k_dim=dim, head_v_dim=dim, conv_dim=(4 + 2 * head_ratio) * dim, state_len=3,
         device=torch.device("cuda"), dtype=dtype,
     )
 
@@ -28,9 +28,10 @@ def _pool(granularity, dim, dtype):
 @pytest.mark.parametrize("granularity", [16, 32, 64])
 @pytest.mark.parametrize("dim", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype):
+@pytest.mark.parametrize("head_ratio", [1, 2, 3, 4])
+def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype, head_ratio):
     torch.manual_seed(31)
-    pool = _pool(granularity, dim, dtype)
+    pool = _pool(granularity, dim, dtype, head_ratio)
     allocated = pool.reserve(logs=4, works=6)
     assert allocated is not None
     logs, works = allocated[1:]
@@ -44,8 +45,8 @@ def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype):
     slots[1:9] = -1
     query = torch.nn.functional.normalize(torch.randn(1, total, 2, dim, device=pool.device), dim=-1).to(dtype)
     key = torch.nn.functional.normalize(torch.randn_like(query).float(), dim=-1).to(dtype)
-    value = torch.randn_like(query) * .1
-    gate = -torch.rand(1, total, 2, device=pool.device) * .1
+    value = torch.randn(1, total, 2 * head_ratio, dim, device=pool.device, dtype=dtype) * .1
+    gate = -torch.rand(1, total, 2 * head_ratio, device=pool.device) * .1
     beta = torch.rand_like(gate)
     work_slots = torch.tensor(works[:3], dtype=torch.int32, device=pool.device)
     writes = torch.full((len(indices.chunk_indices),), -1, dtype=torch.int32, device=pool.device)
@@ -55,16 +56,18 @@ def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype):
         chunk_write_slots=writes, final_write_slots=work_slots,
         payload_frames=pool.payload_frame_table, frame_bytes=pool.frame_bytes,
         head_payload_bytes=pool.head_payload_bytes, layer=1,
+        num_layers=pool.layout.num_linear_layers, granularity=pool.layout.granularity,
+        page_size=pool.page_size,
     )
     pool.storage.fill_(0)
-    pool.write_states(work_slots, 1, torch.randn(3, 2, dim, dim, device=pool.device, dtype=dtype) * .01)
+    pool.write_states(work_slots, 1, torch.randn(3, 2 * head_ratio, dim, dim, device=pool.device, dtype=dtype) * .01)
     initial = pool.storage.clone()
     expected, residual = chunk_gated_delta_rule_to_cache(
         query, key, value, gate, beta, io, indices.cu_seqlens,
         chunk_size=granularity, **indices.fla_kwargs(),
     )
     active = slots >= 0
-    store_framed_log_states(pool, slots[active], positions[active],
+    store_log_states(pool, slots[active], positions[active],
                             key[0, active], residual[0, active], gate[0, active], 1)
     expected_storage = pool.storage.clone()
     pool.storage.copy_(initial)
@@ -81,8 +84,8 @@ def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype):
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
-@pytest.mark.parametrize("framed", [False, True])
-def test_conv_prefill_direct_snapshots_and_mutable_graph_destinations(granularity, framed):
+@pytest.mark.parametrize("logstate", [False, True])
+def test_conv_prefill_direct_snapshots_and_mutable_graph_destinations(granularity, logstate):
     torch.manual_seed(13)
     pool = _pool(granularity, 32, torch.bfloat16)
     allocated = pool.reserve(logs=5, works=3)
@@ -119,7 +122,7 @@ def test_conv_prefill_direct_snapshots_and_mutable_graph_destinations(granularit
     slots[rows] = token_slots[rows]
     granules[rows] = (token_offsets[rows] // granularity).int()
     final_slots = torch.tensor(works, device=pool.device, dtype=torch.int32)
-    if framed:
+    if logstate:
         storage = pool.storage.view(pool.dtype)
         io = PackedConvStateIO(storage, slots, granules, final_slots,
                                pool.conv_frame_table, pool.frame_bytes, 1)
@@ -132,7 +135,7 @@ def test_conv_prefill_direct_snapshots_and_mutable_graph_destinations(granularit
 
     def check():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        if framed:
+        if logstate:
             got = pool.read_conv(slots[rows], granules[rows], 1)
             ends = indices.cu_seqlens[1:] - 1
             end_indices = torch.searchsorted(rows, ends)
@@ -149,7 +152,7 @@ def test_conv_prefill_direct_snapshots_and_mutable_graph_destinations(granularit
     with torch.cuda.graph(graph):
         actual = packed_causal_conv1d(x, weight, history, indices.cu_seqlens,
                                      indices.conv_chunks, bias, state_io=io)
-    if framed:
+    if logstate:
         # Mutate descriptors without recapturing; the graph must resolve them at replay.
         pool.conv_frame_table[logs[0], 0], pool.conv_frame_table[logs[4], 0] = (
             pool.conv_frame_table[logs[4], 0].clone(), pool.conv_frame_table[logs[0], 0].clone()

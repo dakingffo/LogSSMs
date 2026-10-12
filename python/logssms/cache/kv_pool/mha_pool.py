@@ -8,10 +8,6 @@ from .base import BaseKVCachePool
 
 
 class MHAKVCachePool(BaseKVCachePool):
-    """
-    Base class for key-value caches.
-    This class defines the interface for key-value caches used in LLMs.
-    """
 
     def __init__(
         self,

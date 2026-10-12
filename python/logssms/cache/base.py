@@ -140,7 +140,6 @@ class BaseCacheManager(ABC):
         return True
 
     def prepare_batch(self, batch: Batch) -> None:
-        """Prepare cache-specific work after allocation and before model metadata."""
         return None
 
     def record_prefill_queue(
@@ -248,7 +247,7 @@ class BaseCacheManager(ABC):
         sample = {
             "tag": tag,
             "input_len": input_len,
-            # match_req intentionally excludes the final prompt token.
+
             "matchable_len": max(0, input_len - 1),
             "tree_match_len": tree_match_len,
             "recoverable_len": recoverable_len,

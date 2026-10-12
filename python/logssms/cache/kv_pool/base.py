@@ -6,10 +6,6 @@ import torch
 
 
 class BaseKVCachePool(ABC):
-    """
-    Base class for key-value caches.
-    This class defines the interface for key-value caches used.
-    """
 
     @abstractmethod
     def k_cache(self, index: int) -> torch.Tensor: ...

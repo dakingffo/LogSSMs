@@ -75,7 +75,7 @@ def chunk_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
-    # offset calculation
+
     q += (bos * H + i_h // (HV // H)) * K
     k += (bos * H + i_h // (HV // H)) * K
     v += (bos * HV + i_h) * V
@@ -99,18 +99,18 @@ def chunk_fwd_kernel_o(
         else:
             p_h = h + o_k[:, None] * V + o_v[None, :]
             m_h = m_k[:, None] & (o_v[None, :] < V)
-        # [BT, BK]
+
         b_q = tl.load(p_q, mask=m_t[:, None] & m_k[None, :], other=0.0)
-        # [BK, BT]
+
         b_k = tl.load(p_k, mask=m_k[:, None] & m_t[None, :], other=0.0)
         b_h = tl.load(p_h, mask=m_h, other=0.0)
 
-        # [BT, BK] @ [BK, BV] -> [BT, BV]
+
         if STATE_V_FIRST:
             b_o += tl.dot(b_q, tl.trans(b_h))
         else:
             b_o += tl.dot(b_q, b_h)
-        # [BT, BK] @ [BK, BT] -> [BT, BT]
+
         b_A += tl.dot(b_q, b_k)
 
     if USE_G:
@@ -131,8 +131,8 @@ def chunk_fwd_kernel_o(
     p_o = o + o_t[:, None] * (HV*V) + o_v[None, :]
 
     b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0)
-    # to fix mma -> mma layout conversion
-    # already solved by triton v3.2 or higher
+
+
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 

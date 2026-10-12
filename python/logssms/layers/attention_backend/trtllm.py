@@ -106,14 +106,14 @@ class TensorRTLLMBackend(BaseAttnBackend):
 
         if max_seqlen_q == 1:
             cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
-        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
+        elif all(l == 0 for l in cached_lens):
             cu_seqlens_q = cu_seqlens_k
-        else:  # normal extend prefill, with partial cache hit
+        else:
             cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
+        new_page_table = torch.stack(
             [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
         )
         if self.page_size > 1:
@@ -145,7 +145,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
             cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
             cache_seqlens=capture.seq_lens[:bs],
             max_seqlen_k=capture.page_table.size(1) * self.page_size,
-            max_seqlen_q=1,  # decode only
+            max_seqlen_q=1,
             page_table=capture.page_table[:bs, :],
         )
         batch.attn_metadata = metadata
@@ -154,7 +154,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, TRTLLMMetadata)
         assert self.capture is not None and bs in self.capture_bs
-        # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
+
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)

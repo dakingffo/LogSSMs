@@ -37,7 +37,6 @@ def configure_chat_tokenizer(
     tokenizer : PreTrainedTokenizerBase,
     model_path: str,
 ) -> PreTrainedTokenizerBase:
-    """Keep Qwen3.5/3.6 assistant prefixes stable across turns."""
     config_path = os.path.join(model_path, "config.json")
     if not os.path.isfile(config_path):
         return tokenizer
@@ -55,8 +54,8 @@ def configure_chat_tokenizer(
     elif (_QWEN35_PRESERVED_BRANCH in template
           and _QWEN36_ASSISTANT_BRANCH in template
           and _QWEN36_TOOL_BRANCH in template):
-        # This newer template re-parses and trims historical assistant replies.
-        # Preserve the exact generated text, including an unfinished <think> block.
+
+
         tokenizer.chat_template = template.replace(
             _QWEN36_ASSISTANT_BRANCH,
             _QWEN36_ASSISTANT_BRANCH + "\n"
@@ -132,9 +131,8 @@ def load_model_config(
         config = _load_transformers_config(model_path)
         return type(config)(**config.to_dict())
     except Exception:
-        # Fallback for architectures not yet registered in this transformers version
-        # (e.g. Qwen3Next). Builds a lightweight attribute object mirroring the config;
-        # logssms only reads attributes off it, so this is sufficient.
+
+
         logger = __import__("logging").getLogger("logssms.platform")
         logger.warning("AutoConfig failed for %s, falling back to raw config.json", model_path)
         return _make_config_namespace(raw_config)

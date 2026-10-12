@@ -6,11 +6,12 @@ import safetensors.torch
 import torch
 import torch.nn.functional as F
 
-from logssms.core import Batch, Context, clear_global_ctx, set_global_ctx
+from logssms.core import Batch, Context, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
 from logssms.layers import GatedDeltaNet
 from logssms.models.config import AffineLogCacheSpec
 from logssms.models.weight import _get_merge_info, iter_checkpoint_weights, load_weight
+from tests.utils import clear_global_ctx
 
 
 def test_iter_checkpoint_weights_from_pytorch(tmp_path):
@@ -58,6 +59,7 @@ def test_iter_checkpoint_weights_uses_shard_index(tmp_path):
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gdn_projections_merge_after_tp_sharding(tmp_path, monkeypatch, tp_size):
     config = SimpleNamespace(
         is_hybrid=True, is_moe=False, num_kv_heads=2,
@@ -93,11 +95,12 @@ def test_gdn_projections_merge_after_tp_sharding(tmp_path, monkeypatch, tp_size)
     )}
     safetensors.torch.save_file(first, tmp_path / "model-00001-of-00002.safetensors")
     safetensors.torch.save_file(second, tmp_path / "model-00002-of-00002.safetensors")
-    x = torch.randn(3, hidden_size)
+    raw = {name: value.cuda() for name, value in raw.items()}
+    x = torch.randn(3, hidden_size, device="cuda")
 
     for rank in range(tp_size):
-        with tp_override(DistributedInfo(rank=rank, size=tp_size)):
-            loaded = dict(load_weight(str(tmp_path), "cpu"))
+        with torch.device("cuda"), tp_override(DistributedInfo(rank=rank, size=tp_size)):
+            loaded = dict(load_weight(str(tmp_path), "cuda"))
             layer = GatedDeltaNet(hidden_size, 4, 8, 8, 4, 4, 1e-6, 0)
         layer.load_state_dict(dict(loaded), prefix=prefix.removesuffix("."))
         q, k, v = raw["in_proj_qkv.weight"].split([key_dim, key_dim, value_dim])

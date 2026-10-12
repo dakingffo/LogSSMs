@@ -24,6 +24,7 @@ MODEL_PATH = os.environ.get("QWEN3_5_MODEL", "/home/daking/models/huggingface/Qw
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from logssms.utils import load_model_config, torch_dtype
+from tests.utils import clear_global_ctx
 
 
 def setup():
@@ -218,8 +219,6 @@ def test2_gated_delta_net_math(mcfg):
     assert err < 1e-3, f"chunked continuation mismatch {err}"
     print("  chunked continuation (use_state=True) == full prefill  ✓")
     print("  PASS")
-    from logssms.core import clear_global_ctx
-
     clear_global_ctx()
 
 

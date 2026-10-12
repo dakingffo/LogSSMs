@@ -79,9 +79,8 @@ class DFlashAttention(BaseOP):
         hidden_states: torch.Tensor,
         positions    : torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # qkv_proj is fused in LogSSMs, so Q is produced here as well. Rotating it
-        # together with K lets the common FlashInfer RoPE path remain the only RoPE
-        # implementation; the context query is discarded immediately afterwards.
+
+
         query, key, value = self._project(hidden_states)
         key = self.k_norm.forward(key)
         _, key = self.rotary.forward(positions, query, key)

@@ -1,12 +1,12 @@
-from .frame_allocator import DecayRecord, LinearFrameSlot, LogStateFrameAllocator
-from .frame_pool import FramedMHALogStatePool
+from .allocator import DecayRecord, LinearCacheSlot, LogStateAllocator
+from .mha_pool import MHALogStatePool
 from .layout import LOG_STATE_GRANULARITY, LogStateSlotLayout
 
 __all__ = [
     "LOG_STATE_GRANULARITY",
     "LogStateSlotLayout",
     "DecayRecord",
-    "LinearFrameSlot",
-    "LogStateFrameAllocator",
-    "FramedMHALogStatePool",
+    "LinearCacheSlot",
+    "LogStateAllocator",
+    "MHALogStatePool",
 ]

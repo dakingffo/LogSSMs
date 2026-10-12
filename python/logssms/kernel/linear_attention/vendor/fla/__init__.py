@@ -4,7 +4,7 @@ from .gated_delta import (
 )
 from .fused_recurrent import (
     fused_recurrent_gated_delta_rule,
-    fused_recurrent_gated_delta_rule_to_framed_logstate,
+    fused_recurrent_gated_delta_rule_to_logstate,
     fused_recurrent_gated_delta_rule_to_slots,
 )
 
@@ -13,6 +13,6 @@ __all__ = [
     "ChunkLogIO",
     "chunk_gated_delta_rule_to_cache",
     "fused_recurrent_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule_to_framed_logstate",
+    "fused_recurrent_gated_delta_rule_to_logstate",
     "fused_recurrent_gated_delta_rule_to_slots",
 ]

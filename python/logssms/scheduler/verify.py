@@ -113,7 +113,7 @@ class VerifyManager(ARManagerBase):
 
         if (0 < len(self.inflight_uids[0]) * K < self.token_budget 
             and len(self.running_reqs) > len(self.inflight_uids[0])):
-            # skip one iteration to try achieving a larger batch size
+
             return None
 
         scheduled_token = 0
@@ -202,9 +202,9 @@ class VerifyManager(ARManagerBase):
     ) -> tuple[list[DetokenizeMsg], list[Request]]:
         batch = forward_input.batch
         if not batch.is_verify:
-            return super().process(ctx, forward_input, output)  # prefill commit
+            return super().process(ctx, forward_input, output)
 
-        extend_tokens = output.next_tokens_gpu  # (bs, K+1) int32
+        extend_tokens = output.next_tokens_gpu
         hidden_captor = batch.hidden_captor
         assert hidden_captor is not None
         reply: list[DetokenizeMsg] = []
@@ -231,12 +231,12 @@ class VerifyManager(ARManagerBase):
                         break
                 else:
                     sampled_token.append(
-                        int(target_tokens[n_drafts].item())  # full-accept bonus
+                        int(target_tokens[n_drafts].item())
                     )
                 num_sampled = len(sampled_token)
 
                 req.complete_to_device_len(progress=num_sampled)
-                # Promote the accepted snapshots by swapping reserve and live page slot ids.
+
                 self.cache_manager.commit_speculative(req, C, num_sampled)
                 self.token_pool[req.table_idx, req.cached_len] = sampled_token[-1]
                 st.set_carry(

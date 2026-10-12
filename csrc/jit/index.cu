@@ -107,17 +107,17 @@ void masked_index_kernel(
 }
 
 template <
-  std::size_t element_size,          // depends on data type and embedding dim
-  std::size_t num_splits      = 1,   // how many warps handles one element
-  std::size_t num_threads     = 128, // number of threads per block
-  std::size_t max_concurrency = 1,   // max blocks per SM
+  std::size_t element_size,
+  std::size_t num_splits      = 1,
+  std::size_t num_threads     = 128,
+  std::size_t max_concurrency = 1,
   bool        use_pdl         = false
 >
 struct IndexKernel {
   static void run(
-    const tvm::ffi::TensorView weights, // [V / tp_size, D]
-    const tvm::ffi::TensorView indices, // [L]
-    const tvm::ffi::TensorView output,  // [L, D]
+    const tvm::ffi::TensorView weights,
+    const tvm::ffi::TensorView indices,
+    const tvm::ffi::TensorView output,
     tvm::ffi::Optional<tvm::ffi::Tuple<int, int>> mask_options
   ) {
     using namespace host;
@@ -192,4 +192,4 @@ struct IndexKernel {
   }
 };
 
-} // namespace logssms
+}

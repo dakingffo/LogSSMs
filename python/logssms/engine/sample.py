@@ -127,7 +127,7 @@ class Sampler:
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
-        if args.is_greedy:  # greedy sampling
+        if args.is_greedy:
             return torch.argmax(logits, dim=-1)
         else:
             return sample_impl(logits.float(), args)
@@ -187,7 +187,6 @@ class Sampler:
 
     @nvtx_annotate("Sampler")
     def reject_sample(self, logits, batch) -> torch.Tensor:
-        """Return accepted drafts followed by one target bonus token and -1 padding."""
         bs = batch.size
         K = 0 if batch.draft_tokens is None else batch.draft_tokens.shape[1]
         extend_token = torch.full((bs, K + 1), -1, dtype=torch.int32, device=self.device)

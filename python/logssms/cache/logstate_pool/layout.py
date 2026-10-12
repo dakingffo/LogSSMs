@@ -56,8 +56,14 @@ class LogStateSlotLayout:
     def head_recurrent_state_bytes(self) -> int:
         return self.head_k_dim * self.head_v_dim * self.dtype.itemsize
 
+    @property
+    def log_payload_bytes(self) -> int:
+        return self.num_linear_layers * self.page_size * (
+            self.num_key_heads * self.head_k_dim + self.num_value_heads * self.head_v_dim
+        ) * self.dtype.itemsize
+
+
     def head_payload_bytes(self, frame_bytes: int) -> int:
-        """Keep each head overlay inside one frame for direct kernel addressing."""
         size = max(self.head_log_key_bytes + self.head_log_value_bytes,
                    self.head_recurrent_state_bytes)
         if frame_bytes % size == 0:
@@ -66,6 +72,29 @@ class LogStateSlotLayout:
         if frame_bytes % padded != 0:
             raise ValueError("Linear head payload cannot be aligned within a KV frame")
         return padded
+
+    def payload_offsets(self, elements, layer: int, heads, frame_bytes: int):
+        head_granule = self.head_payload_bytes(frame_bytes) // (
+            self.dtype.itemsize * self.num_granules
+        )
+        key_size = self.granularity * self.head_k_dim
+        value_size = self.granularity * self.head_v_dim
+        padding = head_granule - key_size - value_size
+        granules = elements // head_granule
+        within = elements % head_granule
+        key = (within // self.head_k_dim * self.num_value_heads + heads) * self.head_k_dim
+        key += within % self.head_k_dim
+        value = within - key_size
+        value = key_size * self.num_value_heads + (
+            value // self.head_v_dim * self.num_value_heads + heads
+        ) * self.head_v_dim + value % self.head_v_dim
+        tail = (key_size + value_size) * self.num_value_heads
+        tail += heads * padding + within - key_size - value_size
+        offset = torch.where(within < key_size, key,
+                             torch.where(within < key_size + value_size, value, tail))
+        return (granules * self.num_linear_layers + layer) * (
+            self.num_value_heads * head_granule
+        ) + offset
 
     @property
     def log_decay_bytes(self) -> int:

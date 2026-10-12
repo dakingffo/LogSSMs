@@ -27,6 +27,7 @@ struct LogStateKernelParams {
   std::int64_t head_payload_bytes;
   std::int64_t decay_record_bytes;
   std::int64_t page_size;
+  std::int64_t granularity;
 
   const std::int32_t *__restrict__ base_slots;
   const std::int32_t *__restrict__ task_log_offsets;
@@ -51,8 +52,42 @@ struct LogStateKernelParams {
   std::int64_t state_head_stride;
   std::int64_t num_layers;
   std::int64_t num_heads;
+  std::int64_t num_key_heads;
   std::int64_t num_tasks;
 };
+
+template <typename T, std::size_t kHeadKDim, std::size_t kHeadVDim>
+LOGSSMS_DEVICE T *payload_pointer(
+  const LogStateKernelParams& params, std::int32_t slot,
+  std::int64_t layer, std::int64_t head, std::int64_t element
+) {
+  const auto head_granule = params.head_payload_bytes / sizeof(T)
+    / (params.page_size / params.granularity);
+  const auto key_size = params.granularity * kHeadKDim;
+  const auto value_size = params.granularity * kHeadVDim;
+  const auto granule = element / head_granule;
+  const auto within = element % head_granule;
+  std::int64_t offset;
+  if (within < key_size) {
+    offset = (within / kHeadKDim * params.num_heads + head) * kHeadKDim
+      + within % kHeadKDim;
+  } else if (within < key_size + value_size) {
+    const auto value = within - key_size;
+    offset = key_size * params.num_heads
+      + (value / kHeadVDim * params.num_heads + head) * kHeadVDim + value % kHeadVDim;
+  } else {
+    offset = (key_size + value_size) * params.num_heads
+      + head * (head_granule - key_size - value_size) + within - key_size - value_size;
+  }
+  offset += (granule * params.num_layers + layer) * params.num_heads * head_granule;
+  const auto bytes = offset * sizeof(T);
+  const auto frame = params.payload_frames[
+    slot * params.payload_frames_per_slot + bytes / params.frame_bytes
+  ];
+  return reinterpret_cast<T *>(
+    params.frame_storage + frame * params.frame_bytes + bytes % params.frame_bytes
+  );
+}
 
 struct LogStateConstructionParams : LogStateKernelParams {
   const std::int32_t *__restrict__ output_offsets;
@@ -99,22 +134,34 @@ LOGSSMS_DEVICE const T *key_pointer(
   std::int32_t slot,
   std::int64_t layer,
   std::int64_t head,
-  std::int32_t token
+  std::int32_t token,
+  std::int64_t column = 0
 ) {
   if (params.frame_storage != nullptr) {
-    const auto offset = (layer * params.num_heads + head) * params.head_payload_bytes;
-    const auto frame = params.payload_frames[
-      slot * params.payload_frames_per_slot + offset / params.frame_bytes
-    ];
-    const auto *head_ptr = params.frame_storage
-      + frame * params.frame_bytes + offset % params.frame_bytes;
-    return reinterpret_cast<const T *>(head_ptr) + token * kHeadKDim;
+    if (params.num_key_heads != params.num_heads) {
+      const auto group = head / (params.num_heads / params.num_key_heads);
+      const auto key_size = params.granularity * params.num_key_heads * kHeadKDim;
+      const auto layer_size = key_size + params.granularity * params.num_heads * kHeadVDim;
+      const auto offset = (token / params.granularity * params.num_layers + layer) * layer_size
+        + (token % params.granularity * params.num_key_heads + group) * kHeadKDim + column;
+      const auto bytes = offset * sizeof(T);
+      const auto frame = params.payload_frames[
+        slot * params.payload_frames_per_slot + bytes / params.frame_bytes
+      ];
+      return reinterpret_cast<const T *>(params.frame_storage + frame * params.frame_bytes + bytes % params.frame_bytes);
+    }
+    const auto head_granule = params.head_payload_bytes / sizeof(T)
+      / (params.page_size / params.granularity);
+    return payload_pointer<T, kHeadKDim, kHeadVDim>(
+      params, slot, layer, head,
+      token / params.granularity * head_granule + token % params.granularity * kHeadKDim + column
+    );
   }
   return static_cast<const T *>(params.key_log)
        + slot  * params.key_slot_stride
        + layer * params.key_layer_stride
        + token * params.key_token_stride
-       + head  * params.key_head_stride;
+       + head  * params.key_head_stride + column;
 }
 
 template <typename T, std::size_t kHeadKDim, std::size_t kHeadVDim>
@@ -123,23 +170,34 @@ LOGSSMS_DEVICE const T *value_pointer(
   std::int32_t slot,
   std::int64_t layer,
   std::int64_t head,
-  std::int32_t token
+  std::int32_t token,
+  std::int64_t column = 0
 ) {
   if (params.frame_storage != nullptr) {
-    const auto offset = (layer * params.num_heads + head) * params.head_payload_bytes;
-    const auto frame = params.payload_frames[
-      slot * params.payload_frames_per_slot + offset / params.frame_bytes
-    ];
-    const auto *head_ptr = params.frame_storage
-      + frame * params.frame_bytes + offset % params.frame_bytes;
-    return reinterpret_cast<const T *>(head_ptr)
-      + params.page_size * kHeadKDim + token * kHeadVDim;
+    if (params.num_key_heads != params.num_heads) {
+      const auto key_size = params.granularity * params.num_key_heads * kHeadKDim;
+      const auto layer_size = key_size + params.granularity * params.num_heads * kHeadVDim;
+      const auto offset = (token / params.granularity * params.num_layers + layer) * layer_size
+        + key_size + (token % params.granularity * params.num_heads + head) * kHeadVDim + column;
+      const auto bytes = offset * sizeof(T);
+      const auto frame = params.payload_frames[
+        slot * params.payload_frames_per_slot + bytes / params.frame_bytes
+      ];
+      return reinterpret_cast<const T *>(params.frame_storage + frame * params.frame_bytes + bytes % params.frame_bytes);
+    }
+    const auto head_granule = params.head_payload_bytes / sizeof(T)
+      / (params.page_size / params.granularity);
+    return payload_pointer<T, kHeadKDim, kHeadVDim>(
+      params, slot, layer, head,
+      token / params.granularity * head_granule + params.granularity * kHeadKDim
+        + token % params.granularity * kHeadVDim + column
+    );
   }
   return static_cast<const T *>(params.value_log)
        + slot  * params.value_slot_stride
        + layer * params.value_layer_stride
        + token * params.value_token_stride
-       + head  * params.value_head_stride;
+       + head  * params.value_head_stride + column;
 }
 
 template <typename T, std::size_t kHeadKDim, std::size_t kHeadVDim>
@@ -147,21 +205,16 @@ LOGSSMS_DEVICE T *state_pointer(
   const LogStateKernelParams& params,
   std::int32_t slot,
   std::int64_t layer,
-  std::int64_t head
+  std::int64_t head,
+  std::int64_t element = 0
 ) {
   if (params.frame_storage != nullptr) {
-    const auto offset = (layer * params.num_heads + head) * params.head_payload_bytes;
-    const auto frame = params.payload_frames[
-      slot * params.payload_frames_per_slot + offset / params.frame_bytes
-    ];
-    return reinterpret_cast<T *>(
-      params.frame_storage + frame * params.frame_bytes + offset % params.frame_bytes
-    );
+    return payload_pointer<T, kHeadKDim, kHeadVDim>(params, slot, layer, head, element);
   }
   return static_cast<T *>(params.recurrent_state)
        + slot  * params.state_slot_stride
        + layer * params.state_layer_stride
-       + head  * params.state_head_stride;
+       + head  * params.state_head_stride + element;
 }
 
 LOGSSMS_DEVICE const float *decay_pointer(
@@ -213,9 +266,10 @@ LOGSSMS_DEVICE void prefetch_log_chunk(
     const auto valid = chunk + token < length;
     const auto *source = reinterpret_cast<const std::uint8_t *>(
       key_pointer<T, kHeadKDim, kHeadVDim>(
-        params, slot, layer, head, begin + chunk + (valid ? token : 0)
+        params, slot, layer, head, begin + chunk + (valid ? token : 0),
+        (index % (kHeadKDim * sizeof(T) / kBytes)) * kBytes / sizeof(T)
       )
-    ) + (index % (kHeadKDim * sizeof(T) / kBytes)) * kBytes;
+    );
     const auto shared = static_cast<std::uint32_t>(__cvta_generic_to_shared(
       reinterpret_cast<std::uint8_t *>(shared_key) + index * kBytes
     ));
@@ -232,9 +286,10 @@ LOGSSMS_DEVICE void prefetch_log_chunk(
     const auto valid = chunk + token < length;
     const auto *source = reinterpret_cast<const std::uint8_t *>(
       value_pointer<T, kHeadKDim, kHeadVDim>(
-        params, slot, layer, head, begin + chunk + (valid ? token : 0)
+        params, slot, layer, head, begin + chunk + (valid ? token : 0),
+        (index % (kHeadVDim * sizeof(T) / kBytes)) * kBytes / sizeof(T)
       )
-    ) + (index % (kHeadVDim * sizeof(T) / kBytes)) * kBytes;
+    );
     const auto shared = static_cast<std::uint32_t>(__cvta_generic_to_shared(
       reinterpret_cast<std::uint8_t *>(shared_value) + index * kBytes
     ));
@@ -277,16 +332,13 @@ void construct_log_state_kernel(
 
   Accumulator state[kTileSteps];
   const auto base_slot = params.base_slots[task];
-  const auto *base = base_slot >= 0
-    ? state_pointer<T, kHeadKDim, kHeadVDim>(params, base_slot, layer, head)
-    : nullptr;
 #pragma unroll
   for (auto step = 0; step < kTileSteps; ++step) {
     const auto tile = step * kWarps + warp;
     if (tile >= kTiles) {
       continue;
     }
-    if (base == nullptr) {
+    if (base_slot < 0) {
       wmma::fill_fragment(state[step], 0.0f);
     } else {
       const auto k_begin = (tile / kTilesV) * kTile;
@@ -296,7 +348,9 @@ void construct_log_state_kernel(
         const auto v = v_begin + index % kTile;
         shared_tile[warp * kTile * kTile + index] =
           k < kHeadKDim && v < kHeadVDim
-            ? to_float(base[k * kHeadVDim + v]) : 0.0f;
+            ? to_float(*state_pointer<T, kHeadKDim, kHeadVDim>(
+                params, base_slot, layer, head, k * kHeadVDim + v
+              )) : 0.0f;
       }
       __syncwarp();
       wmma::load_matrix_sync(
@@ -384,13 +438,9 @@ void construct_log_state_kernel(
       __syncthreads();
     }
 
-    // One CTA owns a complete layer/head. All its Log reads have finished
-    // before any warp is allowed to overwrite the corresponding payload.
+
     for (auto output = params.output_offsets[segment];
          output < params.output_offsets[segment + 1]; ++output) {
-      auto *destination = state_pointer<T, kHeadKDim, kHeadVDim>(
-        params, params.construction_output_slots[output], layer, head
-      );
 #pragma unroll
       for (auto step = 0; step < kTileSteps; ++step) {
         const auto tile = step * kWarps + warp;
@@ -408,7 +458,9 @@ void construct_log_state_kernel(
           const auto k = k_begin + index / kTile;
           const auto v = v_begin + index % kTile;
           if (k < kHeadKDim && v < kHeadVDim) {
-            destination[k * kHeadVDim + v] = from_float<T>(
+            *state_pointer<T, kHeadKDim, kHeadVDim>(
+              params, params.construction_output_slots[output], layer, head, k * kHeadVDim + v
+            ) = from_float<T>(
               shared_tile[warp * kTile * kTile + index]
             );
           }
@@ -461,16 +513,15 @@ void restore_log_state_kernel(
 
   float state[div_ceil(kTileSize, 256)];
   const auto base_slot = params.base_slots[task];
-  const auto *base = base_slot >= 0
-    ? state_pointer<T, kHeadKDim, kHeadVDim>(params, base_slot, layer, head)
-    : nullptr;
 #pragma unroll
   for (auto item = 0; item < div_ceil(kTileSize, 256); ++item) {
     const auto local = threadIdx.x + item * 256;
     const auto k = k_begin + local / kTileV;
     const auto v = v_begin + local % kTileV;
     state[item] = base_slot >= 0 && k < kHeadKDim && v < kHeadVDim
-      ? to_float(base[k * kHeadVDim + v]) : 0.0f;
+      ? to_float(*state_pointer<T, kHeadKDim, kHeadVDim>(
+          params, base_slot, layer, head, k * kHeadVDim + v
+        )) : 0.0f;
   }
 
   for (auto segment = params.task_log_offsets[task];
@@ -498,18 +549,18 @@ void restore_log_state_kernel(
         const auto token = index / kTileK;
         const auto dim = k_begin + index % kTileK;
         const auto *key = key_pointer<T, kHeadKDim, kHeadVDim>(
-          params, slot, layer, head, begin + chunk + token
+          params, slot, layer, head, begin + chunk + token, dim < kHeadKDim ? dim : 0
         );
-        shared_key[index] = dim < kHeadKDim ? key[dim] : from_float<T>(0.0f);
+        shared_key[index] = dim < kHeadKDim ? *key : from_float<T>(0.0f);
       }
       for (auto index = threadIdx.x; index < kChunk * kTileV; index += 256) {
         const auto token = index / kTileV;
         const auto dim = v_begin + index % kTileV;
         const auto *value = value_pointer<T, kHeadKDim, kHeadVDim>(
-          params, slot, layer, head, begin + chunk + token
+          params, slot, layer, head, begin + chunk + token, dim < kHeadVDim ? dim : 0
         );
         const auto weighted = dim < kHeadVDim
-          ? to_float(value[dim]) * suffix[chunk + token]
+          ? to_float(*value) * suffix[chunk + token]
           : 0.0f;
         shared_value[index] = from_float<T>(weighted);
       }
@@ -539,18 +590,28 @@ void restore_log_state_kernel(
     __syncthreads();
   }
 
-  auto *destination = state_pointer<T, kHeadKDim, kHeadVDim>(
-    params, params.output_slots[task], layer, head
-  );
 #pragma unroll
   for (auto item = 0; item < div_ceil(kTileSize, 256); ++item) {
     const auto local = threadIdx.x + item * 256;
     const auto k = k_begin + local / kTileV;
     const auto v = v_begin + local % kTileV;
     if (k < kHeadKDim && v < kHeadVDim) {
-      destination[k * kHeadVDim + v] = from_float<T>(state[item]);
+      *state_pointer<T, kHeadKDim, kHeadVDim>(
+        params, params.output_slots[task], layer, head, k * kHeadVDim + v
+      ) = from_float<T>(state[item]);
     }
   }
 }
 
-} // namespace logssms
+template <typename T, std::size_t kHeadKDim, std::size_t kHeadVDim>
+__global__ void copy_log_state_kernel(const __grid_constant__ LogStateRestoreParams params) {
+  const auto head = blockIdx.x % params.num_heads;
+  const auto layer = blockIdx.x / params.num_heads % params.num_layers;
+  const auto task = blockIdx.x / params.num_heads / params.num_layers;
+  for (auto index = threadIdx.x; index < kHeadKDim * kHeadVDim; index += blockDim.x) {
+    *state_pointer<T, kHeadKDim, kHeadVDim>(params, params.output_slots[task], layer, head, index)
+      = *state_pointer<T, kHeadKDim, kHeadVDim>(params, params.base_slots[task], layer, head, index);
+  }
+}
+
+}

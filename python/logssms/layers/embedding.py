@@ -30,8 +30,8 @@ class VocabParallelEmbedding(BaseOP):
     @nvtx_annotate("Embedding")
     def forward(
         self, 
-        x: torch.Tensor # [N]
-    ) -> torch.Tensor:  # [N, D]
+        x: torch.Tensor
+    ) -> torch.Tensor:
         from logssms.kernel import indexing
 
         y = indexing(
@@ -67,7 +67,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         if not self.tied_embedding:
             return super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
         else:
-            # pop the lm_head.weights and lm_head.bias if they exist
+
             possible_weight = f"{prefix}.weight"
             possible_bias = f"{prefix}.bias"
             if possible_weight in state_dict:
@@ -89,8 +89,8 @@ class ParallelLMHead(VocabParallelEmbedding):
     @with_speculator(HiddenCapturePoint.LM_HEAD_INPUT)
     def forward(
         self, 
-        x: torch.Tensor # [N, D]
-    ) -> torch.Tensor:  # [N, V]
+        x: torch.Tensor
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
@@ -103,16 +103,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
-        input_shape = logits.shape # [N, V_tp]
-        output_tensor = self._comm.all_gather(logits) # [TP * N, V_tp]
+        input_shape = logits.shape
+        output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1 and input_shape[0] == 1: # [TP, V_tp]
-            # single-token decode fast path; only valid when the gather input really is
-            # one row per rank (an MTP verify batch is bs==1 but T = n_drafts+1 rows, so
-            # it must fall through to the general reshape below)
+        if bs == 1 and input_shape[0] == 1:
+
+
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
-        output_tensor = output_tensor.view((self.tp_size,) + input_shape) # [TP, N, V_tp]
-        output_tensor = output_tensor.permute(1, 0, 2).contiguous() # [N, TP, V_tp]
-        output_tensor = output_tensor.reshape((input_shape[0], self.tp_size * input_shape[1],)) # [N, V]
+        output_tensor = output_tensor.view((self.tp_size,) + input_shape)
+        output_tensor = output_tensor.permute(1, 0, 2).contiguous()
+        output_tensor = output_tensor.reshape((input_shape[0], self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]

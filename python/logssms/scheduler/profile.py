@@ -85,12 +85,6 @@ class _PhaseProfile:
 
 
 class SchedulerProfiler:
-    """Low-overhead scheduler profiling, disabled unless explicitly requested.
-
-    Set ``LOGSSMS_PROFILE_SCHEDULER=1`` to collect aggregate CPU, CUDA-event,
-    batch-size, padding and graph-hit statistics.  CUDA timings are harvested
-    asynchronously, so serving does not synchronize once per forward.
-    """
 
     def __init__(
         self,

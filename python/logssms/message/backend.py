@@ -32,7 +32,7 @@ class ExitMsg(BaseBackendMsg):
 @dataclass
 class UserMsg(BaseBackendMsg):
     uid            : int
-    input_ids      : torch.Tensor  # CPU 1D int32 tensor
+    input_ids      : torch.Tensor
     sampling_params: SamplingParams
     profile_tag     : str | None = None
     return_token_ids: bool       = False

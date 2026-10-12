@@ -1,12 +1,12 @@
-from logssms.cache.logstate_pool.frame_allocator import LogStateFrameAllocator
+from logssms.cache.logstate_pool.allocator import LogStateAllocator
 from logssms.cache.logstate_pool.layout import LogStateSlotLayout
 import random
 import pytest
 import torch
 
 
-def make_allocator(num_frames: int = 80) -> LogStateFrameAllocator:
-    return LogStateFrameAllocator(
+def make_allocator(num_frames: int = 80) -> LogStateAllocator:
+    return LogStateAllocator(
         num_frames=num_frames,
         frame_bytes=100,
         payload_bytes=300,
@@ -14,6 +14,66 @@ def make_allocator(num_frames: int = 80) -> LogStateFrameAllocator:
         decay_bytes=20,
         num_granules=4,
     )
+
+
+def test_compact_log_capacity_and_frame_transfer_do_not_require_free_memory():
+    allocator = LogStateAllocator(
+        num_frames=40, frame_bytes=100, payload_bytes=400, log_payload_bytes=300,
+        conv_snapshot_bytes=80, decay_bytes=20, num_granules=2,
+    )
+    assert allocator.required_frames(0, 2, 1) == 16
+    _kv, logs, works = allocator.reserve(logs=2, states=1)
+    sources = set(frame for slot in logs for frame in allocator.slot(slot).payload)
+    sources.update(frame for slot in logs for conv in allocator.slot(slot).conv for frame in conv)
+    allocator.reserve(kv=allocator.free_frames)
+    assert allocator.free_frames == 0
+    retirement = allocator.coalesce_to_checkpoint(tuple(logs))
+    right = allocator.slot(logs[-1])
+    assert len(right.payload) == 4 and set(right.payload) <= sources
+    assert allocator.free_frames == 0
+    assert allocator.slot(works[0]).kind == "work"
+    allocator.check_integrity()
+    projected = allocator.projected_free_capacity()[0]
+    allocator.release_retirement(retirement)
+    allocator.release_slot(logs[0])
+    assert allocator.free_frames == projected == 6
+    allocator.check_integrity()
+
+
+def test_compact_group_rejects_insufficient_storage_without_mutating_ownership():
+    allocator = LogStateAllocator(
+        num_frames=40, frame_bytes=100, payload_bytes=1000, log_payload_bytes=100,
+        conv_snapshot_bytes=80, decay_bytes=20, num_granules=2,
+    )
+    _kv, logs, _states = allocator.reserve(logs=2)
+    before = allocator.profile_usage()
+    with pytest.raises(AssertionError):
+        allocator.coalesce_to_checkpoint(tuple(logs))
+    assert allocator.profile_usage() == before
+    allocator.check_integrity()
+
+
+def test_compact_group_requires_positive_net_frame_savings():
+    allocator = LogStateAllocator(
+        num_frames=40, frame_bytes=100, payload_bytes=500, log_payload_bytes=100,
+        conv_snapshot_bytes=80, decay_bytes=20, num_granules=2,
+    )
+    _kv, logs, _states = allocator.reserve(logs=3)
+    group = tuple(logs[:2])
+    assert allocator.checkpoint_frame_capacity(group) == allocator.payload_frames
+    # The third Log owns another record in the same decay frame, so freeing
+    # this group yields bitmap holes only. It does not release physical memory.
+    assert allocator.checkpoint_frame_savings(group) == 0
+    before = allocator.profile_usage()
+    with pytest.raises(AssertionError, match="release more than its expansion"):
+        allocator.coalesce_to_checkpoint(group)
+    assert allocator.profile_usage() == before
+    allocator.release_slot(logs[2])
+    assert allocator.checkpoint_frame_savings(group) == 1
+    retirement = allocator.coalesce_to_checkpoint(group)
+    allocator.release_retirement(retirement)
+    allocator.release_slot(logs[0])
+    allocator.check_integrity()
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
@@ -43,7 +103,7 @@ def test_lock_frame_cost_matches_bitmap_projection_without_mutation(seed):
 @pytest.mark.parametrize("records_per_frame", [1, 2, 5])
 def test_incremental_capacity_matches_full_projection_through_lifecycle(seed, records_per_frame):
     rng = random.Random(seed)
-    allocator = LogStateFrameAllocator(
+    allocator = LogStateAllocator(
         num_frames=80, frame_bytes=100, payload_bytes=300,
         conv_snapshot_bytes=80, decay_bytes=100 // records_per_frame,
         num_granules=4,
@@ -74,7 +134,7 @@ def test_incremental_capacity_matches_full_projection_through_lifecycle(seed, re
         allocator.check_integrity()
 
 
-def test_one_frame_pool_with_independent_log_frames():
+def test_one_mha_pool_with_independent_log_frames():
     allocator = make_allocator()
     allocated = allocator.reserve(kv=2, logs=2, states=1)
     assert allocated is not None
@@ -147,7 +207,7 @@ def test_projected_reclamation_matches_checkpoint_and_shared_decay_release():
 
 
 def test_admission_uses_free_decay_bitmap_records_before_new_frames():
-    allocator = LogStateFrameAllocator(
+    allocator = LogStateAllocator(
         num_frames=8,
         frame_bytes=100,
         payload_bytes=100,
@@ -194,7 +254,7 @@ def test_slot_ids_reused_without_requiring_same_physical_frames():
     allocator.check_integrity()
 
 
-def test_qwen35_2b_frame_layout_and_released_side_data():
+def test_qwen35_2b_layout_and_released_side_data():
     layout = LogStateSlotLayout(
         page_size=64,
         num_linear_layers=18,
@@ -213,7 +273,7 @@ def test_qwen35_2b_frame_layout_and_released_side_data():
         layout.head_recurrent_state_bytes,
     )
     conv_snapshot_bytes = layout.conv_state_bytes // layout.num_granules
-    allocator = LogStateFrameAllocator(
+    allocator = LogStateAllocator(
         num_frames=256,
         frame_bytes=frame_bytes,
         payload_bytes=payload_bytes,

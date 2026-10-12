@@ -42,7 +42,7 @@ class RadixTreeNode:
         self.ref_count: int = 0
         self.timestamp = tic or time.monotonic_ns()
 
-        # these fields should be updated later
+
         self._key: torch.Tensor
         self._kv: torch.Tensor
         self._length: int
@@ -182,7 +182,7 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
         self.evictable_size = 0
         self.protected_size = 0
         self.root_node = self.NodeType(self.key_fn, self.page_size)
-        self.root_node.ref_count = 1  # root is always protected
+        self.root_node.ref_count = 1
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
@@ -212,7 +212,6 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
         )
 
     def trace_prefix(self, input_ids: torch.Tensor) -> tuple[NodeT, int]:
-        """Read-only match for profiling; unlike match_prefix, never splits nodes."""
         node = self.root_node
         prefix_len = 0
         while prefix_len < len(input_ids):
@@ -237,7 +236,7 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
     ) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
         node, prefix_len = self._tree_walk(input_ids)
-        if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
+        if prefix_len != insert_len:
             new_node = self.NodeType(self.key_fn, self.page_size)
             if isinstance(new_node, HybridRadixTreeNode):
                 assert value.state_indices is not None
@@ -258,10 +257,6 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
         size         : int,
         evicted_nodes: list[tuple[int, int, int]] | None = None,
     ) -> StandardPrefixValue:
-        """Evict prefixes. Returns (evicted KV page indices, evicted state slots).
-
-        For the non-hybrid radix cache the state slots are None.
-        """
         if size == 0:
             return StandardPrefixValue(self.empty_tensor)
         assert size <= self.evictable_size, f"Can't evict {size}, only {self.evictable_size}"
@@ -291,7 +286,7 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
             self.evictable_size -= node.length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
-            # NOTE: root is always protected, so won't be evicted
+
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
@@ -368,7 +363,6 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
             )
 
     def total_state_pages(self) -> int:
-        """Total number of linear-state slots owned by the tree (one per cached page)."""
         total = 0
         stack: list[NodeT] = [self.root_node]
         while stack:
@@ -403,20 +397,20 @@ class RadixPrefixCache(StandardPrefixCacheBase, Generic[NodeT]):
             child_node = node.children.get(self.key_fn(input_ids[prefix_len:]))
             if child_node is None:
                 break
-            node = child_node  # walk to child node
+            node = child_node
 
-            # NOTE: at least 1 page is matched, so match_len >= page_size
+
             match_len = node.get_match_len(input_ids[prefix_len:])
             match_len = align_down(match_len, self.page_size)
             prefix_len += match_len
 
-            # need to split the node if not fully matched
+
             if match_len != node.length:
                 node = node.split_at(match_len)
                 node.timestamp = tic
                 break
 
-            # update timestamp for accessed node
+
             node.timestamp = tic
 
         return node, prefix_len

@@ -39,8 +39,8 @@ Indice2D : TypeAlias = tuple[torch.Tensor, torch.Tensor]
 class ForwardInput(NamedTuple):
     batch      : Batch
     sample_args: BatchSamplingArgs
-    input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+    input_tuple: Indice2D
+    write_tuple: Indice2D
 
 
 class ForwardOutput(NamedTuple):
@@ -75,7 +75,7 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[0]  # min across ranks (tightest rank anchors budget)
+        init_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         if (
@@ -86,7 +86,7 @@ class Engine:
             assert speculator_start_event is not None
             speculator_start_event.set()
 
-        # ======================= Model initialization ========================
+
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = make_model(config.model_config)
@@ -143,7 +143,7 @@ class Engine:
         self.ctx.state_table = self.state_table
         self.ctx.work_state_table = self.work_state_table
 
-        # ======================= Attention & MoE backend initialization ========================
+
         self.ctx.attn_backend = self.attn_backend = make_attention_backend(
             config.attention_backend, config.model_config
         )
@@ -162,13 +162,13 @@ class Engine:
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = make_moe_backend(config.moe_backend)
 
-        # ======================= Sampler initialization ========================
+
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
-        # ======================= Graph capture initialization ========================
+
         self.dummy_req = Request(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -229,8 +229,8 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            # Cast each tensor to its parameter's dtype (not blanket self.dtype) so that
-            # fp32 params (e.g. GatedDeltaNet A_log / gated norm weight) stay fp32.
+
+
             param_dtypes = {k: v.dtype for k, v in self.model.state_dict().items()}
             return {
                 k: v.to(param_dtypes.get(k, self.dtype))
@@ -238,7 +238,6 @@ class Engine:
             }
 
     def _sync_get_memory(self) -> tuple[int, int]:
-        """Get the min and max free memory across TP ranks."""
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -323,7 +322,7 @@ class Engine:
                 logits = self.model.forward()
         if batch.is_verify:
             next_tokens_gpu = self.sampler.reject_sample(logits, batch).to(torch.int32)
-        else: # prefill / decode
+        else:
             next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -345,7 +344,7 @@ class Engine:
                     sample["eager_state"] = self.linear_attn_backend.enable_eager_state
             counts = batch.logstate_replay_counts
             if counts is not None:
-                # Already CPU-side; do not inspect captured GPU buffers or dummy rows.
+
                 sample["replay_counts"] = list(counts[:batch.size])
                 sample["effective_replay_counts"] = (
                     [0] * batch.size if sample.get("eager_state", False)
@@ -393,7 +392,7 @@ class Engine:
 
     @staticmethod
     def _adjust_config(config: EngineConfig) -> None:
-        def override(attr: str, value: Any):  # this is dangerous, use with caution
+        def override(attr: str, value: Any):
             object.__setattr__(config, attr, value)
 
         def override_page_size(value: int) -> None:

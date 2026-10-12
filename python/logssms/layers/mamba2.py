@@ -38,7 +38,6 @@ class Mamba2Conv(BaseOP):
 
 
 class Mamba2GatedNorm(BaseOP):
-    """Grouped Mamba2 normalization, including replicated-group TP reductions."""
 
     def __init__(self, size: int, groups: int, eps: float, before_gate: bool):
         tp = get_tp_info().size
@@ -59,8 +58,8 @@ class Mamba2GatedNorm(BaseOP):
         grouped = x.reshape(shape[0], self._groups, -1)
         variance = grouped.square().mean(-1, keepdim=True)
         if self._group_ranks > 1:
-            # Supported TP layouts either shard groups or replicate the one
-            # global group. Do not mix unrelated groups in this collective.
+
+
             variance = self._comm.all_reduce(variance) / self._group_ranks
         x = (grouped * torch.rsqrt(variance + self._eps)).reshape(shape)
         x = x * self.weight

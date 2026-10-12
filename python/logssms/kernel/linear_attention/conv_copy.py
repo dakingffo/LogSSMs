@@ -1,12 +1,10 @@
-"""Copy framed convolution snapshots without staging them in a tensor."""
-
 import torch
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def _copy_framed_conv_snapshots(
+def _copy_conv_snapshots(
     storage, frame_table,
     source_slots, source_granules, output_slots, output_granules,
     NUM_GRANULES: tl.constexpr, SNAPSHOT_ELEMS: tl.constexpr,
@@ -32,14 +30,13 @@ def _copy_framed_conv_snapshots(
              mask=offsets < SNAPSHOT_ELEMS)
 
 
-def copy_framed_conv_snapshots(
+def copy_conv_snapshots(
     pool,
     source_slots: torch.Tensor,
     source_granules: torch.Tensor,
     output_slots: torch.Tensor,
     output_granules: torch.Tensor,
 ) -> None:
-    """Copy every linear layer's conv state for each independent restore task."""
     count = source_slots.numel()
     assert source_granules.numel() == output_slots.numel() == output_granules.numel() == count
     if count == 0:
@@ -53,7 +50,7 @@ def copy_framed_conv_snapshots(
     )
     frame_elems = pool.frame_bytes // pool.dtype.itemsize
     assert snapshot_elems <= frame_elems
-    _copy_framed_conv_snapshots[(count, triton.cdiv(snapshot_elems, 1024))](
+    _copy_conv_snapshots[(count, triton.cdiv(snapshot_elems, 1024))](
         pool.storage.view(pool.dtype), pool.conv_frame_table,
         source_slots, source_granules, output_slots, output_granules,
         pool.layout.num_granules, snapshot_elems, frame_elems, 1024,

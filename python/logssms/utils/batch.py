@@ -8,12 +8,6 @@ import torch
 
 @dataclass
 class BatchIndices:
-    """One immutable host/device packet per prepared batch, shared by backends.
-
-    Fresh pinned storage is owned by each packet. Overlapping batches cannot
-    overwrite a staging buffer that a previous asynchronous copy still reads.
-    CPU indptr views remain available for FlashInfer's host-side planner.
-    """
     table_ids          : torch.Tensor
     cached_lens        : torch.Tensor
     previous_positions : torch.Tensor
@@ -63,8 +57,8 @@ class BatchIndices:
         packed = host.to(device, non_blocking=True)
         cpu = tuple(host[a:b] for a, b in zip(boundaries, boundaries[1:]))
         gpu = tuple(packed[a:b] for a, b in zip(boundaries, boundaries[1:]))
-        # Keep the scheduler's public mapping dtype unchanged; one conversion
-        # covers both output mapping rows instead of two separate transfers.
+
+
         writes = packed[boundaries[8]:].to(torch.int64).view(2, len(write_tables))
         return cls(gpu[0], gpu[1], gpu[2], cpu[3], gpu[3], cpu[4], gpu[4],
                    cpu[5], gpu[5], cpu[6], gpu[7], (writes[0], writes[1]),

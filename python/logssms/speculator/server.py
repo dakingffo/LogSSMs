@@ -99,8 +99,6 @@ def make_local_data_plane_pair(
     )
 
 
-# The speculator always owns an independent process. DT separation only selects whether
-# that process shares Target rank 0's device or runs on the next device.
 @torch.inference_mode()
 def speculator_worker(
     *,
@@ -110,8 +108,8 @@ def speculator_worker(
     speculator_data_plane : DataPlane | None = None,
     ack_queue             : mp.Queue[str] | None = None,
 ) -> None:
-    # In shared-device mode Target rank 0 must capture its initial free-memory baseline
-    # before this process creates a CUDA context or allocates the drafter.
+
+
     if not args.dt_separation:
         assert speculator_start_event is not None
         speculator_start_event.wait()
@@ -124,10 +122,7 @@ def speculator_worker(
     stream = torch.cuda.Stream(device=device)
     torch.cuda.set_stream(stream)
 
-    # the drafter is always tp=1 (standalone rank 0): the split controls the DEVICE it
-    # runs on (--dt-separation true), not the drafter's TP sharding. Layer builders
-    # read the global TP info, which the main engine sets for itself — this process must
-    # set it before constructing the model.
+
     with tp_override(DistributedInfo(0, 1)):
         speculator_config = args.speculator_config
         assert speculator_config is not None
@@ -166,7 +161,6 @@ def speculator_worker(
         runner.run_forever()
 
 
-# called by scheduler
 def make_speculator_client(
     sche: Scheduler, config: SchedulerConfig
 ) -> SpeculatorClientBase:

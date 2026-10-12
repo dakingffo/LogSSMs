@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from logssms.core import get_global_ctx
 from logssms.kernel import prepare_gdn
 from .base import BaseGatedDeltaBackend
@@ -100,12 +100,12 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         )
 
         pool = get_global_ctx().linear_state
-        assert isinstance(pool, FramedMHALogStatePool)
+        assert isinstance(pool, MHALogStatePool)
         layer_idx = config.layer_idx
         assert metadata.cu_seqlens is not None
         assert metadata.prefill_indices is not None
         assert metadata.chunk_write_slots is not None
-        # Snapshot input history before any conv program updates the work slot.
+
         conv_history = pool.read_conv(
             metadata.conv_read_slots, metadata.conv_read_granules, layer_idx
         )
@@ -150,6 +150,9 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
                     frame_bytes=pool.frame_bytes,
                     head_payload_bytes=pool.head_payload_bytes,
                     layer=layer_idx,
+                    num_layers=pool.layout.num_linear_layers,
+                    granularity=pool.layout.granularity,
+                    page_size=pool.page_size,
                 ),
                 metadata.cu_seqlens,
                 chunk_size=pool.layout.granularity,
@@ -178,12 +181,12 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         metadata   : LogStateLinearAttentionMetadata,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
-            fused_recurrent_gated_delta_rule_to_framed_logstate,
+            fused_recurrent_gated_delta_rule_to_logstate,
         )
         from logssms.kernel.linear_attention.gdn_conv_decode import conv_decode_qkv
 
         pool = get_global_ctx().linear_state
-        assert isinstance(pool, FramedMHALogStatePool)
+        assert isinstance(pool, MHALogStatePool)
         layer_idx = config.layer_idx
         query, key, value = conv_decode_qkv(
             mixed_qkv, conv_weight, config,
@@ -194,7 +197,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
             work_slots=metadata.work_slots,
             pool=pool,
         )
-        output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        output = fused_recurrent_gated_delta_rule_to_logstate(
             query,
             key,
             value,

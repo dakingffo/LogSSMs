@@ -64,12 +64,10 @@ def init_pynccl(
 
 
 def make_nccl_uid_bytes() -> bytes:
-    """Create a fresh ncclUniqueId and return its 128 raw bytes (for the zmq handshake)."""
     return bytes([v & 0xFF for v in _load_nccl_module().create_nccl_uid()])
 
 
 def _nccl_uid_to_ffi(nccl_uid: bytes) -> list[int]:
-    """Decode the 128 raw uid bytes into the signed-char ``Array<char>`` the FFI expects."""
     assert len(nccl_uid) == 128, f"ncclUniqueId must be 128 bytes, got {len(nccl_uid)}"
     return [v if v < 128 else v - 256 for v in nccl_uid]
 
@@ -81,12 +79,6 @@ def init_pynccl_drafter_target_separation(
     nccl_uid      : bytes,
     max_size_bytes: int = 0,
 ):
-    """Init a standalone NCCL communicator from a uid shipped over the control plane.
-
-    Used for the 2-rank target↔drafter data plane, which has no gloo group to broadcast
-    the uid through (unlike the TP group's ``init_pynccl``). ``nccl_uid`` is the 128 raw
-    bytes of the ncclUniqueId created on rank 0 and carried by SpeculatorHandshakeMsg.
-    """
     max_size_bytes = min(max_size_bytes, ENV.PYNCCL_MAX_BUFFER_SIZE.value)
 
     module = _load_nccl_module()

@@ -10,8 +10,7 @@ if TYPE_CHECKING:
 
 
 class BaseDrafterModel(ABC, BaseOP):
-    """Common lifecycle interface for standalone speculative drafter models."""
 
     @abstractmethod
     def load_weights(self, model_path: str, device: torch.device) -> None:
-        """Load drafter weights onto ``device``."""
+        pass

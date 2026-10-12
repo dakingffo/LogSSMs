@@ -1,7 +1,6 @@
 #pragma once
 
-// Work around older NVCC/libstdc++ combinations that cannot parse
-// std::source_location's consteval implementation.
+
 #ifdef __CUDACC__
 #pragma push_macro("__cpp_consteval")
 #pragma push_macro("_NODISCARD")
@@ -65,7 +64,7 @@ LOGSSMS_HOST_DEVICE const void* offset(const void* ptr, Ints... offsets) {
   return static_cast<const char*>(ptr) + (... + offsets);
 }
 
-} // namespace pointer
+}
 
 namespace host {
 
@@ -133,7 +132,7 @@ runtime_assert(T&&, Args&&...) -> runtime_assert<Args...>;
 template <typename... Args>
 runtime_panic(Args&&...) -> runtime_panic<Args...>;
 
-} // namespace host
+}
 
 #ifdef __CUDACC__
 
@@ -153,7 +152,7 @@ LOGSSMS_DEVICE void launch() {
   }
 }
 
-} // namespace device::PDL
+}
 
 namespace host {
 
@@ -264,8 +263,8 @@ private:
   cudaLaunchAttribute attr_{};
 };
 
-} // namespace host
+}
 
-#endif // __CUDACC__
+#endif
 
-} // namespace logssms
+}

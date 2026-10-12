@@ -24,15 +24,6 @@ class ServerArgs(SchedulerConfig):
 
 
 def parse_args(args: list[str]) -> ServerArgs:
-    """
-    Parse command line arguments and return an EngineConfig.
-
-    Args:
-        args: Command line arguments (e.g., sys.argv[1:])
-
-    Returns:
-        EngineConfig instance with parsed arguments
-    """
     from logssms.layers.attention_backend import validate_attn_backend
     from logssms.cache import (
         SUPPORTED_CACHE_ARGUMENT_PARSERS,
@@ -244,7 +235,7 @@ def parse_args(args: list[str]) -> ServerArgs:
         help="Run the drafter on a separate device (requires tp_size + 1 GPUs).",
     )
 
-    # Parse arguments
+
     kwargs = parser.parse_args(args).__dict__.copy()
 
     kwargs["cache_config"] = cache_parser.make_config(kwargs)
@@ -254,7 +245,7 @@ def parse_args(args: list[str]) -> ServerArgs:
     if speculator_parser is not None:
         kwargs["speculator_config"] = speculator_parser.make_config(kwargs)
 
-    # resolve the auto --max-decode-tokens default (token budget, not a req count)
+
     if kwargs["max_decode_tokens"] is None:
         base = max(1, kwargs["max_running_req"] // 2)
         speculator_config = kwargs.get("speculator_config")
@@ -297,9 +288,7 @@ def parse_args(args: list[str]) -> ServerArgs:
     if (dtype_str := kwargs["dtype"]) == "auto":
         from logssms.utils import load_model_config
 
-        # `dtype` is the transformers alias of `torch_dtype`. The raw-config fallback
-        # (unregistered architectures like Qwen3Next) mirrors only fields present in
-        # config.json, where torch_dtype may be null -> default to bf16.
+
         pretrained_config = load_model_config(kwargs["model_path"])
         dtype_str = (
             getattr(pretrained_config, "dtype", None)

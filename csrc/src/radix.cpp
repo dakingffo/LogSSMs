@@ -50,6 +50,6 @@ private:
           (tensor.dtype().bits == 32 || tensor.dtype().bits == 64);
   }
 };
-} // namespace logssms
+}
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_key, logssms::Radix::fast_compare_key);

@@ -1,12 +1,13 @@
 import torch
 import pytest
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
-from tests.logstate_helpers import head_view
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from tests.logstate_helpers import head_view, write_head, _head_indices
+from tests.logstate_helpers import decay_view
 
 
-def make_pool(device: torch.device | None = None) -> FramedMHALogStatePool:
-    return FramedMHALogStatePool(
+def make_pool(device: torch.device | None = None) -> MHALogStatePool:
+    return MHALogStatePool(
         num_frames=64,
         page_size=64,
         granularity=16,
@@ -26,7 +27,7 @@ def make_pool(device: torch.device | None = None) -> FramedMHALogStatePool:
 
 
 def test_grouped_value_heads_use_value_head_payloads():
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=64,
         page_size=64,
         granularity=32,
@@ -52,6 +53,53 @@ def test_grouped_value_heads_use_value_head_payloads():
     torch.testing.assert_close(pool.read_states(slots, 0), values)
 
 
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+@pytest.mark.parametrize("key_heads", [1, 2])
+def test_log_payload_matches_kv_granule_layer_token_head_order(granularity, key_heads):
+    pool = MHALogStatePool(
+        num_frames=64, page_size=64, granularity=granularity,
+        num_attention_layers=2, num_kv_heads=1, head_dim=32,
+        num_linear_layers=2, num_key_heads=key_heads, num_value_heads=2,
+        head_k_dim=32, head_v_dim=32, conv_dim=192, state_len=3,
+        device=torch.device("cpu"), dtype=torch.float16,
+    )
+    # Force the logical payload to span non-adjacent physical frames.
+    kv, logs, _works = pool.reserve(kv=20, logs=0)
+    pool.release_kv(kv[::2])
+    _kv, logs, _works = pool.reserve(logs=1)
+    slot = logs[0]
+    pool.storage.fill_(0)
+    heads = []
+    for layer in range(2):
+        for head in range(2):
+            values = torch.arange(4096, dtype=torch.float16) % 127 + layer * 128 + head * 256
+            values[:2048] = torch.arange(2048, dtype=torch.float16) % 127 + layer * 128 + (head // (2 // key_heads)) * 256
+            write_head(pool, slot, layer, head, values, state=False)
+            heads.append(values)
+    expected = []
+    for begin in range(0, 64, granularity):
+        for layer in range(2):
+            for plane in range(2):
+                for token in range(begin, begin + granularity):
+                    for index_head in range(key_heads if plane == 0 else 2):
+                        head = index_head * (2 // key_heads) if plane == 0 else index_head
+                        index = plane * 64 * 32 + token * 32
+                        expected.append(heads[layer * 2 + head][index:index + 32])
+    frames = pool.allocator.slot(slot).payload
+    actual = pool.storage[list(frames)].view(pool.dtype).flatten()
+    expected = torch.cat(expected)
+    torch.testing.assert_close(actual[:len(expected)], expected)
+    occupied = set()
+    for layer in range(2):
+        for head in range(2):
+            log = set(_head_indices(pool, slot, layer, head, state=False).tolist())
+            state = set(_head_indices(pool, slot, layer, head, state=True).tolist())
+            if not pool.shared_keys:
+                assert state <= log
+                assert not occupied & log
+            occupied.update(log)
+
+
 def test_reserve_profile_separates_allocator_and_descriptor_work():
     pool = make_pool()
     timings = {}
@@ -66,7 +114,7 @@ def test_reserve_profile_separates_allocator_and_descriptor_work():
     assert failed["failed"] == 1
 
 
-def test_framed_kv_preserves_sixteen_token_page_view():
+def test_logstate_kv_preserves_sixteen_token_page_view():
     pool = make_pool()
     allocated = pool.reserve(kv=2)
     assert allocated is not None
@@ -79,7 +127,7 @@ def test_framed_kv_preserves_sixteen_token_page_view():
     assert pool.k_cache(0)[first * 4].data_ptr() != pool.v_cache(1)[second * 4].data_ptr()
 
 
-def test_framed_work_state_and_conv_roundtrip():
+def test_logstate_work_state_and_conv_roundtrip():
     pool = make_pool()
     allocated = pool.reserve(works=2)
     assert allocated is not None
@@ -156,7 +204,7 @@ def test_batch_release_clears_only_selected_descriptors():
     assert pool.reserve(logs=1, works=1) is not None
 
 
-def test_framed_kv_store_uses_physical_token_offsets():
+def test_logstate_kv_store_uses_physical_token_offsets():
     pool = make_pool()
     allocated = pool.reserve(kv=2)
     assert allocated is not None
@@ -186,7 +234,7 @@ def test_linear_descriptors_change_when_log_becomes_checkpoint():
     assert torch.all(pool.conv_frame_table[log, -1] >= 0)
     assert torch.all(pool.decay_frame_table[log] == -1)
     pool.allocator.check_integrity()
-    pool.release_slot(log)
+    pool.release_slots([log])
     assert torch.all(pool.payload_frame_table[log] == -1)
 
 
@@ -273,13 +321,12 @@ def test_head_overlay_and_side_views_survive_noncontiguous_allocation():
     allocated = pool.reserve(logs=1)
     assert allocated is not None
     slot = allocated[1][0]
-    log_head = head_view(pool, slot, 1, 0, state=False)
-    log_head[0] = 7
+    write_head(pool, slot, 1, 0, 7, state=False, index=0)
     assert head_view(pool, slot, 1, 0, state=True)[0, 0] == 7
     pool.conv_view(slot, 3).fill_(5)
     assert torch.all(pool.conv_view(slot, 3) == 5)
-    pool.decay_view(slot).fill_(0.75)
-    assert torch.all(pool.decay_view(slot) == 0.75)
+    decay_view(pool, slot).fill_(0.75)
+    assert torch.all(decay_view(pool, slot) == 0.75)
     pool.materialize(slot)
     assert torch.all(pool.conv_view(slot, 3) == 5)
     pool.allocator.check_integrity()
@@ -293,7 +340,7 @@ def test_cuda_frame_descriptors_and_kv_views():
     frame = allocated[0][0]
     slot = allocated[1][0]
     pool.k_cache(0)[frame * 4 + 2].fill_(3)
-    head_view(pool, slot, 0, 0, state=False).fill_(4)
+    write_head(pool, slot, 0, 0, 4, state=False)
     assert torch.all(pool.k_cache(0)[frame * 4 + 2] == 3)
     assert torch.all(head_view(pool, slot, 0, 0, state=True) == 4)
     torch.testing.assert_close(
@@ -336,8 +383,8 @@ def test_cuda_graph_conv_indices_follow_updated_slots_and_granules():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cuda_store_framed_log_updates_payload_and_decay():
-    from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
+def test_cuda_store_logstate_log_updates_payload_and_decay():
+    from logssms.kernel.linear_attention.logstate import store_log_states
 
     pool = make_pool(torch.device("cuda"))
     allocated = pool.reserve(logs=1)
@@ -346,7 +393,7 @@ def test_cuda_store_framed_log_updates_payload_and_decay():
     keys = torch.full((1, 2, 32), 3, dtype=torch.float16, device="cuda")
     values = torch.full((1, 2, 32), 5, dtype=torch.float16, device="cuda")
     decays = torch.full((1, 2), 0.75, dtype=torch.float32, device="cuda")
-    store_framed_log_states(
+    store_log_states(
         pool,
         torch.tensor([slot], dtype=torch.int32, device="cuda"),
         torch.tensor([17], dtype=torch.int32, device="cuda"),
@@ -356,14 +403,14 @@ def test_cuda_store_framed_log_updates_payload_and_decay():
     key_size = pool.layout.head_log_key_bytes // pool.dtype.itemsize
     assert torch.all(head[17 * 32:18 * 32] == 3)
     assert torch.all(head[key_size + 17 * 32:key_size + 18 * 32] == 5)
-    assert torch.all(pool.decay_view(slot)[1, 17] == 0.75)
+    assert torch.all(decay_view(pool, slot)[1, 17] == 0.75)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_store_qwen35_2b_layout_across_payload_frames():
-    from logssms.kernel.linear_attention.framed_logstate import store_framed_log_states
+    from logssms.kernel.linear_attention.logstate import store_log_states
 
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=32,
         page_size=64,
         granularity=16,
@@ -388,7 +435,7 @@ def test_cuda_store_qwen35_2b_layout_across_payload_frames():
     keys = torch.full((1, 16, 128), 3, dtype=torch.bfloat16, device="cuda")
     values = torch.full((1, 16, 128), 5, dtype=torch.bfloat16, device="cuda")
     decays = torch.full((1, 16), 0.75, dtype=torch.float32, device="cuda")
-    store_framed_log_states(
+    store_log_states(
         pool,
         torch.tensor([slot], dtype=torch.int32, device="cuda"),
         torch.tensor([63], dtype=torch.int32, device="cuda"),
@@ -397,4 +444,4 @@ def test_cuda_store_qwen35_2b_layout_across_payload_frames():
     head = head_view(pool, slot, 17, 15, state=False)
     assert torch.all(head[63 * 128:64 * 128] == 3)
     assert torch.all(head[64 * 128 + 63 * 128:] == 5)
-    assert torch.all(pool.decay_view(slot)[17, 63] == 0.75)
+    assert torch.all(decay_view(pool, slot)[17, 63] == 0.75)

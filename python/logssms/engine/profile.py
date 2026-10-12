@@ -22,7 +22,6 @@ def batch_identity(batch: Batch) -> dict:
 
 
 def batch_snapshot(batch: Batch) -> dict:
-    """Copy CPU metadata before overlap advances the mutable Requests."""
     return {
         **batch_identity(batch),
         "phase": batch.phase,
@@ -35,12 +34,6 @@ def batch_snapshot(batch: Batch) -> dict:
 
 
 class EngineProfiler:
-    """Host-stage timings and asynchronous CUDA timings outside graph capture.
-
-    Every batch gets fresh events, including graph replays. No event is captured
-    in a graph or reused by overlapping batches. GPU timings measure stream
-    intervals, not a sum of kernel durations; CPU/GPU times must not be added.
-    """
 
     def __init__(self) -> None:
         self.enabled = os.getenv("LOGSSMS_PROFILE_SCHEDULER", "0").lower() in (
@@ -126,7 +119,7 @@ class EngineProfiler:
                 self._last_forward_cpu_end = stop
                 self._last_forward_identity = (batch.profile_id, batch.phase)
             else:
-                # Padding and cache preparation may add CPU-only metadata.
+
                 sample.update(batch_snapshot(batch))
                 sample["logical_tokens"] = sample["input_tokens"]
                 sample["total_ms"] = sample["cpu_total_ms"]
@@ -186,7 +179,7 @@ class EngineProfiler:
                     totals["gpu_stages_ms"][name] += elapsed
                     group["gpu_stages_ms"][name] += elapsed
             if previous_end is not None:
-                # Forward scopes are ordered on the same engine stream.
+
                 sample["gpu_gap_before_ms"] = previous_end.elapsed_time(events[0][1])
         self.pending = remaining
 

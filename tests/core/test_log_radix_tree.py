@@ -7,6 +7,7 @@ from logssms.cache.prefix_cache.logstate import (
     LogStateEntry,
     LogStateKind,
 )
+from tests.logstate_helpers import matched_kv
 
 
 PAGE_SIZE = 4
@@ -133,7 +134,7 @@ def test_insert_match_and_collect_path_values():
     assert result.previous_len == 0
     assert result.inserted_len == 12
     assert match.matched_len == 12
-    assert torch.equal(tree.matched_kv(match.node), kv)
+    assert torch.equal(matched_kv(tree, match.node), kv)
     assert tree.matched_entries(match.node) == entries
     assert tree.size_info.evictable_size == 12
     tree.check_integrity()
@@ -221,9 +222,222 @@ def test_evict_prefers_log_branch_over_older_checkpoint_branch():
         ids(4, 20), ids(4, 200),
         (LogStateEntry(1, LogStateKind.LOG, 0, 4),),
     ).node
-    checkpoint.timestamp = 1
+    tree._checkpoint_timestamps[0] = 1
     log.timestamp = 2
     assert list(tree.iter_evict_candidates()) == [log, checkpoint]
+
+
+def test_matching_refreshes_kv_path_but_only_the_selected_checkpoint():
+    tree = make_tree()
+    tokens = ids(12)
+    leaf = tree.insert(tokens, tokens + 100, tuple(
+        LogStateEntry(slot, LogStateKind.CHECKPOINT, slot * 4, (slot + 1) * 4, span_pages=1)
+        for slot in range(3)
+    )).node
+    tree._checkpoint_timestamps.update({0: 10, 1: 20, 2: 30})
+    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+        handle = tree.match_prefix(tokens).cuda_handle
+    assert handle.recovery.base_checkpoint_slot == 2
+    assert all(node.timestamp == 100 for node in tree.path(leaf))
+    assert tree._checkpoint_timestamps == {0: 10, 1: 20, 2: 100}
+    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=200):
+        earlier = tree.match_prefix(tokens[:8]).cuda_handle
+    assert earlier.recovery.base_checkpoint_slot == 1
+    assert tree._checkpoint_timestamps == {0: 10, 1: 200, 2: 100}
+    assert tree.entry_owner(2).timestamp == 100
+    assert tree.checkpoint_eviction_pairs() == [(0, 1, 4, 10), (1, 2, 8, 200)]
+    tree.check_integrity()
+
+
+def test_log_endpoint_match_touches_its_base_checkpoint_not_earlier_states():
+    tree = make_tree()
+    tokens = ids(12)
+    tree.insert(tokens, tokens + 100, (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 4, 8, span_pages=1),
+        LogStateEntry(2, LogStateKind.LOG, 8, 12),
+    ))
+    tree._checkpoint_timestamps.update({0: 10, 1: 20})
+    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+        handle = tree.match_prefix(tokens[:10]).cuda_handle
+    assert handle.cached_len == 10
+    assert handle.recovery.base_checkpoint_slot == 1
+    assert handle.recovery.log_slots == (2,)
+    assert tree._checkpoint_timestamps == {0: 10, 1: 100}
+    assert all(node.timestamp == 100 for node in handle.match_path)
+    assert tree.entries_for_slot(2)[-1].end == 12  # split Log remains shared
+    tree.check_integrity()
+
+
+def test_insert_trace_split_and_handle_construction_do_not_heat_checkpoints():
+    tree = make_tree()
+    tokens = ids(8)
+    leaf = tree.insert(tokens, tokens + 100, (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),
+    )).node
+    tree._checkpoint_timestamps[0] = 10
+    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+        tree.insert(tokens, tokens + 100)
+        assert leaf.timestamp == 100
+        tree.trace(tokens)
+        tree.recovery_at(leaf, 8)
+        tree.make_handle(leaf)
+        tree.split_at(leaf, 4)
+    assert tree.checkpoint_timestamp(0) == 10
+    tree.check_integrity()
+
+
+def test_checkpoint_eviction_uses_state_heat_not_kv_heat_and_cleans_slot_reuse():
+    tree = make_tree()
+    cold = tree.insert(ids(4), ids(4, 100), (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),
+    )).node
+    hot = tree.insert(ids(4, 20), ids(4, 200), (
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),
+    )).node
+    cold.timestamp, hot.timestamp = 999, 1
+    tree._checkpoint_timestamps.update({0: 10, 1: 20})
+    assert list(tree.iter_evict_candidates()) == [cold, hot]
+    tree.evict_nodes([cold])
+    assert 0 not in tree._checkpoint_timestamps
+    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+        tree.insert(ids(4, 40), ids(4, 300), (
+            LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),
+        ))
+    assert tree.checkpoint_timestamp(0) == 100
+    tree.reset()
+    assert tree._checkpoint_timestamps == {}
+    tree.check_integrity()
+
+
+def test_small_evictions_follow_global_lru_without_refreshing_access_times():
+    tree = make_tree()
+    leaves = []
+    for chain in range(5):
+        leaf = tree.insert(ids(12, chain * 100), ids(12, 1000 + chain * 12), tuple(
+            LogStateEntry(chain * 3 + page, LogStateKind.LOG, page * 4, (page + 1) * 4)
+            for page in range(3)
+        )).node
+        for node in tree.path(leaf):
+            node.timestamp = chain * 10
+        leaves.append(leaf)
+    timestamps = {node.uuid: node.timestamp for node in tree._iter_nodes()}
+    for _ in range(3):
+        candidate = next(tree.iter_evict_candidates())
+        assert candidate is leaves[0]
+        leaves[0] = candidate.parent
+        tree.evict_nodes([candidate])
+        tree.check_integrity()
+        assert all(node.timestamp == timestamps[node.uuid] for node in tree._iter_nodes())
+    assert next(tree.iter_evict_candidates()) is leaves[1]
+    tree.reset()
+    assert list(tree.iter_evict_candidates()) == []
+
+
+def test_drop_old_checkpoint_preserves_kv_and_later_cumulative_state():
+    tree = LogRadixTree(64, torch.device("cpu"), granularity=32)
+    tokens = ids(384)
+    leaf = tree.insert(tokens, tokens + 1000, (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 256, span_pages=4),
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 256, 384, span_pages=2),
+    )).node
+    assert tree.checkpoint_eviction_pairs() == [(0, 1, 256, tree.checkpoint_timestamp(0))]
+    timestamp = tree.checkpoint_timestamp(1)
+    kv = matched_kv(tree, leaf).clone()
+    tree.drop_checkpoint(0, 1)
+    assert tree.checkpoint_timestamp(1) == timestamp
+    assert 0 not in tree._checkpoint_timestamps
+    assert tree.matched_entries(leaf) == (
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 0, 384, span_pages=6),
+    )
+    torch.testing.assert_close(matched_kv(tree, leaf), kv)
+    assert tree.recovery_at(leaf, 384).base_checkpoint_slot == 1
+    assert tree.recovery_at(leaf, 256).position == 0
+    assert not tree.has_slot(0)
+    assert tree.size_info.evictable_size == 384
+    tree.check_integrity()
+
+
+def test_pressure_checkpoint_pairs_stop_at_logs_protections_and_branches_not_kv_locks():
+    tree = make_tree()
+    tokens = ids(16)
+    leaf = tree.insert(tokens, tokens + 100, (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 4, 8, span_pages=1),
+        LogStateEntry(2, LogStateKind.LOG, 8, 12),
+        LogStateEntry(3, LogStateKind.CHECKPOINT, 12, 16, span_pages=1),
+    )).node
+    pairs = tree.checkpoint_eviction_pairs()
+    assert [(left, right) for left, right, *_ in pairs] == [(0, 1)]
+    first = tree.entry_owner(0)
+    tree.protect(first)
+    assert tree.checkpoint_eviction_pairs() == []
+    tree.protect(first, False)
+    tree.lock(tree.entry_owner(1))
+    assert tree.checkpoint_eviction_pairs() == pairs
+    assert 0 in tree.evictable_slots() and 1 not in tree.evictable_slots()
+    tree.pin_recovery((1,))
+    assert tree.checkpoint_eviction_pairs() == []
+    assert 0 not in tree.evictable_slots()
+    tree.pin_recovery((1,), release=True)
+    assert tree.checkpoint_eviction_pairs() == pairs
+    tree.lock(tree.entry_owner(1), unlock=True)
+    tree.insert(torch.cat((tokens[:4], ids(4, 50))), ids(8, 200), (
+        LogStateEntry(4, LogStateKind.CHECKPOINT, 4, 8, span_pages=1),
+    ))
+    assert len(first.children) == 2
+    assert tree.checkpoint_eviction_pairs() == []
+    assert tree.recovery_at(leaf, 16).base_checkpoint_slot == 3
+    tree.check_integrity()
+
+
+def test_locked_kv_path_allows_state_thinning_and_updates_capacity():
+    tree = make_tree()
+    tokens = ids(12)
+    leaf = tree.insert(tokens, tokens + 100, tuple(
+        LogStateEntry(slot, LogStateKind.CHECKPOINT, slot * 4, (slot + 1) * 4, span_pages=1)
+        for slot in range(3)
+    )).node
+    tree.lock(leaf)
+    assert tree.evictable_kv_frames() == 0
+    assert set(tree.evictable_slots()) == {0, 1}
+    tree.drop_checkpoint(1, 2)
+    assert leaf.is_locked
+    assert set(tree.evictable_slots()) == {0}
+    torch.testing.assert_close(matched_kv(tree, leaf), tokens + 100)
+    assert tree.recovery_at(leaf, 12).base_checkpoint_slot == 2
+    tree.check_integrity()
+    tree.drop_checkpoint(0, 2)
+    assert tree.evictable_slots() == ()
+    assert tree.locked_size == 12
+    tree.check_integrity()
+    tree.lock(leaf, unlock=True)
+    assert tree.evictable_slots() == (2,)
+    tree.check_integrity()
+
+
+def test_locked_checkpoint_capacity_tracks_branch_and_protection_changes():
+    tree = make_tree()
+    tokens = ids(12)
+    leaf = tree.insert(tokens, tokens + 100, tuple(
+        LogStateEntry(slot, LogStateKind.CHECKPOINT, slot * 4, (slot + 1) * 4, span_pages=1)
+        for slot in range(3)
+    )).node
+    tree.lock(leaf)
+    first = tree.entry_owner(0)
+    tree.protect(first)
+    assert set(tree.evictable_slots()) == {1}
+    tree.check_integrity()
+    tree.protect(first, False)
+    assert set(tree.evictable_slots()) == {0, 1}
+    branch = tree.insert(torch.cat((tokens[:4], ids(4, 50))), ids(8, 200), (
+        LogStateEntry(3, LogStateKind.CHECKPOINT, 4, 8, span_pages=1),
+    )).node
+    assert set(tree.evictable_slots()) == {1, 3}
+    tree.check_integrity()
+    tree.evict_nodes([branch])
+    assert set(tree.evictable_slots()) == {0, 1}
+    tree.check_integrity()
 
 
 def test_new_tail_smaller_than_one_physical_page_is_not_admitted():

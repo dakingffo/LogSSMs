@@ -62,7 +62,7 @@ def make_attention_backend(
             p_backend = make_attention_backend(p_backend, config)
             d_backend = make_attention_backend(d_backend, config)
             return HybridBackend(p_backend, d_backend)
-        backend = p_backend  # both are the same, fall through to single backend
+        backend = p_backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)

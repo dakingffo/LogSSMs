@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from logssms.core import get_global_ctx
 
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
@@ -73,7 +73,6 @@ class LogStateLinearAttentionCaptureData:
 
 
 class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
-    """Shared frame/log metadata and graph lifecycle, independent of recurrence."""
 
     def __init__(self, *, enable_eager_state: bool = False) -> None:
         self.capture: LogStateLinearAttentionCaptureData | None = None
@@ -114,7 +113,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         pool = ctx.linear_state
         state_table = ctx.state_table
         work_state_table = ctx.work_state_table
-        assert isinstance(pool, FramedMHALogStatePool)
+        assert isinstance(pool, MHALogStatePool)
         assert state_table is not None and work_state_table is not None
         assert ctx.page_table is not None
         assert work_state_table.shape[1] == 1
@@ -174,7 +173,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         if batch.is_decode:
             counts = batch.logstate_replay_counts
             if counts is None:
-                counts = [0] * len(reqs)  # direct/capture callers
+                counts = [0] * len(reqs)
             assert len(counts) == len(reqs)
             replay_counts = torch.tensor(
                 counts, dtype=torch.int32, pin_memory=pool.device.type == "cuda"
@@ -240,8 +239,8 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                         if not is_checkpoint_row(index)
                     )
                 if first_offsets is None:
-                    # Direct backend callers (e.g. isolated tests) may not
-                    # have gone through CacheManager.prepare_batch.
+
+
                     item_start = perf_counter_ns() if profile else 0
                     first_offset = int(token_offsets[offsets[-1]].item())
                     item_calls += 1
@@ -375,7 +374,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         del max_seq_len
         assert self.capture is None, "Capture already initialized."
         pool = get_global_ctx().linear_state
-        assert isinstance(pool, FramedMHALogStatePool)
+        assert isinstance(pool, MHALogStatePool)
         self.capture = LogStateLinearAttentionCaptureData.make(
             max(bs_list), pool.device
         )

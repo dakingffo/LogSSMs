@@ -48,35 +48,34 @@ class DataPlane(ABC):
 
     @abstractmethod
     def make_connection_id(self) -> bytes:
-        """Create transport-specific connection metadata for the handshake."""
+        pass
 
     def prepare_rank1(self, sizes: DataPlaneSizes) -> None:
-        """Allocate worker-owned transport storage before signaling engine readiness."""
         pass
 
     @abstractmethod
     def init_rank0(self, connection_id: bytes, sizes: DataPlaneSizes) -> None:
-        """Target side: initialize the communicator (blocks until rank1 inits)."""
+        pass
 
     @abstractmethod
     def init_rank1(self, connection_id: bytes, sizes: DataPlaneSizes) -> None:
-        """Drafter side: initialize the communicator (blocks until rank0 inits)."""
+        pass
 
     @abstractmethod
     def send_hidden(self, hidden: torch.Tensor) -> None:
-        """Target → drafter: the appended carry-hidden rows (or a request's init window)."""
+        pass
 
     @abstractmethod
     def recv_hidden(self, num_rows: int) -> torch.Tensor:
-        """Drafter side of the transfer; returns the target's rows on its device."""
+        pass
 
     @abstractmethod
     def send_probs(self, probs: torch.Tensor) -> None:
-        """Drafter → target: the draft_probs rows for this step's sampling requests."""
+        pass
 
     @abstractmethod
     def recv_probs(self, num_rows: int) -> torch.Tensor:
-        """Target side of the transfer; returns the drafter's rows on its device."""
+        pass
 
     def destroy(self) -> None:
         pass
@@ -133,7 +132,7 @@ class NCCLDataPlane(DataPlane):
     def send_hidden(self, hidden: torch.Tensor) -> None:
         rows = hidden.shape[0]
         assert self._hidden_in is not None and rows <= self._hidden_in.shape[0]
-        self._hidden_in[:rows].copy_(hidden)  # rest stale; receiver only reads [:rows]
+        self._hidden_in[:rows].copy_(hidden)
         call_cuda_ffi(self._nccld.all_gather, self._hidden_out, self._hidden_in)
 
     def recv_hidden(self, num_rows: int) -> torch.Tensor:
@@ -226,13 +225,6 @@ class _QueueDataPlane(DataPlane):
 
 
 class CUDAIPCDataPlane(_QueueDataPlane):
-    """Same-device data plane backed by CUDA IPC memory and interprocess events.
-
-    The worker owns both shared buffers so their memory is visible before Target cache
-    sizing. Each direction has one producer-owned CUDA event and one multiprocessing
-    queue used only as a generation fence. Tensor payloads remain on the GPU; the queues
-    carry setup handles and row counts, never hidden states or probabilities.
-    """
 
     def __init__(
         self,
@@ -309,12 +301,6 @@ class CUDAIPCDataPlane(_QueueDataPlane):
 
 
 class SharedMemoryDataPlane(_QueueDataPlane):
-    """Compatibility data plane for platforms without CUDA IPC support.
-
-    The worker owns two shared CPU tensors. Transfers synchronize through the same two
-    queues as ``CUDAIPCDataPlane`` and stage through host memory. This is a correctness
-    fallback, not a production-performance path.
-    """
 
     def __init__(
         self,

@@ -25,7 +25,7 @@ def _stop_workers(workers, shutdown_event, logger, timeout: float = 60.0) -> Non
     if shutdown_event is not None:
         shutdown_event.set()
 
-    # Keep the speculator alive while schedulers finish collectives and dump profiles.
+
     schedulers = [worker for worker in workers if worker.name.endswith("-scheduler")]
     _join_workers(schedulers, timeout)
 
@@ -162,7 +162,7 @@ def launch_server() -> None:
     try:
         run_api_server(server_args, start_subprocess)
     finally:
-        # A second terminal Ctrl-C must not interrupt child reaping halfway through.
+
         previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             _stop_workers(workers, scheduler_shutdown_event, logger)

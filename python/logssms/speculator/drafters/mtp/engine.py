@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 
 
 class MTPEngine(EngineBase):
-    """Batched MTP engine with persistent canonical KV and round-local scratch KV."""
 
     def __init__(
         self,
@@ -213,7 +212,7 @@ class MTPEngine(EngineBase):
             token_matrix[active_rows, j] = next_tokens
             mtp_hidden[active_rows] = step_hidden
 
-        token_rows = token_matrix.tolist()  # one synchronization for the whole draft batch
+        token_rows = token_matrix.tolist()
         for st, row in zip(active_states, token_rows):
             st.draft_tokens = row[: st.n_drafts]
 
@@ -223,7 +222,6 @@ class MTPEngine(EngineBase):
         states: list[MTPState],
         step: int,
     ) -> torch.Tensor:
-        """Sample active rows and retain the exact distribution used for each draft."""
         tokens = logits.argmax(dim=-1).to(torch.int32)
         sampling_rows = [
             i for i, st in enumerate(states)

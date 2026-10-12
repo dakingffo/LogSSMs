@@ -12,7 +12,7 @@ class TokenizeManager:
 
     def tokenize(self, msgs: list[TokenizeMsg]) -> list[torch.Tensor]:
         results: list[torch.Tensor] = []
-        # TODO: batch tokenization
+
         for msg in msgs:
             if msg.input_ids is not None:
                 assert msg.input_ids.ndim == 1 and msg.input_ids.dtype == torch.int32
@@ -40,7 +40,7 @@ class DecodeStatus:
 
 class DetokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
-        # uid -> DecodeStatus
+
         self.decode_map: dict[int, DecodeStatus] = {}
         self.tokenizer = tokenizer
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -56,9 +56,9 @@ class DetokenizeManager:
             if isinstance(msg.next_token, int):
                 if not (msg.finished and msg.next_token == self.eos_token_id):
                     s.decoded_ids.append(msg.next_token)
-            else:  # verify: list of committed tokens. A trailing EOS is a stream
-                # terminator, never user-visible -- strip it (the scalar EOS filter
-                # above cannot catch a list).
+            else:
+
+
                 toks = msg.next_token
                 if msg.finished and toks and toks[-1] == self.eos_token_id:
                     toks = toks[:-1]
@@ -73,7 +73,7 @@ class DetokenizeManager:
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str):]
-            # Streaming chunk: update the decode status
+
             if len(new_text) > 0 and not new_text.endswith("�"):
                 incremental_strs.append(new_text[s.partial_sent:])
                 s.partial_sent = 0
@@ -90,24 +90,17 @@ class DetokenizeManager:
 
     @staticmethod
     def _is_chinese_char(cp: int):
-        """Checks whether CP is the codepoint of a CJK character."""
-        # This defines a "chinese character" as anything in the CJK Unicode block:
-        #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
-        #
-        # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
-        # despite its name. The modern Korean Hangul alphabet is a different block,
-        # as is Japanese Hiragana and Katakana. Those alphabets are used to write
-        # space-separated words, so they are not treated specially and handled
-        # like the all of the other languages.
+
+
         if (
             (cp >= 0x4E00 and cp <= 0x9FFF)
-            or (cp >= 0x3400 and cp <= 0x4DBF)    #
-            or (cp >= 0x20000 and cp <= 0x2A6DF)  #
-            or (cp >= 0x2A700 and cp <= 0x2B73F)  #
-            or (cp >= 0x2B740 and cp <= 0x2B81F)  #
-            or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
-            or (cp >= 0xF900 and cp <= 0xFAFF)    #
-            or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
+            or (cp >= 0x3400 and cp <= 0x4DBF)
+            or (cp >= 0x20000 and cp <= 0x2A6DF)
+            or (cp >= 0x2A700 and cp <= 0x2B73F)
+            or (cp >= 0x2B740 and cp <= 0x2B81F)
+            or (cp >= 0x2B820 and cp <= 0x2CEAF)
+            or (cp >= 0xF900 and cp <= 0xFAFF)
+            or (cp >= 0x2F800 and cp <= 0x2FA1F)
         ):  
             return True
 
@@ -115,8 +108,7 @@ class DetokenizeManager:
 
     @staticmethod
     def _find_printable_text(text: str):
-        """Returns the longest printable substring of text that contains only entire words."""
-        # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
+
 
         if text.endswith("\n"):
             return text

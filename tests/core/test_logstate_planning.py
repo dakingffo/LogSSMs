@@ -6,6 +6,37 @@ import torch
 from logssms.kernel import logstate as planning
 
 
+def eviction_oracle(nodes):
+    from collections import defaultdict
+
+    rows = {row[0]: row for row in nodes}
+    indices = {row[0]: i for i, row in enumerate(nodes)}
+    children = defaultdict(set)
+    for row in nodes:
+        if row[1] in rows:
+            children[row[1]].add(row[0])
+    remaining = set(rows)
+    order = []
+    while True:
+        leaves = [uuid for uuid in remaining if not children[uuid] and not rows[uuid][2]]
+        if not leaves:
+            return order
+        uuid = min(leaves, key=lambda uuid: (rows[uuid][3], rows[uuid][4], uuid))
+        order.append(indices[uuid])
+        remaining.remove(uuid)
+        children[rows[uuid][1]].discard(uuid)
+
+
+def eviction_chains(count, length, checkpoint=False):
+    nodes = [(0, -1, 1, 0, 0)]
+    for chain in range(count):
+        for position in range(length):
+            uuid = len(nodes)
+            nodes.append((uuid, 0 if position == 0 else uuid - 1, 0,
+                          int(checkpoint), chain * 10 + position))
+    return nodes
+
+
 @pytest.mark.parametrize("granularity", [16, 32, 64])
 def test_native_branches_preserve_token_prefixes_and_ignore_partial_granules(granularity):
     common = torch.arange(granularity, dtype=torch.int64)
@@ -94,7 +125,6 @@ def test_native_metadata_validation_precedes_pointer_access():
 
 
 def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
-    import heapq
     from collections import Counter
 
     rng = random.Random(381)
@@ -106,20 +136,7 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
             locked[parents[i]] |= locked[i]
         nodes = [(i, parents[i], locked[i], rng.randrange(2), rng.randrange(100))
                  for i in range(count)]
-        children = Counter(parents[1:])
-        heap = [(row[3], row[4], row[0]) for row in nodes
-                if not locked[row[0]] and not children[row[0]]]
-        heapq.heapify(heap)
-        order = []
-        while heap:
-            _, _, i = heapq.heappop(heap)
-            order.append(i)
-            parent = parents[i]
-            if parent >= 0:
-                children[parent] -= 1
-                if not children[parent] and not locked[parent]:
-                    row = nodes[parent]
-                    heapq.heappush(heap, (row[3], row[4], row[0]))
+        order = eviction_oracle(nodes)
         assert planning.eviction_candidates(nodes) == order
 
         page_refs = [[rng.randrange(10) for _ in range(rng.randrange(4))]
@@ -137,7 +154,7 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         own_decay = Counter(row[3] for row in slots if row[3] >= 0)
         occupied = [(frame, rng.randrange(max(1, own_decay[frame]), 5)) for frame in range(3)]
         config = [rng.randrange(3), sum(4 - n for _, n in occupied), 2, 1, 2, 4,
-                  rng.randrange(1, 12), rng.randrange(1, 12), rng.randrange(3)]
+                  rng.randrange(1, 12), rng.randrange(1, 12), rng.randrange(3), 2]
         selected, pages, refs, released = [], Counter(), Counter(), set()
         expected = []
         for i in order:
@@ -165,9 +182,111 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
                         + (max(0, config[7] - decay) + 3) // 4)
             if required <= free:
                 expected = [selected, [v for pair in pages.items() for v in pair],
-                            sorted(released)]
+                            sorted(released), []]
                 break
-        assert planning.plan_eviction(nodes, kv, slot_refs, slots, occupied, config) == expected
+        assert planning.plan_eviction(
+            nodes, kv, slot_refs, slots, occupied, config, (),
+        ) == expected
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_eviction_globally_orders_cold_nodes_without_chain_rotation(checkpoint):
+    nodes = eviction_chains(6, 3, checkpoint)
+    assert planning.eviction_candidates(nodes) == [
+        3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10, 15, 14, 13, 18, 17, 16,
+    ]
+
+
+def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
+    nodes = eviction_chains(5, 2)
+    uuid, parent, locked, kind, _ = nodes[1]
+    nodes[1] = (uuid, parent, locked, kind, 999)
+    expected = [2, 4, 3, 6, 5, 8, 7, 10, 9, 1]
+    assert planning.eviction_candidates(nodes) == expected
+    # Input row order is not a chain identity or priority.
+    rng = random.Random(12)
+    rng.shuffle(nodes)
+    assert [nodes[i][0] for i in planning.eviction_candidates(nodes)] == expected
+
+
+def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_locks():
+    nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 0, 1000),
+             (2, 1, 0, 0, 1), (3, 2, 0, 0, 1),
+             (4, 1, 0, 0, 2), (5, 4, 0, 0, 2),
+             (6, 0, 1, 0, 0), (7, 6, 0, 0, 3)]
+    assert planning.eviction_candidates(nodes) == [3, 2, 5, 4, 7, 1]
+
+
+def test_small_capacity_requests_select_the_globally_coldest_leaf():
+    nodes = eviction_chains(4, 2)
+    refs = [[]] + [[i] for i in range(1, len(nodes))]
+    slots = [(i, 1, 1, -1, -1) for i in range(1, len(nodes))]
+    result = planning.plan_eviction(
+        nodes, [[] for _ in nodes], refs, slots, [], [0, 0, 1, 0, 1, 1, 1, 0, 0, 1], (),
+    )
+    assert result == [[2], [], [2], []]
+
+
+def test_checkpoint_pressure_thins_one_fixed_heat_snapshot():
+    nodes = eviction_chains(5, 3, checkpoint=True)
+    refs = [[]] + [[i] for i in range(1, len(nodes))]
+    slots = [(i, 1, 1, -1, -1) for i in range(1, len(nodes))]
+    pairs = [(i, i + 1, position * 64, nodes[i][4])
+             for chain in range(5) for position in (1, 2)
+             for i in [chain * 3 + position]]
+    for needed, dropped in [(4, [2, 5, 8, 11]), (5, [2, 5, 8, 11, 14]),
+                            (9, [2, 5, 8, 11, 14, 4, 10, 7, 13])]:
+        result = planning.plan_eviction(
+            nodes, [[] for _ in nodes], refs, slots, [],
+            [0, 0, 1, 0, 1, 1, needed, 0, 0, 1], pairs,
+        )
+        successors, compressed = {}, []
+        for slot in dropped:
+            right = slot + 1
+            while right in successors:
+                right = successors[right]
+            successors[slot] = right
+            compressed.extend((slot, right))
+        assert result == [[], [], sorted(dropped), compressed]
+
+
+def test_eviction_prunes_logs_before_dropping_private_checkpoints():
+    nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 1, 100),
+             (2, 1, 0, 1, 1), (3, 0, 0, 0, 999)]
+    refs = [[], [10], [11], [12]]
+    slots = [(10, 1, 3, -1, -1), (11, 1, 3, -1, -1), (12, 1, 8, -1, -1)]
+    pairs = [(10, 11, 256, 100)]
+    config = [0, 0, 3, 0, 1, 1, 8, 0, 0, 3]
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
+        [3], [], [12], [],
+    ]
+    config[6] = 11
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
+        [3], [], [10, 12], [10, 11],
+    ]
+    config[6] = 14
+    # Falling back to pruning the newer leaf must not release slot 10 twice.
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
+        [3, 2], [], [10, 11, 12], [10, 11],
+    ]
+
+
+def test_eviction_keeps_coldest_candidate_until_later_thinning_pass():
+    nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 1, 999),
+             (2, 1, 0, 1, 1), (3, 2, 0, 1, 0)]
+    refs = [[], [10], [11], [12]]
+    slots = [(slot, 1, 3, -1, -1) for slot in (10, 11, 12)]
+    pairs = [(11, 12, 384, 1), (10, 11, 256, 999)]
+    config = [0, 0, 3, 0, 1, 1, 3, 0, 0, 3]
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
+        [], [], [10], [10, 11],
+    ]
+    config[6] = 6
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
+        [], [], [10, 11], [10, 11, 11, 12],
+    ]
+    config[6] = 100
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == []
 
 
 def test_native_protections_deduplicate_forced_and_batch_branches():

@@ -50,11 +50,11 @@ def _jit_state_store_module(
 
 
 def store_cache(
-    k_cache: torch.Tensor, # [N, H, D]
-    v_cache: torch.Tensor, # [N, H, D]
-    indices: torch.Tensor, # [T]
-    k      : torch.Tensor, # [T, H, D]
-    v      : torch.Tensor, # [T, H ,D]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    k      : torch.Tensor,
+    v      : torch.Tensor,
 ) -> None:
     num_tokens = k_cache.shape[0]
     k_cache = k_cache.view(num_tokens, -1)
@@ -67,9 +67,9 @@ def store_cache(
 
 
 def store_state(
-    pool   : torch.Tensor, # [N, ...]
-    indices: torch.Tensor, # [T]
-    states : torch.Tensor, # [T, ...]
+    pool   : torch.Tensor,
+    indices: torch.Tensor,
+    states : torch.Tensor,
 ) -> None:
     assert pool.device == states.device == indices.device
     assert pool.dtype == states.dtype

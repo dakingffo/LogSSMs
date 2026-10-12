@@ -9,7 +9,6 @@ import triton.language as tl
 
 @dataclass(frozen=True)
 class PackedConvStateIO:
-    """Per-token snapshot destinations; -1 suppresses a boundary write."""
 
     storage     : torch.Tensor
     slots       : torch.Tensor
@@ -25,9 +24,9 @@ def _conv_destination(
     storage, frames, slot, granule,
     C: tl.constexpr, S: tl.constexpr, LAYER: tl.constexpr,
     SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
-    FRAMED: tl.constexpr, NUM_GRANULES: tl.constexpr, FRAME_ELEMS: tl.constexpr,
+    LOGSTATE: tl.constexpr, NUM_GRANULES: tl.constexpr, FRAME_ELEMS: tl.constexpr,
 ):
-    if FRAMED:
+    if LOGSTATE:
         frame = tl.load(frames + slot * NUM_GRANULES + granule, slot >= 0, other=0).to(tl.int64)
         return storage + frame * FRAME_ELEMS + LAYER * C * S
     return storage + slot.to(tl.int64) * SLOT_STRIDE + LAYER * LAYER_STRIDE
@@ -41,7 +40,7 @@ def _packed_conv_kernel(
     X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    STORE_STATE: tl.constexpr, FRAMED: tl.constexpr, STORE_FINAL: tl.constexpr,
+    STORE_STATE: tl.constexpr, LOGSTATE: tl.constexpr, STORE_FINAL: tl.constexpr,
     LAYER: tl.constexpr, SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
     NUM_GRANULES: tl.constexpr, FRAME_ELEMS: tl.constexpr,
 ):
@@ -55,19 +54,19 @@ def _packed_conv_kernel(
     active = (t[:, None] < end - begin) & (c[None, :] < C)
     if STORE_STATE:
         slot = tl.load(write_slots + begin + t, t < end - begin, other=-1)
-        if FRAMED:
+        if LOGSTATE:
             granule = tl.load(write_granules + begin + t, t < end - begin, other=0)
         else:
             granule = tl.full((BT,), 0, tl.int32)
         destination = _conv_destination(
             state_storage, conv_frames, slot, granule, C, S, LAYER,
-            SLOT_STRIDE, LAYER_STRIDE, FRAMED, NUM_GRANULES, FRAME_ELEMS,
+            SLOT_STRIDE, LAYER_STRIDE, LOGSTATE, NUM_GRANULES, FRAME_ELEMS,
         )
         if STORE_FINAL:
             final_slot = tl.load(final_slots + request)
             final_destination = _conv_destination(
                 state_storage, conv_frames, final_slot, 0, C, S, LAYER,
-                SLOT_STRIDE, LAYER_STRIDE, FRAMED, NUM_GRANULES, FRAME_ELEMS,
+                SLOT_STRIDE, LAYER_STRIDE, LOGSTATE, NUM_GRANULES, FRAME_ELEMS,
             )
     result = tl.full((BT, BC), 0, tl.float32)
     for tap in range(K):
@@ -141,18 +140,17 @@ def packed_causal_conv1d(
     *,
     state_io     : PackedConvStateIO | None = None,
 ) -> torch.Tensor:
-    """Depthwise causal conv over packed requests, without per-request launches."""
     total_tokens, channels = x.shape
     kernel_size = weight.shape[-1]
     state_len = kernel_size - 1
     assert history.shape == (len(cu_seqlens) - 1, channels, state_len)
     assert weight.shape == (channels, 1, kernel_size)
     direct = state_io is not None
-    framed = direct and state_io.frame_table is not None
+    logstate = direct and state_io.frame_table is not None
     if direct:
         assert state_io.slots.shape == (total_tokens,)
         assert state_io.storage.dtype == x.dtype and state_io.storage.device == x.device
-        if framed:
+        if logstate:
             assert state_io.granules is not None and state_io.granules.shape == (total_tokens,)
             assert state_io.frame_table.shape[2] == 1
             assert state_io.frame_bytes % x.element_size() == 0
@@ -165,17 +163,17 @@ def packed_causal_conv1d(
         x, weight, bias, history, cu_seqlens, chunk_indices, output,
         state_io.storage if direct else None,
         state_io.slots if direct else None,
-        state_io.granules if framed else None,
+        state_io.granules if logstate else None,
         state_io.final_slots if direct else None,
-        state_io.frame_table if framed else None,
+        state_io.frame_table if logstate else None,
         channels, kernel_size, state_len, x.stride(0), x.stride(1),
-        64, 32, bias is not None, direct, framed,
+        64, 32, bias is not None, direct, logstate,
         direct and state_io.final_slots is not None,
         state_io.layer if direct else 0,
-        state_io.storage.stride(0) if direct and not framed else 0,
-        state_io.storage.stride(1) if direct and not framed else 0,
-        state_io.frame_table.shape[1] if framed else 0,
-        state_io.frame_bytes // x.element_size() if framed else 0,
+        state_io.storage.stride(0) if direct and not logstate else 0,
+        state_io.storage.stride(1) if direct and not logstate else 0,
+        state_io.frame_table.shape[1] if logstate else 0,
+        state_io.frame_bytes // x.element_size() if logstate else 0,
         num_warps=4,
     )
     return output

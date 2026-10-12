@@ -1,17 +1,20 @@
 import pytest
 import torch
 
-from logssms.cache.logstate_pool.frame_pool import FramedMHALogStatePool
+from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from tests.logstate_helpers import head_view
-from logssms.core import Batch, Context, Request, clear_global_ctx, set_global_ctx
+from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend
-from logssms.kernel.linear_attention.framed_logstate import construct_framed_log_state_chains
-from logssms.kernel.linear_attention.framed_logstate import restore_framed_log_state_chains
+from logssms.kernel.linear_attention.logstate import construct_log_state_chains
+from logssms.kernel.linear_attention.logstate import restore_log_state_chains
+from logssms.kernel.linear_attention.logstate import copy_states
 from logssms.kernel.linear_attention.vendor.fla import (
-    fused_recurrent_gated_delta_rule_to_framed_logstate,
+    fused_recurrent_gated_delta_rule_to_logstate,
     fused_recurrent_gated_delta_rule,
 )
+from tests.logstate_helpers import decay_view
+from tests.utils import clear_global_ctx
 
 
 def _make_request(cached_len: int, device_len: int) -> Request:
@@ -27,8 +30,8 @@ def _make_request(cached_len: int, device_len: int) -> Request:
     )
 
 
-def _make_pool(device: torch.device) -> FramedMHALogStatePool:
-    pool = FramedMHALogStatePool(
+def _make_pool(device: torch.device) -> MHALogStatePool:
+    pool = MHALogStatePool(
         num_frames=64,
         page_size=64,
         granularity=16,
@@ -436,19 +439,20 @@ def test_logstate_decode_graph_metadata_uses_int32_capture_buffers() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("batch_size", [1, 4])
-def test_framed_recurrent_auto_tile_matches_reference_for_128d_heads(
+@pytest.mark.parametrize("batch_size", [1, 4, 32, 64])
+def test_logstate_recurrent_auto_tile_matches_reference_for_128d_heads(
     batch_size: int,
 ) -> None:
     device = torch.device("cuda")
-    pool = FramedMHALogStatePool(
-        num_frames=64, page_size=64, granularity=16,
+    pool = MHALogStatePool(
+        num_frames=max(64, batch_size * 10 + 1), page_size=64, granularity=16,
         num_attention_layers=1, num_kv_heads=1, head_dim=128,
         num_linear_layers=1, num_key_heads=2, num_value_heads=2,
         head_k_dim=128, head_v_dim=128, conv_dim=768, state_len=3,
         device=device, dtype=torch.bfloat16,
     )
-    assert pool.reserve(logs=4, works=4) is not None
+    allocated = pool.reserve(logs=batch_size, works=batch_size)
+    assert allocated is not None
     torch.manual_seed(96)
     query = torch.randn(batch_size, 1, 2, 128, device=device, dtype=pool.dtype)
     key = torch.randn_like(query)
@@ -457,15 +461,15 @@ def test_framed_recurrent_auto_tile_matches_reference_for_128d_heads(
     beta = torch.randn_like(gate)
     A_log = torch.zeros(2, device=device)
     dt_bias = torch.zeros(2, device=device)
-    work = torch.arange(4, 4 + batch_size, device=device, dtype=torch.int32)
-    logs = torch.arange(batch_size, device=device, dtype=torch.int32)
+    work = torch.tensor(allocated[2], device=device, dtype=torch.int32)
+    logs = torch.tensor(allocated[1], device=device, dtype=torch.int32)
     offsets = torch.zeros(batch_size, device=device, dtype=torch.int32)
     initial = torch.randn(batch_size, 2, 128, 128, device=device, dtype=pool.dtype)
     pool.write_states(work, 0, initial)
     expected, expected_state, *_ = fused_recurrent_gated_delta_rule(
         query, key, value, gate, beta, A_log, dt_bias, initial
     )
-    actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
+    actual = fused_recurrent_gated_delta_rule_to_logstate(
         query, key, value, gate, beta, A_log, dt_bias,
         pool, work, logs, offsets, 0,
         torch.zeros(batch_size, dtype=torch.int32, device=device),
@@ -499,7 +503,7 @@ def test_decode_replays_log_and_commits_work_only_at_granule_end(
         expected, states = fused_recurrent_gated_delta_rule(
             query, key, value, gate, beta, A_log, dt_bias, baseline
         )[:2]
-        actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        actual = fused_recurrent_gated_delta_rule_to_logstate(
             query, key, value, gate, beta, A_log, dt_bias,
             pool, work, log,
             torch.tensor([first_offset + step], dtype=torch.int32, device=device),
@@ -534,7 +538,7 @@ def test_decode_eager_state_writes_work_every_token() -> None:
         expected, states = fused_recurrent_gated_delta_rule(
             query, key, value, gate, beta, A_log, dt_bias, initial
         )[:2]
-        actual = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        actual = fused_recurrent_gated_delta_rule_to_logstate(
             query, key, value, gate, beta, A_log, dt_bias,
             pool, work, log,
             torch.tensor([20 + step], dtype=torch.int32, device=device),
@@ -565,7 +569,7 @@ def test_gemm_replay_matches_eager_window(granularity: int) -> None:
     initial = torch.randn(batch_size, 2, 128, 128, device=device, dtype=dtype) * 0.02
 
     def run(mode: str) -> tuple[torch.Tensor, torch.Tensor]:
-        pool = FramedMHALogStatePool(
+        pool = MHALogStatePool(
             num_frames=128, page_size=64, granularity=granularity,
             num_attention_layers=1, num_kv_heads=1, head_dim=128,
             num_linear_layers=1, num_key_heads=2, num_value_heads=2,
@@ -578,7 +582,7 @@ def test_gemm_replay_matches_eager_window(granularity: int) -> None:
         pool.write_states(work, 0, initial)
         outputs = []
         for step in range(granularity):
-            output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+            output = fused_recurrent_gated_delta_rule_to_logstate(
                 query[:, step:step + 1].contiguous(),
                 key[:, step:step + 1].contiguous(),
                 value[:, step:step + 1].contiguous(),
@@ -623,7 +627,7 @@ def test_replay_count_and_offset_are_mutable_cuda_graph_inputs() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = fused_recurrent_gated_delta_rule_to_framed_logstate(
+        captured_output = fused_recurrent_gated_delta_rule_to_logstate(
             query, key, value, gate, beta, A_log, dt_bias,
             pool, work, log, offsets, 0, counts,
         )
@@ -709,7 +713,7 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
             key = log[token * 32:(token + 1) * 32].float()
             value_begin = 64 * 32 + token * 32
             value = log[value_begin:value_begin + 32].float()
-            state[head] = state[head] * pool.decay_view(0)[0, token, head].exp() + key[:, None] * value[None, :]
+            state[head] = state[head] * decay_view(pool, 0)[0, token, head].exp() + key[:, None] * value[None, :]
     torch.testing.assert_close(
         pool.read_states(torch.tensor([2], dtype=torch.int32, device=device), 0)[0].float(),
         state,
@@ -735,7 +739,7 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
     clear_global_ctx()
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=96,
         page_size=64,
         granularity=16,
@@ -802,7 +806,7 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
             torch.tensor([works[0]], dtype=torch.int32, device=device), 0
         ).clone()
         restored = torch.tensor([works[1]], dtype=torch.int32, device=device)
-        restore_framed_log_state_chains(
+        restore_log_state_chains(
             pool,
             [(None, [(slot, 0, 64) for slot in logs[:4]]
               + [(logs[4], 0, 16)], works[1])],
@@ -828,7 +832,7 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
     device = torch.device("cuda")
     dtype = torch.bfloat16
     config = GatedDeltaConfig(16, 16, 128, 128, 6144, 3, 0)
-    pool = FramedMHALogStatePool(
+    pool = MHALogStatePool(
         num_frames=128,
         page_size=64,
         granularity=16,
@@ -882,7 +886,7 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
         full_state = pool.read_states(
             torch.tensor([work_slot], dtype=torch.int32, device=device), 0
         ).clone()
-        restore_framed_log_state_chains(
+        restore_log_state_chains(
             pool, [(None, [(log_slot, 0, 16)], restored_slot)]
         )
         actual = pool.read_states(
@@ -1012,14 +1016,14 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
         first = run(resumed_ctx, 0, 64)
         pool = resumed_ctx.linear_state
         expected_state = pool.read_states(torch.tensor([2], dtype=torch.int32, device=device), 0).clone()
-        construct_framed_log_state_chains(
+        construct_log_state_chains(
             pool,
             [(None, [(0, 0, 64)], [(
                 0 if materialized else 2,
             )])],
         )
         if materialized:
-            pool.copy_state(0, 2)
+            copy_states(pool, [0], [2])
         source = torch.tensor([0], dtype=torch.int32, device=device)
         destination = torch.tensor([2], dtype=torch.int32, device=device)
         pool.write_conv(

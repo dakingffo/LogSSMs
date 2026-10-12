@@ -36,7 +36,7 @@ class EngineConfig:
     distributed_timeout     : float            = 60.0
     use_dummy_weight        : bool             = False
     max_seq_len_override    : int | None       = None
-    num_page_override       : int | None       = None  # if not None, will override the number of pages
+    num_page_override       : int | None       = None
     cache_type              : str              = "radix"
     cache_config            : BaseCacheConfig  = field(
         default_factory=_make_default_cache_config

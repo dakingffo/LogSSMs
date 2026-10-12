@@ -1,4 +1,3 @@
-# Diagnostics: SIGUSR1 to any logssms process dumps its Python stacks (faulthandler).
 import faulthandler
 import signal
 

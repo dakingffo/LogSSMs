@@ -8,7 +8,7 @@
 
 namespace logssms {
 
-struct FramedLogStoreParams {
+struct LogStoreParams {
   std::uint8_t *__restrict__ storage;
   const std::int32_t *__restrict__ payload_frames;
   const std::int32_t *__restrict__ decay_frames;
@@ -22,8 +22,11 @@ struct FramedLogStoreParams {
   std::int64_t head_payload_bytes;
   std::int64_t decay_record_bytes;
   std::int64_t num_heads;
+  std::int64_t num_key_heads;
+  std::int64_t input_key_heads;
   std::int64_t num_tokens;
   std::int64_t layer;
+  std::int64_t num_layers;
   std::int64_t key_bytes;
   std::int64_t value_bytes;
   std::int64_t key_row_bytes;
@@ -31,9 +34,10 @@ struct FramedLogStoreParams {
   std::int64_t decay_row;
 };
 
-template <std::size_t kPageSize, std::size_t kHeadKDim, std::size_t kHeadVDim>
-__global__ void framed_log_store_kernel(
-  const __grid_constant__ FramedLogStoreParams params
+template <std::size_t kPageSize, std::size_t kHeadKDim, std::size_t kHeadVDim,
+          std::size_t kGranularity>
+__global__ void log_store_kernel(
+  const __grid_constant__ LogStoreParams params
 ) {
   const auto row = blockIdx.x;
   const auto token = row / params.num_heads;
@@ -43,24 +47,35 @@ __global__ void framed_log_store_kernel(
   }
   const auto slot = params.slots[token];
   const auto position = params.token_offsets[token];
-  const auto head_offset =
-    (params.layer * params.num_heads + head) * params.head_payload_bytes;
-  const auto frame_index = head_offset / params.frame_bytes;
-  const auto in_frame = head_offset % params.frame_bytes;
-  const auto frame = params.payload_frames[
-    slot * params.payload_frames_per_slot + frame_index
-  ];
-  auto *payload = params.storage + frame * params.frame_bytes + in_frame;
+  const auto head_granule = params.head_payload_bytes / (kPageSize / kGranularity);
+  const auto key_head = head / (params.num_heads / params.num_key_heads);
+  const auto layer_bytes = params.num_key_heads == params.num_heads
+    ? params.num_heads * head_granule
+    : kGranularity * (params.num_key_heads * params.key_bytes + params.num_heads * params.value_bytes);
+  const auto layer_offset = (position / kGranularity * params.num_layers + params.layer) * layer_bytes;
+  const auto key_offset = layer_offset
+    + (position % kGranularity * params.num_key_heads + key_head) * params.key_bytes;
+  const auto value_offset = layer_offset + kGranularity * params.num_key_heads * params.key_bytes
+    + (position % kGranularity * params.num_heads + head) * params.value_bytes;
   const auto *key = params.keys
-      + token * params.key_row_bytes + head * params.key_bytes;
+      + token * params.key_row_bytes
+      + (params.input_key_heads == params.num_heads ? head : key_head) * params.key_bytes;
   const auto *value = params.residual_values
       + token * params.value_row_bytes + head * params.value_bytes;
-  for (auto index = threadIdx.x; index < params.key_bytes; index += blockDim.x) {
-    payload[position * params.key_bytes + index] = key[index];
+  for (auto index = threadIdx.x; head % (params.num_heads / params.num_key_heads) == 0
+       && index < params.key_bytes; index += blockDim.x) {
+    const auto offset = key_offset + index;
+    const auto frame = params.payload_frames[
+      slot * params.payload_frames_per_slot + offset / params.frame_bytes
+    ];
+    params.storage[frame * params.frame_bytes + offset % params.frame_bytes] = key[index];
   }
   for (auto index = threadIdx.x; index < params.value_bytes; index += blockDim.x) {
-    payload[kPageSize * params.key_bytes + position * params.value_bytes + index]
-      = value[index];
+    const auto offset = value_offset + index;
+    const auto frame = params.payload_frames[
+      slot * params.payload_frames_per_slot + offset / params.frame_bytes
+    ];
+    params.storage[frame * params.frame_bytes + offset % params.frame_bytes] = value[index];
   }
   if (threadIdx.x == 0) {
     const auto decay_frame = params.decay_frames[slot * 2];
@@ -74,8 +89,10 @@ __global__ void framed_log_store_kernel(
   }
 }
 
-template <std::size_t page_size, std::size_t head_k_dim, std::size_t head_v_dim>
-struct FramedLogStateKernel {
+template <std::size_t page_size, std::size_t head_k_dim, std::size_t head_v_dim,
+          std::size_t granularity>
+struct LogStateKernel {
+  static_assert(granularity > 0 && page_size % granularity == 0);
   static void store(
     const tvm::ffi::TensorView storage,
     const tvm::ffi::TensorView payload_frames,
@@ -87,7 +104,9 @@ struct FramedLogStateKernel {
     const tvm::ffi::TensorView decays,
     std::int64_t layer,
     std::int64_t head_payload_bytes,
-    std::int64_t decay_record_bytes
+    std::int64_t decay_record_bytes,
+    std::int64_t num_layers,
+    std::int64_t num_key_heads
   ) {
     using namespace host;
     auto num_frames = SymbolicSize{"num_frames"};
@@ -96,6 +115,7 @@ struct FramedLogStateKernel {
     auto num_payload_frames = SymbolicSize{"num_payload_frames"};
     auto num_tokens = SymbolicSize{"num_tokens"};
     auto num_heads = SymbolicSize{"num_heads"};
+    auto input_key_heads = SymbolicSize{"input_key_heads"};
     auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     TensorMatcher({num_frames, frame_bytes})
@@ -118,7 +138,7 @@ struct FramedLogStateKernel {
         .with_device(device)
         .verify(slots)
         .verify(token_offsets);
-    TensorMatcher({num_tokens, num_heads, head_k_dim})
+    TensorMatcher({num_tokens, input_key_heads, head_k_dim})
         .with_strides({-1, head_k_dim, 1})
         .with_dtype(dtype)
         .with_device(device)
@@ -137,7 +157,11 @@ struct FramedLogStateKernel {
     const auto itemsize = dtype_bytes(dtype.unwrap());
     const auto key_bytes = head_k_dim * itemsize;
     const auto value_bytes = head_v_dim * itemsize;
-    runtime_assert(layer >= 0);
+    runtime_assert(num_layers > 0 && layer >= 0 && layer < num_layers);
+    runtime_assert(num_key_heads > 0 && num_heads.unwrap() % num_key_heads == 0);
+    runtime_assert(input_key_heads.unwrap() == num_key_heads || input_key_heads.unwrap() == num_heads.unwrap());
+    runtime_assert(num_layers * num_heads.unwrap() * head_payload_bytes
+      <= num_payload_frames.unwrap() * frame_bytes.unwrap());
     runtime_assert(head_payload_bytes >= page_size * (key_bytes + value_bytes));
     runtime_assert(head_payload_bytes <= frame_bytes.unwrap());
     runtime_assert(frame_bytes.unwrap() % head_payload_bytes == 0);
@@ -147,7 +171,7 @@ struct FramedLogStateKernel {
       return;
     }
 
-    const auto params = FramedLogStoreParams{
+    const auto params = LogStoreParams{
       .storage = static_cast<std::uint8_t *>(storage.data_ptr()),
       .payload_frames = static_cast<const std::int32_t *>(payload_frames.data_ptr()),
       .decay_frames = static_cast<const std::int32_t *>(decay_frames.data_ptr()),
@@ -161,8 +185,11 @@ struct FramedLogStateKernel {
       .head_payload_bytes = head_payload_bytes,
       .decay_record_bytes = decay_record_bytes,
       .num_heads = num_heads.unwrap(),
+      .num_key_heads = num_key_heads,
+      .input_key_heads = input_key_heads.unwrap(),
       .num_tokens = num_tokens.unwrap(),
       .layer = layer,
+      .num_layers = num_layers,
       .key_bytes = static_cast<std::int64_t>(key_bytes),
       .value_bytes = static_cast<std::int64_t>(value_bytes),
       .key_row_bytes = keys.stride(0) * itemsize,
@@ -170,9 +197,9 @@ struct FramedLogStateKernel {
       .decay_row = decays.stride(0),
     };
     LaunchKernel(params.num_tokens * params.num_heads, 128, device.unwrap())(
-      framed_log_store_kernel<page_size, head_k_dim, head_v_dim>, params
+      log_store_kernel<page_size, head_k_dim, head_v_dim, granularity>, params
     );
   }
 };
 
-} // namespace logssms
+}

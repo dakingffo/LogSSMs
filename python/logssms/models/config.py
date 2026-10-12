@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class LinearCacheSpec:
-    """Per-TP-rank storage requirements, independent of decoder layer layout."""
 
     recurrent_type: str
     num_layers    : int
@@ -26,7 +25,6 @@ class LinearCacheSpec:
 
 @dataclass(frozen=True)
 class AffineLogCacheSpec(LinearCacheSpec):
-    """Per-head rank-one updates plus scalar decay, grouped across heads."""
 
     num_groups: int
 
@@ -74,7 +72,6 @@ class ModelConfig:
     def shard_weight(
         self, name: str, tensor: torch.Tensor, rank: int, tp_size: int,
     ) -> torch.Tensor | None:
-        """Override packed architecture-specific layouts; None uses common sharding."""
         return None
 
 

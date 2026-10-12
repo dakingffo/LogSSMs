@@ -15,7 +15,7 @@ class DecodeManager(ARManagerBase):
         for uid, req in sorted(
             self.running_reqs.items(), 
             key=lambda x: x[0] in self.inflight_uids[0]
-            # prioritize the requests that have not been scheduled in the last iteration
+
         ):
             if scheduled_token >= self.token_budget:
                 break

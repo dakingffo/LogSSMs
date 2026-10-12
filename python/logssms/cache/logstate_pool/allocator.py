@@ -11,20 +11,20 @@ class DecayRecord:
 
 
 @dataclass(frozen=True)
-class LinearFrameSlot:
+class LinearCacheSlot:
     payload: tuple[int, ...]
     conv: tuple[tuple[int, ...], ...]
     decay: DecayRecord | None
     kind: Literal["log", "work", "checkpoint"]
 
 
-class LogStateFrameAllocator:
-    """One physical frame pool for KV, linear payload and side information.
+@dataclass(frozen=True)
+class RetiredResources:
+    frames: tuple[int, ...]
+    decays: tuple[DecayRecord, ...]
 
-    A logical linear slot owns independent frames, so no allocation requires
-    adjacent physical addresses. Only the small decay records share a frame.
-    Slot identifiers remain stable when a log is materialized in place.
-    """
+
+class LogStateAllocator:
 
     def __init__(
         self,
@@ -35,6 +35,7 @@ class LogStateFrameAllocator:
         conv_snapshot_bytes: int,
         decay_bytes        : int,
         num_granules       : int,
+        log_payload_bytes  : int | None = None,
     ) -> None:
         assert num_frames > 0 and frame_bytes > 0
         assert payload_bytes > 0 and conv_snapshot_bytes > 0 and decay_bytes > 0
@@ -43,12 +44,16 @@ class LogStateFrameAllocator:
         self.num_frames = num_frames
         self.frame_bytes = frame_bytes
         self.payload_frames = (payload_bytes + frame_bytes - 1) // frame_bytes
+        self.log_payload_frames = self.payload_frames if log_payload_bytes is None else (
+            log_payload_bytes + frame_bytes - 1
+        ) // frame_bytes
+        assert 0 < self.log_payload_frames <= self.payload_frames
         self.conv_frames = (conv_snapshot_bytes + frame_bytes - 1) // frame_bytes
         self.decay_records_per_frame = frame_bytes // decay_bytes
         self.num_granules = num_granules
         self._free = list(range(num_frames - 1, -1, -1))
         self._kv: set[int] = set()
-        self._slots: dict[int, LinearFrameSlot] = {}
+        self._slots: dict[int, LinearCacheSlot] = {}
         self._next_slot = 0
         self._free_slot_ids: list[int] = []
         self._decay_masks: dict[int, int] = {}
@@ -59,9 +64,9 @@ class LogStateFrameAllocator:
         self._reclaimable_decay_masks: dict[int, int] = {}
         self._reclaimable_decay_records = 0
         self._reclaimable_decay_frames = 0
+        self._retired_resources: dict[int, RetiredResources] = {}
 
     def set_reclaimable(self, slot: int, reclaimable: bool) -> None:
-        """Update the exact projection when tree locks or retirement change."""
         if reclaimable == (slot in self._reclaimable_slots):
             return
         record = self._slots[slot]
@@ -74,17 +79,20 @@ class LogStateFrameAllocator:
             len(record.payload) + sum(map(len, record.conv))
         )
         if record.decay is not None:
-            frame, index = record.decay.frame, record.decay.index
-            mask = self._reclaimable_decay_masks.get(frame, 0)
-            occupied = self._decay_masks[frame]
-            self._reclaimable_decay_frames -= int(mask == occupied)
-            mask = mask | (1 << index) if reclaimable else mask & ~(1 << index)
-            if mask:
-                self._reclaimable_decay_masks[frame] = mask
-            else:
-                self._reclaimable_decay_masks.pop(frame, None)
-            self._reclaimable_decay_frames += int(mask == occupied)
-            self._reclaimable_decay_records += delta
+            self._set_decay_reclaimable(record.decay, reclaimable)
+
+    def _set_decay_reclaimable(self, record: DecayRecord, reclaimable: bool) -> None:
+        frame, index = record.frame, record.index
+        mask = self._reclaimable_decay_masks.get(frame, 0)
+        occupied = self._decay_masks[frame]
+        self._reclaimable_decay_frames -= int(mask == occupied)
+        mask = mask | (1 << index) if reclaimable else mask & ~(1 << index)
+        if mask:
+            self._reclaimable_decay_masks[frame] = mask
+        else:
+            self._reclaimable_decay_masks.pop(frame, None)
+        self._reclaimable_decay_frames += int(mask == occupied)
+        self._reclaimable_decay_records += 1 if reclaimable else -1
 
     def _set_decay_mask(self, frame: int, mask: int) -> None:
         reclaimable = self._reclaimable_decay_masks.get(frame, 0)
@@ -108,17 +116,17 @@ class LogStateFrameAllocator:
     def allocated_slots(self) -> frozenset[int]:
         return frozenset(self._slots)
 
-    def slot(self, slot: int) -> LinearFrameSlot:
+    def slot(self, slot: int) -> LinearCacheSlot:
         return self._slots[slot]
 
     def profile_usage(self) -> dict[str, int]:
-        """Physical ownership accounting; only called by the opt-in profiler."""
         kinds = {"log": 0, "checkpoint": 0, "work": 0}
         payload_frames = conv_frames = 0
         for record in self._slots.values():
             kinds[record.kind] += 1
             payload_frames += len(record.payload)
             conv_frames += sum(map(len, record.conv))
+        payload_frames += sum(len(record.frames) for record in self._retired_resources.values())
         return {
             "total_frames": self.num_frames,
             "free_frames": self.free_frames,
@@ -176,10 +184,10 @@ class LogStateFrameAllocator:
         if slot == self._next_slot:
             self._next_slot += 1
         granules = self.num_granules if kind == "log" else 1
-        payload = self._take_frames(self.payload_frames)
+        payload = self._take_frames(self.log_payload_frames if kind == "log" else self.payload_frames)
         conv = tuple(self._take_frames(self.conv_frames) for _ in range(granules))
         decay = self._take_decay() if kind == "log" else None
-        self._slots[slot] = LinearFrameSlot(payload, conv, decay, kind)
+        self._slots[slot] = LinearCacheSlot(payload, conv, decay, kind)
         return slot
 
     def required_frames(
@@ -196,7 +204,7 @@ class LogStateFrameAllocator:
         ) // self.decay_records_per_frame
         return (
             kv
-            + (logs + states) * self.payload_frames
+            + logs * self.log_payload_frames + states * self.payload_frames
             + (logs * self.num_granules + states) * self.conv_frames
             + decay_frames
         )
@@ -204,16 +212,18 @@ class LogStateFrameAllocator:
     def projected_free_capacity(
         self, released_slots: Iterable[int] | None = None,
     ) -> tuple[int, int]:
-        """Free frames and decay records after releasing the given whole slots."""
         if released_slots is None:
             return (
                 self.free_frames + self._reclaimable_frames + self._reclaimable_decay_frames,
                 self._free_decay_records + self._reclaimable_decay_records
                 - self._reclaimable_decay_frames * self.decay_records_per_frame,
             )
-        free_frames = self.free_frames
+        free_frames = self.free_frames + sum(len(record.frames) for record in self._retired_resources.values())
         free_decay_records = self._free_decay_records
         released_decay_masks: dict[int, int] = {}
+        for record in self._retired_resources.values():
+            for decay in record.decays:
+                released_decay_masks[decay.frame] = released_decay_masks.get(decay.frame, 0) | 1 << decay.index
         for slot in set(released_slots):
             record = self._slots[slot]
             free_frames += len(record.payload) + sum(
@@ -238,7 +248,6 @@ class LogStateFrameAllocator:
         return free_frames, free_decay_records
 
     def lock_frame_cost(self, slots: Iterable[int]) -> int:
-        """Exact loss of projected frames, without changing slot/bitmap ownership."""
         frames = 0
         decay_frames = set()
         for slot in slots:
@@ -259,13 +268,12 @@ class LogStateFrameAllocator:
         evictable_slots    : Iterable[int] | None = None,
         free_capacity     : tuple[int, int] | None = None,
     ) -> int:
-        """Maximum KV/Log page pairs with room for the next work slot."""
         free_frames, free_decay_records = (
             self.projected_free_capacity(evictable_slots)
             if free_capacity is None else free_capacity
         )
         free_frames += evictable_kv_frames
-        page_frames = 1 + self.payload_frames + self.num_granules * self.conv_frames
+        page_frames = 1 + self.log_payload_frames + self.num_granules * self.conv_frames
         work_frames = self.payload_frames + self.conv_frames
         upper = max(0, (free_frames - work_frames) // page_frames)
         lower = 0
@@ -282,7 +290,6 @@ class LogStateFrameAllocator:
     def reserve(
         self, *, kv: int = 0, logs: int = 0, states: int = 0
     ) -> tuple[list[int], list[int], list[int]] | None:
-        """Atomically reserve a batch; a failure changes no ownership."""
         assert kv >= 0 and logs >= 0 and states >= 0
         if self.required_frames(kv, logs, states) > self.free_frames:
             return None
@@ -293,26 +300,71 @@ class LogStateFrameAllocator:
         return kv_frames, log_slots, state_slots
 
     def materialize(self, slot: int) -> tuple[int, ...]:
-        """Keep the payload and terminal convolution snapshot in the same slot."""
         record = self._slots[slot]
         assert record.kind == "log" and record.decay is not None
+        assert len(record.payload) == self.payload_frames, "Compact Log needs merged checkpoint storage"
         reclaimable = slot in self._reclaimable_slots
         self.set_reclaimable(slot, False)
         released = tuple(frame for snapshot in record.conv[:-1] for frame in snapshot)
         self._free.extend(released)
         self._release_decay(record.decay)
-        self._slots[slot] = LinearFrameSlot(
+        self._slots[slot] = LinearCacheSlot(
             record.payload, (record.conv[-1],), None, "checkpoint"
         )
         if reclaimable:
             self.set_reclaimable(slot, True)
         return released
 
+    def checkpoint_frame_capacity(self, slots: Iterable[int]) -> int:
+        records = [self._slots[slot] for slot in slots]
+        return sum(len(record.payload) + sum(map(len, record.conv)) for record in records) - self.conv_frames
+
+    def checkpoint_frame_savings(self, slots: Iterable[int]) -> int:
+        slots = tuple(slots)
+        savings = self.checkpoint_frame_capacity(slots) - self.payload_frames
+        decay_masks = {}
+        for slot in slots:
+            decay = self._slots[slot].decay
+            if decay is not None:
+                decay_masks[decay.frame] = decay_masks.get(decay.frame, 0) | (1 << decay.index)
+        return savings + sum(mask == self._decay_masks[frame] for frame, mask in decay_masks.items())
+
+    def coalesce_to_checkpoint(self, slots: tuple[int, ...]) -> RetiredResources:
+        assert len(slots) == len(set(slots)) and len(slots) > 1
+        assert self.checkpoint_frame_capacity(slots) >= self.payload_frames
+        assert self.checkpoint_frame_savings(slots) > 0, "Materialization must release more than its expansion"
+        records = [self._slots[slot] for slot in slots]
+        reclaimable = [slot for slot in slots if slot in self._reclaimable_slots]
+        for slot in reclaimable:
+            self.set_reclaimable(slot, False)
+        terminal = records[-1].conv[-1]
+        frames = [frame for record in reversed(records) for frame in record.payload]
+        frames.extend(frame for record in records for conv in record.conv for frame in conv if frame not in terminal)
+        payload, surplus = tuple(frames[:self.payload_frames]), tuple(frames[self.payload_frames:])
+        for slot in slots[:-1]:
+            self._slots[slot] = LinearCacheSlot((), (), None, "checkpoint")
+        self._slots[slots[-1]] = LinearCacheSlot(payload, (terminal,), None, "checkpoint")
+        retirement = RetiredResources(surplus, tuple(record.decay for record in records if record.decay is not None))
+        self._retired_resources[id(retirement)] = retirement
+        self._reclaimable_frames += len(surplus)
+        for decay in retirement.decays:
+            self._set_decay_reclaimable(decay, True)
+        for slot in reclaimable:
+            self.set_reclaimable(slot, True)
+        return retirement
+
+    def release_retirement(self, record: RetiredResources) -> None:
+        assert self._retired_resources.pop(id(record)) is record
+        self._reclaimable_frames -= len(record.frames)
+        self._free.extend(record.frames)
+        for decay in record.decays:
+            self._set_decay_reclaimable(decay, False)
+            self._release_decay(decay)
+
     def commit_checkpoint(self, slot: int) -> None:
-        """Turn a directly written one-snapshot work slot into a checkpoint."""
         record = self._slots[slot]
         assert record.kind == "work" and record.decay is None
-        self._slots[slot] = LinearFrameSlot(
+        self._slots[slot] = LinearCacheSlot(
             record.payload, record.conv, None, "checkpoint"
         )
 
@@ -336,6 +388,9 @@ class LogStateFrameAllocator:
         assert self.projected_free_capacity() == self.projected_free_capacity(self._reclaimable_slots)
         owned = list(self._kv) + list(self._free) + list(self._decay_masks)
         decay_records: set[DecayRecord] = set()
+        for record in self._retired_resources.values():
+            owned.extend(record.frames)
+            decay_records.update(record.decays)
         for record in self._slots.values():
             owned.extend(record.payload)
             for snapshot in record.conv:

@@ -23,18 +23,13 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def check_environments():
-    """
-    Checks the current operating system, Triton version, and Python version,
-    issuing warnings if they don't meet recommendations.
-    This function's body only runs once due to lru_cache.
-    """
-    # Check Operating System
+
     if sys.platform == 'win32':
-        # Check if triton-windows is installed
+
         try:
             from importlib.metadata import PackageNotFoundError, metadata
             metadata('triton-windows')
-            # triton-windows is installed, no warning needed
+
         except PackageNotFoundError:
             logger.warning(
                 "Detected Windows operating system. Consider installing triton-windows "
@@ -52,7 +47,7 @@ def check_environments():
             "Please consider upgrading Triton.",
         )
 
-    # Check Python version
+
     py_version = package_version.parse(f"{sys.version_info.major}.{sys.version_info.minor}")
     required_py_version = package_version.parse("3.11")
 
@@ -87,13 +82,10 @@ def get_available_device() -> str:
 
 
 def map_triton_backend_to_torch_device() -> str:
-    backend = get_available_device()        # 'cuda' | 'hip' | 'xpu' | 'cpu' | ...
+    backend = get_available_device()
     return {'cuda': 'cuda', 'hip': 'cuda', 'xpu': 'xpu'}.get(backend, backend)
 
 
-# For AMD GPUs, the triton backend is 'hip', while for Nvidia GPUs, the triton backend is 'cuda'.
-# However, the torch backend is 'cuda' for both Nvidia and AMD GPUs.
-# Therefore, we need to check the triton backend to determine the actual GPU vendor.
 device = get_available_device() if get_available_device() != 'hip' else 'cuda'
 device_torch_lib = getattr(torch, device)
 device_platform = get_available_device()
@@ -118,7 +110,7 @@ IS_NVIDIA_HOPPER = (
 IS_NVIDIA_SM100 = (IS_NVIDIA and torch.cuda.get_device_capability()[0] == 10)
 IS_NVIDIA_BLACKWELL = (IS_NVIDIA and torch.cuda.get_device_capability()[0] in (10, 12))
 
-# Nvidia Ampere or newer, haven't check AMD and intel yet.
+
 IS_TF32_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 8)
 IS_TMA_SUPPORTED = (
     IS_NVIDIA
@@ -131,8 +123,8 @@ IS_TMA_SUPPORTED = (
 )
 
 if IS_NVIDIA and not IS_TF32_SUPPORTED:
-    # Make old card happy, since triton will use tf32 by default.
-    # This is a workaround for old nvidia card.
+
+
     os.environ['TRITON_F32_DEFAULT'] = 'ieee'
 
 
@@ -144,9 +136,8 @@ if IS_TMA_SUPPORTED:
     logger.info('TMA is supported, using TMA by default.')
     triton.set_allocator(_default_alloc_fn)
 elif IS_NVIDIA_BLACKWELL:
-    # Blackwell (SM100 datacenter / SM120 consumer): Triton compiler may emit global_scratch for
-    # autotuned kernels even without TMA. Register a default allocator to
-    # prevent NullAllocator crashes. See triton-lang/triton#10002.
+
+
     logger.info('Blackwell detected: registering default global_scratch allocator.')
     triton.set_allocator(_default_alloc_fn)
 
@@ -163,10 +154,10 @@ def get_all_max_shared_mem():
 
 
 class Backend(Enum):
-    ADA = 101376       # RTX 4090
-    AMPERE = 166912    # A100
-    HOPPER = 232448    # H100
-    DEFAULT = 102400   # Default
+    ADA = 101376
+    AMPERE = 166912
+    HOPPER = 232448
+    DEFAULT = 102400
 
     @classmethod
     def get_shared_memory(cls, arch: str) -> int:

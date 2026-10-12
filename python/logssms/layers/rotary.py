@@ -28,7 +28,7 @@ class RotaryEmbedding(BaseOP):
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        # buffer, so don't load/save
+
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
 
     def forward(
@@ -69,7 +69,7 @@ def _get_rope(
 ) -> RotaryEmbedding:
     if rope_scaling is None:
         return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
-    # need to test some cases:
+
     match rope_scaling["rope_type"]:
         case "default":
             return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
@@ -81,7 +81,7 @@ def _get_rope(
             original_max_position: int = rope_scaling["original_max_position_embeddings"]
 
             def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
-                # no smooth if low_freq_factor == high_freq_factor
+
                 wave_len = 2 * math.pi / inv_freq
                 if low_freq_factor == high_freq_factor:
                     return torch.where(
@@ -141,7 +141,7 @@ def get_rope(
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
     if t.device == torch.device("meta"):
-        # we cannot use meta device for rope
+
         if _ROPE_DEVICE is None:
             raise RuntimeError(
                 "We cannot use meta device for rope. Please call set_rope_device() first."

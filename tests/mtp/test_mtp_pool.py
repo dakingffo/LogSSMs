@@ -20,25 +20,26 @@ def test_persistent_slots_form_a_chronological_ring() -> None:
     pool = _make_pool()
     row = pool.persistent_table[1]
 
-    assert torch.equal(pool.append_persistent(1, 3), row[:3])
-    assert torch.equal(pool.persistent_indices(1), row[:3])
+    assert torch.equal(pool.append_persistent_batch([1], [3]), row[:3])
+    indices, valid = pool.batch_indices([1], torch.tensor([0]), scratch_depth=0)
+    assert torch.equal(indices[valid], row[:3])
 
-    assert torch.equal(pool.append_persistent(1, 2), row[torch.tensor([3, 0])])
+    assert torch.equal(pool.append_persistent_batch([1], [2]), row[torch.tensor([3, 0])])
+    indices, valid = pool.batch_indices([1], torch.tensor([0]), scratch_depth=0)
     assert torch.equal(
-        pool.persistent_indices(1),
+        indices[valid],
         row[torch.tensor([1, 2, 3, 0])],
     )
 
 
 def test_batch_indices_append_only_the_current_rows_scratch() -> None:
     pool = _make_pool()
-    pool.append_persistent(0, 2)
-    pool.append_persistent(2, 4)
+    pool.append_persistent_batch([0, 2], [2, 4])
     batch_rows = torch.tensor([1, 0], dtype=torch.int64)
 
     indices, valid = pool.batch_indices([0, 2], batch_rows, scratch_depth=2)
-    expected_0 = torch.cat([pool.persistent_indices(0), pool.scratch_table[1, :2]])
-    expected_1 = torch.cat([pool.persistent_indices(2), pool.scratch_table[0, :2]])
+    expected_0 = torch.cat([pool.persistent_table[0, :2], pool.scratch_table[1, :2]])
+    expected_1 = torch.cat([pool.persistent_table[2], pool.scratch_table[0, :2]])
 
     assert torch.equal(indices[0, :4], expected_0)
     assert torch.equal(indices[1], expected_1)
@@ -49,7 +50,7 @@ def test_batch_indices_append_only_the_current_rows_scratch() -> None:
 
 def test_store_preserves_native_kv_heads() -> None:
     pool = _make_pool()
-    slots = pool.append_persistent(0, 2)
+    slots = pool.append_persistent_batch([0], [2])
     key = torch.arange(16, dtype=torch.float32).view(2, 2, 4)
     value = key + 100
 
@@ -67,5 +68,6 @@ def test_batched_append_matches_request_major_order() -> None:
         slots,
         torch.cat([pool.persistent_table[2, :3], pool.persistent_table[0, :2]]),
     )
-    assert torch.equal(pool.persistent_indices(2), pool.persistent_table[2, :3])
-    assert torch.equal(pool.persistent_indices(0), pool.persistent_table[0, :2])
+    indices, valid = pool.batch_indices([2, 0], torch.tensor([0, 1]), scratch_depth=0)
+    assert torch.equal(indices[0, valid[0]], pool.persistent_table[2, :3])
+    assert torch.equal(indices[1, valid[1]], pool.persistent_table[0, :2])

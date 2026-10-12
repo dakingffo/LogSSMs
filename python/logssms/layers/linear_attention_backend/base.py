@@ -35,7 +35,6 @@ class BaseLinearAttentionBackend(ABC):
 
 
 class BaseGatedDeltaBackend(BaseLinearAttentionBackend):
-    """GDN compute contract; other recurrences share only the lifecycle API."""
 
     @abstractmethod
     def forward(
