@@ -71,6 +71,19 @@ class TreeManager(LogStateCacheManager):
     def logstate_pool(self):
         return self.cpu_pool
 
+    def _commit_materialize(self, plans):
+        for plan in plans:
+            entries = self.tree.entries_for_slot(plan.log_slot)
+            assert len(entries) == 1
+            old_entry = entries[0]
+            owner = self.tree.entry_owner(old_entry)
+            assert self.tree.detach_entry(plan.log_slot) == old_entry
+            self.tree.attach_entry(owner, LogStateEntry(
+                slot=plan.log_slot, kind=LogStateKind.CHECKPOINT,
+                begin=plan.begin, end=plan.end, span_pages=1,
+            ))
+        self.cpu_pool.materialize_slots([plan.log_slot for plan in plans])
+
 
 def run(history, batch_size):
     tree = LogRadixTree(64, torch.device("cpu"), granularity=32)

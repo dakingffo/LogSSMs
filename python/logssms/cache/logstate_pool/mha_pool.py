@@ -188,17 +188,15 @@ class MHALogStatePool(BaseKVCachePool):
             self.layout.head_k_dim * self.layout.head_v_dim,
             dtype=torch.int64, device=self.device,
         )
-        logical = self.layout.payload_offsets(
-            offsets[None, :], layer, heads[:, None], self.frame_bytes
-        ) * self.dtype.itemsize
+        logical = (layer * self.layout.num_value_heads + heads) * self.head_payload_bytes
         frames = self.payload_frame_table[
-            slots[:, None, None], (logical // self.frame_bytes)[None, :, :]
+            slots[:, None], (logical // self.frame_bytes)[None, :]
         ].to(torch.int64)
         base = (
             frames * (self.frame_bytes // self.dtype.itemsize)
-            + (logical % self.frame_bytes)[None, :, :] // self.dtype.itemsize
+            + (logical % self.frame_bytes)[None, :] // self.dtype.itemsize
         )
-        return base
+        return base[:, :, None] + offsets
 
     def read_states(self, slots: torch.Tensor, layer: int) -> torch.Tensor:
         return self.storage.view(self.dtype).flatten()[self._state_indices(slots, layer)].view(

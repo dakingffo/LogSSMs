@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
-from ...layout import log_pointer, payload_pointer
+from ...layout import log_pointer, state_pointer
 
 from .op import exp
 
@@ -112,11 +112,10 @@ def _fused_recurrent_gated_delta_kernel(
         )
     elif DIRECT_STORE:
         work_slot = tl.load(work_slots + batch_idx)
-        state_ptr = payload_pointer(
+        state_ptr = state_pointer(
             initial_state.to(tl.pointer_type(query.dtype.element_ty)), key_log_pool,
             work_slot, LAYER, value_head, k_offset[:, None] * HEAD_V_DIM + v_offset[None, :],
-            LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
-            HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
+            NUM_V_HEADS, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
         )
     else:
         state_ptr = (
@@ -152,6 +151,7 @@ def _fused_recurrent_gated_delta_kernel(
                 log_slot, LAYER, value_head, prior_offsets[None, :], k_offset[:, None],
                 LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
                 HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
+                current_offset - count, current_offset,
             ),
             mask=k_mask[:, None] & valid[None, :], other=0.0,
         )
@@ -161,6 +161,7 @@ def _fused_recurrent_gated_delta_kernel(
                 log_slot, LAYER, value_head, prior_offsets[:, None], v_offset[None, :],
                 LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
                 HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, NUM_K_HEADS,
+                current_offset - count, current_offset,
             ),
             mask=valid[:, None] & v_mask[None, :], other=0.0,
         )
@@ -314,9 +315,9 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     output = torch.empty_like(value)
     full_k = triton.next_power_of_2(head_k_dim)
     tiled = not enable_eager_state and head_k_dim == head_v_dim == 128 and batch_size >= 32
-    block_k = 32 if tiled else None
+    block_k = 64 if tiled else None
     block_v = 64 if tiled else (8 if head_v_dim < 128 else (16 if batch_size == 1 else 32))
-    num_stages = 1 if tiled and batch_size < 64 else 3
+    num_stages = 4 if tiled else 3
     block_v = min(block_v, triton.next_power_of_2(head_v_dim))
     if not enable_eager_state:
         block_v = max(block_v, 16)
@@ -341,7 +342,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
             LAYER=layer, PAGE_SIZE=pool.page_size,
             LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
             REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
-            num_warps=4,
+            num_warps=1,
             num_stages=num_stages,
         )
         return output

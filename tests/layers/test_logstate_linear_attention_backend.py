@@ -263,7 +263,6 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, chunk_size) -> Non
 def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
     from collections import Counter
     from tests.core.test_logstate_cache_manager import make_manager, new_req
-    from logssms.cache.logstate import PageMaterialize, CheckpointCoalesce
     from logssms.cache.prefix_cache.logstate import LogStateKind
 
     torch.manual_seed(321)
@@ -315,14 +314,9 @@ def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
     first.cached_len = 256
     manager.cache_req(first, finished=True)
     entries = manager.tree.iter_entries()
-    materialize = tuple(PageMaterialize(
-        entry.slot, entry.begin, entry.end, None, entries[:index + 1],
-    ) for index, entry in enumerate(entries[:2]))
-    manager._construct((), materialize)
-    manager._commit_materialize(materialize)
-    manager._commit_coalesce((CheckpointCoalesce(
-        tuple(entry.slot for entry in entries[:2]), (1, 1), 0, 128, 2,
-    ),))
+    reuse = new_req(manager, torch.arange(129, dtype=torch.int32), table_idx=1)
+    manager.prepare_batch(Batch([reuse], "prefill"))
+    manager.cache_req(reuse, finished=True)
     leaf = manager.tree.entry_owner(entries[-1])
     manager.recycle_bin.remember(manager.tree, leaf)
     counts = Counter(leaf._kv_page_counts)
@@ -624,6 +618,7 @@ def test_replay_count_and_offset_are_mutable_cuda_graph_inputs() -> None:
     first_output, first_states = fused_recurrent_gated_delta_rule(
         query, key, value, gate, beta, A_log, dt_bias, initial
     )[:2]
+    first_query = query.clone()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -644,6 +639,29 @@ def test_replay_count_and_offset_are_mutable_cuda_graph_inputs() -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(captured_output, expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(pool.read_states(work, 0), initial, rtol=0, atol=0)
+
+    other_work = torch.tensor([3], dtype=torch.int32, device=device)
+    other_log = torch.tensor([1], dtype=torch.int32, device=device)
+    other_initial = initial * .7
+    pool.write_states(other_work, 0, other_initial)
+    fused_recurrent_gated_delta_rule_to_logstate(
+        first_query, key, value, gate, beta, A_log, dt_bias,
+        pool, other_work, other_log, torch.zeros_like(offsets), 0, torch.zeros_like(counts),
+    )
+    _, other_first_states, *_ = fused_recurrent_gated_delta_rule(
+        first_query, key, value, gate, beta, A_log, dt_bias, other_initial,
+    )
+    expected, *_ = fused_recurrent_gated_delta_rule(
+        query, key, value, gate, beta, A_log, dt_bias, other_first_states[:, 0],
+    )
+    for table, indices in ((pool.payload_frame_table, [0, 1]),
+                           (pool.payload_frame_table, [2, 3]),
+                           (pool.decay_frame_table, [0, 1])):
+        table[indices] = table[list(reversed(indices))].clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_output, expected, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(pool.read_states(work, 0), other_initial, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1016,14 +1034,15 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
         first = run(resumed_ctx, 0, 64)
         pool = resumed_ctx.linear_state
         expected_state = pool.read_states(torch.tensor([2], dtype=torch.int32, device=device), 0).clone()
+        checkpoint = pool.reserve(works=1)[2][0] if materialized else 2
         construct_log_state_chains(
             pool,
             [(None, [(0, 0, 64)], [(
-                0 if materialized else 2,
+                checkpoint,
             )])],
         )
         if materialized:
-            copy_states(pool, [0], [2])
+            copy_states(pool, [checkpoint], [2])
         source = torch.tensor([0], dtype=torch.int32, device=device)
         destination = torch.tensor([2], dtype=torch.int32, device=device)
         pool.write_conv(

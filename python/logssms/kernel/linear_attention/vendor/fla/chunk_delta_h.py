@@ -13,8 +13,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp2
-from .runtime import IS_NVIDIA_BLACKWELL
-from ...layout import log_pointer, payload_pointer
+from ...layout import log_pointer, state_pointer
 
 
 @dataclass(frozen=True)
@@ -56,10 +55,9 @@ def _chunk_state_pointer(
     GRANULARITY: tl.constexpr, PAGE_SIZE: tl.constexpr,
 ):
     if LOGSTATE:
-        return payload_pointer(
+        return state_pointer(
             storage, payload_frames, slot, LAYER, head, offsets,
-            LAYERS, HV, K, V, GRANULARITY, PAGE_SIZE, HEAD_PAYLOAD_BYTES,
-            FRAME_BYTES, FRAMES_PER_SLOT,
+            HV, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
         )
     return storage + slot.to(tl.int64) * SLOT_STRIDE + LAYER * LAYER_STRIDE + head * HEAD_STRIDE + offsets
 
@@ -452,6 +450,6 @@ def chunk_gated_delta_rule_fwd_h(
         STORE_LOG=log_io is not None,
         PAGE_SIZE=state_io.page_size,
         DECAY_RECORD_BYTES=log_io.decay_record_bytes if log_io is not None else 0,
-        num_warps=2 if IS_NVIDIA_BLACKWELL else 4, num_stages=2,
+        num_warps=2, num_stages=2,
     )
     return h, v_new

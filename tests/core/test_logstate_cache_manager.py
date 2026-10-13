@@ -40,6 +40,30 @@ def cpu_cache_copy():
             pool.copy_conv_snapshot(source, source_granule, output, output_granule)
 
     from logssms.kernel.linear_attention.logstate import copy_states
+    from logssms.kernel.linear_attention.logstate import restore_log_state_chains
+    from tests.logstate_helpers import decay_view, head_view
+
+    def restore(pool, chains):
+        if pool.device.type == "cuda":
+            return restore_log_state_chains(pool, chains)
+        layout = pool.layout
+        for base, logs, output in chains:
+            for layer in range(layout.num_linear_layers):
+                states = (torch.zeros(1, layout.num_value_heads, layout.head_k_dim, layout.head_v_dim)
+                          if base is None else pool.read_states(torch.tensor([base]), layer).clone())
+                for slot, begin, end in logs:
+                    decay = decay_view(pool, slot)[layer]
+                    keys, values = [], []
+                    for head in range(layout.num_value_heads):
+                        log = head_view(pool, slot, layer, head, state=False)
+                        split = pool.page_size * layout.head_k_dim
+                        keys.append(log[:split].view(pool.page_size, layout.head_k_dim))
+                        values.append(log[split:].view(pool.page_size, layout.head_v_dim))
+                    keys, values = torch.stack(keys, 1), torch.stack(values, 1)
+                    for position in range(begin, end):
+                        states *= decay[position].exp()[None, :, None, None]
+                        states += keys[position, :, :, None] * values[position, :, None, :]
+                pool.write_states(torch.tensor([output]), layer, states)
 
     def copy_state(pool, sources, destinations):
         if pool.device.type == "cuda":
@@ -52,6 +76,7 @@ def cpu_cache_copy():
     with (
         patch("logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.copy_conv", side_effect=copy),
         patch("logssms.kernel.linear_attention.logstate.copy_states", side_effect=copy_state),
+        patch("logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.restore", side_effect=restore),
     ):
         yield
 
@@ -406,7 +431,7 @@ def test_restore_unfused_chain_before_inplace_materialization() -> None:
         ),
         patch(
             "logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct",
-            side_effect=lambda *_args: order.append("materialize") or 0,
+            side_effect=lambda *_args: order.append("materialize"),
         ),
     ):
         manager._construct((), (plan,))
@@ -447,7 +472,7 @@ def test_shared_log_materialization_rebases_branches_across_task_groups() -> Non
     launches = []
     with patch(
         "logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct",
-        side_effect=lambda _pool, group: launches.append(group) or 0,
+        side_effect=lambda _pool, group: launches.append(group),
     ):
         manager._construct((), plans)
     assert len(launches) == 2
@@ -984,7 +1009,7 @@ def test_recycled_shape_participates_in_same_round_merge() -> None:
     )
     manager.allocate([req], phase="prefill")
     req.cached_len = 512
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.cache_req(req, finished=True)
 
     entries = manager.tree.iter_entries()
@@ -1065,7 +1090,7 @@ def test_recycled_log_tail_uses_current_gpu_shape_after_checkpoint_compression()
         (192, 320),
     ]
     manager.allocate([req], phase="prefill")
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(Batch([req], "prefill"))
     req.cached_len = 384
     manager.cache_req(req, finished=True)
@@ -1099,7 +1124,7 @@ def test_recycled_history_matches_unpruned_merge_layout():
     req = new_req(manager, tokens)
     assert req.cached_len == 256
     manager.allocate([req], phase="prefill")
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(Batch([req], "prefill"))
     req.cached_len = 576
     manager.cache_req(req, finished=True)
@@ -1137,7 +1162,7 @@ def test_recycled_half_page_keeps_log_storage_and_restores_only_its_suffix():
     pages = manager._live_pages[0]
     assert (pages[0].begin, pages[0].end) == (32, 64)
     assert pages[0].state_slot is not None and pages[0].checkpoint_begin is None
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(Batch([req], "prefill"))
     req.cached_len = 128
     manager.cache_req(req, finished=True)
@@ -1301,8 +1326,8 @@ def test_recycle_merges_gpu_tail_with_missing_history_and_reuses_its_slot(head_r
     assert torch.all(manager.state_table[req.table_idx, 192:256] == -1)
     batch = Batch([req], "prefill")
     with (
-        patch.object(manager, "_construct", return_value={}),
-        patch.object(manager, "_construct_shared", return_value=({}, (0, 0, {}))),
+        patch.object(manager, "_construct", wraps=manager._construct),
+        patch.object(manager, "_construct_checkpoints", return_value=({}, (0, 0, {}))),
     ):
         manager.prepare_batch(batch)
     assert batch.logstate_checkpoint_writes == [(63, destination)]
@@ -1340,7 +1365,7 @@ def test_recycled_checkpoint_spans_prefill_chunks_without_intermediate_logs(abor
     req.device_len = 128
     manager.allocate([req], phase="prefill")
     first = Batch([req], "prefill")
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(first)
     assert first.logstate_checkpoint_writes == []
     assert first.logstate_checkpoint_ranges == [(0, 0, 256)]
@@ -1356,7 +1381,7 @@ def test_recycled_checkpoint_spans_prefill_chunks_without_intermediate_logs(abor
         req.device_len = 257
         manager.allocate([req], phase="prefill")
         second = Batch([req], "prefill")
-        with patch.object(manager, "_construct", return_value={}):
+        with patch.object(manager, "_construct", wraps=manager._construct):
             manager.prepare_batch(second)
         slot = manager._recycled_restores[0].slots[256]
         assert second.logstate_checkpoint_writes == [(127, slot)]
@@ -1376,7 +1401,7 @@ def test_abort_before_reused_checkpoint_endpoint_releases_detached_slot():
     req.device_len = 193
     req.input_ids = req.input_ids[:193]
     manager.allocate([req], phase="prefill")
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(Batch([req], "prefill"))
     manager.free_to_cached(req)
     manager.cache_req(req, finished=True)
@@ -1422,7 +1447,7 @@ def test_shared_gpu_tail_has_only_one_recycled_slot_writer(abort_first):
     assert all(not item.gpu_entries for item in second.cache_handle.restore_plan.checkpoints)
     manager.allocate([first, second], phase="prefill")
     batch = Batch([first, second], "prefill")
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(batch)
     writes = [slot for _row, slot in batch.logstate_checkpoint_writes]
     assert len(writes) == len(set(writes)) == 2
@@ -1505,7 +1530,7 @@ def test_gpu_and_cpu_groups_use_one_merge_pass_and_one_intensity():
     remember_log_tail(manager.recycle_bin, ghost, leaf)
     req = new_req(manager, torch.arange(321, dtype=torch.int32))
     manager.allocate([req], phase="prefill")
-    with patch.object(manager, "_construct", return_value={}):
+    with patch.object(manager, "_construct", wraps=manager._construct):
         manager.prepare_batch(Batch([req], "prefill"))
     req.cached_len = 320
     manager.cache_req(req, finished=True)
@@ -1640,30 +1665,6 @@ def test_admission_reserves_capacity_without_allocating_future_pages():
     assert manager._allocator.free_frames < first_page_free
     manager.cache_req(req, finished=True)
     assert manager._allocator.free_frames == initial_free
-    manager.check_integrity()
-
-
-def test_admission_does_not_count_released_checkpoint_frames_twice():
-    manager = make_manager(num_pages=4, num_states=4)
-    req = new_req(manager, torch.arange(65, dtype=torch.int32))
-    manager.allocate([req])
-    req.cached_len = 65
-    manager.cache_req(req, finished=True)
-
-    slot = manager.tree.unique_slots()[0]
-    entry = manager.tree.entries_for_slot(slot)[0]
-    capacity = manager.available_size
-    free_frames = manager._allocator.free_frames
-    manager._commit_materialize((PageMaterialize(
-        log_slot=slot,
-        begin=entry.begin,
-        end=entry.end,
-        base_checkpoint_slot=None,
-        replay_logs=(entry,),
-    ),))
-
-    assert manager._allocator.free_frames > free_frames
-    assert manager.available_size == capacity
     manager.check_integrity()
 
 
@@ -2139,7 +2140,7 @@ def test_unfulfillable_eviction_plan_preserves_cached_prefix():
     manager.check_integrity()
 
 
-def test_prepare_batch_applies_branch_protection_and_commits_plan():
+def test_prepare_batch_preserves_log_at_protected_branch():
     manager = make_manager(num_pages=12, num_states=12)
     original_ids = torch.arange(130, dtype=torch.int32)
     original = new_req(manager, original_ids)
@@ -2153,17 +2154,17 @@ def test_prepare_batch_applies_branch_protection_and_commits_plan():
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
     with patch(
-        "logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct",
-        return_value=0,
-    ) as construct:
+        "logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.restore",
+        wraps=manager.logstate_pool.kernels.restore,
+    ) as restore:
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
-    assert construct.call_count == 1
-    assert len(construct.call_args.args[1][0][1]) == 2
+    assert restore.call_count == 1
+    assert len(restore.call_args.args[1][0][1]) == 2
     assert manager.last_plan is not None
     assert any(manager.tree.entry_is_protected(entry.slot) for entry in manager.tree.iter_entries())
     assert any(
-        entry.kind is LogStateKind.CHECKPOINT
+        entry.kind is LogStateKind.LOG
         and entry.begin == 0
         and entry.end == 64
         for entry in manager.tree.iter_entries()
@@ -2182,7 +2183,7 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
 
     request = new_req(manager, input_ids, table_idx=1)
     batch = Batch(reqs=[request], phase="prefill")
-    with patch("logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct", return_value=0):
+    with patch("logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct", return_value=None):
         manager.prepare_batch(batch)
 
     checkpoints = manager.tree.iter_entries()
@@ -2198,12 +2199,13 @@ def test_prepare_batch_materializes_then_coalesces_checkpoints():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("pages,intensity,head_ratio,blocked", [
+    (1, 2, 1, None), (2, 2, 1, None), (7, 3, 1, None),
     (1, 2, 4, None), (2, 2, 4, None), (4, 2, 4, None),
     (7, 3, 2, None), (7, 6, 3, None), (9, 8, 4, None), (17, 16, 3, None),
     (3, 2, 3, "gain"), (4, 3, 3, "gain"), (7, 6, 3, "gain"),
     (9, 8, 3, "gain"), (17, 16, 3, "gain"), (4, 3, 3, "capacity"),
 ])
-def test_shared_key_prepare_only_materializes_merge_outputs_and_recovers_work(pages, intensity, head_ratio, blocked):
+def test_prepare_only_materializes_merge_outputs_and_recovers_work(pages, intensity, head_ratio, blocked):
     from logssms.kernel.linear_attention.logstate import store_log_states
 
     torch.manual_seed(401)
@@ -2402,7 +2404,7 @@ def test_active_branch_recovery_anchor_survives_same_round_maintenance():
     ])
     branch = new_req(manager, branch_ids, table_idx=1)
     assert branch.cached_len == 64
-    with patch("logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct", return_value=0):
+    with patch("logssms.kernel.linear_attention.AFFINE_LOG_STATE_KERNELS.construct", return_value=None):
         manager.prepare_batch(Batch(reqs=[branch], phase="prefill"))
 
     checkpoints = [

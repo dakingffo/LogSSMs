@@ -54,28 +54,51 @@ __global__ void log_store_kernel(
     : kGranularity * (params.num_key_heads * params.key_bytes + params.num_heads * params.value_bytes);
   const auto layer_offset = (position / kGranularity * params.num_layers + params.layer) * layer_bytes;
   const auto key_offset = layer_offset
-    + (position % kGranularity * params.num_key_heads + key_head) * params.key_bytes;
+    + (key_head * kGranularity + position % kGranularity) * params.key_bytes;
   const auto value_offset = layer_offset + kGranularity * params.num_key_heads * params.key_bytes
-    + (position % kGranularity * params.num_heads + head) * params.value_bytes;
+    + (head * kGranularity + position % kGranularity) * params.value_bytes;
   const auto *key = params.keys
       + token * params.key_row_bytes
       + (params.input_key_heads == params.num_heads ? head : key_head) * params.key_bytes;
   const auto *value = params.residual_values
       + token * params.value_row_bytes + head * params.value_bytes;
-  for (auto index = threadIdx.x; head % (params.num_heads / params.num_key_heads) == 0
-       && index < params.key_bytes; index += blockDim.x) {
-    const auto offset = key_offset + index;
-    const auto frame = params.payload_frames[
-      slot * params.payload_frames_per_slot + offset / params.frame_bytes
-    ];
-    params.storage[frame * params.frame_bytes + offset % params.frame_bytes] = key[index];
+  if (head % (params.num_heads / params.num_key_heads) == 0) {
+    const auto within = key_offset % params.frame_bytes;
+    if (within + params.key_bytes <= params.frame_bytes) {
+      const auto frame = params.payload_frames[
+        slot * params.payload_frames_per_slot + key_offset / params.frame_bytes
+      ];
+      auto *target = params.storage + frame * params.frame_bytes + within;
+      for (auto index = threadIdx.x; index < params.key_bytes; index += blockDim.x) {
+        target[index] = key[index];
+      }
+    } else {
+      for (auto index = threadIdx.x; index < params.key_bytes; index += blockDim.x) {
+        const auto offset = key_offset + index;
+        const auto frame = params.payload_frames[
+          slot * params.payload_frames_per_slot + offset / params.frame_bytes
+        ];
+        params.storage[frame * params.frame_bytes + offset % params.frame_bytes] = key[index];
+      }
+    }
   }
-  for (auto index = threadIdx.x; index < params.value_bytes; index += blockDim.x) {
-    const auto offset = value_offset + index;
+  const auto within = value_offset % params.frame_bytes;
+  if (within + params.value_bytes <= params.frame_bytes) {
     const auto frame = params.payload_frames[
-      slot * params.payload_frames_per_slot + offset / params.frame_bytes
+      slot * params.payload_frames_per_slot + value_offset / params.frame_bytes
     ];
-    params.storage[frame * params.frame_bytes + offset % params.frame_bytes] = value[index];
+    auto *target = params.storage + frame * params.frame_bytes + within;
+    for (auto index = threadIdx.x; index < params.value_bytes; index += blockDim.x) {
+      target[index] = value[index];
+    }
+  } else {
+    for (auto index = threadIdx.x; index < params.value_bytes; index += blockDim.x) {
+      const auto offset = value_offset + index;
+      const auto frame = params.payload_frames[
+        slot * params.payload_frames_per_slot + offset / params.frame_bytes
+      ];
+      params.storage[frame * params.frame_bytes + offset % params.frame_bytes] = value[index];
+    }
   }
   if (threadIdx.x == 0) {
     const auto decay_frame = params.decay_frames[slot * 2];

@@ -1630,9 +1630,6 @@ class LogStateCacheManager(BaseCacheManager):
         stats["max_construction_outputs"] = max(
             (value["outputs"] for value in constructions), default=0
         )
-        stats["max_construction_workspace_bytes"] = max(
-            (value["workspace_bytes"] for value in constructions), default=0
-        )
         timing_fields = (
             "analysis_and_tasks_cpu_ms",
             "profile_before_cpu_ms",
@@ -2247,11 +2244,7 @@ class LogStateCacheManager(BaseCacheManager):
                 perf_counter_ns() - profile_before_start
             ) / 1e6
         construction_start = perf_counter_ns() if self._profile_enabled else 0
-        shared_commit = None
-        if self.logstate_pool.shared_keys:
-            construction, shared_commit = self._construct_shared(batch, tasks, plan)
-        else:
-            construction = self._construct(tasks, plan.materialize)
+        construction, merge_commit = self._construct_checkpoints(batch, tasks, plan)
         handles = tuple(id(self._pending_matches[req.table_idx]) for req in batch.reqs
                         if req.table_idx in self._pending_matches
                         and id(self._pending_matches[req.table_idx]) in self._recovery_pins)
@@ -2268,11 +2261,7 @@ class LogStateCacheManager(BaseCacheManager):
         for req in batch.reqs:
             self.pending_recoveries.pop(req.table_idx, None)
             self._pending_matches.pop(req.table_idx, None)
-        if shared_commit is None:
-            self._commit_materialize(plan.materialize)
-            released, released_frames, commit_skips = self._commit_coalesce(plan.coalesce)
-        else:
-            released, released_frames, commit_skips = shared_commit
+        released, released_frames, commit_skips = merge_commit
         commit_cpu_ms = (
             (perf_counter_ns() - commit_start) / 1e6
             if self._profile_enabled else 0.0
@@ -3021,7 +3010,6 @@ class LogStateCacheManager(BaseCacheManager):
                 "segments": len(segments),
                 "outputs": len(outputs),
                 "direct_checkpoint_copies": len(direct),
-                "workspace_bytes": 0,
                 "cuda_ms": None,
             }
             restore_submit_ms = 0.0
@@ -3056,26 +3044,23 @@ class LogStateCacheManager(BaseCacheManager):
                         restore_submit_ms += (perf_counter_ns() - step_start) / 1e6
                 if material_chains:
                     step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-                    construction["workspace_bytes"] = max(
-                        construction["workspace_bytes"],
-                        pool.kernels.construct(
-                            pool,
-                            [
-                                (
-                                    chain.base_slot,
-                                    [
-                                        (
-                                            entry.slot,
-                                            entry.begin - entry.physical_begin,
-                                            entry.end - entry.physical_begin,
-                                        )
-                                        for entry in chain.segments
-                                    ],
-                                    chain.outputs,
-                                )
-                                for chain in material_chains
-                            ],
-                        ),
+                    pool.kernels.construct(
+                        pool,
+                        [
+                            (
+                                chain.base_slot,
+                                [
+                                    (
+                                        entry.slot,
+                                        entry.begin - entry.physical_begin,
+                                        entry.end - entry.physical_begin,
+                                    )
+                                    for entry in chain.segments
+                                ],
+                                chain.outputs,
+                            )
+                            for chain in material_chains
+                        ],
                     )
                     if submit_timing_ms is not None:
                         materialize_submit_ms += (perf_counter_ns() - step_start) / 1e6
@@ -3089,7 +3074,6 @@ class LogStateCacheManager(BaseCacheManager):
                 "segments": 0,
                 "outputs": 0,
                 "direct_checkpoint_copies": len(direct),
-                "workspace_bytes": 0,
                 "cuda_ms": 0.0,
             }
 
@@ -3114,7 +3098,7 @@ class LogStateCacheManager(BaseCacheManager):
             construction["submit_timing_ms"] = submit_timing_ms
         return construction
 
-    def _construct_shared(
+    def _construct_checkpoints(
         self, batch: Batch, tasks: Sequence[_ReconstructionTask], plan: LogStatePlan,
     ) -> tuple[dict, tuple[int, int, dict[str, int]]]:
         pool = self.logstate_pool
@@ -3172,7 +3156,8 @@ class LogStateCacheManager(BaseCacheManager):
 
             pool.kernels.restore(pool, chains)
             committed, committed_works = [], []
-            count, _frames, reasons = self._commit_coalesce(tuple(wave), allow_logs=True)
+            count, _frames, reasons = self._commit_coalesce(tuple(wave), allow_logs=True,
+                                                          retire_sources=False)
             released += count
             skips.update(reasons)
             for index, group in enumerate(wave):
@@ -3184,6 +3169,7 @@ class LogStateCacheManager(BaseCacheManager):
                     released_frames += frame_counts[index] - self._allocator.payload_frames - self._allocator.conv_frames
             if committed:
                 pool.coalesce_groups(committed, committed_works)
+                pool.retire_slots([slot for group in committed for slot in group[:-1]])
             merged += len(committed)
             materialized += len(committed)
             wave_count += 1
@@ -3273,29 +3259,6 @@ class LogStateCacheManager(BaseCacheManager):
             waves[wave].append(chain)
         return tuple(chains), tuple(tuple(wave) for wave in waves)
 
-    def _commit_materialize(
-        self,
-        plans: Sequence[PageMaterialize],
-    ) -> None:
-        for plan in plans:
-            entries = self.tree.entries_for_slot(plan.log_slot)
-            assert len(entries) == 1
-            old_entry = entries[0]
-            owner = self.tree.entry_owner(old_entry)
-            detached = self.tree.detach_entry(plan.log_slot)
-            assert detached == old_entry
-            self.tree.attach_entry(
-                owner,
-                LogStateEntry(
-                    slot=plan.log_slot,
-                    kind=LogStateKind.CHECKPOINT,
-                    begin=plan.begin,
-                    end=plan.end,
-                    span_pages=1,
-                ),
-            )
-        self.logstate_pool.materialize_slots([plan.log_slot for plan in plans])
-
     @staticmethod
     def _merge_batch_outcome(plan: LogStatePlan, released: int) -> str:
         if released:
@@ -3314,7 +3277,7 @@ class LogStateCacheManager(BaseCacheManager):
     def _commit_coalesce(
         self,
         plans: Sequence[CheckpointCoalesce],
-        *, allow_logs: bool = False,
+        *, allow_logs: bool = False, retire_sources: bool = True,
     ) -> tuple[int, int, dict[str, int]]:
         released = []
         released_frames = 0
@@ -3389,7 +3352,7 @@ class LogStateCacheManager(BaseCacheManager):
                 checkpoint_timestamp=checkpoint_timestamp,
             )
             released.extend(plan.slots[:-1])
-        if released:
+        if released and retire_sources:
 
 
             self.logstate_pool.retire_slots(released)

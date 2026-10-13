@@ -25,13 +25,15 @@ def is_lock_boundary(tree, leaf, position: int) -> bool:
     return False
 
 
-def log_offsets(layout, positions, columns, layer, heads, *, value):
+def log_offsets(layout, positions, columns, layer, heads, *, value, head_bytes):
     key_size = layout.granularity * layout.num_key_heads * layout.head_k_dim
     layer_size = key_size + layout.granularity * layout.num_value_heads * layout.head_v_dim
+    if layout.num_key_heads == layout.num_value_heads:
+        layer_size = layout.num_value_heads * head_bytes // layout.dtype.itemsize // layout.num_granules
     offset = (positions // layout.granularity * layout.num_linear_layers + layer) * layer_size
     if value:
-        return offset + key_size + (positions % layout.granularity * layout.num_value_heads + heads) * layout.head_v_dim + columns
-    return offset + (positions % layout.granularity * layout.num_key_heads + heads) * layout.head_k_dim + columns
+        return offset + key_size + (heads * layout.granularity + positions % layout.granularity) * layout.head_v_dim + columns
+    return offset + (heads * layout.granularity + positions % layout.granularity) * layout.head_k_dim + columns
 
 
 def remember_log_tail(recycle, tree, node) -> None:
@@ -48,26 +50,16 @@ def _head_indices(
     layout = pool.layout
     if state:
         elements = torch.arange(layout.head_k_dim * layout.head_v_dim, device=pool.device)
+        offsets = (layer * layout.num_value_heads + head) * pool.head_payload_bytes
+        offsets = offsets + elements * pool.dtype.itemsize
     else:
         positions = torch.arange(pool.page_size, device=pool.device)
-        if pool.shared_keys:
-            key = log_offsets(layout, positions[:, None], torch.arange(layout.head_k_dim, device=pool.device),
-                                     layer, head // (layout.num_value_heads // layout.num_key_heads), value=False)
-            value = log_offsets(layout, positions[:, None], torch.arange(layout.head_v_dim, device=pool.device),
-                                       layer, head, value=True)
-            offsets = torch.cat((key.flatten(), value.flatten())) * pool.dtype.itemsize
-            frames = pool.payload_frame_table[slot, offsets // pool.frame_bytes].long()
-            return frames * (pool.frame_bytes // pool.dtype.itemsize) + offsets % pool.frame_bytes // pool.dtype.itemsize
-        head_granule = pool.head_payload_bytes // pool.dtype.itemsize // layout.num_granules
-        key = positions[:, None] // layout.granularity * head_granule
-        key = key + positions[:, None] % layout.granularity * layout.head_k_dim
-        key = key + torch.arange(layout.head_k_dim, device=pool.device)
-        value = positions[:, None] // layout.granularity * head_granule
-        value = value + layout.granularity * layout.head_k_dim
-        value = value + positions[:, None] % layout.granularity * layout.head_v_dim
-        value = value + torch.arange(layout.head_v_dim, device=pool.device)
-        elements = torch.cat((key.flatten(), value.flatten()))
-    offsets = layout.payload_offsets(elements, layer, head, pool.frame_bytes) * pool.dtype.itemsize
+        key = log_offsets(layout, positions[:, None], torch.arange(layout.head_k_dim, device=pool.device),
+                          layer, head // (layout.num_value_heads // layout.num_key_heads),
+                          value=False, head_bytes=pool.head_payload_bytes)
+        value = log_offsets(layout, positions[:, None], torch.arange(layout.head_v_dim, device=pool.device),
+                            layer, head, value=True, head_bytes=pool.head_payload_bytes)
+        offsets = torch.cat((key.flatten(), value.flatten())) * pool.dtype.itemsize
     frames = pool.payload_frame_table[slot, offsets // pool.frame_bytes].long()
     return frames * (pool.frame_bytes // pool.dtype.itemsize) + offsets % pool.frame_bytes // pool.dtype.itemsize
 
@@ -75,7 +67,7 @@ def _head_indices(
 def head_view(
     pool: MHALogStatePool, slot: int, layer: int, head: int, *, state: bool
 ) -> torch.Tensor:
-    """Read a logical head; granule-major heads are not contiguous views."""
+    """Read a logical State or Log head."""
     result = pool.storage.view(pool.dtype).flatten()[_head_indices(pool, slot, layer, head, state=state)]
     return result.view(pool.layout.head_k_dim, pool.layout.head_v_dim) if state else result
 

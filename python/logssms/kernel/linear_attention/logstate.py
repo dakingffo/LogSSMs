@@ -62,6 +62,9 @@ def restore_log_state_chains(
 ) -> None:
     if not chains:
         return
+    assert all(pool.allocator.slot(output).kind != "log" for _base, _logs, output in chains), (
+        "State output required"
+    )
     module = _load_construction_module(
         pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim, pool.layout.granularity
     )
@@ -91,14 +94,13 @@ def construct_log_state_chains(
     ],
     *,
     max_tasks: int | None = None,
-) -> int:
+) -> None:
     if not chains:
-        return 0
-    if pool.shared_keys:
-        assert all(
-            pool.allocator.slot(slot).kind != "log"
-            for _base, _logs, outputs in chains for slots in outputs for slot in slots
-        ), "Checkpoint output required"
+        return
+    assert all(
+        pool.allocator.slot(slot).kind != "log"
+        for _base, _logs, outputs in chains for slots in outputs for slot in slots
+    ), "Checkpoint output required"
     if max_tasks is None:
         max_tasks = torch.cuda.get_device_properties(pool.device).multi_processor_count
     assert max_tasks > 0
@@ -132,7 +134,6 @@ def construct_log_state_chains(
             *vectors,
             *_construction_dims(pool),
         )
-    return 0
 
 
 def store_log_states(

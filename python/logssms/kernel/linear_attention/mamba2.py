@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
-from .layout import log_pointer, payload_pointer
+from .layout import log_pointer, state_pointer
 
 
 @triton.jit
@@ -215,9 +215,9 @@ def _mamba2_decode_kernel(
     read = tl.load(Read + req * RS)
     if LOGSTATE:
         payload = Storage.to(tl.pointer_type(XBC.dtype.element_ty))
-        state_ptr = payload_pointer(
+        state_ptr = state_pointer(
             payload, Payload, read, LAYER, head, k[:, None] * V + v[None, :],
-            LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES,
+            H, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES,
         )
         log_slot = tl.load(LogSlots + req)
         decay_frame = tl.load(DecayFrames + log_slot * 2)
@@ -239,11 +239,13 @@ def _mamba2_decode_kernel(
         keys = tl.load(log_pointer(
             payload, Payload, log_slot, LAYER, head, previous[None, :], k[:, None],
             LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES, False, G,
+            position - count, position,
         ),
                        (k[:, None] < K) & valid[None, :], other=0)
         values = tl.load(log_pointer(
             payload, Payload, log_slot, LAYER, head, previous[:, None], v[None, :],
             LAYERS, H, K, V, GRANULARITY, PAGE, HEAD_BYTES, FRAME_BYTES, PAYLOAD_FRAMES, True, G,
+            position - count, position,
         ),
                          valid[:, None] & (v[None, :] < V), other=0)
         scaled = (values.to(tl.float32) * suffix[:, None]).to(XBC.dtype.element_ty)

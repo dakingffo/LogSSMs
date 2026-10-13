@@ -3,36 +3,20 @@ import triton.language as tl
 
 from .fused_recurrent import _frame_byte_offset, _softplus
 from .op import exp
-from ...layout import log_pointer, payload_pointer
+from ...layout import log_pointer, state_pointer
 
 
 @triton.jit
 def _reconstruct_tile(
-    storage, payload_frames, work_slot, log_slot, value_head, scaled_values, prior_offsets, valid,
-    k_offset, v_offset, total_decay,
+    state_head, key_rows, scaled_values, valid, k_offset, v_offset, total_decay,
     HEAD_K_DIM: tl.constexpr, HEAD_V_DIM: tl.constexpr,
-    LAYER: tl.constexpr, LAYERS: tl.constexpr, NUM_V_HEADS: tl.constexpr,
-    GRANULARITY: tl.constexpr, PAGE_SIZE: tl.constexpr, HEAD_PAYLOAD_BYTES: tl.constexpr,
-    FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr,
-    NUM_K_HEADS: tl.constexpr,
 ):
     state = tl.load(
-        payload_pointer(
-            storage, payload_frames, work_slot, LAYER, value_head,
-            k_offset[:, None] * HEAD_V_DIM + v_offset[None, :],
-            LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
-            HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
-        ),
-        mask=(k_offset[:, None] < HEAD_K_DIM) & (v_offset[None, :] < HEAD_V_DIM),
-        other=0.0,
+        state_head + k_offset[:, None] * HEAD_V_DIM + v_offset[None, :],
+        mask=(k_offset[:, None] < HEAD_K_DIM) & (v_offset[None, :] < HEAD_V_DIM), other=0.0,
     ).to(tl.float32)
     keys = tl.load(
-        log_pointer(
-            storage, payload_frames, log_slot, LAYER, value_head,
-            prior_offsets[None, :], k_offset[:, None],
-            LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
-            HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
-        ),
+        key_rows[None, :] + k_offset[:, None],
         mask=(k_offset[:, None] < HEAD_K_DIM) & valid[None, :], other=0.0,
     )
     return state * total_decay + tl.dot(keys, scaled_values)
@@ -73,6 +57,22 @@ def _gdn_replay_kernel(
     replay_index = tl.arange(0, REPLAY_WINDOW)
     prior_offsets = position - count + replay_index
     valid = replay_index < count
+    state_head = state_pointer(
+        payload, payload_frames, work_slot, LAYER, value_head, 0,
+        NUM_V_HEADS, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
+    )
+    key_rows = log_pointer(
+        payload, payload_frames, log_slot, LAYER, value_head, prior_offsets, 0,
+        LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+        HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
+        position - count, position,
+    )
+    value_rows = log_pointer(
+        payload, payload_frames, log_slot, LAYER, value_head, prior_offsets, 0,
+        LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+        HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, NUM_K_HEADS,
+        position - count, position,
+    )
     log_decays = tl.load(
         decay_head + (LAYER * PAGE_SIZE + prior_offsets) * NUM_V_HEADS + value_head,
         mask=valid, other=0.0,
@@ -81,12 +81,7 @@ def _gdn_replay_kernel(
     total_decay = tl.exp(total_log_decay)
     suffix_decay = tl.exp(total_log_decay - tl.cumsum(log_decays))
     logged_values = tl.load(
-        log_pointer(
-            payload, payload_frames, log_slot, LAYER, value_head,
-            prior_offsets[:, None], v_offset[None, :],
-            LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
-            HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, NUM_K_HEADS,
-        ),
+        value_rows[:, None] + v_offset[None, :],
         mask=valid[:, None] & v_mask[None, :], other=0.0,
     )
     scaled_values = (
@@ -116,23 +111,20 @@ def _gdn_replay_kernel(
         q = tl.load(q_ptr + k_offset, mask=k_offset < HEAD_K_DIM, other=0.0).to(tl.float32) * q_norm
         k = tl.load(k_ptr + k_offset, mask=k_offset < HEAD_K_DIM, other=0.0).to(tl.float32) * k_norm
         state = _reconstruct_tile(
-            payload, payload_frames, work_slot, log_slot, value_head, scaled_values, prior_offsets, valid,
-            k_offset, v_offset, total_decay, HEAD_K_DIM, HEAD_V_DIM,
-            LAYER, LAYERS, NUM_V_HEADS, GRANULARITY, PAGE_SIZE, HEAD_PAYLOAD_BYTES,
-            FRAME_BYTES, FRAMES_PER_SLOT,
-            NUM_K_HEADS,
+            state_head, key_rows, scaled_values, valid, k_offset, v_offset,
+            total_decay, HEAD_K_DIM, HEAD_V_DIM,
         )
         state_q += tl.sum(state * q[:, None], axis=0)
         state_k += tl.sum(state * k[:, None], axis=0)
         kq += tl.sum(k * q)
 
-
-        if value_block == 0 and value_head % (NUM_V_HEADS // NUM_K_HEADS) == 0:
-            tl.store(log_pointer(
-                payload, payload_frames, log_slot, LAYER, value_head, position, k_offset,
-                LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
-                HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
-            ), k, mask=k_offset < HEAD_K_DIM)
+    if value_block == 0 and value_head % (NUM_V_HEADS // NUM_K_HEADS) == 0:
+        key_destination = log_pointer(
+            payload, payload_frames, log_slot, LAYER, value_head, position, full_k,
+            LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
+            HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, NUM_K_HEADS,
+        )
+        tl.store(key_destination, k_full * k_norm, mask=full_k < HEAD_K_DIM)
 
     v = tl.load(value + batch_head * HEAD_V_DIM + v_offset, mask=v_mask, other=0.0).to(tl.float32)
     delta = (v - state_k * decay) * beta_value
@@ -150,26 +142,16 @@ def _gdn_replay_kernel(
         tl.store(decay_head + (LAYER * PAGE_SIZE + position) * NUM_V_HEADS + value_head, log_decay)
 
     if (position + 1) % REPLAY_WINDOW == 0:
-
-
         for block in range(triton.cdiv(HEAD_K_DIM, BLOCK_K)):
             k_offset = block * BLOCK_K + tl.arange(0, BLOCK_K)
             k = tl.load(k_ptr + k_offset, mask=k_offset < HEAD_K_DIM, other=0.0).to(tl.float32) * k_norm
             state = _reconstruct_tile(
-                payload, payload_frames, work_slot, log_slot, value_head, scaled_values, prior_offsets, valid,
-                k_offset, v_offset, total_decay, HEAD_K_DIM, HEAD_V_DIM,
-                LAYER, LAYERS, NUM_V_HEADS, GRANULARITY, PAGE_SIZE, HEAD_PAYLOAD_BYTES,
-                FRAME_BYTES, FRAMES_PER_SLOT,
-                NUM_K_HEADS,
+                state_head, key_rows, scaled_values, valid, k_offset, v_offset,
+                total_decay, HEAD_K_DIM, HEAD_V_DIM,
             )
             updated = state * decay + k[:, None] * delta[None, :]
             tl.store(
-                payload_pointer(
-                    payload, payload_frames, work_slot, LAYER, value_head,
-                    k_offset[:, None] * HEAD_V_DIM + v_offset[None, :],
-                    LAYERS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, GRANULARITY, PAGE_SIZE,
-                    HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
-                ),
+                state_head + k_offset[:, None] * HEAD_V_DIM + v_offset[None, :],
                 updated,
                 mask=(k_offset[:, None] < HEAD_K_DIM) & v_mask[None, :],
             )

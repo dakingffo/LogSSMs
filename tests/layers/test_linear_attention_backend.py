@@ -10,6 +10,44 @@ from logssms.layers.linear_attention_backend import GatedDeltaBackend
 from tests.utils import clear_global_ctx
 
 
+@pytest.mark.parametrize("logstate", [False, True])
+def test_gdn_prefill_selects_launch_config(monkeypatch, logstate):
+    from logssms.kernel.linear_attention.vendor.fla import ChunkStateIO, chunk_delta_h
+
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                launches.append((grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(chunk_delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", Kernel())
+    key = torch.empty(1, 64, 2, 128, dtype=torch.bfloat16)
+    values = torch.empty(1, 64, 6, 128, dtype=key.dtype)
+    gate = torch.empty(1, 64, 6)
+    io = ChunkStateIO(
+        storage=torch.empty(1, 65536, dtype=key.dtype) if logstate
+        else torch.empty(2, 1, 6, 128, 128, dtype=key.dtype),
+        read_slots=torch.tensor([0]), chunk_write_slots=torch.tensor([1]),
+        payload_frames=torch.zeros(1, 1, dtype=torch.int32) if logstate else None,
+        frame_bytes=131072 if logstate else 0,
+        head_payload_bytes=32768 if logstate else 0,
+        layer=0,
+    )
+    chunk_delta_h.chunk_gated_delta_rule_fwd_h(
+        key, torch.empty_like(values), values, gate, io,
+        torch.tensor([0, 64]), chunk_indices=torch.tensor([[0, 0]]),
+        chunk_offsets=torch.tensor([0, 1]),
+    )
+    grid, config = launches.pop()
+    assert grid == (4, 6)
+    assert config["BV"] == 32
+    assert config["BT"] == 64
+    assert config["num_warps"] == 2
+    assert config["num_stages"] == 2
+
+
 def _make_inputs(seq_len: int) -> dict:
     torch.manual_seed(7)
     device = torch.device("cuda")

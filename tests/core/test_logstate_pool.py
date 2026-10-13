@@ -55,7 +55,7 @@ def test_grouped_value_heads_use_value_head_payloads():
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
 @pytest.mark.parametrize("key_heads", [1, 2])
-def test_log_payload_matches_kv_granule_layer_token_head_order(granularity, key_heads):
+def test_log_payload_uses_granule_layer_head_token_order(granularity, key_heads):
     pool = MHALogStatePool(
         num_frames=64, page_size=64, granularity=granularity,
         num_attention_layers=2, num_kv_heads=1, head_dim=32,
@@ -80,8 +80,8 @@ def test_log_payload_matches_kv_granule_layer_token_head_order(granularity, key_
     for begin in range(0, 64, granularity):
         for layer in range(2):
             for plane in range(2):
-                for token in range(begin, begin + granularity):
-                    for index_head in range(key_heads if plane == 0 else 2):
+                for index_head in range(key_heads if plane == 0 else 2):
+                    for token in range(begin, begin + granularity):
                         head = index_head * (2 // key_heads) if plane == 0 else index_head
                         index = plane * 64 * 32 + token * 32
                         expected.append(heads[layer * 2 + head][index:index + 32])
@@ -93,11 +93,36 @@ def test_log_payload_matches_kv_granule_layer_token_head_order(granularity, key_
     for layer in range(2):
         for head in range(2):
             log = set(_head_indices(pool, slot, layer, head, state=False).tolist())
-            state = set(_head_indices(pool, slot, layer, head, state=True).tolist())
             if not pool.shared_keys:
-                assert state <= log
                 assert not occupied & log
             occupied.update(log)
+
+
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+@pytest.mark.parametrize("key_heads", [1, 2])
+def test_state_heads_are_contiguous_independent_of_log_layout(granularity, key_heads):
+    pool = MHALogStatePool(
+        num_frames=64, page_size=64, granularity=granularity,
+        num_attention_layers=2, num_kv_heads=1, head_dim=32,
+        num_linear_layers=2, num_key_heads=key_heads, num_value_heads=2,
+        head_k_dim=32, head_v_dim=32, conv_dim=192, state_len=3,
+        device=torch.device("cpu"), dtype=torch.float16,
+    )
+    kv, _, _ = pool.reserve(kv=20)
+    pool.release_kv(kv[::2])
+    _, _, works = pool.reserve(works=2)
+    occupied = set()
+    for slot in works:
+        for layer in range(2):
+            for head in range(2):
+                indices = _head_indices(pool, slot, layer, head, state=True)
+                physical = indices
+                assert torch.all(physical.diff() == 1)
+                assert not occupied.intersection(indices.tolist())
+                occupied.update(indices.tolist())
+                values = torch.arange(1024, dtype=pool.dtype).view(32, 32) + 100 * (layer + head)
+                write_head(pool, slot, layer, head, values, state=True)
+                torch.testing.assert_close(head_view(pool, slot, layer, head, state=True), values)
 
 
 def test_reserve_profile_separates_allocator_and_descriptor_work():
@@ -145,6 +170,28 @@ def test_logstate_work_state_and_conv_roundtrip():
     pool.write_conv(slots, granules, 1, conv)
     torch.testing.assert_close(pool.read_states(slots, 1), state)
     torch.testing.assert_close(pool.read_conv(slots, granules, 1), conv)
+
+
+def test_state_payload_stores_value_dimension_contiguously():
+    pool = MHALogStatePool(
+        num_frames=64, page_size=64, granularity=32,
+        num_attention_layers=1, num_kv_heads=1, head_dim=32,
+        num_linear_layers=2, num_key_heads=1, num_value_heads=2,
+        head_k_dim=32, head_v_dim=16, conv_dim=64, state_len=3,
+        device=torch.device("cpu"), dtype=torch.float16,
+    )
+    _, _, works = pool.reserve(works=1)
+    slots = torch.tensor(works, dtype=torch.int32)
+    state = torch.arange(2 * 32 * 16, dtype=pool.dtype).view(1, 2, 32, 16)
+    pool.write_states(slots, 1, state)
+    torch.testing.assert_close(pool.read_states(slots, 1), state)
+    record = pool.allocator.slot(works[0])
+    physical = pool.storage[list(record.payload)].view(pool.dtype).flatten()
+    for head in range(2):
+        begin = (2 + head) * pool.head_payload_bytes // 2
+        torch.testing.assert_close(
+            physical[begin:begin + 32 * 16], state[0, head].flatten(),
+        )
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -322,7 +369,7 @@ def test_head_overlay_and_side_views_survive_noncontiguous_allocation():
     assert allocated is not None
     slot = allocated[1][0]
     write_head(pool, slot, 1, 0, 7, state=False, index=0)
-    assert head_view(pool, slot, 1, 0, state=True)[0, 0] == 7
+    assert head_view(pool, slot, 1, 0, state=False)[0] == 7
     pool.conv_view(slot, 3).fill_(5)
     assert torch.all(pool.conv_view(slot, 3) == 5)
     decay_view(pool, slot).fill_(0.75)
@@ -342,7 +389,7 @@ def test_cuda_frame_descriptors_and_kv_views():
     pool.k_cache(0)[frame * 4 + 2].fill_(3)
     write_head(pool, slot, 0, 0, 4, state=False)
     assert torch.all(pool.k_cache(0)[frame * 4 + 2] == 3)
-    assert torch.all(head_view(pool, slot, 0, 0, state=True) == 4)
+    assert torch.all(head_view(pool, slot, 0, 0, state=False) == 4)
     torch.testing.assert_close(
         pool.payload_frame_table[slot],
         torch.tensor(pool.allocator.slot(slot).payload, dtype=torch.int32, device="cuda"),

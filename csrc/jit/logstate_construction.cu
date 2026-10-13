@@ -128,16 +128,16 @@ public:
     params.log_ends = static_cast<const std::int32_t *>(log_ends.data_ptr());
     params.output_slots = static_cast<const std::int32_t *>(output_slots.data_ptr());
     params.num_tasks = num_tasks;
-    const auto macro_tiles = div_ceil(head_k_dim, std::size_t{32})
+    const auto macro_tiles = div_ceil(head_k_dim, std::size_t{64})
                            * div_ceil(head_v_dim, std::size_t{64});
     const auto blocks = num_tasks * num_layers * num_heads * macro_tiles;
     if (is_bfloat16) {
-      LaunchKernel(blocks, 256, views.device)(
-        restore_log_state_kernel<__nv_bfloat16, head_k_dim, head_v_dim>, params
+      LaunchKernel(blocks, 128, views.device)(
+        log_state_kernel<false, __nv_bfloat16, head_k_dim, head_v_dim>, params
       );
     } else {
-      LaunchKernel(blocks, 256, views.device)(
-        restore_log_state_kernel<__half, head_k_dim, head_v_dim>, params
+      LaunchKernel(blocks, 128, views.device)(
+        log_state_kernel<false, __half, head_k_dim, head_v_dim>, params
       );
     }
   }
@@ -193,12 +193,12 @@ public:
     const auto blocks = num_tasks * num_layers * num_heads;
     if (is_bfloat16) {
       LaunchKernel(blocks, 256, views.device)(
-        construct_log_state_kernel<__nv_bfloat16, head_k_dim, head_v_dim>,
+        log_state_kernel<true, __nv_bfloat16, head_k_dim, head_v_dim>,
         params
       );
     } else {
       LaunchKernel(blocks, 256, views.device)(
-        construct_log_state_kernel<__half, head_k_dim, head_v_dim>,
+        log_state_kernel<true, __half, head_k_dim, head_v_dim>,
         params
       );
     }
