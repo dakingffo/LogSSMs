@@ -134,7 +134,7 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         locked = [1] + [int(rng.random() < .1) for _ in range(1, count)]
         for i in range(count - 1, 0, -1):
             locked[parents[i]] |= locked[i]
-        nodes = [(i, parents[i], locked[i], rng.randrange(2), rng.randrange(100))
+        nodes = [(i, parents[i], locked[i], 0, rng.randrange(100))
                  for i in range(count)]
         order = eviction_oracle(nodes)
         assert planning.eviction_candidates(nodes) == order
@@ -154,7 +154,7 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         own_decay = Counter(row[3] for row in slots if row[3] >= 0)
         occupied = [(frame, rng.randrange(max(1, own_decay[frame]), 5)) for frame in range(3)]
         config = [rng.randrange(3), sum(4 - n for _, n in occupied), 2, 1, 2, 4,
-                  rng.randrange(1, 12), rng.randrange(1, 12), rng.randrange(3), 2]
+                  rng.randrange(1, 12), rng.randrange(1, 12), rng.randrange(3), 2, 0]
         selected, pages, refs, released = [], Counter(), Counter(), set()
         expected = []
         for i in order:
@@ -222,32 +222,23 @@ def test_small_capacity_requests_select_the_globally_coldest_leaf():
     refs = [[]] + [[i] for i in range(1, len(nodes))]
     slots = [(i, 1, 1, -1, -1) for i in range(1, len(nodes))]
     result = planning.plan_eviction(
-        nodes, [[] for _ in nodes], refs, slots, [], [0, 0, 1, 0, 1, 1, 1, 0, 0, 1], (),
+        nodes, [[] for _ in nodes], refs, slots, [], [0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0], (),
     )
     assert result == [[2], [], [2], []]
 
 
 def test_checkpoint_pressure_thins_one_fixed_heat_snapshot():
-    nodes = eviction_chains(5, 3, checkpoint=True)
+    nodes = eviction_chains(10, 1, checkpoint=True)
     refs = [[]] + [[i] for i in range(1, len(nodes))]
     slots = [(i, 1, 1, -1, -1) for i in range(1, len(nodes))]
-    pairs = [(i, i + 1, position * 64, nodes[i][4])
-             for chain in range(5) for position in (1, 2)
-             for i in [chain * 3 + position]]
-    for needed, dropped in [(4, [2, 5, 8, 11]), (5, [2, 5, 8, 11, 14]),
-                            (9, [2, 5, 8, 11, 14, 4, 10, 7, 13])]:
+    actions = [(i, -1, nodes[i][4], i) for i in range(1, len(nodes))]
+    order = [2, 4, 6, 8, 3, 7, 5, 1, 9, 10]
+    for needed in (4, 8, 9, 10):
         result = planning.plan_eviction(
             nodes, [[] for _ in nodes], refs, slots, [],
-            [0, 0, 1, 0, 1, 1, needed, 0, 0, 1], pairs,
+            [0, 0, 1, 0, 1, 1, needed, 0, 0, 1, 2], actions,
         )
-        successors, compressed = {}, []
-        for slot in dropped:
-            right = slot + 1
-            while right in successors:
-                right = successors[right]
-            successors[slot] = right
-            compressed.extend((slot, right))
-        assert result == [[], [], sorted(dropped), compressed]
+        assert result == [order[:needed], [], sorted(order[:needed]), []]
 
 
 def test_eviction_prunes_logs_before_dropping_private_checkpoints():
@@ -255,19 +246,18 @@ def test_eviction_prunes_logs_before_dropping_private_checkpoints():
              (2, 1, 0, 1, 1), (3, 0, 0, 0, 999)]
     refs = [[], [10], [11], [12]]
     slots = [(10, 1, 3, -1, -1), (11, 1, 3, -1, -1), (12, 1, 8, -1, -1)]
-    pairs = [(10, 11, 256, 100)]
-    config = [0, 0, 3, 0, 1, 1, 8, 0, 0, 3]
-    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
+    actions = [(10, 11, 100, 1), (11, -1, 1, 2, 1)]
+    config = [0, 0, 3, 0, 1, 1, 8, 0, 0, 3, 1]
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [
         [3], [], [12], [],
     ]
     config[6] = 11
-    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
-        [3], [], [10, 12], [10, 11],
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [
+        [3, 2], [], [11, 12], [],
     ]
     config[6] = 14
-    # Falling back to pruning the newer leaf must not release slot 10 twice.
-    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
-        [3, 2], [], [10, 11, 12], [10, 11],
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [
+        [3, 2, 1], [], [10, 11, 12], [],
     ]
 
 
@@ -276,17 +266,17 @@ def test_eviction_keeps_coldest_candidate_until_later_thinning_pass():
              (2, 1, 0, 1, 1), (3, 2, 0, 1, 0)]
     refs = [[], [10], [11], [12]]
     slots = [(slot, 1, 3, -1, -1) for slot in (10, 11, 12)]
-    pairs = [(11, 12, 384, 1), (10, 11, 256, 999)]
-    config = [0, 0, 3, 0, 1, 1, 3, 0, 0, 3]
-    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
-        [], [], [10], [10, 11],
+    actions = [(11, 12, 1, 2, 1), (10, 11, 999, 1), (12, -1, 0, 3, 2, 1)]
+    config = [0, 0, 3, 0, 1, 1, 3, 0, 0, 3, 1]
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [
+        [], [], [11], [11, 12],
     ]
     config[6] = 6
-    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == [
-        [], [], [10, 11], [10, 11, 11, 12],
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [
+        [3, 2], [], [11, 12], [11, 12],
     ]
     config[6] = 100
-    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, pairs) == []
+    assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == []
 
 
 def test_native_protections_deduplicate_forced_and_batch_branches():

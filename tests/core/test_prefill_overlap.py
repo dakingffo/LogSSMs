@@ -59,7 +59,7 @@ def test_cold_prefill_initializes_cache_handle() -> None:
         match_req=lambda _req: SimpleNamespace(cuda_handle=handle),
         plan_prefill_chunk=lambda remain, budget: min(remain, budget),
         prefill_acquire=lambda *_args, **_kwargs: True,
-        record_match_profile=lambda *_args, **_kwargs: None,
+        record_match=lambda *_args, **_kwargs: None,
         init_with_handle=lambda index, value: calls.append((index, value)),
     )
     table_manager = SimpleNamespace(available_size=1, allocate=lambda: 3)
@@ -70,6 +70,35 @@ def test_cold_prefill_initializes_cache_handle() -> None:
 
     assert adder._try_allocate_one(pending) == (handle, 3, 16)
     assert calls == [(3, handle)]
+
+
+def test_cache_match_snapshot_is_taken_only_after_successful_admission():
+    from logssms.cache.base import BaseCacheManager
+
+    matches = iter([8, 4])
+    admissions = iter([False, True])
+    manager = SimpleNamespace(
+        _match_profile_enabled=False,
+        reservation_size=lambda tokens, **_: tokens,
+        match_req=lambda _: SimpleNamespace(cuda_handle=SimpleNamespace(cached_len=next(matches))),
+        plan_prefill_chunk=lambda remain, budget: min(remain, budget),
+        prefill_acquire=lambda *_args, **_kwargs: next(admissions),
+        admission_capacity=64,
+        init_with_handle=lambda *_args: None,
+    )
+    manager.record_match = lambda req, match, **kwargs: BaseCacheManager.record_match(
+        manager, req, match, **kwargs
+    )
+    table = SimpleNamespace(
+        available_size=1, allocate=lambda: 0,
+        token_pool=torch.empty((1, 64), dtype=torch.int32),
+    )
+    pending = PendingRequest(0, torch.arange(20, dtype=torch.int32), SamplingParams(max_tokens=8))
+    adder = PrefillAdder(4, 0, manager, table)
+    assert adder._try_allocate_one(pending) is None
+    assert pending.prefix_cached_len == 0
+    assert adder._try_allocate_one(pending) is not None
+    assert pending.prefix_cached_len == 4
 
 
 class FakeChunkAdder:

@@ -38,6 +38,7 @@ class PendingRequest:
     chunked_req    : ChunkedRequest | None = None
     queued_at_ns   : int = field(default_factory=perf_counter_ns)
     admitted       : bool = False
+    prefix_cached_len: int = 0
 
     @property
     def input_len(self) -> int:
@@ -105,8 +106,8 @@ class PrefillAdder:
                 )
             return None
 
-        with self._profile_step("record_match_profile"):
-            self.cache_manager.record_match_profile(
+        with self._profile_step("record_match"):
+            self.cache_manager.record_match(
                 req, match, input_len=req.input_len
             )
 
@@ -160,6 +161,7 @@ class PrefillAdder:
                 sampling_params=pending_req.sampling_params,
                 profile_tag=pending_req.profile_tag,
                 return_token_ids=pending_req.return_token_ids,
+                prefix_cached_len=pending_req.prefix_cached_len,
                 max_device_len=len(pending_req.input_ids) + pending_req.output_len,
             )
 

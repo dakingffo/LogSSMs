@@ -50,12 +50,15 @@ class Request:
     max_device_len : int
     profile_tag    : str | None = None
     return_token_ids: bool = False
+    prefix_cached_len: int | None = None
     device_len     : int  = field(init=False)
     aborted        : bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
+        if self.prefix_cached_len is None:
+            self.prefix_cached_len = self.cached_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
     def __lt__(self, other: Request) -> bool:

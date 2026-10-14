@@ -699,31 +699,46 @@ public:
   }
 
   Int pop() {
+    clean();
     if (heap_.empty()) {
       return -1;
     }
     const auto index = std::get<3>(heap_.top());
     heap_.pop();
-    const auto parent = indices_.find(nodes_[index][1]);
-    if (parent != indices_.end() && !--children_[parent->second] && !nodes_[parent->second][2]) {
-      push(parent->second);
-    }
+    take(index);
     return index;
   }
 
-  bool next_is_log() const {
-    return !heap_.empty() && !std::get<0>(heap_.top());
+  Int take(Int index) {
+    check(leaves_.erase(index) == 1, "Eviction node is not an unlocked leaf");
+    const auto parent = indices_.find(nodes_[index][1]);
+    if (parent != indices_.end() && !--children_[parent->second] && !nodes_[parent->second][2]) {
+      push(parent->second);
+      return parent->second;
+    }
+    return -1;
   }
 
+  bool is_leaf(Int index) const { return leaves_.contains(index); }
+  const std::unordered_set<Int>& leaves() const { return leaves_; }
+
 private:
+  void clean() {
+    while (!heap_.empty() && !leaves_.contains(std::get<3>(heap_.top()))) {
+      heap_.pop();
+    }
+  }
+
   void push(Int index) {
     const auto& row = nodes_[index];
     heap_.emplace(row[3], row[4], row[0], index);
+    leaves_.insert(index);
   }
 
   Rows nodes_;
   Vector children_;
   std::unordered_map<Int, Int> indices_;
+  std::unordered_set<Int> leaves_;
   using Priority = std::tuple<Int, Int, Int, Int>;
   std::priority_queue<Priority, std::vector<Priority>, std::greater<Priority>> heap_;
 };
@@ -739,11 +754,12 @@ Rows eviction_order(const Rows& nodes) {
 
 Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
                    const Rows& slots, const Rows& occupied, const List& config,
-                   const Rows& checkpoint_pairs) {
+                   const Rows& checkpoint_actions) {
 
 
   check(nodes.size() == kv.size() && nodes.size() == node_slots.size()
-        && config.size() == 10 && config[5] > 0, "Invalid eviction capacity metadata");
+        && config.size() == 11 && config[5] > 0 && config[10] >= 0,
+        "Invalid eviction capacity metadata");
   std::unordered_map<Int, List> slot_info;
   for (const auto& row : slots) {
     check(row.size() == 5 && row[1] > 0, "Invalid eviction slot");
@@ -822,72 +838,137 @@ Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
   };
 
 
-  while (queue.next_is_log()) {
-    prune(queue.pop());
-    if (fits()) {
-      return result();
-    }
+  std::vector<Vector> actions;
+  std::unordered_set<Int> checkpoint_slots;
+  for (const auto& row : checkpoint_actions) {
+    check(row.size() >= 3 && row[0] != row[1], "Invalid checkpoint eviction action");
+    actions.emplace_back(row.begin(), row.end());
+    checkpoint_slots.insert(row[0]);
   }
-  std::vector<Vector> pairs;
-  for (const auto& row : checkpoint_pairs) {
-    check(row.size() == 4 && row[0] != row[1], "Invalid checkpoint eviction pair");
-    pairs.emplace_back(row.begin(), row.end());
-  }
-  std::sort(pairs.begin(), pairs.end(), [](const Vector& left, const Vector& right) {
-    return std::tie(left[3], left[2], left[0]) < std::tie(right[3], right[2], right[0]);
+  std::sort(actions.begin(), actions.end(), [](const Vector& left, const Vector& right) {
+    return std::tie(left[2], left[0]) < std::tie(right[2], right[0]);
   });
-
-
-  std::vector<Vector> ordered;
-  ordered.reserve(pairs.size());
-  while (!pairs.empty()) {
-    if (pairs.size() == 1) {
-      ordered.push_back(std::move(pairs.front()));
+  const auto retained_count = std::min(static_cast<size_t>(config[10]), actions.size());
+  const auto cold_count = actions.size() - retained_count;
+  std::vector<size_t> cold, order;
+  for (size_t i = 0; i < cold_count; ++i) {
+    cold.push_back(i);
+  }
+  while (!cold.empty()) {
+    if (cold.size() == 1) {
+      order.push_back(cold.front());
       break;
     }
-    std::vector<Vector> retained;
-    retained.reserve((pairs.size() + 1) / 2);
-    for (size_t i = 0; i < pairs.size(); ++i) {
-      if (i % 2) {
-        ordered.push_back(std::move(pairs[i]));
-      }
-      else {
-        retained.push_back(std::move(pairs[i]));
-      }
+    std::vector<size_t> retained;
+    for (size_t i = 0; i < cold.size(); ++i) {
+      (i % 2 ? order : retained).push_back(cold[i]);
     }
-    pairs = std::move(retained);
+    cold = std::move(retained);
+  }
+  for (size_t i = cold_count; i < actions.size(); ++i) {
+    order.push_back(i);
   }
   std::unordered_map<Int, Int> successors;
-  for (const auto& pair : ordered) {
-    if (released_set.contains(pair[0])) {
-      continue;
+  auto has_checkpoint = [&](Int index) {
+    return std::any_of(node_slots[index].begin(), node_slots[index].end(),
+        [&](Int slot) { return checkpoint_slots.contains(slot) && !released_set.contains(slot); });
+  };
+  using LogPriority = std::tuple<Int, Int, Int>;
+  std::priority_queue<LogPriority, std::vector<LogPriority>, std::greater<LogPriority>> logs;
+  std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> checkpoints;
+  std::unordered_map<Int, std::vector<size_t>> owners;
+  std::vector<bool> queued(order.size());
+  auto enqueue = [&](size_t rank) {
+    if (!queued[rank] && !released_set.contains(actions[order[rank]][0])) {
+      checkpoints.push(rank);
+      queued[rank] = true;
     }
-    auto right = pair[1];
-
-
-    while (successors.contains(right)) {
-      right = successors.at(right);
+  };
+  for (size_t rank = 0; rank < order.size(); ++rank) {
+    const auto& action = actions[order[rank]];
+    if (action.size() > 3) {
+      owners[action[3]].push_back(rank);
     }
-    check(slot_info.contains(pair[0]) && slot_info.contains(right),
-          "Missing checkpoint eviction slot");
-    check(slot_info.at(pair[0])[1] == 1 && slot_info.at(right)[1] == 1,
-          "Cannot compress shared checkpoint slots");
-    compressed.insert(compressed.end(), {pair[0], right});
-    successors.emplace(pair[0], right);
-    release(pair[0]);
-    if (fits()) {
-      return result();
+    if (action[1] >= 0) {
+      enqueue(rank);
     }
   }
-
-
-  for (Int index; (index = queue.pop()) >= 0;) {
+  auto activate = [&](Int index) {
+    if (index < 0 || !queue.is_leaf(index)) {
+      return;
+    }
+    if (has_checkpoint(index)) {
+      for (const auto rank : owners[index]) {
+        enqueue(rank);
+      }
+    }
+    else {
+      logs.emplace(nodes[index][4], nodes[index][0], index);
+    }
+  };
+  for (const auto index : queue.leaves()) {
+    activate(index);
+  }
+  auto prune_leaf = [&](Int index) {
+    const auto parent = queue.take(index);
     prune(index);
+    activate(parent);
+  };
+  while (true) {
+    while (!logs.empty() && !queue.is_leaf(std::get<2>(logs.top()))) {
+      logs.pop();
+    }
+    if (!logs.empty()) {
+      const auto index = std::get<2>(logs.top());
+      logs.pop();
+      prune_leaf(index);
+    }
+    else {
+      bool advanced = false;
+      while (!checkpoints.empty()) {
+        const auto rank = checkpoints.top();
+        checkpoints.pop();
+        queued[rank] = false;
+        const auto& action = actions[order[rank]];
+        if (released_set.contains(action[0])) {
+          continue;
+        }
+        auto right = action[1];
+        while (successors.contains(right)) {
+          right = successors.at(right);
+        }
+        if (right >= 0 && !released_set.contains(right)) {
+          check(slot_info.at(action[0])[1] == 1 && slot_info.at(right)[1] == 1,
+                "Cannot compress shared checkpoint slots");
+          compressed.insert(compressed.end(), {action[0], right});
+          successors.emplace(action[0], right);
+          release(action[0]);
+          if (action.size() > 3) {
+            activate(action[3]);
+          }
+          advanced = true;
+        }
+        else if (action.size() > 3 && queue.is_leaf(action[3])) {
+          for (size_t i = 3; i < action.size(); ++i) {
+            if (i > 3 && has_checkpoint(action[i])) {
+              break;
+            }
+            prune_leaf(action[i]);
+          }
+          advanced = true;
+        }
+        if (advanced) {
+          break;
+        }
+      }
+      if (!advanced) {
+        return {};
+      }
+    }
     if (fits()) {
       return result();
     }
   }
-  return {};
 }
 
 class RecycleBin {
@@ -1155,10 +1236,10 @@ struct Planner {
   static tvm::ffi::Tensor eviction(tvm::ffi::TensorView nodes, tvm::ffi::TensorView kv,
                                  tvm::ffi::TensorView node_slots, tvm::ffi::TensorView slots,
                                  tvm::ffi::TensorView occupied, const List& config,
-                                 tvm::ffi::TensorView checkpoint_pairs) {
+                                 tvm::ffi::TensorView checkpoint_actions) {
     return write_rows(plan_eviction(read_rows(nodes), read_rows(kv), read_rows(node_slots),
                                     read_rows(slots), read_rows(occupied), config,
-                                    read_rows(checkpoint_pairs)));
+                                    read_rows(checkpoint_actions)));
   }
 
   static tvm::ffi::Tensor eviction_candidates(tvm::ffi::TensorView nodes) {

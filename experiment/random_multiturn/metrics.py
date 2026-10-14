@@ -32,6 +32,8 @@ def summarize(
     tics_all      : list[list[float]],
     input_lengths : list[int],
     output_lengths: list[int],
+    *,
+    ignore_eos    : bool = True,
 ) -> dict:
     if not tics_all:
         raise ValueError("Cannot summarize an empty request set")
@@ -43,16 +45,20 @@ def summarize(
     start = min(tics[0] for tics in tics_all)
     end = max(tics[-1] for tics in tics_all)
     duration = end - start
-    ttft = [tics[1] - tics[0] for tics in tics_all]
+    ttft = [
+        tics[1] - tics[0] for tics, count in zip(tics_all, actual, strict=True)
+        if count > 0
+    ]
     e2e = [tics[-1] - tics[0] for tics in tics_all]
     tpot = [
         (tics[-1] - tics[1]) / (count - 1) if count > 1 else 0.0
         for tics, count in zip(tics_all, actual, strict=True)
+        if ignore_eos or count > 1
     ]
     output_rate = out_tokens / duration if duration > 0 else 0.0
     return {
         "n": len(tics_all),
-        "ignore_eos": True,
+        "ignore_eos": ignore_eos,
         "in_tokens": sum(input_lengths),
         "requested_out": requested,
         "early_stops": sum(
@@ -61,17 +67,22 @@ def summarize(
         ),
         "out_tokens": out_tokens,
         "duration_s": duration,
-        "prefill_tok_per_s": sum(input_lengths) / max(ttft) if ttft else 0.0,
+        "prefill_tok_per_s": sum(input_lengths) / max(ttft) if ttft and max(ttft) > 0 else 0.0,
         "output_tok_per_s": output_rate,
         "decode_tok_per_s": output_rate,
         "req_per_s": len(tics_all) / duration if duration > 0 else 0.0,
         "ttft_ms": _stats(ttft),
         "tpot_ms": _stats(tpot),
+        "ttft_requests": len(ttft),
+        "tpot_requests": len(tpot),
         "e2e_s": _stats(e2e, scale=1.0),
         "rounds": 0,
         "avg_accept": 0.0,
         "is_mtp": False,
-        "chunks_ok": actual == output_lengths,
+        "chunks_ok": (
+            actual == output_lengths if ignore_eos else
+            all(0 <= count <= length for count, length in zip(actual, output_lengths, strict=True))
+        ),
     }
 
 

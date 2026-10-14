@@ -1,0 +1,412 @@
+{
+  "model": "/home/daking/models/huggingface/Qwen3.5-0.8B",
+  "cache_type": "logstate",
+  "cache_config": "LogStateCacheConfig(granularity=32, enable_eager_state=False, enable_memorized_evict=True, enable_merge_adjustment=False, min_sampling_len=1024, max_merge_intensity=16, default_merge_growth_rate=2)",
+  "seed": 0,
+  "input_len": 256,
+  "append_len": 64,
+  "output_len": 64,
+  "num_turns": 8,
+  "num_sessions": 4,
+  "shared_prefix_len": 0,
+  "ignore_eos": true,
+  "chat_template": false,
+  "server_argv": [
+    "--model-path",
+    "/home/daking/models/huggingface/Qwen3.5-0.8B",
+    "--tensor-parallel-size",
+    "1",
+    "--memory-ratio",
+    "0.9",
+    "--max-running-requests",
+    "4",
+    "--max-seq-len-override",
+    "2048",
+    "--max-prefill-tokens",
+    "512",
+    "--max-decode-tokens",
+    "4",
+    "--cuda-graph-max-bs",
+    "4",
+    "--port",
+    "28300",
+    "--cache-type",
+    "logstate",
+    "--granularity",
+    "32"
+  ],
+  "points": {
+    "4": {
+      "n": 32,
+      "ignore_eos": true,
+      "in_tokens": 22528,
+      "requested_out": 2048,
+      "early_stops": 0,
+      "out_tokens": 2048,
+      "duration_s": 10.653730035999615,
+      "prefill_tok_per_s": 15195.884793036146,
+      "output_tok_per_s": 192.233142108884,
+      "decode_tok_per_s": 192.233142108884,
+      "req_per_s": 3.0036428454513127,
+      "ttft_ms": [
+        530.0368349063547,
+        372.73843699949794,
+        1457.7543669984152,
+        1482.5066330013215,
+        1482.5066330013215
+      ],
+      "tpot_ms": [
+        12.698332858134462,
+        11.961821952383385,
+        15.7443737618797,
+        16.448746317427506,
+        16.448746317427506
+      ],
+      "e2e_s": [
+        1.3300318049688258,
+        1.1876965579976968,
+        2.1656011220002256,
+        2.1668317039984686,
+        2.1668317039984686
+      ],
+      "rounds": 0,
+      "avg_accept": 0.0,
+      "is_mtp": false,
+      "chunks_ok": true,
+      "sessions": 4,
+      "concurrency": 4,
+      "num_turns": 8,
+      "session_per_s": 0.3754553556814141,
+      "turn_stats": [
+        {
+          "turn": 1,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 1024,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.633673946998897,
+          "prefill_tok_per_s": 1596.044157173441,
+          "output_tok_per_s": 156.7020153992655,
+          "decode_tok_per_s": 156.7020153992655,
+          "req_per_s": 2.4484689906135233,
+          "ttft_ms": [
+            610.1354910006194,
+            637.6664890012762,
+            641.586259000178,
+            641.586259000178,
+            641.586259000178
+          ],
+          "tpot_ms": [
+            16.093985523805294,
+            16.441912190491585,
+            16.448746317427506,
+            16.448746317427506,
+            16.448746317427506
+          ],
+          "e2e_s": [
+            1.624056579000353,
+            1.6295620359996974,
+            1.6332635780017881,
+            1.6332635780017881,
+            1.6332635780017881
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 2,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 1536,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 2.1812195730017265,
+          "prefill_tok_per_s": 1036.0830540706463,
+          "output_tok_per_s": 117.3655340198973,
+          "decode_tok_per_s": 117.3655340198973,
+          "req_per_s": 1.8338364690608953,
+          "ttft_ms": [
+            1470.2265982505196,
+            1481.7972560013004,
+            1482.5066330013215,
+            1482.5066330013215,
+            1482.5066330013215
+          ],
+          "tpot_ms": [
+            11.04739160317487,
+            11.235662777806514,
+            11.23783439678456,
+            11.23783439678456,
+            11.23783439678456
+          ],
+          "e2e_s": [
+            2.1662122692505363,
+            2.1665740060016105,
+            2.1668317039984686,
+            2.1668317039984686,
+            2.1668317039984686
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 3,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 2048,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.3422005950014864,
+          "prefill_tok_per_s": 5699.730710800371,
+          "output_tok_per_s": 190.73155007781568,
+          "decode_tok_per_s": 190.73155007781568,
+          "req_per_s": 2.98018046996587,
+          "ttft_ms": [
+            346.44924300118873,
+            358.06201200102805,
+            359.3152210014523,
+            359.3152210014523,
+            359.3152210014523
+          ],
+          "tpot_ms": [
+            15.540109611099487,
+            15.689884761885633,
+            15.761829523802993,
+            15.761829523802993,
+            15.761829523802993
+          ],
+          "e2e_s": [
+            1.3254761485004565,
+            1.3262995389995922,
+            1.3282279680024658,
+            1.3282279680024658,
+            1.3282279680024658
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 4,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 2560,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.117298020002636,
+          "prefill_tok_per_s": 6361.168738459095,
+          "output_tok_per_s": 229.12418657950906,
+          "decode_tok_per_s": 229.12418657950906,
+          "req_per_s": 3.580065415304829,
+          "ttft_ms": [
+            387.62912424954266,
+            399.4983820011839,
+            402.44176899796,
+            402.44176899796,
+            402.44176899796
+          ],
+          "tpot_ms": [
+            11.309761884943342,
+            11.510661873058233,
+            11.520073698424284,
+            11.520073698424284,
+            11.520073698424284
+          ],
+          "e2e_s": [
+            1.1001441230009732,
+            1.1009287020024203,
+            1.1010096070021973,
+            1.1010096070021973,
+            1.1010096070021973
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 5,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 3072,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.2026699849993747,
+          "prefill_tok_per_s": 6557.295852808011,
+          "output_tok_per_s": 212.85972311027044,
+          "decode_tok_per_s": 212.85972311027044,
+          "req_per_s": 3.3259331735979756,
+          "ttft_ms": [
+            458.903613000075,
+            465.55235000050743,
+            468.4858010004973,
+            468.4858010004973,
+            468.4858010004973
+          ],
+          "tpot_ms": [
+            11.60634439681402,
+            11.747481555565694,
+            11.753714047598704,
+            11.753714047598704,
+            11.753714047598704
+          ],
+          "e2e_s": [
+            1.1901033099993583,
+            1.190785489998234,
+            1.1913661340004182,
+            1.1913661340004182,
+            1.1913661340004182
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 6,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 3584,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.1094498900019971,
+          "prefill_tok_per_s": 10267.845075654664,
+          "output_tok_per_s": 230.7449865983034,
+          "decode_tok_per_s": 230.7449865983034,
+          "req_per_s": 3.6053904155984906,
+          "ttft_ms": [
+            337.0119325009,
+            348.4713370016834,
+            349.05084500132944,
+            349.05084500132944,
+            349.05084500132944
+          ],
+          "tpot_ms": [
+            12.074848567459007,
+            12.254409746039153,
+            12.256701888887504,
+            12.256701888887504,
+            12.256701888887504
+          ],
+          "e2e_s": [
+            1.0977273922508175,
+            1.0982177360019705,
+            1.0984609830011323,
+            1.0984609830011323,
+            1.0984609830011323
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 7,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 4096,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.1144405659979384,
+          "prefill_tok_per_s": 11411.447539113578,
+          "output_tok_per_s": 229.71166683147604,
+          "decode_tok_per_s": 229.71166683147604,
+          "req_per_s": 3.589244794241813,
+          "ttft_ms": [
+            347.6367602479513,
+            356.84319699794287,
+            358.93781099730404,
+            358.93781099730404,
+            358.93781099730404
+          ],
+          "tpot_ms": [
+            11.937797968260254,
+            12.078865793661127,
+            12.086582380958596,
+            12.086582380958596,
+            12.086582380958596
+          ],
+          "e2e_s": [
+            1.0997180322483473,
+            1.1000005099995178,
+            1.1032199849978497,
+            1.1032199849978497,
+            1.1032199849978497
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 8,
+          "n": 4,
+          "ignore_eos": true,
+          "in_tokens": 4608,
+          "requested_out": 256,
+          "early_stops": 0,
+          "out_tokens": 256,
+          "duration_s": 1.044608882999455,
+          "prefill_tok_per_s": 15932.073218678599,
+          "output_tok_per_s": 245.06779921776095,
+          "decode_tok_per_s": 245.06779921776095,
+          "req_per_s": 3.829184362777515,
+          "ttft_ms": [
+            282.3019170000407,
+            288.32271799910814,
+            289.2278949984757,
+            289.2278949984757,
+            289.2278949984757
+          ],
+          "tpot_ms": [
+            11.97642330951942,
+            11.979663761892533,
+            11.991430015884347,
+            11.991430015884347,
+            11.991430015884347
+          ],
+          "e2e_s": [
+            1.0368165854997642,
+            1.0426077009979053,
+            1.042822677998629,
+            1.042822677998629,
+            1.042822677998629
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        }
+      ],
+      "cache": {
+        "continuations": 28,
+        "expected_reusable_tokens": 19712,
+        "tree_matched_tokens": 17920,
+        "admitted_cached_tokens": 17920,
+        "tree_match_fraction": 0.9090909090909091,
+        "admitted_hit_fraction": 0.9090909090909091
+      },
+      "profiled_timing": false,
+      "profile_vs_timing_input_equal": false,
+      "profile_vs_timing_output_equal": false,
+      "history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/local-baseline-0p8b-c4-t8-o64/history-c4.json",
+      "profile_history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/local-baseline-0p8b-c4-t8-o64/history-profile-c4.json",
+      "profile_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/local-baseline-0p8b-c4-t8-o64/profile-c4.rank0.json",
+      "input_trace_sha256": "0ec4a91f44ebcfd5670b377ea4e407f4458be56ce49327b945f99befa5cb836f",
+      "output_trace_sha256": "e64f52c7682e53993e67994d66bab0ad1359e3d1e09b456cd2803ee6068a9943"
+    }
+  }
+}

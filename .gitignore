@@ -10,6 +10,8 @@ __pycache__/
 # json files
 *.json
 *.jsonl
+!experiment/**/*.json
+!experiment/**/*.jsonl
 datasets/swe_bench/
 datasets/sharegpt/
 datasets/lmsys_chat_1m/
@@ -17,10 +19,11 @@ datasets/spec_bench/
 datasets/swe_agent/trajs/
 datasets/agentic_coding_trajectories/.cache/
 datasets/agentic_coding_trajectories/sessions.parquet
-experiment/results/
+datasets/oasst2/.cache/
+datasets/oasst2/*.jsonl.gz
+datasets/oasst2/data/
 benchmark-results/
 benchmark-result/
-experiment/random_multiturn/*/
 
 # profiling data
 *.nsys-rep

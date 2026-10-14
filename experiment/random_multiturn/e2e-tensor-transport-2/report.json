@@ -1,0 +1,176 @@
+{
+  "model": "/home/daking/models/huggingface/Qwen3.5-0.8B",
+  "cache_type": "logstate",
+  "cache_config": "LogStateCacheConfig(granularity=32, enable_eager_state=False, enable_memorized_evict=True, enable_merge_adjustment=False, min_sampling_len=1024, max_merge_intensity=16, default_merge_growth_rate=2)",
+  "seed": 0,
+  "input_len": 64,
+  "append_len": 4,
+  "output_len": 2,
+  "num_turns": 2,
+  "num_sessions": 1,
+  "shared_prefix_len": 0,
+  "ignore_eos": true,
+  "chat_template": false,
+  "server_argv": [
+    "--model-path",
+    "/home/daking/models/huggingface/Qwen3.5-0.8B",
+    "--tensor-parallel-size",
+    "1",
+    "--cache-type",
+    "logstate",
+    "--granularity",
+    "32",
+    "--memory-ratio",
+    "0.7",
+    "--max-running-requests",
+    "1",
+    "--max-seq-len-override",
+    "256",
+    "--max-prefill-tokens",
+    "256",
+    "--max-decode-tokens",
+    "1",
+    "--graph",
+    "0"
+  ],
+  "points": {
+    "1": {
+      "n": 2,
+      "ignore_eos": true,
+      "in_tokens": 134,
+      "requested_out": 4,
+      "early_stops": 0,
+      "out_tokens": 4,
+      "duration_s": 30.704854692998197,
+      "prefill_tok_per_s": 4.8637773848477455,
+      "output_tok_per_s": 0.1302725591765182,
+      "decode_tok_per_s": 0.1302725591765182,
+      "req_per_s": 0.0651362795882591,
+      "ttft_ms": [
+        14307.764873998167,
+        27550.603038998815,
+        27550.603038998815,
+        27550.603038998815,
+        27550.603038998815
+      ],
+      "tpot_ms": [
+        1040.7449640006234,
+        2044.822510000813,
+        2044.822510000813,
+        2044.822510000813,
+        2044.822510000813
+      ],
+      "e2e_s": [
+        15.34850983799879,
+        29.59542554899963,
+        29.59542554899963,
+        29.59542554899963,
+        29.59542554899963
+      ],
+      "rounds": 0,
+      "avg_accept": 0.0,
+      "is_mtp": false,
+      "chunks_ok": true,
+      "sessions": 1,
+      "concurrency": 1,
+      "num_turns": 2,
+      "session_per_s": 0.03256813979412955,
+      "turn_stats": [
+        {
+          "turn": 1,
+          "n": 1,
+          "ignore_eos": true,
+          "in_tokens": 64,
+          "requested_out": 2,
+          "early_stops": 0,
+          "out_tokens": 2,
+          "duration_s": 29.59542554899963,
+          "prefill_tok_per_s": 2.322998153957132,
+          "output_tok_per_s": 0.06757801122638708,
+          "decode_tok_per_s": 0.06757801122638708,
+          "req_per_s": 0.03378900561319354,
+          "ttft_ms": [
+            27550.603038998815,
+            27550.603038998815,
+            27550.603038998815,
+            27550.603038998815,
+            27550.603038998815
+          ],
+          "tpot_ms": [
+            2044.822510000813,
+            2044.822510000813,
+            2044.822510000813,
+            2044.822510000813,
+            2044.822510000813
+          ],
+          "e2e_s": [
+            29.59542554899963,
+            29.59542554899963,
+            29.59542554899963,
+            29.59542554899963,
+            29.59542554899963
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 2,
+          "n": 1,
+          "ignore_eos": true,
+          "in_tokens": 70,
+          "requested_out": 2,
+          "early_stops": 0,
+          "out_tokens": 2,
+          "duration_s": 1.1015941269979521,
+          "prefill_tok_per_s": 65.73222308030508,
+          "output_tok_per_s": 1.8155507105419764,
+          "decode_tok_per_s": 1.8155507105419764,
+          "req_per_s": 0.9077753552709882,
+          "ttft_ms": [
+            1064.9267089975183,
+            1064.9267089975183,
+            1064.9267089975183,
+            1064.9267089975183,
+            1064.9267089975183
+          ],
+          "tpot_ms": [
+            36.66741800043383,
+            36.66741800043383,
+            36.66741800043383,
+            36.66741800043383,
+            36.66741800043383
+          ],
+          "e2e_s": [
+            1.1015941269979521,
+            1.1015941269979521,
+            1.1015941269979521,
+            1.1015941269979521,
+            1.1015941269979521
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        }
+      ],
+      "cache": {
+        "continuations": 1,
+        "expected_reusable_tokens": 66,
+        "tree_matched_tokens": 64,
+        "admitted_cached_tokens": 64,
+        "tree_match_fraction": 0.9696969696969697,
+        "admitted_hit_fraction": 0.9696969696969697
+      },
+      "profiled_timing": true,
+      "profile_vs_timing_input_equal": true,
+      "profile_vs_timing_output_equal": true,
+      "history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-tensor-transport-2/history-c1.json",
+      "profile_history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-tensor-transport-2/history-profile-c1.json",
+      "profile_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-tensor-transport-2/profile-c1.rank0.json",
+      "input_trace_sha256": "41cbc2a7568520a9eaa94365947eb01080c92adeeb7c5c256f77950faf19c782",
+      "output_trace_sha256": "f59ec145c26401ff37557ecea330f3dfb9808ee354a5b4f60d38ebafc5f8cf5c"
+    }
+  }
+}

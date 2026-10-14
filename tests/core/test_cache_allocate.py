@@ -118,7 +118,7 @@ def test_radix_lifecycle_profile_tracks_arrival_admission_and_eviction():
         sampling_params=arrival.sampling_params, profile_tag=arrival.profile_tag,
     )
     match = manager.match_req(pending)
-    manager.record_match_profile(pending, match, input_len=len(next_tokens))
+    manager.record_match(pending, match, input_len=len(next_tokens))
     profile = manager.profile_result()
     assert [event["event"] for event in profile["lifecycle_events"]] == [
         "complete", "arrival", "admission",
@@ -135,6 +135,43 @@ def test_radix_lifecycle_profile_tracks_arrival_admission_and_eviction():
     assert events[-1]["event"] == "eviction"
     assert events[-1]["nodes"][0]["uuid"] == child.uuid
     assert events[-1]["kv_tokens"] == 4
+
+
+@pytest.mark.parametrize("profile", [False, True])
+def test_prefix_match_snapshot_survives_chunked_prefill(profile):
+    from types import SimpleNamespace
+    from logssms.core import ChunkedRequest
+    from logssms.scheduler.prefill import PrefillAdder
+
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": str(int(profile))}):
+        manager = _make_cache_manager(num_pages=16, page_size=4)
+    manager.resources.page_table = torch.full((1, 64), -1, dtype=torch.int32)
+    tokens = torch.arange(20, dtype=torch.int32)
+    _insert_evictable(manager, tokens[:8], torch.arange(8, dtype=torch.int32))
+    table = SimpleNamespace(
+        available_size=1, allocate=lambda: 0,
+        token_pool=torch.empty((1, 64), dtype=torch.int32),
+    )
+    pending = PendingRequest(0, tokens, SamplingParams(max_tokens=8))
+    requests = []
+    for _ in range(3):
+        request = PrefillAdder(4, 0, manager, table).try_add_one(pending)
+        assert request is not None
+        requests.append(request)
+        request.complete_to_device_len()
+        pending.chunked_req = request if isinstance(request, ChunkedRequest) else None
+    assert [req.cached_len for req in requests] == [12, 16, 20]
+    assert all(req.prefix_cached_len == 8 for req in requests)
+    assert pending.prefix_cached_len == 8
+    requests[-1].complete_n(1)
+    assert requests[-1].prefix_cached_len == 8
+    result = manager.profile_result()
+    if profile:
+        assert len(result["match_samples"]) == 1
+        assert result["match_samples"][0]["admitted_cached_len"] == 8
+    else:
+        assert result is None
+        assert manager._match_profile_samples == []
 
 
 class TestAllocateEvictPageAlignment:

@@ -1,0 +1,864 @@
+{
+  "tp_rank": 0,
+  "ar_forward_count": 2,
+  "ar_no_batch": 2,
+  "pending_gpu_events": 0,
+  "phases": {
+    "prefill": {
+      "batches": 2,
+      "logical_rows": 2,
+      "padded_rows": 2,
+      "logical_tokens": 70,
+      "padded_tokens": 70,
+      "graph_batches": 0,
+      "avg_logical_bs": 1.0,
+      "avg_padded_bs": 1.0,
+      "row_padding_efficiency": 1.0,
+      "token_padding_efficiency": 1.0,
+      "graph_hit_rate": 0.0,
+      "schedule_ms": 34.974073,
+      "prepare_ms": 1443.819492,
+      "submit_ms": 24950.915475,
+      "wait_ms": 2.149163,
+      "process_ms": 1497.283352,
+      "gpu_ms": 24679.64051,
+      "avg_gpu_ms": 12339.820255,
+      "gpu_ms_per_logical_token": 352.56629300000003,
+      "logical_bs": {
+        "1": 2
+      },
+      "padded_bs": {
+        "1": 2
+      }
+    },
+    "decode": {
+      "batches": 2,
+      "logical_rows": 2,
+      "padded_rows": 2,
+      "logical_tokens": 2,
+      "padded_tokens": 2,
+      "graph_batches": 0,
+      "avg_logical_bs": 1.0,
+      "avg_padded_bs": 1.0,
+      "row_padding_efficiency": 1.0,
+      "token_padding_efficiency": 1.0,
+      "graph_hit_rate": 0.0,
+      "schedule_ms": 0.031106,
+      "prepare_ms": 6.367976,
+      "submit_ms": 2173.094279,
+      "wait_ms": 3.613042,
+      "process_ms": 6.491564,
+      "gpu_ms": 2053.769162,
+      "avg_gpu_ms": 1026.884581,
+      "gpu_ms_per_logical_token": 1026.884581,
+      "logical_bs": {
+        "1": 2
+      },
+      "padded_bs": {
+        "1": 2
+      }
+    },
+    "verify": {
+      "batches": 0,
+      "logical_rows": 0,
+      "padded_rows": 0,
+      "logical_tokens": 0,
+      "padded_tokens": 0,
+      "graph_batches": 0,
+      "avg_logical_bs": 0.0,
+      "avg_padded_bs": 0.0,
+      "row_padding_efficiency": 0.0,
+      "token_padding_efficiency": 0.0,
+      "graph_hit_rate": 0.0,
+      "schedule_ms": 0.0,
+      "prepare_ms": 0.0,
+      "submit_ms": 0.0,
+      "wait_ms": 0.0,
+      "process_ms": 0.0,
+      "gpu_ms": 0.0,
+      "avg_gpu_ms": 0.0,
+      "gpu_ms_per_logical_token": 0.0,
+      "logical_bs": {},
+      "padded_bs": {}
+    }
+  },
+  "cache": {
+    "type": "logstate",
+    "capacity": {
+      "total_frames": 4486,
+      "frame_bytes": 786432,
+      "payload_frames_per_slot": 12,
+      "conv_frames_per_snapshot": 1,
+      "granules_per_log": 2,
+      "decay_records_per_frame": 10
+    },
+    "aggregate": {
+      "admission_attempts": 2,
+      "admission_rejections": 0,
+      "queue_observations": 8,
+      "max_pending_requests": 1,
+      "max_pending_wait_ms": 0.008707,
+      "current_pending_requests": 0,
+      "current_oldest_wait_ms": 0.0,
+      "admitted_requests": 2,
+      "total_admission_wait_ms": 20.193573,
+      "max_admission_wait_ms": 10.639181,
+      "eviction_rounds": 0,
+      "evicted_kv_tokens": 0,
+      "recycle_matches": 0,
+      "recycle_matched_tokens": 0,
+      "released_state_slots_from_eviction": 0,
+      "released_state_slots_from_merge": 0,
+      "scheduled_payload_conv_frames_from_merge": 0,
+      "merge_batch_outcomes": {
+        "no_match_anchor": 1,
+        "no_adjacent_candidate": 1
+      },
+      "merge_plan_diagnostics": {
+        "anchors_without_eligible_entries": 0,
+        "candidate_groups": 0,
+        "checkpoint_candidates": 1,
+        "entries_beyond_match_endpoint": 0,
+        "entries_not_eligible_this_round": 0,
+        "entries_outside_adaptive_owner": 0,
+        "gaps": 0,
+        "groups_already_planned": 0,
+        "internal_endpoints": 0,
+        "leaf_endpoints": 1,
+        "lock_boundaries": 0,
+        "logs_not_materialized": 0,
+        "matched_endpoints": 1,
+        "merge_anchors": 1,
+        "planned_groups": 0,
+        "planned_slot_releases": 0,
+        "protected_boundaries": 0,
+        "protected_entries": 0,
+        "rejected_discontinuity": 0,
+        "rejected_level_mismatch": 0,
+        "rejected_lock_boundary": 0,
+        "rejected_protected_interval": 0,
+        "rejected_span_mismatch": 0,
+        "segments": 1,
+        "segments_without_merge_pair": 1
+      },
+      "merge_commit_skips": {},
+      "avg_admission_wait_ms": 10.0967865,
+      "pending_cuda_events": 0,
+      "construction_cuda_ms": 815.8824462890625,
+      "avg_construction_cuda_ms": 407.94122314453125,
+      "max_construction_cuda_ms": 815.8824462890625,
+      "min_free_kv_pages": 4414,
+      "min_free_state_slots": 0,
+      "max_construction_chains": 1,
+      "max_construction_segments": 1,
+      "max_construction_outputs": 2,
+      "max_construction_workspace_bytes": 28312704,
+      "prepare_cpu_timing_ms": {
+        "analysis_and_tasks_cpu_ms": 0.8503700000000001,
+        "profile_before_cpu_ms": 4.009508,
+        "construction_submit_cpu_ms": 884.141123,
+        "construction_event_setup_cpu_ms": 0.223476,
+        "commit_cpu_ms": 0.12072,
+        "profile_after_cpu_ms": 1.5950440000000001,
+        "manager_total_cpu_ms": 890.817659,
+        "unaccounted_cpu_ms": -0.1769090000000162,
+        "production_cpu_ms": 884.888737,
+        "profile_diagnostics_cpu_ms": 5.828028,
+        "avg_manager_total_cpu_ms": 445.4088295
+      }
+    },
+    "match_samples": [
+      {
+        "tag": "random-0/turn-1",
+        "input_len": 64,
+        "matchable_len": 63,
+        "tree_match_len": 0,
+        "recoverable_len": 0,
+        "admitted_cached_len": 0,
+        "state_recovery_gap": 0,
+        "unmatched_suffix_len": 63,
+        "session_previous_cached_len": 0,
+        "session_prefix_lcp_len": 0,
+        "session_expected_hit_len": 0,
+        "session_aligned_expected_hit_len": 0,
+        "session_cache_miss_len": 0,
+        "admission_wait_ms": 2.827331,
+        "arrival_tree_match_len": 0,
+        "arrival_recoverable_len": 0,
+        "arrival_seq": 0,
+        "previous_inserted_len": null,
+        "admission_seq": 1
+      },
+      {
+        "tag": "random-0/turn-2",
+        "input_len": 70,
+        "matchable_len": 69,
+        "tree_match_len": 64,
+        "recoverable_len": 64,
+        "admitted_cached_len": 64,
+        "state_recovery_gap": 0,
+        "unmatched_suffix_len": 5,
+        "session_previous_cached_len": 64,
+        "session_prefix_lcp_len": 64,
+        "session_expected_hit_len": 64,
+        "session_aligned_expected_hit_len": 64,
+        "session_cache_miss_len": 0,
+        "admission_wait_ms": 8.560824,
+        "arrival_tree_match_len": 64,
+        "arrival_recoverable_len": 64,
+        "arrival_seq": 3,
+        "previous_inserted_len": 64,
+        "admission_seq": 4
+      }
+    ],
+    "prefill_batches": [
+      {
+        "batch_size": 1,
+        "input_tokens": 64,
+        "request_tags": [
+          "random-0/turn-1"
+        ],
+        "resources_before": {
+          "frame_usage": {
+            "total_frames": 4486,
+            "free_frames": 4429,
+            "kv_frames": 2,
+            "payload_frames": 48,
+            "conv_frames": 6,
+            "decay_frames": 1,
+            "free_decay_records": 8,
+            "log_slots": 2,
+            "checkpoint_slots": 0,
+            "work_slots": 2
+          },
+          "free_frames": 4429,
+          "free_kv_pages": 4429,
+          "free_state_slots": 0,
+          "evictable_kv_tokens": 0,
+          "cached_kv_tokens": 0,
+          "evictable_kv_pages": 0.0,
+          "evictable_state_slots": 0,
+          "tree_log_entries": 0,
+          "tree_checkpoint_entries": 0,
+          "tree_log_slots": 0,
+          "tree_checkpoint_slots": 0,
+          "checkpoint_span_pages": {},
+          "checkpoint_covered_pages": 0,
+          "live_log_pages": 1
+        },
+        "requests": [
+          {
+            "uid": 0,
+            "cached_len": 0,
+            "device_len": 64,
+            "recovery_log_slots": 0,
+            "recovery_has_checkpoint": false,
+            "cached_log_slots": 0,
+            "cached_checkpoint_slots": 0,
+            "cached_checkpoint_span_pages": {},
+            "live_log_pages": 1
+          }
+        ],
+        "active_requests": [],
+        "queue": {
+          "pending_requests": 1,
+          "oldest_wait_ms": 0.008707
+        },
+        "plan": {
+          "protections": 0,
+          "restores": 0,
+          "materialize": 0,
+          "coalesce": 0,
+          "planned_merge_releases": 0,
+          "merge_diagnostics": {
+            "anchors_without_eligible_entries": 0,
+            "candidate_groups": 0,
+            "checkpoint_candidates": 0,
+            "entries_beyond_match_endpoint": 0,
+            "entries_not_eligible_this_round": 0,
+            "entries_outside_adaptive_owner": 0,
+            "gaps": 0,
+            "groups_already_planned": 0,
+            "internal_endpoints": 0,
+            "leaf_endpoints": 0,
+            "lock_boundaries": 0,
+            "logs_not_materialized": 0,
+            "matched_endpoints": 0,
+            "merge_anchors": 0,
+            "planned_groups": 0,
+            "planned_slot_releases": 0,
+            "protected_boundaries": 0,
+            "protected_entries": 0,
+            "rejected_discontinuity": 0,
+            "rejected_level_mismatch": 0,
+            "rejected_lock_boundary": 0,
+            "rejected_protected_interval": 0,
+            "rejected_span_mismatch": 0,
+            "segments": 0,
+            "segments_without_merge_pair": 0
+          }
+        },
+        "construction": {
+          "chains": 0,
+          "segments": 0,
+          "outputs": 0,
+          "direct_checkpoint_copies": 0,
+          "workspace_bytes": 0,
+          "cuda_ms": 0.0,
+          "event_setup_cpu_ms": 0.0
+        },
+        "materialized_slots": 0,
+        "released_state_slots": 0,
+        "scheduled_payload_conv_frames": 0,
+        "merge_outcome": "no_match_anchor",
+        "merge_commit_skips": {},
+        "resources_after": {
+          "frame_usage": {
+            "total_frames": 4486,
+            "free_frames": 4429,
+            "kv_frames": 2,
+            "payload_frames": 48,
+            "conv_frames": 6,
+            "decay_frames": 1,
+            "free_decay_records": 8,
+            "log_slots": 2,
+            "checkpoint_slots": 0,
+            "work_slots": 2
+          },
+          "free_frames": 4429,
+          "free_kv_pages": 4429,
+          "free_state_slots": 0,
+          "evictable_kv_tokens": 0,
+          "cached_kv_tokens": 0,
+          "evictable_kv_pages": 0.0,
+          "evictable_state_slots": 0,
+          "tree_log_entries": 0,
+          "tree_checkpoint_entries": 0,
+          "tree_log_slots": 0,
+          "tree_checkpoint_slots": 0,
+          "checkpoint_span_pages": {},
+          "checkpoint_covered_pages": 0,
+          "live_log_pages": 1
+        },
+        "timing_ms": {
+          "first_offsets_cpu_ms": 0.022143,
+          "analysis_and_tasks_cpu_ms": 0.264141,
+          "profile_before_cpu_ms": 2.906075,
+          "construction_submit_cpu_ms": 0.020661,
+          "construction_event_setup_cpu_ms": 0.0,
+          "commit_cpu_ms": 0.006312,
+          "profile_after_cpu_ms": 0.811759,
+          "manager_total_cpu_ms": 4.051402,
+          "unaccounted_cpu_ms": 0.020310999999999524
+        }
+      },
+      {
+        "batch_size": 1,
+        "input_tokens": 6,
+        "request_tags": [
+          "random-0/turn-2"
+        ],
+        "resources_before": {
+          "frame_usage": {
+            "total_frames": 4486,
+            "free_frames": 4414,
+            "kv_frames": 3,
+            "payload_frames": 60,
+            "conv_frames": 8,
+            "decay_frames": 1,
+            "free_decay_records": 7,
+            "log_slots": 3,
+            "checkpoint_slots": 0,
+            "work_slots": 2
+          },
+          "free_frames": 4414,
+          "free_kv_pages": 4414,
+          "free_state_slots": 0,
+          "evictable_kv_tokens": 0,
+          "cached_kv_tokens": 64,
+          "evictable_kv_pages": 0.0,
+          "evictable_state_slots": 0,
+          "tree_log_entries": 1,
+          "tree_checkpoint_entries": 0,
+          "tree_log_slots": 1,
+          "tree_checkpoint_slots": 0,
+          "checkpoint_span_pages": {},
+          "checkpoint_covered_pages": 0,
+          "live_log_pages": 1
+        },
+        "requests": [
+          {
+            "uid": 1,
+            "cached_len": 64,
+            "device_len": 70,
+            "recovery_log_slots": 1,
+            "recovery_has_checkpoint": false,
+            "cached_log_slots": 1,
+            "cached_checkpoint_slots": 0,
+            "cached_checkpoint_span_pages": {},
+            "live_log_pages": 1
+          }
+        ],
+        "active_requests": [],
+        "queue": {
+          "pending_requests": 1,
+          "oldest_wait_ms": 0.00432
+        },
+        "plan": {
+          "protections": 0,
+          "restores": 1,
+          "materialize": 1,
+          "coalesce": 0,
+          "planned_merge_releases": 0,
+          "merge_diagnostics": {
+            "anchors_without_eligible_entries": 0,
+            "candidate_groups": 0,
+            "checkpoint_candidates": 1,
+            "entries_beyond_match_endpoint": 0,
+            "entries_not_eligible_this_round": 0,
+            "entries_outside_adaptive_owner": 0,
+            "gaps": 0,
+            "groups_already_planned": 0,
+            "internal_endpoints": 0,
+            "leaf_endpoints": 1,
+            "lock_boundaries": 0,
+            "logs_not_materialized": 0,
+            "matched_endpoints": 1,
+            "merge_anchors": 1,
+            "planned_groups": 0,
+            "planned_slot_releases": 0,
+            "protected_boundaries": 0,
+            "protected_entries": 0,
+            "rejected_discontinuity": 0,
+            "rejected_level_mismatch": 0,
+            "rejected_lock_boundary": 0,
+            "rejected_protected_interval": 0,
+            "rejected_span_mismatch": 0,
+            "segments": 1,
+            "segments_without_merge_pair": 1
+          }
+        },
+        "construction": {
+          "chains": 1,
+          "segments": 1,
+          "outputs": 2,
+          "direct_checkpoint_copies": 0,
+          "workspace_bytes": 28312704,
+          "cuda_ms": 815.8824462890625,
+          "event_setup_cpu_ms": 0.223476
+        },
+        "materialized_slots": 1,
+        "released_state_slots": 0,
+        "scheduled_payload_conv_frames": 0,
+        "merge_outcome": "no_adjacent_candidate",
+        "merge_commit_skips": {},
+        "resources_after": {
+          "frame_usage": {
+            "total_frames": 4486,
+            "free_frames": 4414,
+            "kv_frames": 3,
+            "payload_frames": 60,
+            "conv_frames": 8,
+            "decay_frames": 1,
+            "free_decay_records": 7,
+            "log_slots": 3,
+            "checkpoint_slots": 0,
+            "work_slots": 2
+          },
+          "free_frames": 4414,
+          "free_kv_pages": 4414,
+          "free_state_slots": 0,
+          "evictable_kv_tokens": 0,
+          "cached_kv_tokens": 64,
+          "evictable_kv_pages": 0.0,
+          "evictable_state_slots": 0,
+          "tree_log_entries": 0,
+          "tree_checkpoint_entries": 1,
+          "tree_log_slots": 0,
+          "tree_checkpoint_slots": 1,
+          "checkpoint_span_pages": {
+            "1": 1
+          },
+          "checkpoint_covered_pages": 1,
+          "live_log_pages": 1
+        },
+        "timing_ms": {
+          "first_offsets_cpu_ms": 0.032184,
+          "analysis_and_tasks_cpu_ms": 0.586229,
+          "profile_before_cpu_ms": 1.103433,
+          "construction_submit_cpu_ms": 884.120462,
+          "construction_event_setup_cpu_ms": 0.223476,
+          "commit_cpu_ms": 0.114408,
+          "profile_after_cpu_ms": 0.783285,
+          "manager_total_cpu_ms": 886.766257,
+          "unaccounted_cpu_ms": -0.19722000000001572
+        }
+      }
+    ],
+    "allocation_profile": {
+      "phases": {
+        "work": {
+          "calls": 2,
+          "eviction_calls": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "initial_reserve_ms": 4.655685,
+            "initial_poll_reclamation_ms": 0.002911,
+            "initial_allocator_reserve_ms": 0.061230999999999994,
+            "initial_descriptor_write_ms": 4.5694,
+            "tensor_build_ms": 0.678743,
+            "core_total_ms": 5.364625
+          },
+          "counts": {
+            "initial_descriptor_count": 2
+          }
+        },
+        "prefill": {
+          "calls": 2,
+          "eviction_calls": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "scan_and_zero_ms": 5.922676999999999,
+            "zero_work_ms": 5.870883999999999,
+            "scan_ms": 0.051792999999999936,
+            "initial_reserve_ms": 1.895678,
+            "initial_poll_reclamation_ms": 0.004132,
+            "initial_allocator_reserve_ms": 0.10273,
+            "initial_descriptor_write_ms": 1.768523,
+            "tensor_build_ms": 1.440888,
+            "core_total_ms": 3.36132,
+            "core_allocate_ms": 3.387706,
+            "ids_to_host_ms": 0.707639,
+            "mapping_write_ms": 6.674825,
+            "mapping_ms": 7.382464000000001,
+            "total_ms": 16.692847
+          },
+          "counts": {
+            "initial_descriptor_count": 2
+          }
+        },
+        "decode": {
+          "calls": 2,
+          "eviction_calls": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "scan_and_zero_ms": 0.021831,
+            "zero_work_ms": 0.004200000000000001,
+            "scan_ms": 0.017631,
+            "initial_reserve_ms": 1.083495,
+            "initial_poll_reclamation_ms": 0.001391,
+            "initial_allocator_reserve_ms": 0.037741,
+            "initial_descriptor_write_ms": 1.038854,
+            "tensor_build_ms": 0.187136,
+            "core_total_ms": 1.280441,
+            "core_allocate_ms": 1.287905,
+            "ids_to_host_ms": 0.155489,
+            "mapping_write_ms": 0.389231,
+            "mapping_ms": 0.54472,
+            "total_ms": 1.8558119999999998
+          },
+          "counts": {
+            "initial_descriptor_count": 1
+          }
+        }
+      },
+      "samples": [
+        {
+          "phase": "work",
+          "batch_size": 0,
+          "needed_pages": 0,
+          "needed_states": 0,
+          "needed_works": 1,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "initial_reserve_ms": 3.740549,
+            "initial_poll_reclamation_ms": 0.000902,
+            "initial_allocator_reserve_ms": 0.02553,
+            "initial_descriptor_write_ms": 3.700299,
+            "tensor_build_ms": 0.414757,
+            "core_total_ms": 4.171859
+          },
+          "counts": {
+            "initial_descriptor_count": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "batch_size": 1,
+          "request_tags": [
+            "random-0/turn-1"
+          ],
+          "needed_pages": 1,
+          "needed_states": 1,
+          "needed_works": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "scan_and_zero_ms": 5.89833,
+            "zero_work_ms": 5.868561,
+            "scan_ms": 0.029768999999999934,
+            "initial_reserve_ms": 0.925303,
+            "initial_poll_reclamation_ms": 0.002525,
+            "initial_allocator_reserve_ms": 0.059127,
+            "initial_descriptor_write_ms": 0.850044,
+            "tensor_build_ms": 1.149754,
+            "core_total_ms": 2.088674,
+            "core_allocate_ms": 2.105497,
+            "ids_to_host_ms": 0.428945,
+            "mapping_write_ms": 3.291475,
+            "mapping_ms": 3.7204200000000003,
+            "total_ms": 11.724247
+          },
+          "counts": {
+            "initial_descriptor_count": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "batch_size": 1,
+          "request_tags": [
+            "random-0/turn-1"
+          ],
+          "needed_pages": 1,
+          "needed_states": 1,
+          "needed_works": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "scan_and_zero_ms": 0.015372,
+            "zero_work_ms": 0.002442,
+            "scan_ms": 0.01293,
+            "initial_reserve_ms": 1.083495,
+            "initial_poll_reclamation_ms": 0.001391,
+            "initial_allocator_reserve_ms": 0.037741,
+            "initial_descriptor_write_ms": 1.038854,
+            "tensor_build_ms": 0.187136,
+            "core_total_ms": 1.280441,
+            "core_allocate_ms": 1.287905,
+            "ids_to_host_ms": 0.155489,
+            "mapping_write_ms": 0.389231,
+            "mapping_ms": 0.54472,
+            "total_ms": 1.847997
+          },
+          "counts": {
+            "initial_descriptor_count": 1
+          }
+        },
+        {
+          "phase": "work",
+          "batch_size": 0,
+          "needed_pages": 0,
+          "needed_states": 0,
+          "needed_works": 1,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "initial_reserve_ms": 0.915136,
+            "initial_poll_reclamation_ms": 0.002009,
+            "initial_allocator_reserve_ms": 0.035701,
+            "initial_descriptor_write_ms": 0.869101,
+            "tensor_build_ms": 0.263986,
+            "core_total_ms": 1.192766
+          },
+          "counts": {
+            "initial_descriptor_count": 1
+          }
+        },
+        {
+          "phase": "prefill",
+          "batch_size": 1,
+          "request_tags": [
+            "random-0/turn-2"
+          ],
+          "needed_pages": 1,
+          "needed_states": 1,
+          "needed_works": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "scan_and_zero_ms": 0.024347,
+            "zero_work_ms": 0.002323,
+            "scan_ms": 0.022024000000000002,
+            "initial_reserve_ms": 0.970375,
+            "initial_poll_reclamation_ms": 0.001607,
+            "initial_allocator_reserve_ms": 0.043603,
+            "initial_descriptor_write_ms": 0.918479,
+            "tensor_build_ms": 0.291134,
+            "core_total_ms": 1.272646,
+            "core_allocate_ms": 1.282209,
+            "ids_to_host_ms": 0.278694,
+            "mapping_write_ms": 3.38335,
+            "mapping_ms": 3.662044,
+            "total_ms": 4.9686
+          },
+          "counts": {
+            "initial_descriptor_count": 1
+          }
+        },
+        {
+          "phase": "decode",
+          "batch_size": 1,
+          "request_tags": [
+            "random-0/turn-2"
+          ],
+          "needed_pages": 0,
+          "needed_states": 0,
+          "needed_works": 0,
+          "evicted_nodes": 0,
+          "timing_ms": {
+            "scan_and_zero_ms": 0.006459,
+            "zero_work_ms": 0.001758,
+            "scan_ms": 0.004701,
+            "total_ms": 0.007815
+          }
+        }
+      ]
+    },
+    "lifecycle_events": [
+      {
+        "event": "arrival",
+        "tag": "random-0/turn-1",
+        "uid": 0,
+        "matchable_len": 63,
+        "tree_match_len": 0,
+        "recoverable_len": 0,
+        "node_path": [],
+        "previous_inserted_len": null,
+        "seq": 0,
+        "time_ns": 18574271638576
+      },
+      {
+        "event": "admission",
+        "tag": "random-0/turn-1",
+        "uid": 0,
+        "tree_match_len": 0,
+        "recoverable_len": 0,
+        "arrival_seq": 0,
+        "seq": 1,
+        "time_ns": 18574274491257
+      },
+      {
+        "event": "complete",
+        "tag": "random-0/turn-1",
+        "uid": 0,
+        "request_cached_len": 65,
+        "inserted_len": 64,
+        "node_path": [
+          1
+        ],
+        "seq": 2,
+        "time_ns": 18603312727129
+      },
+      {
+        "event": "arrival",
+        "tag": "random-0/turn-2",
+        "uid": 1,
+        "matchable_len": 69,
+        "tree_match_len": 64,
+        "recoverable_len": 64,
+        "node_path": [
+          1
+        ],
+        "previous_inserted_len": 64,
+        "seq": 3,
+        "time_ns": 18603340528407
+      },
+      {
+        "event": "admission",
+        "tag": "random-0/turn-2",
+        "uid": 1,
+        "tree_match_len": 64,
+        "recoverable_len": 64,
+        "arrival_seq": 3,
+        "seq": 4,
+        "time_ns": 18603349116433
+      },
+      {
+        "event": "complete",
+        "tag": "random-0/turn-2",
+        "uid": 1,
+        "request_cached_len": 71,
+        "inserted_len": 64,
+        "node_path": [
+          1
+        ],
+        "seq": 5,
+        "time_ns": 18604423161759
+      }
+    ]
+  },
+  "linear_attention_backend": {
+    "type": "logstate",
+    "aggregate": {
+      "prefill_batches": 2,
+      "item_calls": 0,
+      "metadata_cpu_ms": 517.172242,
+      "repeat_interleave_cpu_ms": 0.01186,
+      "item_cpu_ms": 0.0
+    },
+    "prefill_batches": [
+      {
+        "batch_size": 1,
+        "metadata_cpu_ms": 514.327378,
+        "repeat_interleave_cpu_ms": 0.007355,
+        "item_calls": 0,
+        "item_cpu_ms": 0.0
+      },
+      {
+        "batch_size": 1,
+        "metadata_cpu_ms": 2.844864,
+        "repeat_interleave_cpu_ms": 0.004505,
+        "item_calls": 0,
+        "item_cpu_ms": 0.0
+      }
+    ]
+  },
+  "engine_prepare": {
+    "phases": {
+      "prefill": {
+        "batches": 2,
+        "pad_batch_ms": 0.016322,
+        "allocate_ms": 16.768784,
+        "positions_mappings_ms": 8.404735,
+        "cache_prepare_ms": 890.9344060000001,
+        "attention_metadata_ms": 10.177551,
+        "linear_metadata_ms": 517.323602,
+        "sampler_prepare_ms": 0.11760399999999999,
+        "total_ms": 1443.743004
+      },
+      "decode": {
+        "batches": 2,
+        "pad_batch_ms": 0.009309,
+        "allocate_ms": 1.880395,
+        "positions_mappings_ms": 1.05907,
+        "cache_prepare_ms": 0.060372,
+        "attention_metadata_ms": 2.1708049999999997,
+        "linear_metadata_ms": 1.123583,
+        "sampler_prepare_ms": 0.031975,
+        "total_ms": 6.335509
+      }
+    },
+    "prefill_batches": [
+      {
+        "batch_size": 1,
+        "logical_tokens": 64,
+        "pad_batch_ms": 0.01046,
+        "allocate_ms": 11.751099,
+        "positions_mappings_ms": 7.693266,
+        "cache_prepare_ms": 4.150336,
+        "attention_metadata_ms": 9.744466,
+        "linear_metadata_ms": 514.450189,
+        "sampler_prepare_ms": 0.101029,
+        "total_ms": 547.900845
+      },
+      {
+        "batch_size": 1,
+        "logical_tokens": 6,
+        "pad_batch_ms": 0.005862,
+        "allocate_ms": 5.017685,
+        "positions_mappings_ms": 0.711469,
+        "cache_prepare_ms": 886.78407,
+        "attention_metadata_ms": 0.433085,
+        "linear_metadata_ms": 2.873413,
+        "sampler_prepare_ms": 0.016575,
+        "total_ms": 895.842159
+      }
+    ]
+  }
+}

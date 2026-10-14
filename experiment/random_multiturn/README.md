@@ -31,8 +31,10 @@ python -m experiment.random_multiturn \
 For an SGLang server, change `--api` to `sglang` and choose a different name.
 The client uses SGLang's native `/generate` endpoint with token-ID input and
 reads actual generated `output_ids` from the SSE stream. Its
-`meta_info.cached_tokens` is recorded per request. LogSSMs cache-hit metrics
-require a separate scheduler profile; the client never enables profiling.
+`meta_info.cached_tokens` is recorded per request. LogSSMs returns the same field
+in streamed and non-streamed chat completions, measured at the request's first
+successful prefill admission. It is available with profiling disabled and excludes
+newly computed prefill chunks and decode tokens. The client never enables profiling.
 
 For vLLM, use `--api vllm`. It sends integer `prompt` IDs to `/v1/completions`
 with `add_special_tokens=False`, `return_token_ids=True`, and streaming usage
@@ -69,7 +71,7 @@ Each run writes `experiment/random_multiturn/<name>/report.json` and
 every turn. The report contains input/output trace hashes; different hashes
 across implementations mean later requests were not strictly paired.
 
-For LogSSMs cache-hit measurements, start the server with
+For additional LogSSMs tree-match and recovery diagnostics, start the server with
 `LOGSSMS_PROFILE_SCHEDULER=1` and
 `LOGSSMS_PROFILE_SCHEDULER_PATH=/path/to/profile.json`, run the client, stop
 the server so it writes `profile.rank0.json`, then attach it:

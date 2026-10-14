@@ -27,3 +27,4 @@ class UserReply(BaseFrontendMsg):
     incremental_output: str
     finished          : bool
     token_ids         : list[int] | None = None
+    cached_tokens     : int | None = None

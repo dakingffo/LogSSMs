@@ -31,6 +31,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     next_token       : int | list[int]
     finished         : bool
     return_token_ids: bool = False
+    cached_tokens   : int | None = None
 
 
 @dataclass

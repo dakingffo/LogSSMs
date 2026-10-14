@@ -157,6 +157,7 @@ class FrontendManager:
 
     async def stream_chat_completions(self, uid: int, return_token_ids: bool = False):
         first_chunk = True
+        cached_tokens = None
         async for ack in self.wait_for_ack(uid):
             delta = {}
             if first_chunk:
@@ -172,6 +173,9 @@ class FrontendManager:
                 "object": "text_completion.chunk",
                 "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
             }
+            if ack.cached_tokens is not None:
+                cached_tokens = ack.cached_tokens
+                chunk["meta_info"] = {"cached_tokens": cached_tokens}
             yield f"data: {json.dumps(chunk)}\n\n".encode()
 
             if ack.finished:
@@ -183,6 +187,8 @@ class FrontendManager:
             "object": "text_completion.chunk",
             "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
         }
+        if cached_tokens is not None:
+            end_chunk["meta_info"] = {"cached_tokens": cached_tokens}
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
@@ -305,8 +311,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
     else:
         full_content = ""
         full_token_ids: list[int] = []
+        cached_tokens = None
         async for ack in state.wait_for_ack(uid):
             full_content += ack.incremental_output
+            if ack.cached_tokens is not None:
+                cached_tokens = ack.cached_tokens
             if req.return_token_ids:
                 full_token_ids.extend(ack.token_ids or [])
             if ack.finished:
@@ -317,6 +326,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model,
+            **({"meta_info": {"cached_tokens": cached_tokens}}
+               if cached_tokens is not None else {}),
             "choices": [
                 {
                     "index": 0,

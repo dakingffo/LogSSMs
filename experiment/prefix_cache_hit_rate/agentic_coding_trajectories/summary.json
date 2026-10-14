@@ -1,0 +1,69 @@
+{
+  "num_queries": 2241,
+  "raw_hits": 2240,
+  "raw_hit_rate": 0.999553770638108,
+  "bin_width": 256,
+  "page_sizes": {
+    "1": {
+      "hits": 2240,
+      "hit_rate": 0.999553770638108,
+      "branch_hits": 2240,
+      "branch_hit_rate": 0.999553770638108
+    },
+    "16": {
+      "hits": 2217,
+      "hit_rate": 0.9892904953145917,
+      "branch_hits": 2217,
+      "branch_hit_rate": 0.9892904953145917
+    },
+    "32": {
+      "hits": 2180,
+      "hit_rate": 0.9727800089245873,
+      "branch_hits": 2180,
+      "branch_hit_rate": 0.9727800089245873
+    },
+    "64": {
+      "hits": 2142,
+      "hit_rate": 0.9558232931726908,
+      "branch_hits": 2142,
+      "branch_hit_rate": 0.9558232931726908
+    },
+    "128": {
+      "hits": 2142,
+      "hit_rate": 0.9558232931726908,
+      "branch_hits": 2142,
+      "branch_hit_rate": 0.9558232931726908
+    },
+    "256": {
+      "hits": 2142,
+      "hit_rate": 0.9558232931726908,
+      "branch_hits": 2142,
+      "branch_hit_rate": 0.9558232931726908
+    }
+  },
+  "configuration": {
+    "tokenizer": "/home/daking/models/huggingface/Qwen3.5-2B",
+    "dataset": "agentic_coding_trajectories",
+    "num_trajectories": 100,
+    "page_sizes": [
+      1,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "bin_width": 256,
+    "order": "round_robin",
+    "seed": 0,
+    "max_turns": null,
+    "min_isl": 8192,
+    "max_isl": 16384,
+    "exclude_system_prompt": true,
+    "sources": {
+      "kwai-klear-swe-smith-mini": 61,
+      "swe-smith-claude-3-7-sonnet": 39
+    },
+    "plot_max_distance": 2000
+  }
+}

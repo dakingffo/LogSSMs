@@ -1,3 +1,4 @@
+import gzip
 import json
 
 import pytest
@@ -8,7 +9,7 @@ from benchmarks.bench_common import (
     load_dataset_prompts,
     resolve_dataset_path,
 )
-from datasets.parser import iter_dataset, sample_dataset
+from datasets.parser import iter_dataset, load_dataset, sample_dataset
 
 
 class FakeTokenizer:
@@ -219,3 +220,129 @@ def test_parquet_datasets_normalize_and_sample(tmp_path, name, raw, expected):
 
     record = sample_dataset(path.parent, count=1, seed=7)[0]
     assert (record.uid, record.category, record.prompt) == expected
+
+
+def _oasst2_tree():
+    def node(uid, parent, role, text, *replies):
+        return {
+            "message_id": uid,
+            "parent_id": parent,
+            "role": role,
+            "text": text,
+            "lang": "en",
+            "rank": 0 if role == "assistant" else None,
+            "deleted": False,
+            "review_result": True,
+            "replies": list(replies),
+        }
+    root = node("root", None, "prompter", "question",
+        node("answer", "root", "assistant", "recorded answer",
+            node("follow-a", "answer", "prompter", "follow-up A",
+                node("leaf-a", "follow-a", "assistant", "answer A"),
+                node("leaf-b", "follow-a", "assistant", "alternative A"),
+            ),
+            node("follow-b", "answer", "prompter", "follow-up B",
+                node("leaf-c", "follow-b", "assistant", "answer B"),
+            ),
+        ),
+    )
+    return {"message_tree_id": "root", "tree_state": "ready_for_export", "prompt": root}
+
+
+def _write_oasst2_tree(path, tree):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as file:
+        file.write(json.dumps(tree) + "\n")
+
+
+def test_oasst2_preserves_branch_ancestry_and_normalizes_messages(tmp_path):
+    path = tmp_path / "oasst2" / "2023-11-05_oasst2_ready.trees.jsonl.gz"
+    _write_oasst2_tree(path, _oasst2_tree())
+    records = list(iter_dataset(path.parent))
+    assert [record.uid for record in records] == ["leaf-a", "leaf-b", "leaf-c"]
+    assert records == list(iter_dataset(path))
+    first = records[0]
+    assert first.category == "en"
+    assert first.num_turns == 2
+    assert [message.role for message in first.messages] == [
+        "user", "assistant", "user", "assistant",
+    ]
+    assert [message.content for message in first.user_turns] == ["question", "follow-up A"]
+    assert first.metadata["message_tree_id"] == "root"
+    assert first.metadata["message_ids"] == ("root", "answer", "follow-a", "leaf-a")
+    assert first.metadata["parent_ids"] == (None, "root", "answer", "follow-a")
+    assert first.metadata["user_branch_ids"] == ("answer",)
+    assert first.metadata["assistant_branch_ids"] == ("follow-a",)
+    assert records[-1].metadata["assistant_branch_ids"] == ()
+    assert first.metadata["node_metadata"][1]["rank"] == 0
+
+
+def test_oasst2_sampling_filters_language_and_user_turns(tmp_path, monkeypatch):
+    import datasets.parser as parser
+
+    path = tmp_path / "oasst2" / "2023-11-05_oasst2_ready.trees.jsonl.gz"
+    _write_oasst2_tree(path, _oasst2_tree())
+    monkeypatch.setattr(parser, "_DATASET_ROOT", tmp_path)
+    assert parser.resolve_dataset_path("OpenAssistant/oasst2") == path.parent
+    assert load_dataset("oasst2", categories="en") == list(iter_dataset(path))
+    assert load_dataset("oasst2", categories="zh") == []
+    selected = sample_dataset("oasst2", 2, seed=7, min_turns=2, categories="en")
+    assert selected == sample_dataset("oasst2", 2, seed=7, min_turns=2, categories="en")
+    assert len({record.uid for record in selected}) == 2
+    with pytest.raises(ValueError, match="at least 3 user turns"):
+        sample_dataset("oasst2", 1, seed=7, min_turns=3)
+    with pytest.raises(ValueError, match="refusing to repeat prompts"):
+        sample_dataset("oasst2", 4, seed=7)
+    assert sample_dataset("oasst2", 0, seed=7) == []
+
+
+def test_oasst2_parquet_reassembles_nodes_across_shards(tmp_path):
+    parquet = pytest.importorskip("pyarrow.parquet")
+    pyarrow = pytest.importorskip("pyarrow")
+    tree = _oasst2_tree()
+    stack = [tree["prompt"]]
+    rows = []
+    while stack:
+        node = stack.pop()
+        rows.append({k: v for k, v in node.items() if k != "replies"} | {
+            "message_tree_id": "root", "tree_state": "ready_for_export",
+        })
+        stack.extend(reversed(node["replies"]))
+    path = tmp_path / "oasst2" / "data"
+    path.mkdir(parents=True)
+    parquet.write_table(pyarrow.Table.from_pylist(rows[1:]), path / "train-00000.parquet")
+    parquet.write_table(pyarrow.Table.from_pylist(rows[:1]), path / "validation-00000.parquet")
+    records = list(iter_dataset(path.parent))
+    assert {record.uid for record in records} == {"leaf-a", "leaf-b", "leaf-c"}
+    assert all(record.metadata["user_branch_ids"] == ("answer",) for record in records)
+    selected = sample_dataset(path.parent, 2, seed=7, min_turns=2)
+    assert len({record.uid for record in selected}) == 2
+
+
+@pytest.mark.parametrize("kind", ["parent", "role", "duplicate", "root"])
+def test_oasst2_rejects_invalid_tree_links(tmp_path, kind):
+    tree = _oasst2_tree()
+    answer = tree["prompt"]["replies"][0]
+    if kind == "parent":
+        answer["parent_id"] = "missing"
+    elif kind == "role":
+        answer["role"] = "prompter"
+    elif kind == "duplicate":
+        answer["replies"][1]["replies"][0]["message_id"] = "leaf-a"
+    else:
+        tree["message_tree_id"] = "other-root"
+    path = tmp_path / "oasst2" / "sample.trees.jsonl.gz"
+    _write_oasst2_tree(path, tree)
+    with pytest.raises(ValueError, match="OASST2"):
+        list(iter_dataset(path))
+
+
+def test_oasst2_flat_messages_reject_missing_parent(tmp_path):
+    path = tmp_path / "oasst2" / "sample.messages.jsonl"
+    path.parent.mkdir()
+    path.write_text(json.dumps({
+        "message_tree_id": "root", "message_id": "child", "parent_id": "missing",
+        "role": "assistant", "text": "answer", "lang": "en",
+    }) + "\n")
+    with pytest.raises(ValueError, match="Missing OASST2 parent"):
+        list(iter_dataset(path))

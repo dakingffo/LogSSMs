@@ -206,13 +206,14 @@ class BaseCacheManager(ABC):
         if "/turn-" in tag:
             self._profile_completed_sessions[tag.partition("/turn-")[0]] = event
 
-    def record_match_profile(
+    def record_match(
         self,
         req: PendingRequest,
         match: MatchResult,
         *,
         input_len: int,
     ) -> None:
+        req.prefix_cached_len = match.cuda_handle.cached_len
         if not self._match_profile_enabled:
             return
         handle = match.cuda_handle
@@ -251,7 +252,7 @@ class BaseCacheManager(ABC):
             "matchable_len": max(0, input_len - 1),
             "tree_match_len": tree_match_len,
             "recoverable_len": recoverable_len,
-            "admitted_cached_len": handle.cached_len,
+            "admitted_cached_len": req.prefix_cached_len,
             "state_recovery_gap": max(0, tree_match_len - recoverable_len),
             "unmatched_suffix_len": max(0, input_len - 1 - tree_match_len),
             "session_previous_cached_len": (

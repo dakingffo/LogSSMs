@@ -117,6 +117,7 @@ class ARManagerBase:
                 reply.append(DetokenizeMsg(
                     uid=req.uid, next_token=next_token, finished=finished,
                     return_token_ids=req.return_token_ids,
+                    cached_tokens=req.prefix_cached_len if batch.is_prefill else None,
                 ))
 
                 if finished and req not in self.finished_reqs:

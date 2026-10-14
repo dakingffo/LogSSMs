@@ -1,0 +1,93 @@
+{
+  "model": "/home/daking/models/huggingface/Qwen3.5-0.8B",
+  "cache_type": "radix",
+  "cache_config": "StandardCacheConfig(page_size=16)",
+  "seed": 0,
+  "input_len": 64,
+  "append_len": 8,
+  "output_len": 4,
+  "num_turns": 2,
+  "num_sessions": 1,
+  "shared_prefix_len": 0,
+  "ignore_eos": true,
+  "chat_template": false,
+  "server_argv": [
+    "--model-path",
+    "/home/daking/models/huggingface/Qwen3.5-0.8B",
+    "--tensor-parallel-size",
+    "1",
+    "--cache-type",
+    "radix",
+    "--page-size",
+    "16",
+    "--memory-ratio",
+    "0.7",
+    "--max-running-requests",
+    "1",
+    "--max-seq-len-override",
+    "256",
+    "--max-prefill-tokens",
+    "256",
+    "--max-decode-tokens",
+    "1",
+    "--graph",
+    "0"
+  ],
+  "points": {
+    "1": {
+      "n": 2,
+      "ignore_eos": true,
+      "in_tokens": 140,
+      "requested_out": 8,
+      "early_stops": 0,
+      "out_tokens": 8,
+      "duration_s": 48.03245868199883,
+      "prefill_tok_per_s": 8.372283166596368,
+      "output_tok_per_s": 0.16655403907104524,
+      "decode_tok_per_s": 0.16655403907104524,
+      "req_per_s": 0.04163850976776131,
+      "ttft_ms": [
+        8420.362718999968,
+        16721.842442999332,
+        16721.842442999332,
+        16721.842442999332,
+        16721.842442999332
+      ],
+      "tpot_ms": [
+        5197.17612100006,
+        10364.588333000333,
+        10364.588333000333,
+        10364.588333000333,
+        10364.588333000333
+      ],
+      "e2e_s": [
+        24.011891082000147,
+        47.81560744200033,
+        47.81560744200033,
+        47.81560744200033,
+        47.81560744200033
+      ],
+      "rounds": 0,
+      "avg_accept": 0.0,
+      "is_mtp": false,
+      "chunks_ok": true,
+      "sessions": 1,
+      "concurrency": 1,
+      "num_turns": 2,
+      "cache": {
+        "continuations": 1,
+        "expected_reusable_tokens": 68,
+        "tree_matched_tokens": 64,
+        "admitted_cached_tokens": 64,
+        "tree_match_fraction": 0.9411764705882353,
+        "admitted_hit_fraction": 0.9411764705882353
+      },
+      "profiled_timing": true,
+      "profile_vs_timing_input_equal": true,
+      "history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-radix-smoke/history-c1.json",
+      "profile_history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-radix-smoke/history-profile-c1.json",
+      "profile_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-radix-smoke/profile-c1.rank0.json",
+      "input_trace_sha256": "be944ad27fd4068dcbd5349c6c108a69d7e221253de2b5612d9183c61476bbd4"
+    }
+  }
+}

@@ -535,7 +535,7 @@ def test_profile_tracks_complete_arrival_and_admission_without_mutating_tree():
         profile_tag=arrival.profile_tag,
     )
     match = manager.match_req(pending)
-    manager.record_match_profile(pending, match, input_len=len(next_tokens))
+    manager.record_match(pending, match, input_len=len(next_tokens))
 
     profile = manager.profile_result()
     assert profile is not None
@@ -1981,7 +1981,7 @@ def test_heat_thinning_preserves_recovery_with_nonmonotonic_endpoint_timestamps(
     )
     needed_pages = pool.allocator.free_frames + released_frames
     assert manager._plan_eviction(needed_pages, 0, 0)[3] == [
-        (left.slot, middle.slot), (middle.slot, right.slot),
+        (middle.slot, right.slot), (left.slot, right.slot),
     ]
     pages, states, _ = manager._allocate(needed_pages, 0)
     assert manager.tree.matched_entries(leaf) == (
@@ -2011,12 +2011,12 @@ def test_active_kv_chain_can_thin_states_without_touching_its_work():
     expected = torch.randn_like(pool.read_states(work_indices, 0))
     pool.write_states(work_indices, 0, expected)
     manager.tree._checkpoint_timestamps.update({entry.slot: i for i, entry in enumerate(entries)})
-    middle = entries[1]
-    record = manager._allocator.slot(middle.slot)
+    cold = entries[0]
+    record = manager._allocator.slot(cold.slot)
     frames = len(record.payload) + sum(map(len, record.conv))
     pages, logs, _ = manager._allocate(manager._allocator.free_frames + frames, 0)
-    assert not manager.tree.has_slot(middle.slot)
-    assert manager.tree.has_slot(entries[0].slot)
+    assert not manager.tree.has_slot(cold.slot)
+    assert manager.tree.has_slot(entries[1].slot)
     assert leaf.is_locked and manager.tree.evictable_kv_frames() == 0
     torch.testing.assert_close(matched_kv(manager.tree, leaf), kv)
     torch.testing.assert_close(pool.read_states(work_indices, 0), expected)
@@ -2421,4 +2421,163 @@ def test_active_branch_recovery_anchor_survives_same_round_maintenance():
     manager.cache_req(branch, finished=False)
     assert branch.cache_handle.cached_len == 128
     manager.cache_req(branch, finished=True)
+    manager.check_integrity()
+
+
+@pytest.mark.parametrize("granularity", [16, 32])
+@pytest.mark.parametrize("suffix_len", [16, 64])
+@pytest.mark.parametrize("device", [torch.device("cpu"), pytest.param(
+    torch.device("cuda"), marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+)])
+def test_compressed_branch_restores_a_protected_log_prefix(granularity, suffix_len, device):
+    from tests.logstate_helpers import decay_view, write_head
+
+    manager = make_manager(num_pages=16, num_states=16, granularity=granularity,
+                           device=device, value_head_ratio=4 if device.type == "cuda" else 1)
+    history, _, checkpoints = cache_checkpoint_chain(manager, (1, 2))
+    base_slot = checkpoints[0].slot
+    base = torch.randn_like(manager.logstate_pool.read_states(torch.tensor([base_slot]), 0))
+    manager.logstate_pool.write_states(torch.tensor([base_slot]), 0, base)
+    position = 96
+    branch_ids = torch.cat((history[:position], torch.arange(1000, 1000 + suffix_len, dtype=torch.int32)))
+    branch = new_req(manager, branch_ids, table_idx=1)
+    assert branch.cached_len == 64
+    assert branch.cache_handle.protected_endpoints == (position,)
+    assert manager.tree.trace(history[:position]).node.is_protected
+    manager.allocate([branch], phase="prefill")
+    manager.prepare_batch(Batch([branch], "prefill"))
+    page = manager._live_pages[1][0]
+    assert page.begin == 64
+    pool = manager.logstate_pool
+    layout = pool.layout
+    for head in range(layout.num_value_heads):
+        split = PAGE_SIZE * layout.head_k_dim
+        write_head(pool, page.state_slot, 0, head, .01, state=False, index=slice(0, split))
+        write_head(pool, page.state_slot, 0, head, .03, state=False, index=slice(split, None))
+    decay_view(pool, page.state_slot).zero_()
+    for granule in range(layout.num_granules):
+        pool.conv_view(page.state_slot, granule).fill_(granule + 1)
+    branch.cached_len = len(branch_ids)
+    manager.cache_req(branch, finished=True)
+    shared = manager.tree.trace(history[:position]).node
+    assert shared.is_protected
+    assert any(entry.kind is LogStateKind.LOG and entry.end == position for entry in shared.entries)
+    assert manager.tree.entry_is_protected(page.state_slot)
+    next_ids = torch.cat((history[:position], torch.arange(2000, 2064, dtype=torch.int32)))
+    next_req = new_req(manager, next_ids, table_idx=2)
+    assert next_req.cached_len == position
+    assert next_req.cache_handle.recovery.logs[-1].end == position
+    manager.allocate([next_req], phase="prefill")
+    manager.prepare_batch(Batch([next_req], "prefill"))
+    actual = pool.read_states(torch.tensor([manager._work_slots[2]]), 0)
+    increment = (32 * torch.tensor(.01, dtype=pool.dtype).float()
+                 * torch.tensor(.03, dtype=pool.dtype).float()).item()
+    expected = (base.float() + increment).to(pool.dtype)
+    torch.testing.assert_close(actual, expected, atol=.02 if device.type == "cuda" else 1e-5,
+                               rtol=.01 if device.type == "cuda" else 1.3e-6)
+    torch.testing.assert_close(pool.conv_view(manager._work_slots[2], 0),
+                               torch.full_like(pool.conv_view(manager._work_slots[2], 0), 32 // granularity))
+    assert not any(item.log_slot == page.state_slot for item in manager.last_plan.materialize)
+    next_req.cached_len = len(next_ids)
+    manager.cache_req(next_req, finished=True)
+    manager.check_integrity()
+
+
+def test_terminal_checkpoint_eviction_releases_its_entire_private_kv_span():
+    with patch.dict(os.environ, {"LOGSSMS_PROFILE_SCHEDULER": "1"}):
+        manager = make_manager()
+    tokens, _, (base, tail) = cache_checkpoint_chain(manager, (1, 2))
+    manager.tree._checkpoint_timestamps.update({base.slot: 100, tail.slot: 1})
+    pages, states, _ = manager._allocate(manager._allocator.free_frames + 1, 0)
+    assert not manager.tree.has_slot(tail.slot)
+    assert manager.tree.has_slot(base.slot)
+    assert manager.tree.match_prefix(tokens).cuda_handle.cached_len == 64
+    event = manager.profile_result()["lifecycle_events"][-1]
+    assert event["kv_tokens"] == 128
+    assert event["dropped_checkpoints"] == []
+    assert len(manager.recycle_bin) == 0
+    manager._return_slots(pages, states)
+    manager.check_integrity()
+
+
+def test_cold_terminal_checkpoint_precedes_recent_active_middle_checkpoints():
+    manager = make_manager(num_pages=16, num_states=16)
+    tokens, leaf, hot = cache_checkpoint_chain(manager, (1, 1, 1))
+    cold_tokens = torch.arange(1000, 1064, dtype=torch.int32)
+    cold_req = new_req(manager, cold_tokens)
+    manager.allocate([cold_req])
+    cold_req.cached_len = len(cold_tokens)
+    manager.cache_req(cold_req, finished=True)
+    cold = manager.tree.match_prefix(cold_tokens).cuda_handle.recovery.logs[0]
+    owner = manager.tree.entry_owner(cold.slot)
+    manager.tree.detach_entry(cold.slot)
+    manager.logstate_pool.materialize(cold.slot)
+    manager.tree.attach_entry(owner, LogStateEntry(cold.slot, LogStateKind.CHECKPOINT, 0, 64, span_pages=1))
+    manager.tree._checkpoint_timestamps.update({entry.slot: 100 + i for i, entry in enumerate(hot)})
+    manager.tree._checkpoint_timestamps[cold.slot] = 1
+    handle = manager.tree.make_handle(leaf)
+    manager.lock(handle)
+    pages, states, _ = manager._allocate(manager._allocator.free_frames + 1, 0)
+    assert not manager.tree.has_slot(cold.slot)
+    assert all(manager.tree.has_slot(entry.slot) for entry in hot)
+    assert manager.tree.match_prefix(tokens).cuda_handle.cached_len == len(tokens)
+    manager._return_slots(pages, states)
+    manager.unlock(handle)
+    manager.check_integrity()
+
+
+def test_protected_restore_position_survives_eviction_while_pending():
+    manager = make_manager(num_pages=16, num_states=16)
+    history, _, checkpoints = cache_checkpoint_chain(manager, (1, 2))
+    branch_ids = torch.cat((history[:96], torch.arange(1000, 1032, dtype=torch.int32)))
+    pending = PendingRequest(20, branch_ids, SamplingParams(max_tokens=16))
+    manager.prepare_prefill_requests([pending])
+    first = manager.match_req(pending).cuda_handle
+    assert first.protected_endpoints == (96,)
+    frames = len(manager._cached_page_tokens) + sum(
+        len(record.payload) + sum(map(len, record.conv))
+        for record in (manager._allocator.slot(entry.slot) for entry in checkpoints)
+    )
+    pages, states, _ = manager._allocate(manager._allocator.free_frames + frames, 0)
+    assert manager.tree.size_info.total_size == 0
+    manager._return_slots(pages, states)
+    handle = manager.match_req(pending).cuda_handle
+    assert handle.cached_len == 0 and handle.protected_endpoints == (96,)
+    manager.lock(handle)
+    req = Request(input_ids=branch_ids, table_idx=1, cached_len=0, output_len=16,
+                  uid=20, sampling_params=pending.sampling_params, cache_handle=handle,
+                  max_device_len=len(branch_ids) + 16)
+    manager.init_with_handle(1, handle)
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(branch_ids)
+    manager.cache_req(req, finished=True)
+    assert manager.tree.trace(branch_ids[:96]).node.is_protected
+    assert manager.tree.match_prefix(torch.cat((history[:96], torch.tensor([9999], dtype=torch.int32)))).cuda_handle.cached_len == 96
+    manager.check_integrity()
+
+
+def test_recycled_protected_prefix_is_retained_when_reply_ends_before_page_boundary():
+    from logssms.cache.prefix_cache.logstate import LogRadixTree
+
+    manager = make_manager(num_pages=16, num_states=16)
+    history = torch.arange(128, dtype=torch.int32)
+    ghost = LogRadixTree(PAGE_SIZE, torch.device("cpu"), granularity=GRANULARITY)
+    leaf = ghost.insert(history, history + 1000, (
+        LogStateEntry(100, LogStateKind.LOG, 0, 64),
+        LogStateEntry(101, LogStateKind.LOG, 64, 128),
+    )).node
+    point = ghost._node_at_depth(leaf, 96)
+    ghost.protect(point)
+    remember_log_tail(manager.recycle_bin, ghost, leaf)
+    branch_ids = torch.cat((history[:96], torch.arange(1000, 1016, dtype=torch.int32)))
+    req = new_req(manager, branch_ids)
+    assert req.cached_len == 0
+    assert req.cache_handle.protected_endpoints == ()
+    assert 96 in req.cache_handle.restore_plan.protected_endpoints
+    manager.allocate([req], phase="prefill")
+    req.cached_len = len(branch_ids)
+    manager.cache_req(req, finished=True)
+    assert manager.tree.trace(history[:96]).node.is_protected
+    handle = manager.tree.match_prefix(torch.cat((history[:96], torch.tensor([9999], dtype=torch.int32)))).cuda_handle
+    assert handle.cached_len == 96 and handle.recovery.logs[-1].end == 96
     manager.check_integrity()

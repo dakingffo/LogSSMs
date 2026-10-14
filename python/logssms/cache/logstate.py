@@ -1011,6 +1011,7 @@ class LogStateCacheManager(BaseCacheManager):
         self._prefill_matches: OrderedDict[int, tuple] = OrderedDict()
         self._prefix_match_revision = -1
         self._prefix_matches: OrderedDict[int, tuple] = OrderedDict()
+        self._protected_prefixes: dict[int, set[int]] = {}
         self._request_ends: dict[int, int] = {}
         dummy_kv = pool.reserve(kv=1)
         assert dummy_kv is not None
@@ -1048,6 +1049,7 @@ class LogStateCacheManager(BaseCacheManager):
             "max_admission_wait_ms": 0.0,
             "eviction_rounds": 0,
             "pressure_dropped_checkpoints": 0,
+            "pressure_pruned_checkpoints": 0,
             "evicted_kv_tokens": 0,
             "recycle_matches": 0,
             "recycle_matched_tokens": 0,
@@ -1164,6 +1166,17 @@ class LogStateCacheManager(BaseCacheManager):
                     self._prefix_matches.popitem(last=False)
         handle = result.cuda_handle
         assert isinstance(handle, LogStateCacheHandle)
+        if result.tree_match_len > handle.cached_len:
+            position = result.tree_match_len
+            trace = handle.match_trace
+            assert trace is not None
+            node = self.tree._node_at_depth(trace.node, position)
+            self.tree.protect(node)
+            self._protected_prefixes.setdefault(req.uid, set()).add(position)
+            result = super().match_req(req)
+            handle = result.cuda_handle
+            assert isinstance(handle, LogStateCacheHandle)
+        protected = tuple(sorted(self._protected_prefixes.get(req.uid, ())))
         values = req.input_ids[: req.input_len - 1]
         with self.record_schedule_step("recycle_match"):
             recycle_match = (
@@ -1186,6 +1199,7 @@ class LogStateCacheManager(BaseCacheManager):
                         handle, recycle_match, self._prefill_branch_points.get(req.uid, ()),
                     ),
                     request_end=req.input_len + req.output_len,
+                    protected_endpoints=protected,
                 ),
                 tree_match_len=result.tree_match_len,
                 recoverable_len=result.recoverable_len,
@@ -1234,6 +1248,7 @@ class LogStateCacheManager(BaseCacheManager):
                     intensity=intensity,
                 ),
                 request_end=req.input_len + req.output_len,
+                protected_endpoints=protected,
             ),
             tree_match_len=result.tree_match_len,
             recoverable_len=result.recoverable_len,
@@ -1250,6 +1265,9 @@ class LogStateCacheManager(BaseCacheManager):
         self._prefill_request_signature = signature
         self._prefill_matches.clear()
         pending = {req.uid for req in reqs}
+        self._protected_prefixes = {
+            uid: positions for uid, positions in self._protected_prefixes.items() if uid in pending
+        }
         for uid in tuple(self._prefix_matches):
             if uid not in pending:
                 del self._prefix_matches[uid]
@@ -1685,6 +1703,7 @@ class LogStateCacheManager(BaseCacheManager):
             "type": "logstate",
             "capacity": {
                 "total_frames": self._allocator.num_frames,
+                "recent_checkpoint_limit": self.work_state_table.shape[0] - 1,
                 "frame_bytes": self._allocator.frame_bytes,
                 "payload_frames_per_slot": self._allocator.payload_frames,
                 "log_payload_frames_per_slot": self._allocator.log_payload_frames,
@@ -2020,6 +2039,9 @@ class LogStateCacheManager(BaseCacheManager):
                 )
             result.append({
                 "uid": req.uid,
+                "protected_restore_positions": (
+                    list(handle.protected_endpoints) if isinstance(handle, LogStateCacheHandle) else []
+                ),
                 "cached_len": req.cached_len,
                 "device_len": req.device_len,
                 "source_merge_stats": merge_stats,
@@ -2363,13 +2385,26 @@ class LogStateCacheManager(BaseCacheManager):
         old_handle = req.cache_handle
         assert isinstance(old_handle, LogStateCacheHandle)
         pages = self._live_pages.get(req.table_idx, [])
+        restore = self._recycled_restores.get(req.table_idx)
+        protected_endpoints = set(old_handle.protected_endpoints)
+        if restore is not None:
+            protected_endpoints.update(restore.plan.protected_endpoints)
         full_pages = [page for page in pages if page.end <= req.cached_len]
+        committed_ends = {page: page.end for page in full_pages}
+        if finished:
+            for page in pages:
+                if page.end <= req.cached_len or page.checkpoint_begin is not None:
+                    continue
+                position = max((value for value in protected_endpoints
+                                if page.begin < value <= req.cached_len < page.end), default=0)
+                if position:
+                    full_pages.append(page)
+                    committed_ends[page] = position
         insert_len = old_handle.cached_len
         for page in full_pages:
             if page.begin != insert_len:
                 break
-            insert_len = page.end
-        restore = self._recycled_restores.get(req.table_idx)
+            insert_len = committed_ends[page]
         if restore is not None:
             for checkpoint in restore.plan.checkpoints:
                 if checkpoint.begin < insert_len < checkpoint.end and (
@@ -2396,7 +2431,7 @@ class LogStateCacheManager(BaseCacheManager):
             page
             for page in full_pages
             if old_handle.cached_len <= page.begin
-            and page.end <= insert.inserted_len
+            and committed_ends[page] <= insert.inserted_len
         ]
         stage_start = perf_counter_ns() if self._profile_enabled else 0
         existing = self.tree.recovery_at(insert.node, insert.inserted_len)
@@ -2409,8 +2444,9 @@ class LogStateCacheManager(BaseCacheManager):
         released_state_slots = []
         retain_kv_ms = 0.0
         for page in adopted:
+            page_end = committed_ends[page]
             logical_begin = max(page.begin, covered_len)
-            if page.checkpoint_begin is not None and logical_begin < page.end:
+            if page.checkpoint_begin is not None and logical_begin < page_end:
                 assert page.state_slot is not None
                 assert page.checkpoint_begin >= covered_len
                 kind = self._allocator.slot(page.state_slot).kind
@@ -2437,29 +2473,29 @@ class LogStateCacheManager(BaseCacheManager):
                         self._profile_stats["recycle_committed_tokens"] += (
                             page.end - max(page.checkpoint_begin, restore.plan.cached_len)
                         )
-            elif page.state_slot is not None and logical_begin < page.end:
+            elif page.state_slot is not None and logical_begin < page_end:
                 self.tree.attach_entry(
                     insert.node,
                     LogStateEntry(
                         slot=page.state_slot,
                         kind=LogStateKind.LOG,
                         begin=logical_begin,
-                        end=page.end,
+                        end=page_end,
                         storage_begin=page.begin,
                     ),
                 )
-                covered_len = page.end
+                covered_len = page_end
             elif page.state_slot is not None:
                 released_state_slots.append(page.state_slot)
                 if restore is not None and page.checkpoint_begin is not None:
                     restore.slots.pop(page.end, None)
 
             kv_begin = max(page.begin, insert.previous_len)
-            if kv_begin < page.end:
+            if kv_begin < page_end:
                 stage_start = perf_counter_ns() if self._profile_enabled else 0
                 self._cached_page_tokens[page.kv_page] = (
                     self._cached_page_tokens.get(page.kv_page, 0)
-                    + page.end - kv_begin
+                    + page_end - kv_begin
                 )
                 if self._profile_enabled:
                     retain_kv_ms += (perf_counter_ns() - stage_start) / 1e6
@@ -2469,7 +2505,7 @@ class LogStateCacheManager(BaseCacheManager):
         duplicates = [
             page
             for page in full_pages
-            if page not in adopted and page.end <= insert.previous_len
+            if page not in adopted and committed_ends[page] <= insert.previous_len
         ]
         self._release_live_pages(req.table_idx, duplicates)
         if released_kv_pages or released_state_slots:
@@ -2486,14 +2522,18 @@ class LogStateCacheManager(BaseCacheManager):
                 ),
             )
 
-        if restore is not None:
-            for position in sorted(restore.plan.protected_endpoints):
+        if protected_endpoints:
+            for position in sorted(protected_endpoints):
                 if 0 < position <= insert.inserted_len:
                     trace = self.tree.trace(req.input_ids[:position])
                     node = trace.node
                     if not trace.is_exact:
                         node = self.tree.split_at(node, trace.matched_in_node)
                     self.tree.protect(node)
+                    for entry in self.tree.matched_entries(insert.node):
+                        if (entry.kind is LogStateKind.LOG
+                            and entry.physical_begin < position < entry.physical_begin + self.page_size):
+                            self.tree.protect_entry(entry.slot)
 
         merge_stats_start = perf_counter_ns() if self._profile_enabled else 0
         stats = old_handle.merge_stats
@@ -2513,6 +2553,7 @@ class LogStateCacheManager(BaseCacheManager):
         new_handle = replace(
             self.tree.make_handle(insert.node, insert.inserted_len),
             merge_stats=stats,
+            protected_endpoints=old_handle.protected_endpoints,
         )
         self.unlock(old_handle)
         self.pending_recoveries.pop(req.table_idx, None)
@@ -2557,6 +2598,7 @@ class LogStateCacheManager(BaseCacheManager):
             if self._profile_enabled:
                 conv_copy_ms = (perf_counter_ns() - stage_start) / 1e6
         if finished:
+            self._protected_prefixes.pop(req.uid, None)
             recycled = self._recycle_matches.pop(req.table_idx, None)
             if (
                 recycled is not None
@@ -2824,6 +2866,9 @@ class LogStateCacheManager(BaseCacheManager):
                 })
                 self._profile_stats["eviction_rounds"] += 1
                 self._profile_stats["pressure_dropped_checkpoints"] += len(checkpoint_pairs)
+                self._profile_stats["pressure_pruned_checkpoints"] += sum(
+                    entry["kind"] == LogStateKind.CHECKPOINT.value for entry in evicted_entry_spans
+                )
                 self._profile_stats["evicted_kv_tokens"] += len(
                     eviction.kv_indices
                 )
@@ -2879,8 +2924,8 @@ class LogStateCacheManager(BaseCacheManager):
             (allocator.free_frames, allocator._free_decay_records,
              allocator.payload_frames, allocator.conv_frames, allocator.num_granules,
              allocator.decay_records_per_frame, needed_pages, needed_states, needed_works,
-             allocator.log_payload_frames),
-            self.tree.checkpoint_eviction_pairs(),
+             allocator.log_payload_frames, self.work_state_table.shape[0] - 1),
+            self.tree.checkpoint_eviction_actions(nodes),
         )
         if not rows:
             raise LogStateCapacityError(

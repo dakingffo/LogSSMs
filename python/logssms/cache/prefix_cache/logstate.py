@@ -212,6 +212,7 @@ class LogStateCacheHandle(BaseCacheHandle):
     recycle_match     : RecycledMatch | None = None
     restore_plan      : RecycledRestorePlan | None = None
     request_end       : int = 0
+    protected_endpoints: tuple[int, ...] = ()
     match_trace       : LogRadixTrace | None = field(default=None, compare=False)
     trace_revision    : int = field(default=-1, compare=False)
     trace_input_len   : int = field(default=0, compare=False)
@@ -455,7 +456,16 @@ class LogRadixTree(BasePrefixCache):
         owner = self._find_owner(leaf, entry.end)
         if entry.end < owner.depth:
             owner = self.split_at(owner, entry.end - owner.begin)
-        self._register_entry(owner, entry, checkpoint_timestamp)
+        if entry.kind is LogStateKind.LOG and entry.begin < owner.begin:
+            cursor = entry.end
+            while cursor > entry.begin:
+                begin = max(entry.begin, owner.begin)
+                self._register_entry(owner, entry.slice(begin, cursor))
+                cursor = begin
+                if cursor > entry.begin:
+                    owner = owner.parent
+        else:
+            self._register_entry(owner, entry, checkpoint_timestamp)
         self.revision += 1
 
     def detach_entry(self, slot: int) -> LogStateEntry:
@@ -615,7 +625,9 @@ class LogRadixTree(BasePrefixCache):
         nodes = self._iter_nodes()
         rows = [(
             node.uuid, -1 if node.is_root() else node.parent.uuid,
-            int(node.is_root() or node.is_locked),
+            int(node.is_root() or node.is_locked or any(
+                entry.slot in self._recovery_slot_refs for entry in node.entries
+            )),
             int(any(entry.kind is LogStateKind.CHECKPOINT for entry in node.entries)),
             min((self._checkpoint_timestamps[entry.slot] for entry in node.entries
                  if entry.kind is LogStateKind.CHECKPOINT), default=node.timestamp),
@@ -645,6 +657,36 @@ class LogRadixTree(BasePrefixCache):
                 previous = None
             stack.extend((child, previous) for child in node.children.values())
         return pairs
+
+    def checkpoint_eviction_actions(
+        self, nodes: list[LogRadixTreeNode],
+    ) -> list[tuple[int, ...]]:
+        indices = {node.uuid: index for index, node in enumerate(nodes)}
+        result = []
+        for node in nodes:
+            for entry in node.entries:
+                if entry.kind is not LogStateKind.CHECKPOINT:
+                    continue
+                successor = self._checkpoint_successor(entry)
+                tail = []
+                if entry.slot not in self._recovery_slot_refs:
+                    current = node
+                    while not current.is_root() and not current.is_locked:
+                        if any(value.slot in self._recovery_slot_refs for value in current.entries):
+                            break
+                        tail.append(indices[current.uuid])
+                        parent = current.parent
+                        if (parent.is_root() or parent.is_protected or len(parent.children) != 1
+                            or any(value.kind is LogStateKind.LOG for value in parent.entries)):
+                            break
+                        current = parent
+                else:
+                    successor = None
+                result.append((
+                    entry.slot, -1 if successor is None else successor.slot,
+                    self._checkpoint_timestamps[entry.slot], *tail,
+                ))
+        return result
 
     def drop_checkpoint(self, left_slot: int, right_slot: int) -> LogStateEntry:
         left, = self.entries_for_slot(left_slot)

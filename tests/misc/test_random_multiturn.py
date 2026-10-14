@@ -338,7 +338,10 @@ def test_http_client_continues_actual_output_ids(api, monkeypatch):
             events = [
                 {"choices": [{"delta": {"token_ids": [token]}}]}
                 for token in ids
-            ] + [{"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+            ] + [{
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "meta_info": {"cached_tokens": len(prompt) - 1},
+            }]
         body = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
         body += "data: [DONE]\n\n"
         return httpx.Response(200, text=body)
@@ -355,10 +358,13 @@ def test_http_client_continues_actual_output_ids(api, monkeypatch):
     assert stats["chunks_ok"]
     assert prompts[1] == prompts[0] + [31, 32] + list(sessions[0].increments[0])
     assert records[0]["turns"][1]["generated_token_ids"] == [31, 32]
-    if api == "vllm":
+    if api in ("logssms", "vllm"):
         cache = random_multiturn.summarize_response_cache(records, api)
         assert cache["admitted_hit_fraction"] == 1.0
-        assert cache["source"] == "response.usage.prompt_tokens_details.cached_tokens"
+        assert cache["source"] == (
+            "response.usage.prompt_tokens_details.cached_tokens"
+            if api == "vllm" else "response.meta_info.cached_tokens"
+        )
 
 
 def vllm_events(prompt, ids, *, cached_tokens=0):

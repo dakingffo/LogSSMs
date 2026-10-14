@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import json
 import random
 from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from itertools import chain
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -72,6 +74,8 @@ _ALIASES = {
     "lmsys"           : "lmsys_chat_1m",
     "lmsys_chat"      : "lmsys_chat_1m",
     "lmsys_chat_1m"   : "lmsys_chat_1m",
+    "oasst2"         : "oasst2",
+    "openassistant/oasst2": "oasst2",
     "agentic_coding"  : "agentic_coding_trajectories",
     "agentic_coding_trajectories": "agentic_coding_trajectories",
 }
@@ -87,6 +91,8 @@ def _dataset_name(dataset: str | Path) -> str:
     normalized = _normalize_name(candidate)
     if normalized in _ALIASES:
         return _ALIASES[normalized]
+    if "oasst2" in normalized.split("_"):
+        return "oasst2"
 
     for part in reversed(path.parts):
         normalized = _normalize_name(part)
@@ -121,6 +127,7 @@ def _message(
 ) -> DatasetMessage | None:
     role = {
         "human": "user",
+        "prompter": "user",
         "gpt"  : "assistant",
     }.get(role.lower(), role.lower())
     if role not in ("system", "user", "assistant", "tool"):
@@ -252,6 +259,33 @@ def _parse_agentic_coding(record: dict[str, Any]) -> DatasetRecord:
     )
 
 
+def _parse_oasst2(record: dict[str, Any]) -> DatasetRecord:
+    nodes = record["messages"]
+    messages = []
+    for node in nodes:
+        message = _message(node["role"], node["text"])
+        if message is None:
+            raise ValueError(f"OASST2 message {node['message_id']!r} has no content")
+        messages.append(message)
+    return DatasetRecord(
+        uid=nodes[-1]["message_id"],
+        category=nodes[0].get("lang"),
+        messages=tuple(messages),
+        metadata={
+            "message_tree_id"    : record["message_tree_id"],
+            "tree_state"         : record.get("tree_state"),
+            "message_ids"        : tuple(node["message_id"] for node in nodes),
+            "parent_ids"         : (None, *(node["message_id"] for node in nodes[:-1])),
+            "user_branch_ids"    : record["user_branch_ids"],
+            "assistant_branch_ids": record["assistant_branch_ids"],
+            "node_metadata"      : tuple({
+                key: node.get(key)
+                for key in ("lang", "rank", "deleted", "review_result", "synthetic")
+            } for node in nodes),
+        },
+    )
+
+
 def _parse_custom(record: dict[str, Any]) -> DatasetRecord:
     if "turns" in record:
         messages = tuple(
@@ -281,7 +315,11 @@ def _parse_custom(record: dict[str, Any]) -> DatasetRecord:
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
-    with path.open(encoding="utf-8") as file:
+    file = (
+        gzip.open(path, "rt", encoding="utf-8")
+        if path.suffix == ".gz" else path.open(encoding="utf-8")
+    )
+    with file:
         for line in file:
             if line.strip():
                 yield json.loads(line)
@@ -324,6 +362,101 @@ def _iter_parquet(paths: list[Path]) -> Iterator[dict[str, Any]]:
             yield from batch.to_pylist()
 
 
+def _oasst2_trees_from_messages(
+    records: Iterator[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    trees: dict[str, dict[str, dict[str, Any]]] = {}
+    for record in records:
+        tree_id = record["message_tree_id"]
+        nodes = trees.setdefault(tree_id, {})
+        message_id = record["message_id"]
+        if message_id in nodes:
+            raise ValueError(f"Duplicate OASST2 message {message_id!r}")
+        nodes[message_id] = {**record, "replies": []}
+    for tree_id, nodes in trees.items():
+        for node in nodes.values():
+            parent_id = node.get("parent_id")
+            if parent_id is not None:
+                if parent_id not in nodes:
+                    raise ValueError(f"Missing OASST2 parent {parent_id!r}")
+                nodes[parent_id]["replies"].append(node)
+        if tree_id not in nodes or nodes[tree_id].get("parent_id") is not None:
+            raise ValueError(f"Missing OASST2 root {tree_id!r}")
+        yield {
+            "message_tree_id": tree_id,
+            "tree_state"     : nodes[tree_id].get("tree_state"),
+            "prompt"         : nodes[tree_id],
+            "message_count"  : len(nodes),
+        }
+
+
+def _oasst2_threads(tree: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    root = tree["prompt"]
+    tree_id = tree["message_tree_id"]
+    if root["message_id"] != tree_id:
+        raise ValueError(f"OASST2 root does not match tree {tree_id!r}")
+    seen = set()
+    stack = [(root, (), (), ())]
+    while stack:
+        node, ancestors, user_branches, assistant_branches = stack.pop()
+        message_id = node["message_id"]
+        if message_id in seen:
+            raise ValueError(f"Duplicate OASST2 message {message_id!r}")
+        seen.add(message_id)
+        parent_id = ancestors[-1]["message_id"] if ancestors else None
+        if node.get("parent_id", parent_id) != parent_id:
+            raise ValueError(f"Invalid OASST2 parent for {message_id!r}")
+        expected_role = "assistant" if len(ancestors) % 2 else "prompter"
+        if node["role"] != expected_role:
+            raise ValueError(f"Invalid OASST2 role for {message_id!r}")
+        path = (*ancestors, node)
+        replies = node.get("replies") or []
+        if len(replies) > 1:
+            if node["role"] == "assistant":
+                user_branches = (*user_branches, message_id)
+            else:
+                assistant_branches = (*assistant_branches, message_id)
+        if replies:
+            stack.extend(
+                (reply, path, user_branches, assistant_branches)
+                for reply in reversed(replies)
+            )
+        else:
+            yield {
+                "message_tree_id"    : tree_id,
+                "tree_state"         : tree.get("tree_state"),
+                "messages"           : path,
+                "user_branch_ids"    : user_branches,
+                "assistant_branch_ids": assistant_branches,
+            }
+    if "message_count" in tree and len(seen) != tree["message_count"]:
+        raise ValueError(f"Disconnected OASST2 messages in tree {tree_id!r}")
+
+
+def _iter_oasst2(path: Path) -> Iterator[dict[str, Any]]:
+    if path.is_dir():
+        ready = path / "2023-11-05_oasst2_ready.trees.jsonl.gz"
+        tree_paths = [ready] if ready.is_file() else sorted(path.glob("*.trees.jsonl*"))
+        paths = tree_paths or sorted(path.rglob("*.parquet")) or sorted(
+            path.glob("*.messages.jsonl*")
+        )
+    else:
+        paths = [path]
+    if not paths:
+        raise FileNotFoundError(f"No OASST2 trees or messages found under {path}")
+    records = (
+        _iter_parquet(paths) if paths[0].suffix == ".parquet"
+        else chain.from_iterable(_iter_jsonl(source) for source in paths)
+    )
+    first = next(records, None)
+    if first is None:
+        return
+    records = chain((first,), records)
+    trees = records if "prompt" in first else _oasst2_trees_from_messages(records)
+    for tree in trees:
+        yield from _oasst2_threads(tree)
+
+
 def _parquet_source(
     path: Path,
     name: str,
@@ -360,6 +493,8 @@ def _dataset_source(
         return _iter_json(source), _parse_sharegpt
     elif name == "swe_agent":
         return _iter_swe_agent(path), _parse_swe_agent
+    elif name == "oasst2":
+        return _iter_oasst2(path), _parse_oasst2
     elif name in (
         "swe_bench",
         "lmsys_chat_1m",

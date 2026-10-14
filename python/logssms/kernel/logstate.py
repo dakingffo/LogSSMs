@@ -64,10 +64,10 @@ def eviction_candidates(nodes: Rows) -> list[int]:
 
 
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
-                  occupied: Rows, config: Sequence[int], checkpoint_pairs: Rows) -> list[list[int]]:
+                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]]:
     return _unpack(_load_logstate_module().plan_eviction(
         _pack(nodes), _pack(kv), _pack(node_slots), _pack(slots), _pack(occupied), config,
-        _pack(checkpoint_pairs),
+        _pack(checkpoint_actions),
     ))
 
 

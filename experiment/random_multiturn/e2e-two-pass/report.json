@@ -1,0 +1,176 @@
+{
+  "model": "/home/daking/models/huggingface/Qwen3.5-0.8B",
+  "cache_type": "radix",
+  "cache_config": "StandardCacheConfig(page_size=64)",
+  "seed": 0,
+  "input_len": 64,
+  "append_len": 4,
+  "output_len": 2,
+  "num_turns": 2,
+  "num_sessions": 1,
+  "shared_prefix_len": 0,
+  "ignore_eos": true,
+  "chat_template": false,
+  "server_argv": [
+    "--model-path",
+    "/home/daking/models/huggingface/Qwen3.5-0.8B",
+    "--tensor-parallel-size",
+    "1",
+    "--cache-type",
+    "radix",
+    "--page-size",
+    "64",
+    "--memory-ratio",
+    "0.7",
+    "--max-running-requests",
+    "1",
+    "--max-seq-len-override",
+    "256",
+    "--max-prefill-tokens",
+    "256",
+    "--max-decode-tokens",
+    "1",
+    "--graph",
+    "0"
+  ],
+  "points": {
+    "1": {
+      "n": 2,
+      "ignore_eos": true,
+      "in_tokens": 134,
+      "requested_out": 4,
+      "early_stops": 0,
+      "out_tokens": 4,
+      "duration_s": 18.055691735000437,
+      "prefill_tok_per_s": 8.165560659898647,
+      "output_tok_per_s": 0.22153679065344895,
+      "decode_tok_per_s": 0.22153679065344895,
+      "req_per_s": 0.11076839532672447,
+      "ttft_ms": [
+        8281.053062501087,
+        16410.385713999858,
+        16410.385713999858,
+        16410.385713999858,
+        16410.385713999858
+      ],
+      "tpot_ms": [
+        745.6141855000169,
+        1453.3531580018462,
+        1453.3531580018462,
+        1453.3531580018462,
+        1453.3531580018462
+      ],
+      "e2e_s": [
+        9.026667248001104,
+        17.863738872001704,
+        17.863738872001704,
+        17.863738872001704,
+        17.863738872001704
+      ],
+      "rounds": 0,
+      "avg_accept": 0.0,
+      "is_mtp": false,
+      "chunks_ok": true,
+      "sessions": 1,
+      "concurrency": 1,
+      "num_turns": 2,
+      "session_per_s": 0.055384197663362236,
+      "turn_stats": [
+        {
+          "turn": 1,
+          "n": 1,
+          "ignore_eos": true,
+          "in_tokens": 64,
+          "requested_out": 2,
+          "early_stops": 0,
+          "out_tokens": 2,
+          "duration_s": 17.863738872001704,
+          "prefill_tok_per_s": 3.8999692703993536,
+          "output_tok_per_s": 0.11195864507035821,
+          "decode_tok_per_s": 0.11195864507035821,
+          "req_per_s": 0.05597932253517911,
+          "ttft_ms": [
+            16410.385713999858,
+            16410.385713999858,
+            16410.385713999858,
+            16410.385713999858,
+            16410.385713999858
+          ],
+          "tpot_ms": [
+            1453.3531580018462,
+            1453.3531580018462,
+            1453.3531580018462,
+            1453.3531580018462,
+            1453.3531580018462
+          ],
+          "e2e_s": [
+            17.863738872001704,
+            17.863738872001704,
+            17.863738872001704,
+            17.863738872001704,
+            17.863738872001704
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        },
+        {
+          "turn": 2,
+          "n": 1,
+          "ignore_eos": true,
+          "in_tokens": 70,
+          "requested_out": 2,
+          "early_stops": 0,
+          "out_tokens": 2,
+          "duration_s": 0.18959562400050345,
+          "prefill_tok_per_s": 461.37496950843047,
+          "output_tok_per_s": 10.548766674038264,
+          "decode_tok_per_s": 10.548766674038264,
+          "req_per_s": 5.274383337019132,
+          "ttft_ms": [
+            151.7204110023158,
+            151.7204110023158,
+            151.7204110023158,
+            151.7204110023158,
+            151.7204110023158
+          ],
+          "tpot_ms": [
+            37.875212998187635,
+            37.875212998187635,
+            37.875212998187635,
+            37.875212998187635,
+            37.875212998187635
+          ],
+          "e2e_s": [
+            0.18959562400050345,
+            0.18959562400050345,
+            0.18959562400050345,
+            0.18959562400050345,
+            0.18959562400050345
+          ],
+          "rounds": 0,
+          "avg_accept": 0.0,
+          "is_mtp": false,
+          "chunks_ok": true
+        }
+      ],
+      "cache": {
+        "continuations": 1,
+        "expected_reusable_tokens": 66,
+        "tree_matched_tokens": 64,
+        "admitted_cached_tokens": 64,
+        "tree_match_fraction": 0.9696969696969697,
+        "admitted_hit_fraction": 0.9696969696969697
+      },
+      "profiled_timing": false,
+      "profile_vs_timing_input_equal": true,
+      "profile_vs_timing_output_equal": true,
+      "history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-two-pass/history-c1.json",
+      "profile_history_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-two-pass/history-profile-c1.json",
+      "profile_path": "/home/daking/PROJECT/LogSSMs/experiment/random_multiturn/e2e-two-pass/profile-c1.rank0.json",
+      "input_trace_sha256": "41cbc2a7568520a9eaa94365947eb01080c92adeeb7c5c256f77950faf19c782",
+      "output_trace_sha256": "f59ec145c26401ff37557ecea330f3dfb9808ee354a5b4f60d38ebafc5f8cf5c"
+    }
+  }
+}

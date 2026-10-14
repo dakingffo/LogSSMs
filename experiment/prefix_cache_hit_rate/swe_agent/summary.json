@@ -1,0 +1,79 @@
+{
+  "num_queries": 6425,
+  "raw_hits": 6424,
+  "raw_hit_rate": 0.9998443579766537,
+  "bin_width": 256,
+  "page_sizes": {
+    "1": {
+      "hits": 6424,
+      "hit_rate": 0.9998443579766537,
+      "branch_hits": 6424,
+      "branch_hit_rate": 0.9998443579766537
+    },
+    "16": {
+      "hits": 6424,
+      "hit_rate": 0.9998443579766537,
+      "branch_hits": 6424,
+      "branch_hit_rate": 0.9998443579766537
+    },
+    "32": {
+      "hits": 6424,
+      "hit_rate": 0.9998443579766537,
+      "branch_hits": 6424,
+      "branch_hit_rate": 0.9998443579766537
+    },
+    "64": {
+      "hits": 6424,
+      "hit_rate": 0.9998443579766537,
+      "branch_hits": 6424,
+      "branch_hit_rate": 0.9998443579766537
+    },
+    "128": {
+      "hits": 6424,
+      "hit_rate": 0.9998443579766537,
+      "branch_hits": 6424,
+      "branch_hit_rate": 0.9998443579766537
+    },
+    "256": {
+      "hits": 6424,
+      "hit_rate": 0.9998443579766537,
+      "branch_hits": 6424,
+      "branch_hit_rate": 0.9998443579766537
+    }
+  },
+  "configuration": {
+    "tokenizer": "/home/daking/models/huggingface/Qwen3.5-2B",
+    "dataset": "swe_agent",
+    "num_trajectories": 300,
+    "page_sizes": [
+      1,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "bin_width": 256,
+    "order": "round_robin",
+    "seed": 0,
+    "max_turns": null,
+    "min_isl": null,
+    "max_isl": null,
+    "exclude_system_prompt": true,
+    "sources": {
+      "django/django": 114,
+      "astropy/astropy": 6,
+      "sphinx-doc/sphinx": 16,
+      "sympy/sympy": 77,
+      "pallets/flask": 3,
+      "pytest-dev/pytest": 17,
+      "pydata/xarray": 5,
+      "psf/requests": 6,
+      "scikit-learn/scikit-learn": 23,
+      "matplotlib/matplotlib": 23,
+      "mwaskom/seaborn": 4,
+      "pylint-dev/pylint": 6
+    },
+    "plot_max_distance": 2000
+  }
+}

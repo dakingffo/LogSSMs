@@ -134,6 +134,7 @@ def detokenize_worker(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
+                            cached_tokens=msg.cached_tokens,
                             token_ids=(
                                 [msg.next_token] if isinstance(msg.next_token, int)
                                 else list(msg.next_token)

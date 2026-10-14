@@ -105,6 +105,8 @@ async def stream_token_ids(
     output_len : int,
     tag        : str,
     api        : str = "logssms",
+    *,
+    ignore_eos : bool = True,
 ) -> TokenStream:
     if api == "logssms":
         endpoint = "/v1/chat/completions"
@@ -115,7 +117,7 @@ async def stream_token_ids(
             "temperature": 0.0,
             "top_k": 1,
             "stream": True,
-            "ignore_eos": True,
+            "ignore_eos": ignore_eos,
             "return_token_ids": True,
         }
         headers = {"X-LogSSMs-Profile-Tag": tag}
@@ -127,7 +129,7 @@ async def stream_token_ids(
                 "max_new_tokens": output_len,
                 "temperature": 0.0,
                 "top_k": 1,
-                "ignore_eos": True,
+                "ignore_eos": ignore_eos,
             },
             "stream": True,
         }
@@ -144,7 +146,7 @@ async def stream_token_ids(
             "echo": False,
             "add_special_tokens": False,
             "stream": True,
-            "ignore_eos": True,
+            "ignore_eos": ignore_eos,
             "return_token_ids": True,
             "stream_options": {"include_usage": True},
         }
@@ -175,6 +177,8 @@ async def stream_token_ids(
                 raise RuntimeError(f"{tag}: server error: {event['error']}")
             now = time.perf_counter()
             if api == "logssms":
+                meta = event.get("meta_info") or {}
+                cached_tokens = meta.get("cached_tokens", cached_tokens)
                 chunk = event["choices"][0]
                 new_ids = chunk["delta"].get("token_ids") or []
                 if chunk.get("finish_reason") is not None:
@@ -227,9 +231,14 @@ async def stream_token_ids(
             generated.extend(new_ids)
             token_tics.extend([now] * len(new_ids))
 
-    if done_tic is None or len(generated) != output_len:
+    valid_length = (
+        len(generated) == output_len if ignore_eos else
+        0 <= len(generated) <= output_len
+    )
+    if done_tic is None or not valid_length or (not ignore_eos and finish_tic is None):
         raise RuntimeError(
-            f"{tag}: expected {output_len} generated IDs and [DONE], "
+            f"{tag}: expected {'' if ignore_eos else 'at most '}"
+            f"{output_len} generated IDs and a complete stream, "
             f"got {len(generated)} IDs, finished={done_tic is not None}"
         )
     if api == "vllm" and not prompt_verified:
