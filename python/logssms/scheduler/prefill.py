@@ -257,9 +257,6 @@ class PrefillManager:
         if len(self.pending_list) == 0:
             return None
 
-        if self.cache_manager is not None:
-            self.cache_manager.prepare_prefill_requests(self.pending_list)
-
         reqs: list[Request] = []
         chunked_list: list[PendingRequest] = []
         for pending_req in self.pending_list:

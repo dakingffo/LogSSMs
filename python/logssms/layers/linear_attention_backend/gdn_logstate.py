@@ -163,6 +163,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
                     gate=prepared_gate,
                     page_size=pool.page_size,
                     decay_record_bytes=pool.layout.log_decay_bytes,
+                    num_key_heads=pool.layout.num_key_heads,
                 ),
                 **metadata.prefill_indices.fla_kwargs(),
             )

@@ -49,11 +49,11 @@ template hash and random topological priorities. The default run directory is
 - Dispatch asynchronously using that order as priority. A request is executable
   only after its parent response has completed and its actual output IDs are
   available, not merely after its parent HTTP request was submitted.
-- Skip a temporarily blocked request and dispatch subsequent executable requests;
-  revisit blocked requests when their parents finish. Newly executable siblings
-  rejoin the global ordering rather than being sent as a dedicated sibling batch.
-- The selected trees' roots are executable from the start. Do not serialize whole
-  trees or impose a sibling-completion dependency.
+- Allow only one in-flight request per tree. After it completes, dispatch that
+  tree's highest-priority ready request. This also serializes alternative replies
+  and root siblings without changing their content-parent relationships.
+- Different trees run concurrently. Skip requests whose tree is busy and dispatch
+  ready requests from other trees without waiting for the busy tree to finish.
 - Finish when the selected trees have completed or explicitly report failures.
   There are no cross-tree dependencies, traffic counters or per-turn barriers.
 
@@ -90,10 +90,11 @@ The matrix has 9 points: 3 tree counts × 3 systems. Increasing tree count incre
 both offered load and retained-history pressure; it is not a fixed-client-concurrency
 capacity sweep.
 
-The client does not impose a 32-request or per-tree semaphore. HTTP connection
-limits must accommodate ready requests without unintentionally serializing them;
-record any transport-side waiting separately. The server queues and admits the
-submitted traffic according to its normal scheduler and memory constraints.
+The client allows at most one in-flight request per tree, so peak submitted
+concurrency is bounded by the selected tree count. HTTP connection limits match
+that count. Record client-side ready/dispatch waiting separately from server TTFT.
+The server queues and admits submitted traffic according to its normal scheduler
+and memory constraints.
 Keep the server maximum running requests fixed at 32 across the three systems
 and all tree-count points initially. This is distinct from the number of submitted
 or pending requests.

@@ -26,6 +26,7 @@ GRANULARITY = 16
 def test_batch_branch_points_match_granule_trie_oracle():
     rng = random.Random(711)
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
+    tree = LogRadixTree(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     for _ in range(100):
         paths = []
         for _ in range(rng.randint(1, 24)):
@@ -47,8 +48,8 @@ def test_batch_branch_points_match_granule_trie_oracle():
                 tokens = tuple(value for value in prefix for _ in range(GRANULARITY))
                 expected[tokens] = indices
         actual = {
-            tuple(inputs[indices[0]][:position].tolist()): set(indices)
-            for position, *indices in scheduler._batch_branch_points(inputs)
+            tuple(inputs[value.request_indices[0]][:value.position].tolist()): set(value.request_indices)
+            for value in scheduler._find_protections(tree, inputs)
         }
         assert actual == expected
 
@@ -72,6 +73,15 @@ def make_history() -> tuple[LogRadixTree, torch.Tensor]:
     )
     tree.insert(input_ids, ids(256, 1000), entries)
     return tree, input_ids
+
+
+def test_edge_split_does_not_protect_a_node_without_a_branch():
+    tree, _history = make_history()
+    leaf = tree.leaves()[0]
+    prefix = tree.split_at(leaf, GRANULARITY)
+    assert len(prefix.children) == 1
+    assert not prefix.is_protected
+    assert not leaf.is_protected
 
 
 def test_branch_inside_log_page_restores_work_state_and_protects_page():
@@ -211,19 +221,20 @@ def test_internal_match_endpoint_plans_merges_only_on_the_hit_path():
     endpoint = tree.trace(shared)
     assert endpoint.matched_len == len(shared)
     assert not endpoint.node.is_leaf()
+    assert endpoint.node.is_protected
 
     plan = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).analyze(
         tree, [shared], collect_diagnostics=True
     )
 
-    assert tuple(task.slots for task in plan.coalesce) == ((0, 1), (2, 3))
+    assert tuple(task.slots for task in plan.coalesce) == ((0, 1),)
     diagnostics = dict(plan.merge_diagnostics)
     assert diagnostics["internal_endpoints"] == 1
     assert diagnostics["merge_anchors"] == 1
-    assert diagnostics["planned_groups"] == 2
-    assert diagnostics["planned_slot_releases"] == 2
+    assert diagnostics["planned_groups"] == 1
+    assert diagnostics["planned_slot_releases"] == 1
     assert diagnostics["entries_beyond_match_endpoint"] == 0
-    assert 4 not in {
+    assert not {3, 4} & {
         slot for task in plan.coalesce for slot in task.slots
     }
 
@@ -231,8 +242,8 @@ def test_internal_match_endpoint_plans_merges_only_on_the_hit_path():
 def test_adaptive_internal_endpoint_merges_without_an_owner():
     tree, leaf = make_checkpoint_history(4)
     leaf.merge_stats = LogStateMergeStats(origin=0, tail=256, intensity=4)
-    shared = ids(128)
-    branch = torch.cat([shared, ids(128, 10_000)])
+    shared = ids(192)
+    branch = torch.cat([shared, ids(64, 10_000)])
     tree.insert(branch, ids(256, 20_000))
     endpoint = tree.trace(shared)
     assert not endpoint.node.is_leaf()

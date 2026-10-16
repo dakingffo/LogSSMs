@@ -29,7 +29,8 @@ def _pool(granularity, dim, dtype, head_ratio=1):
 @pytest.mark.parametrize("dim", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_ratio", [1, 2, 3, 4])
-def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype, head_ratio):
+@pytest.mark.parametrize("expand_key_heads", [False, True])
+def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype, head_ratio, expand_key_heads):
     torch.manual_seed(31)
     pool = _pool(granularity, dim, dtype, head_ratio)
     allocated = pool.reserve(logs=4, works=6)
@@ -45,6 +46,10 @@ def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype, head
     slots[1:9] = -1
     query = torch.nn.functional.normalize(torch.randn(1, total, 2, dim, device=pool.device), dim=-1).to(dtype)
     key = torch.nn.functional.normalize(torch.randn_like(query).float(), dim=-1).to(dtype)
+    log_key = key
+    if expand_key_heads:
+        query = query.repeat_interleave(head_ratio, dim=2)
+        key = key.repeat_interleave(head_ratio, dim=2)
     value = torch.randn(1, total, 2 * head_ratio, dim, device=pool.device, dtype=dtype) * .1
     gate = -torch.rand(1, total, 2 * head_ratio, device=pool.device) * .1
     beta = torch.rand_like(gate)
@@ -68,14 +73,14 @@ def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype, head
     )
     active = slots >= 0
     store_log_states(pool, slots[active], positions[active],
-                            key[0, active], residual[0, active], gate[0, active], 1)
+                            log_key[0, active], residual[0, active], gate[0, active], 1)
     expected_storage = pool.storage.clone()
     pool.storage.copy_(initial)
     actual, actual_residual = chunk_gated_delta_rule_to_cache(
         query, key, value, gate, beta, io, indices.cu_seqlens,
         chunk_size=granularity, **indices.fla_kwargs(),
         log_io=ChunkLogIO(slots, positions, pool.decay_frame_table, gate,
-                          pool.page_size, pool.layout.log_decay_bytes),
+                         pool.page_size, pool.layout.log_decay_bytes, pool.layout.num_key_heads),
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_residual, residual, rtol=0, atol=0)

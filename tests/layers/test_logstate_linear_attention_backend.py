@@ -845,24 +845,29 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
+@pytest.mark.parametrize("granularity", [16, 32])
+@pytest.mark.parametrize("heads", [(16, 16), (8, 24)])
+def test_logstate_model_sized_prefill_log_restores_first_granule(granularity, heads) -> None:
     clear_global_ctx()
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    config = GatedDeltaConfig(16, 16, 128, 128, 6144, 3, 0)
+    key_heads, value_heads = heads
+    conv_dim = (2 * key_heads + value_heads) * 128
+    seq_len = granularity + 19
+    config = GatedDeltaConfig(key_heads, value_heads, 128, 128, conv_dim, 3, 0)
     pool = MHALogStatePool(
         num_frames=128,
         page_size=64,
-        granularity=16,
+        granularity=granularity,
         num_attention_layers=4,
         num_kv_heads=2,
         head_dim=128,
         num_linear_layers=1,
-        num_key_heads=16,
-        num_value_heads=16,
+        num_key_heads=key_heads,
+        num_value_heads=value_heads,
         head_k_dim=128,
         head_v_dim=128,
-        conv_dim=6144,
+        conv_dim=conv_dim,
         state_len=3,
         device=device,
         dtype=dtype,
@@ -883,16 +888,16 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
     pool.zero_state(work_slot)
     pool.zero_work_conv(work_slot)
     torch.manual_seed(127)
-    mixed_qkv = torch.randn(35, 6144, device=device, dtype=dtype)
-    gate = torch.randn(35, 16, device=device, dtype=dtype)
+    mixed_qkv = torch.randn(seq_len, conv_dim, device=device, dtype=dtype)
+    gate = torch.randn(seq_len, value_heads, device=device, dtype=dtype)
     beta = torch.randn_like(gate)
-    conv_weight = torch.randn(6144, 1, 4, device=device, dtype=dtype) * 0.02
-    A_log = torch.zeros(16, device=device)
-    dt_bias = torch.zeros(16, device=device)
-    req = _make_request(0, 35)
+    conv_weight = torch.randn(conv_dim, 1, 4, device=device, dtype=dtype) * 0.02
+    A_log = torch.zeros(value_heads, device=device)
+    dt_bias = torch.zeros(value_heads, device=device)
+    req = _make_request(0, seq_len)
     batch = Batch(reqs=[req], phase="prefill")
     batch.padded_reqs = batch.reqs
-    batch.positions = torch.arange(35, dtype=torch.int32, device=device)
+    batch.positions = torch.arange(seq_len, dtype=torch.int32, device=device)
     batch.out_loc = batch.positions
     backend = GatedDeltaLogStateBackend()
     set_global_ctx(ctx)
@@ -905,7 +910,7 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
             torch.tensor([work_slot], dtype=torch.int32, device=device), 0
         ).clone()
         restore_log_state_chains(
-            pool, [(None, [(log_slot, 0, 16)], restored_slot)]
+            pool, [(None, [(log_slot, 0, granularity)], restored_slot)]
         )
         actual = pool.read_states(
             torch.tensor([restored_slot], dtype=torch.int32, device=device), 0
@@ -914,16 +919,16 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
         ctx.work_state_table.fill_(reference_work_slot)
         pool.zero_state(reference_work_slot)
         pool.zero_work_conv(reference_work_slot)
-        reference_req = _make_request(0, 16)
+        reference_req = _make_request(0, granularity)
         reference_batch = Batch(reqs=[reference_req], phase="prefill")
         reference_batch.padded_reqs = reference_batch.reqs
         reference_batch.positions = torch.arange(
-            16, dtype=torch.int32, device=device
+            granularity, dtype=torch.int32, device=device
         )
         reference_batch.out_loc = reference_batch.positions
         backend.prepare_metadata(reference_batch)
         backend.forward(
-            mixed_qkv[:16], gate[:16], beta[:16], conv_weight,
+            mixed_qkv[:granularity], gate[:granularity], beta[:granularity], conv_weight,
             A_log, dt_bias, config, reference_batch,
         )
         expected = pool.read_states(
@@ -948,22 +953,22 @@ def test_logstate_model_sized_prefill_log_restores_first_granule() -> None:
                 torch.tensor([0], dtype=torch.int32, device=device), 0,
             ),
         )
-        ctx.state_table[:, :16].fill_(-1)
+        ctx.state_table[:, :granularity].fill_(-1)
         ctx.work_state_table.fill_(restored_slot)
-        suffix_req = _make_request(16, 35)
+        suffix_req = _make_request(granularity, seq_len)
         suffix_batch = Batch(reqs=[suffix_req], phase="prefill")
         suffix_batch.padded_reqs = suffix_batch.reqs
         suffix_batch.positions = torch.arange(
-            16, 35, dtype=torch.int32, device=device
+            granularity, seq_len, dtype=torch.int32, device=device
         )
         suffix_batch.out_loc = suffix_batch.positions
         backend.prepare_metadata(suffix_batch)
         suffix_output = backend.forward(
-            mixed_qkv[16:], gate[16:], beta[16:], conv_weight,
+            mixed_qkv[granularity:], gate[granularity:], beta[granularity:], conv_weight,
             A_log, dt_bias, config, suffix_batch,
         )
         torch.testing.assert_close(
-            suffix_output, full_output[16:], rtol=2e-2, atol=2e-2
+            suffix_output, full_output[granularity:], rtol=2e-2, atol=2e-2
         )
         torch.testing.assert_close(
             pool.read_states(

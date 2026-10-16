@@ -95,9 +95,6 @@ class BaseCacheManager(ABC):
     def unlock(self, handle: BaseCacheHandle) -> None:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
-    def prepare_prefill_requests(self, reqs: Sequence[PendingRequest]) -> None:
-        return None
-
     def reservation_size(
         self,
         token_len: int,

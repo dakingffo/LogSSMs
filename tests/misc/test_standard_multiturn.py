@@ -211,11 +211,56 @@ def test_scheduler_skips_blocked_priority_without_head_of_line_wait(monkeypatch)
     assert [record["dispatch_index"] for record in history] == [0, 2, 1]
 
 
-def test_failure_cancels_remaining_tasks_and_retains_completed_history(monkeypatch):
-    requests = [standard.Request(str(i), str(i), "u", "a", None, 1, "root", (2,), None) for i in range(3)]
-    canceled = []
+def test_scheduler_serializes_each_tree_but_not_different_trees(monkeypatch):
+    requests = [
+        standard.Request("a", "tree", "u", "a", None, 1, "root", (2,), None),
+        standard.Request("b", "tree", "v", "b", "a", 2, "continuation", (1, 3), 1),
+        standard.Request("c", "tree", "w", "c", "a", 2, "continuation", (1, 4), 1),
+        standard.Request("d", "tree", "u", "d", None, 1, "root", (5,), None),
+        standard.Request("x", "other", "u", "x", None, 1, "root", (6,), None),
+    ]
+    dispatched, completed, prompts = [], [], {}
+    running = set()
 
     async def execute(client, base, model, prompt, length, tag, api, **kwargs):
+        tree = next(node.tree_id for node in requests if node.uid == tag)
+        assert tree not in running
+        running.add(tree)
+        dispatched.append(tag)
+        prompts[tag] = list(prompt)
+        started = time.perf_counter()
+        if tag == "a":
+            await asyncio.sleep(.02)
+            assert "x" in completed
+        else:
+            await asyncio.sleep(0)
+        running.remove(tree)
+        completed.append(tag)
+        now = time.perf_counter()
+        return TokenStream([started, now, now, now], [9], 0)
+
+    monkeypatch.setattr(standard, "stream_token_ids", execute)
+    stats, history = asyncio.run(standard.run_point(
+        "http://unused", "model", requests, api="logssms", output_len=4, request_timeout=3,
+    ))
+    assert dispatched == ["a", "x", "b", "c", "d"]
+    assert stats["peak_inflight"] == 2 and stats["dispatch_policy"] == "serial_per_tree"
+    assert prompts["b"] == [2, 9, 1, 3]
+    assert prompts["c"] == [2, 9, 1, 4]
+    assert prompts["d"] == [5]
+    by_uid = {record["uid"]: record for record in history}
+    for left, right in zip(("a", "b", "c"), ("b", "c", "d")):
+        assert by_uid[right]["dispatched_at"] >= by_uid[left]["tics"][-1]
+
+
+def test_failure_cancels_remaining_tasks_and_retains_completed_history(monkeypatch):
+    requests = [standard.Request(str(i), str(i), "u", "a", None, 1, "root", (2,), None) for i in range(3)]
+    requests.append(standard.Request("3", "1", "u", "b", None, 1, "root", (3,), None))
+    canceled = []
+    dispatched = []
+
+    async def execute(client, base, model, prompt, length, tag, api, **kwargs):
+        dispatched.append(tag)
         if tag == "1":
             await asyncio.sleep(.01)
             raise RuntimeError("failed request")
@@ -234,6 +279,7 @@ def test_failure_cancels_remaining_tasks_and_retains_completed_history(monkeypat
         asyncio.run(standard.run_point("http://unused", "model", requests, api="logssms",
                                       output_len=4, request_timeout=3, history=history))
     assert canceled == ["2"]
+    assert dispatched == ["0", "1", "2"]
     assert [record["uid"] for record in history] == ["0"]
 
 

@@ -5,6 +5,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
+from heapq import nsmallest
 from itertools import count
 from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias, TYPE_CHECKING
 
@@ -266,6 +267,7 @@ class LogRadixTree(BasePrefixCache):
         self._lock_footprint_epoch = (-1, -1)
         self._lock_footprints: dict[int, tuple[int, tuple[int, ...]]] = {}
         self._entry_owners: dict[int, LogRadixTreeNode] = {}
+        self._leaves: dict[int, LogRadixTreeNode] = {}
         self._slot_entries: dict[int, list[LogStateEntry]] = {}
         self._checkpoint_timestamps: dict[int, int] = {}
         self._kv_frame_refs: dict[int, int] = {}
@@ -350,6 +352,7 @@ class LogRadixTree(BasePrefixCache):
         self.evictable_size = 0
         self.locked_size = 0
         self._entry_owners.clear()
+        self._leaves.clear()
         self._slot_entries.clear()
         self._checkpoint_timestamps.clear()
         self._kv_frame_refs.clear()
@@ -418,6 +421,14 @@ class LogRadixTree(BasePrefixCache):
                 self.page_size,
             )
             new_node.set_parent(node)
+            self._leaves.pop(node.uuid, None)
+            self._leaves[new_node.uuid] = new_node
+            if not node.is_root() and len(node.children) > 1:
+                self.protect(node)
+                for entry in node.entries:
+                    if (entry.kind is LogStateKind.LOG
+                        and entry.physical_begin < node.depth < entry.physical_begin + self.page_size):
+                        self.protect_entry(entry.slot)
             self._refresh_checkpoint_neighbors(node)
             self._update_kv_refs(new_node, 1)
             self.evictable_size += new_node.length
@@ -634,6 +645,43 @@ class LogRadixTree(BasePrefixCache):
         ) for node in nodes]
         return nodes, rows
 
+    def log_eviction_snapshot(
+        self, limit: int = 8,
+    ) -> tuple[list[LogRadixTreeNode], list[tuple[int, ...]]]:
+        assert limit > 0
+        leaves = nsmallest(limit + 1, (
+            node for node in self._leaves.values()
+            if not node.is_locked and not any(
+                entry.kind is LogStateKind.CHECKPOINT
+                or entry.slot in self._recovery_slot_refs
+                for entry in node._entries
+            )
+        ), key=lambda node: (node.timestamp, node.uuid))
+        if not leaves:
+            return [], []
+        cutoff = (leaves[-1].timestamp, leaves[-1].uuid) if len(leaves) > limit else None
+        selected: dict[int, LogRadixTreeNode] = {}
+        children: Counter[int] = Counter()
+        for node in leaves[:limit]:
+            while node.uuid not in selected:
+                selected[node.uuid] = node
+                if node.is_root():
+                    break
+                children[node.parent.uuid] += 1
+                node = node.parent
+        nodes = list(selected.values())
+        rows = [(
+            node.uuid, -1 if node.is_root() else node.parent.uuid,
+            int(node.is_root() or node.is_locked
+                or children[node.uuid] != len(node.children)
+                or (cutoff is not None and (node.timestamp, node.uuid) >= cutoff)
+                or any(entry.kind is LogStateKind.CHECKPOINT
+                       or entry.slot in self._recovery_slot_refs
+                       for entry in node._entries)),
+            0, node.timestamp,
+        ) for node in nodes]
+        return nodes, rows
+
     def slot_entry_count(self, slot: int) -> int:
         return len(self._slot_entries[slot])
 
@@ -736,6 +784,9 @@ class LogRadixTree(BasePrefixCache):
 
             parent = node.parent
             del parent.children[self.key_fn(node.key)]
+            self._leaves.pop(node.uuid)
+            if parent.is_leaf() and not parent.is_root():
+                self._leaves[parent.uuid] = parent
             self._refresh_checkpoint_neighbors(parent)
         if not evicted_kv:
             return LogRadixEviction(self.empty_tensor, ())
@@ -876,6 +927,7 @@ class LogRadixTree(BasePrefixCache):
         seen_nodes: set[int] = set()
         seen_entries: dict[int, LogRadixTreeNode] = {}
         seen_slots: dict[int, list[LogStateEntry]] = {}
+        seen_leaves: dict[int, LogRadixTreeNode] = {}
         kv_refs: Counter[int] = Counter()
         locked_kv_refs: Counter[int] = Counter()
         unprunable_log_refs: Counter[int] = Counter()
@@ -893,6 +945,8 @@ class LogRadixTree(BasePrefixCache):
                 if node.ref_count != 1 or node.length != 0:
                     raise RuntimeError("Log-Radix-Tree has an invalid root node.")
             else:
+                if node.is_leaf():
+                    seen_leaves[node.uuid] = node
                 if node.parent.children.get(self.key_fn(node.key)) is not node:
                     raise RuntimeError(
                         f"Node {node.uuid} is not indexed by its parent."
@@ -948,6 +1002,8 @@ class LogRadixTree(BasePrefixCache):
 
         if seen_entries != self._entry_owners:
             raise RuntimeError("Log-Radix-Tree slot ownership index is stale.")
+        if seen_leaves != self._leaves:
+            raise RuntimeError("Log-Radix-Tree leaf index is stale.")
         if (
             dict(kv_refs) != self._kv_frame_refs
             or dict(locked_kv_refs) != self._locked_kv_refs

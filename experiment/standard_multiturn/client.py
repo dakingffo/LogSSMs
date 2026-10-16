@@ -1,4 +1,4 @@
-"""Token-exact OASST2 tree client with randomized topological priorities."""
+"""Token-exact OASST2 client with serial requests within each conversation tree."""
 from __future__ import annotations
 
 import argparse
@@ -238,13 +238,17 @@ async def run_point(
     heapq.heapify(ready)
     complete: dict[str, dict] = {}
     active: dict[asyncio.Task, int] = {}
+    active_trees: set[str] = set()
     ready_at = {index: time.perf_counter() for index in ready}
     dispatch_count = 0
     peak_inflight = 0
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30, read=None, write=None, pool=None),
-        limits=httpx.Limits(max_connections=len(requests), max_keepalive_connections=len(requests)),
+        limits=httpx.Limits(
+            max_connections=len({node.tree_id for node in requests}),
+            max_keepalive_connections=len({node.tree_id for node in requests}),
+        ),
         trust_env=False,
     ) as client:
         async def execute(index: int, dispatch_index: int) -> dict:
@@ -287,15 +291,24 @@ async def run_point(
 
         try:
             while ready or active:
+                deferred = []
                 while ready:
                     index = heapq.heappop(ready)
+                    tree_id = requests[index].tree_id
+                    if tree_id in active_trees:
+                        deferred.append(index)
+                        continue
                     task = asyncio.create_task(execute(index, dispatch_count))
                     active[task] = index
+                    active_trees.add(tree_id)
                     dispatch_count += 1
+                for index in deferred:
+                    heapq.heappush(ready, index)
                 peak_inflight = max(peak_inflight, len(active))
                 done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
                 for task in sorted(done, key=lambda task: active[task]):
                     index = active.pop(task)
+                    active_trees.remove(requests[index].tree_id)
                     record = task.result()
                     complete[requests[index].uid] = record
                     for child in children.get(requests[index].uid, ()):
@@ -320,6 +333,7 @@ async def run_point(
         cache["overall_hit_fraction"] = cache["total_cached_tokens"] / stats["in_tokens"]
     stats.update(
         trees=len({node.tree_id for node in requests}), peak_inflight=peak_inflight,
+        dispatch_policy="serial_per_tree",
         cache=cache, exact_continuations=sum(record["parent"] is not None for record in ordered),
         single_token_responses=sum(len(record["generated_token_ids"]) == 1 for record in ordered),
         empty_responses=sum(not record["generated_token_ids"] for record in ordered),
@@ -371,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=False)
     manifest = {
         "dataset": args.dataset, "language": args.language, "seed": args.seed,
+        "dispatch_policy": "serial_per_tree",
         "tree_ids": [tree.uid for tree in selected[:args.num_trees]],
         "warmup_tree_ids": [tree.uid for tree in selected[args.num_trees:]],
         "chat_template_sha256": hashlib.sha256(protocol.tokenizer.chat_template.encode()).hexdigest(),

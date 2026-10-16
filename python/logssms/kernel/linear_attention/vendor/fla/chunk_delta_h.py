@@ -41,6 +41,7 @@ class ChunkLogIO:
     gate              : torch.Tensor
     page_size         : int
     decay_record_bytes: int
+    num_key_heads     : int
 
 
 @triton.jit
@@ -90,6 +91,7 @@ def _store_chunk_log(
     FRAMES_PER_SLOT: tl.constexpr, HEAD_PAYLOAD_BYTES: tl.constexpr,
     DECAY_RECORD_BYTES: tl.constexpr, BK: tl.constexpr,
     LAYERS: tl.constexpr, GRANULARITY: tl.constexpr,
+    LOG_KEY_HEADS: tl.constexpr,
 ):
     slot = tl.load(slots + rows, token_mask, other=-1)
     position = tl.load(token_offsets + rows, token_mask, other=0).to(tl.int64)
@@ -98,22 +100,22 @@ def _store_chunk_log(
         log_pointer(
             storage, payload_frames, slot[:, None], LAYER, head,
             position[:, None], value_offsets[None, :], LAYERS, HV, K, V, GRANULARITY,
-            PAGE_SIZE, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, H,
+            PAGE_SIZE, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, LOG_KEY_HEADS,
         ),
         residual, active[:, None] & (value_offsets[None, :] < V),
     )
 
     if value_tile == 0:
-        columns = tl.arange(0, BK)
-        keys = tl.load(
-            key + rows[:, None].to(tl.int64) * H * K + (head // (HV // H)) * K + columns[None, :],
-            token_mask[:, None] & (columns[None, :] < K), other=0,
-        )
-        if head % (HV // H) == 0:
+        if head % (HV // LOG_KEY_HEADS) == 0:
+            columns = tl.arange(0, BK)
+            keys = tl.load(
+                key + rows[:, None].to(tl.int64) * H * K + (head // (HV // H)) * K + columns[None, :],
+                token_mask[:, None] & (columns[None, :] < K), other=0,
+            )
             tl.store(log_pointer(
                 storage, payload_frames, slot[:, None], LAYER, head,
                 position[:, None], columns[None, :], LAYERS, HV, K, V, GRANULARITY,
-                PAGE_SIZE, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, H,
+                PAGE_SIZE, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, LOG_KEY_HEADS,
             ), keys, active[:, None] & (columns[None, :] < K))
         frame = tl.load(decay_frames + slot * 2, active, other=0).to(tl.int64)
         record = tl.load(decay_frames + slot * 2 + 1, active, other=0).to(tl.int64)
@@ -163,6 +165,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     DECAY_RECORD_BYTES: tl.constexpr,
     LAYERS: tl.constexpr,
     GRANULARITY: tl.constexpr,
+    LOG_KEY_HEADS: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // HV, i_nh % HV
@@ -289,7 +292,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 K, V, H, HV, LAYER, PAGE_SIZE, FRAME_BYTES,
                 FRAMES_PER_SLOT, HEAD_PAYLOAD_BYTES, DECAY_RECORD_BYTES,
                 triton.next_power_of_2(K),
-                LAYERS, GRANULARITY,
+                LAYERS, GRANULARITY, LOG_KEY_HEADS,
             )
 
         last_idx = min((i_t + 1) * BT, T) - 1
@@ -423,6 +426,8 @@ def chunk_gated_delta_rule_fwd_h(
         assert logstate
         assert log_io.slots.shape == log_io.token_offsets.shape == (B * T,)
         assert log_io.gate.numel() == B * T * HV
+        assert log_io.num_key_heads > 0
+        assert H % log_io.num_key_heads == HV % log_io.num_key_heads == 0
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, 32), N * HV)](
         k=k, v=u, w=w, v_new=v_new, g=g, h=h,
@@ -449,6 +454,7 @@ def chunk_gated_delta_rule_fwd_h(
         STORE_WORK_STATE=state_io.final_write_slots is not None,
         STORE_LOG=log_io is not None,
         PAGE_SIZE=state_io.page_size,
+        LOG_KEY_HEADS=H if log_io is None else log_io.num_key_heads,
         DECAY_RECORD_BYTES=log_io.decay_record_bytes if log_io is not None else 0,
         num_warps=2, num_stages=2,
     )
