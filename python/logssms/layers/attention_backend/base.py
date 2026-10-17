@@ -16,6 +16,8 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    uses_paged_indices = False
+
     @abstractmethod
     def forward(
         self, q: torch.Tensor, layer_id: int, batch: Batch
@@ -43,6 +45,7 @@ class HybridBackend(BaseAttnBackend):
     ) -> None:
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.uses_paged_indices = decode_backend.uses_paged_indices
 
     def forward(
         self, q: torch.Tensor, layer_id: int, batch: Batch

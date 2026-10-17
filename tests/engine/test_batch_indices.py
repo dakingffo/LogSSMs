@@ -6,6 +6,16 @@ from logssms.kernel.metadata import make_batch_mapping, gather_paged_indices, ga
 from logssms.utils.batch import BatchIndices
 
 
+def test_hybrid_paged_metadata_follows_decode_backend():
+    from types import SimpleNamespace
+    from logssms.layers.attention_backend.base import HybridBackend
+
+    paged = SimpleNamespace(uses_paged_indices=True)
+    flat = SimpleNamespace(uses_paged_indices=False)
+    assert HybridBackend(flat, paged).uses_paged_indices
+    assert not HybridBackend(paged, flat).uses_paged_indices
+
+
 def make_batch(phase):
     reqs = []
     for table, cached in ((2, 0), (0, 127), (3, 64), (3, 64)):
@@ -43,7 +53,7 @@ def test_batched_gpu_indices_match_ragged_torch_reference(phase, page_size):
     storage = torch.arange(4 * 512, dtype=torch.int32, device="cuda").view(4, 512)
     table = storage[:, :256]
     packet = BatchIndices.make(batch, torch.device("cuda"), page_size)
-    positions, mapping, out_loc = make_batch_mapping(packet, table)
+    positions, mapping, out_loc = make_batch_mapping(packet, table, decode=phase == "decode")
     expected_positions = torch.tensor([p for r in batch.padded_reqs
                                       for p in range(r.cached_len, r.device_len)], device="cuda", dtype=torch.int32)
     expected_rows = torch.tensor([r.table_idx for r in batch.padded_reqs
@@ -67,6 +77,21 @@ def test_batched_gpu_indices_match_ragged_torch_reference(phase, page_size):
         torch.testing.assert_close(log[1], table[expected_rows, expected_positions])
         torch.testing.assert_close(log[2], out_loc % 64)
         assert not log[3].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("page_size", [1, 16, 32, 64])
+def test_decode_paged_mapping_spans_multiple_blocks(page_size):
+    req = Request(torch.zeros(8193, dtype=torch.int32), 1, 8192, 1, 0, None, None, 8194)
+    batch = Batch([req], "decode")
+    batch.padded_reqs = batch.reqs
+    table = torch.arange(2 * 16384, dtype=torch.int32, device="cuda").reshape(2, 16384)[:, :8194]
+    packet = BatchIndices.make(batch, torch.device("cuda"), page_size)
+    positions, mapping, locations = make_batch_mapping(packet, table, decode=True)
+    torch.testing.assert_close(positions, torch.tensor([8192], dtype=torch.int32, device="cuda"))
+    torch.testing.assert_close(locations, table[1, 8192:8193])
+    torch.testing.assert_close(gather_paged_indices(packet, table), table[1, :8193:page_size] // page_size)
+    assert packet.page_indices is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

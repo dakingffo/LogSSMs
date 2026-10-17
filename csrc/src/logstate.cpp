@@ -679,9 +679,10 @@ Rows construction_plan(tvm::ffi::TensorView entry_rows, tvm::ffi::TensorView res
   return result;
 }
 
+template <typename NodeRows>
 class EvictionQueue {
 public:
-  explicit EvictionQueue(const Rows& nodes) : nodes_(nodes), children_(nodes.size()) {
+  explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes), children_(nodes.size()) {
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
       check(nodes[i].size() == 5, "Invalid eviction node");
       check(indices_.emplace(nodes[i][0], i).second, "Duplicate eviction node");
@@ -735,7 +736,7 @@ private:
     leaves_.insert(index);
   }
 
-  Rows nodes_;
+  const NodeRows& nodes_;
   Vector children_;
   std::unordered_map<Int, Int> indices_;
   std::unordered_set<Int> leaves_;
@@ -752,18 +753,19 @@ Rows eviction_order(const Rows& nodes) {
   return Rows({List(order.begin(), order.end())});
 }
 
-Rows plan_eviction(const Rows& nodes, const Rows& kv, const Rows& node_slots,
-                   const Rows& slots, const Rows& occupied, const List& config,
-                   const Rows& checkpoint_actions) {
+template <typename NodeRows>
+Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& node_slots,
+                   const NodeRows& slots, const NodeRows& occupied, const List& config,
+                   const NodeRows& checkpoint_actions) {
 
 
   check(nodes.size() == kv.size() && nodes.size() == node_slots.size()
         && config.size() == 11 && config[5] > 0 && config[10] >= 0,
         "Invalid eviction capacity metadata");
-  std::unordered_map<Int, List> slot_info;
+  std::unordered_map<Int, Vector> slot_info;
   for (const auto& row : slots) {
     check(row.size() == 5 && row[1] > 0, "Invalid eviction slot");
-    slot_info.emplace(row[0], row);
+    slot_info.emplace(row[0], Vector(row.begin(), row.end()));
   }
   std::unordered_map<Int, Int> decay_occupied, decay_released, references, pages;
   for (const auto& row : occupied) {
@@ -1233,13 +1235,27 @@ struct Planner {
     return write_rows(construction_plan(entries, restores, materialize));
   }
 
-  static tvm::ffi::Tensor eviction(tvm::ffi::TensorView nodes, tvm::ffi::TensorView kv,
-                                 tvm::ffi::TensorView node_slots, tvm::ffi::TensorView slots,
-                                 tvm::ffi::TensorView occupied, const List& config,
-                                 tvm::ffi::TensorView checkpoint_actions) {
-    return write_rows(plan_eviction(read_rows(nodes), read_rows(kv), read_rows(node_slots),
-                                    read_rows(slots), read_rows(occupied), config,
-                                    read_rows(checkpoint_actions)));
+  static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List& counts,
+                                 const List& config) {
+    check(counts.size() == 6, "Invalid eviction metadata groups");
+    const auto begin = cpu_ints(packed);
+    const auto end = begin + packed.shape()[0];
+    auto cursor = begin;
+    std::array<std::vector<Vector>, 6> groups;
+    for (size_t group = 0; group < groups.size(); ++group) {
+      check(counts[group] >= 0, "Invalid eviction row count");
+      groups[group].reserve(counts[group]);
+      for (Int row = 0; row < counts[group]; ++row) {
+        check(cursor < end, "Truncated eviction metadata");
+        const auto size = *cursor++;
+        check(size >= 0 && size <= end - cursor, "Invalid eviction row size");
+        groups[group].emplace_back(cursor, cursor + size);
+        cursor += size;
+      }
+    }
+    check(cursor == end, "Unexpected eviction metadata");
+    return write_rows(plan_eviction(groups[0], groups[1], groups[2], groups[3],
+                                    groups[4], config, groups[5]));
   }
 
   static tvm::ffi::Tensor eviction_candidates(tvm::ffi::TensorView nodes) {

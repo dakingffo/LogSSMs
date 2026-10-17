@@ -401,15 +401,20 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         bs      : int,
     ) -> LogStateLinearAttentionMetadata:
         assert self.capture is not None
-        for name in (
+        from logssms.kernel.metadata import copy_metadata
+
+        names = (
             "work_slots",
             "log_slots",
             "token_offsets",
             "conv_read_slots",
             "conv_read_granules",
             "replay_counts",
-        ):
-            getattr(self.capture, name)[:bs].copy_(getattr(metadata, name))
+        )
+        copy_metadata(
+            tuple(getattr(metadata, name) for name in names),
+            tuple(getattr(self.capture, name)[:bs] for name in names),
+        )
         return LogStateLinearAttentionMetadata(
             phase="decode",
             work_slots=self.capture.work_slots[:bs],

@@ -1334,8 +1334,8 @@ def test_recycled_checkpoint_commit_preserves_a_late_partial_log_branch(granular
         released.update(entry.slot for entry in node.entries)
     with patch.object(manager, "_plan_eviction", return_value=(selected, page_counts, released, [])):
         pages, logs, works = manager._allocate(manager._allocator.free_frames + 1, 0)
-    assert logs.numel() == works.numel() == 0
-    manager._return_slots(pages, logs)
+    assert not logs and not works
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(logs, dtype=torch.int32))
     assert not manager.tree.has_slot(checkpoint.slot)
     assert manager.tree.entries_for_slot(shared.slot) == (shared,)
     assert manager.tree.match_prefix(shorter[:split]).recoverable_len == split
@@ -2272,11 +2272,11 @@ def test_fragmented_log_slot_is_returned_only_after_all_routes_are_evicted():
     manager.cache_req(branch, finished=True)
 
     pages, states, _ = manager._allocate(12, 12)
-    assert len(torch.unique(pages)) == 12
-    assert len(torch.unique(states)) == 12
+    assert len(set(pages)) == 12
+    assert len(set(states)) == 12
     assert not manager.tree.has_slot(1)
 
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     manager.check_integrity()
 
 
@@ -2337,7 +2337,7 @@ def test_pressure_drops_old_checkpoint_without_kv_eviction_or_prefill_restore(me
     assert event["dropped_checkpoints"][0]["slot"] == left.slot
     assert manager.profile_result()["aggregate"]["pressure_dropped_checkpoints"] == 1
     assert not len(works)
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     manager.check_integrity()
 
 
@@ -2367,7 +2367,7 @@ def test_heat_thinning_preserves_recovery_with_nonmonotonic_endpoint_timestamps(
     assert handle.cached_len == len(tokens)
     assert handle.recovery.base_checkpoint_slot == right.slot
     assert not len(manager.recycle_bin)
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     manager.check_integrity()
 
 
@@ -2395,7 +2395,7 @@ def test_active_kv_chain_can_thin_states_without_touching_its_work():
     assert leaf.is_locked and manager.tree.evictable_kv_frames() == 0
     torch.testing.assert_close(matched_kv(manager.tree, leaf), kv)
     torch.testing.assert_close(pool.read_states(work_indices, 0), expected)
-    manager._return_slots(pages, logs)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(logs, dtype=torch.int32))
     pool.release_slots([work])
     manager.unlock(handle)
     manager.check_integrity()
@@ -2482,7 +2482,7 @@ def test_last_checkpoint_is_pruned_without_creating_a_recycle_record():
     assert not manager.tree.has_slot(checkpoint.slot)
     assert not len(manager.recycle_bin)
     assert manager.recycle_bin.match(tokens, start=0, granularity=GRANULARITY) is None
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     manager.check_integrity()
 
 
@@ -2873,7 +2873,7 @@ def test_terminal_checkpoint_eviction_releases_its_entire_private_kv_span():
     assert event["kv_tokens"] == 128
     assert event["dropped_checkpoints"] == []
     assert len(manager.recycle_bin) == 0
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     manager.check_integrity()
 
 
@@ -2898,7 +2898,7 @@ def test_cold_terminal_checkpoint_precedes_recent_active_middle_checkpoints():
     assert not manager.tree.has_slot(cold.slot)
     assert all(manager.tree.has_slot(entry.slot) for entry in hot)
     assert manager.tree.match_prefix(tokens).cuda_handle.cached_len == len(tokens)
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     manager.unlock(handle)
     manager.check_integrity()
 
@@ -2916,7 +2916,7 @@ def test_protected_restore_position_survives_eviction_while_pending():
     )
     pages, states, _ = manager._allocate(manager._allocator.free_frames + frames, 0)
     assert manager.tree.size_info.total_size == 0
-    manager._return_slots(pages, states)
+    manager._return_slots(torch.tensor(pages, dtype=torch.int32), torch.tensor(states, dtype=torch.int32))
     handle = manager.match_req(pending).cuda_handle
     assert handle.cached_len == 0 and handle.protected_endpoints == (96,)
     manager.lock(handle)

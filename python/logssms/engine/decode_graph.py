@@ -40,9 +40,13 @@ class DecodeGraphCaptureBuffer:
 
     @nvtx_annotate("DecodeGraph::copy_inputs")
     def copy_from(self, batch: Batch) -> None:
-        self.input_ids[0:batch.padded_size] = batch.input_ids
-        self.out_loc[0:batch.padded_size] = batch.out_loc
-        self.positions[0:batch.padded_size] = batch.positions
+        from logssms.kernel.metadata import copy_metadata
+
+        copy_metadata(
+            (batch.input_ids, batch.out_loc, batch.positions),
+            (self.input_ids[:batch.padded_size], self.out_loc[:batch.padded_size],
+             self.positions[:batch.padded_size]),
+        )
 
 
 def _determine_cuda_graph_bs(

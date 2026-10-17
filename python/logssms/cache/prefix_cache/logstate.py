@@ -5,7 +5,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
-from heapq import nsmallest
+from heapq import heappop, heappush
 from itertools import count
 from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias, TYPE_CHECKING
 
@@ -96,7 +96,9 @@ class LogRadixTreeNode:
         self.ref_count = 0
         self.is_protected = False
 
-        self.timestamp = time.monotonic_ns() if tic is None else tic
+        self._timestamp = time.monotonic_ns() if tic is None else tic
+        self._log_leaf_index = -1
+        self._log_leaf_tree: LogRadixTree | None = None
         self._key = torch.empty(0, dtype=torch.int32)
         self._kv = torch.empty(0, dtype=torch.int32)
         self._kv_pages = torch.empty(0, dtype=torch.int32)
@@ -137,6 +139,16 @@ class LogRadixTreeNode:
         return self._parent
 
     @property
+    def timestamp(self) -> int:
+        return self._timestamp
+
+    @timestamp.setter
+    def timestamp(self, value: int) -> None:
+        self._timestamp = value
+        if self._log_leaf_index >= 0:
+            self._log_leaf_tree._update_log_leaf(self)
+
+    @property
     def key(self) -> torch.Tensor:
         return self._key
 
@@ -147,6 +159,15 @@ class LogRadixTreeNode:
     @property
     def entries(self) -> tuple[LogStateEntry, ...]:
         return tuple(self._entries)
+
+    @cached_property
+    def eviction_slots(self) -> tuple[int, ...]:
+        return tuple(entry.slot for entry in self._entries)
+
+    @cached_property
+    def checkpoint_slots(self) -> tuple[int, ...]:
+        return tuple(entry.slot for entry in self._entries
+                     if entry.kind is LogStateKind.CHECKPOINT)
 
     @property
     def length(self) -> int:
@@ -268,6 +289,7 @@ class LogRadixTree(BasePrefixCache):
         self._lock_footprints: dict[int, tuple[int, tuple[int, ...]]] = {}
         self._entry_owners: dict[int, LogRadixTreeNode] = {}
         self._leaves: dict[int, LogRadixTreeNode] = {}
+        self._log_leaf_heap: list[tuple[int, int, LogRadixTreeNode]] = []
         self._slot_entries: dict[int, list[LogStateEntry]] = {}
         self._checkpoint_timestamps: dict[int, int] = {}
         self._kv_frame_refs: dict[int, int] = {}
@@ -352,7 +374,11 @@ class LogRadixTree(BasePrefixCache):
         self.evictable_size = 0
         self.locked_size = 0
         self._entry_owners.clear()
+        for node in self._leaves.values():
+            node._log_leaf_tree = None
+            node._log_leaf_index = -1
         self._leaves.clear()
+        self._log_leaf_heap.clear()
         self._slot_entries.clear()
         self._checkpoint_timestamps.clear()
         self._kv_frame_refs.clear()
@@ -421,8 +447,8 @@ class LogRadixTree(BasePrefixCache):
                 self.page_size,
             )
             new_node.set_parent(node)
-            self._leaves.pop(node.uuid, None)
-            self._leaves[new_node.uuid] = new_node
+            self._remove_leaf(node)
+            self._add_leaf(new_node)
             if not node.is_root() and len(node.children) > 1:
                 self.protect(node)
                 for entry in node.entries:
@@ -588,7 +614,9 @@ class LogRadixTree(BasePrefixCache):
                 self._recovery_slot_refs.pop(slot, None)
             self._update_slot_reclaimability(slot)
             for entry in self._slot_entries.get(slot, ()):
-                self._refresh_checkpoint_neighbors(self.entry_owner(entry))
+                owner = self.entry_owner(entry)
+                self._update_log_leaf(owner)
+                self._refresh_checkpoint_neighbors(owner)
 
     def protect(
         self,
@@ -637,11 +665,11 @@ class LogRadixTree(BasePrefixCache):
         rows = [(
             node.uuid, -1 if node.is_root() else node.parent.uuid,
             int(node.is_root() or node.is_locked or any(
-                entry.slot in self._recovery_slot_refs for entry in node.entries
+                slot in self._recovery_slot_refs for slot in node.eviction_slots
             )),
-            int(any(entry.kind is LogStateKind.CHECKPOINT for entry in node.entries)),
-            min((self._checkpoint_timestamps[entry.slot] for entry in node.entries
-                 if entry.kind is LogStateKind.CHECKPOINT), default=node.timestamp),
+            int(bool(node.checkpoint_slots)),
+            min((self._checkpoint_timestamps[slot] for slot in node.checkpoint_slots),
+                default=node.timestamp),
         ) for node in nodes]
         return nodes, rows
 
@@ -649,14 +677,16 @@ class LogRadixTree(BasePrefixCache):
         self, limit: int = 8,
     ) -> tuple[list[LogRadixTreeNode], list[tuple[int, ...]]]:
         assert limit > 0
-        leaves = nsmallest(limit + 1, (
-            node for node in self._leaves.values()
-            if not node.is_locked and not any(
-                entry.kind is LogStateKind.CHECKPOINT
-                or entry.slot in self._recovery_slot_refs
-                for entry in node._entries
-            )
-        ), key=lambda node: (node.timestamp, node.uuid))
+        leaves = []
+        heap = self._log_leaf_heap
+        pending = [(heap[0][0], heap[0][1], 0)] if heap else []
+        while pending and len(leaves) <= limit:
+            _timestamp, _uuid, index = heappop(pending)
+            leaves.append(heap[index][2])
+            for child in (2 * index + 1, 2 * index + 2):
+                if child < len(heap):
+                    timestamp, uuid, _node = heap[child]
+                    heappush(pending, (timestamp, uuid, child))
         if not leaves:
             return [], []
         cutoff = (leaves[-1].timestamp, leaves[-1].uuid) if len(leaves) > limit else None
@@ -675,9 +705,8 @@ class LogRadixTree(BasePrefixCache):
             int(node.is_root() or node.is_locked
                 or children[node.uuid] != len(node.children)
                 or (cutoff is not None and (node.timestamp, node.uuid) >= cutoff)
-                or any(entry.kind is LogStateKind.CHECKPOINT
-                       or entry.slot in self._recovery_slot_refs
-                       for entry in node._entries)),
+                or bool(node.checkpoint_slots)
+                or any(slot in self._recovery_slot_refs for slot in node.eviction_slots)),
             0, node.timestamp,
         ) for node in nodes]
         return nodes, rows
@@ -784,9 +813,9 @@ class LogRadixTree(BasePrefixCache):
 
             parent = node.parent
             del parent.children[self.key_fn(node.key)]
-            self._leaves.pop(node.uuid)
+            self._remove_leaf(node)
             if parent.is_leaf() and not parent.is_root():
-                self._leaves[parent.uuid] = parent
+                self._add_leaf(parent)
             self._refresh_checkpoint_neighbors(parent)
         if not evicted_kv:
             return LogRadixEviction(self.empty_tensor, ())
@@ -967,6 +996,12 @@ class LogRadixTree(BasePrefixCache):
                     raise RuntimeError(
                         f"Node {node.uuid} has a negative reference count."
                     )
+                if (node.eviction_slots != tuple(entry.slot for entry in node._entries)
+                    or node.checkpoint_slots != tuple(
+                        entry.slot for entry in node._entries
+                        if entry.kind is LogStateKind.CHECKPOINT
+                    )):
+                    raise RuntimeError(f"Node {node.uuid} has stale eviction metadata.")
                 kv_refs.update(node._kv_page_counts.keys())
                 if node.is_locked:
                     locked_kv_refs.update(node._kv_page_counts.keys())
@@ -1004,6 +1039,20 @@ class LogRadixTree(BasePrefixCache):
             raise RuntimeError("Log-Radix-Tree slot ownership index is stale.")
         if seen_leaves != self._leaves:
             raise RuntimeError("Log-Radix-Tree leaf index is stale.")
+        eligible = {
+            node.uuid for node in seen_leaves.values()
+            if not node.is_locked and not any(
+                entry.kind is LogStateKind.CHECKPOINT
+                or entry.slot in self._recovery_slot_refs for entry in node._entries
+            )
+        }
+        if eligible != {uuid for _timestamp, uuid, _node in self._log_leaf_heap}:
+            raise RuntimeError("Log-Radix-Tree Log eviction index is stale.")
+        for index, (timestamp, uuid, node) in enumerate(self._log_leaf_heap):
+            if (node._log_leaf_index != index or node._log_leaf_tree is not self
+                or (timestamp, uuid) != (node.timestamp, node.uuid)
+                or (index and self._log_leaf_heap[(index - 1) // 2][:2] > (timestamp, uuid))):
+                raise RuntimeError("Log-Radix-Tree Log eviction heap is stale.")
         if (
             dict(kv_refs) != self._kv_frame_refs
             or dict(locked_kv_refs) != self._locked_kv_refs
@@ -1182,6 +1231,7 @@ class LogRadixTree(BasePrefixCache):
     ) -> None:
         if was_locked == node.is_locked:
             return
+        self._update_log_leaf(node)
         delta = 1 if node.is_locked else -1
         for frame in node._kv_page_counts:
             self._update_kv_frame(frame, 0, delta)
@@ -1210,6 +1260,8 @@ class LogRadixTree(BasePrefixCache):
     ) -> None:
         owner._entries.append(entry)
         owner._entries.sort(key=lambda value: (value.end, value.begin, value.slot))
+        owner.__dict__.pop("eviction_slots", None)
+        owner.__dict__.pop("checkpoint_slots", None)
         self._entry_owners[id(entry)] = owner
         self._slot_entries.setdefault(entry.slot, []).append(entry)
         if entry.kind is LogStateKind.CHECKPOINT:
@@ -1221,10 +1273,13 @@ class LogRadixTree(BasePrefixCache):
                 self._unprunable_log_refs.get(entry.slot, 0) + 1
             )
         self._update_slot_reclaimability(entry.slot)
+        self._update_log_leaf(owner)
         self._refresh_checkpoint_neighbors(owner)
 
     def _unregister_entry(self, entry: LogStateEntry) -> None:
         owner = self._entry_owners[id(entry)]
+        owner.__dict__.pop("eviction_slots", None)
+        owner.__dict__.pop("checkpoint_slots", None)
         if owner.is_locked and entry.kind is LogStateKind.LOG:
             locked = self._unprunable_log_refs[entry.slot] - 1
             if locked:
@@ -1238,7 +1293,62 @@ class LogRadixTree(BasePrefixCache):
             del self._slot_entries[entry.slot]
             self._checkpoint_timestamps.pop(entry.slot, None)
         self._update_slot_reclaimability(entry.slot)
+        self._update_log_leaf(owner)
         self._refresh_checkpoint_neighbors(owner)
+
+    def _add_leaf(self, node: LogRadixTreeNode) -> None:
+        self._leaves[node.uuid] = node
+        node._log_leaf_tree = self
+        self._update_log_leaf(node)
+
+    def _remove_leaf(self, node: LogRadixTreeNode) -> None:
+        if self._leaves.pop(node.uuid, None) is None:
+            return
+        node._log_leaf_tree = None
+        self._update_log_leaf(node)
+
+    def _update_log_leaf(self, node: LogRadixTreeNode) -> None:
+        index = node._log_leaf_index
+        eligible = (node._log_leaf_tree is self and not node.is_locked
+                    and not node.checkpoint_slots and not any(
+                        slot in self._recovery_slot_refs for slot in node.eviction_slots
+                    ))
+        heap = self._log_leaf_heap
+        if eligible:
+            item = (node.timestamp, node.uuid, node)
+            if index < 0:
+                index = len(heap)
+                heap.append(item)
+            else:
+                heap[index] = item
+        elif index >= 0:
+            node._log_leaf_index = -1
+            item = heap.pop()
+            if index == len(heap):
+                return
+            heap[index] = item
+        else:
+            return
+        while index:
+            parent = (index - 1) // 2
+            if heap[parent] <= item:
+                break
+            heap[index] = heap[parent]
+            heap[index][2]._log_leaf_index = index
+            index = parent
+        heap[index] = item
+        item[2]._log_leaf_index = index
+        while 2 * index + 1 < len(heap):
+            child = 2 * index + 1
+            if child + 1 < len(heap) and heap[child + 1] < heap[child]:
+                child += 1
+            if item <= heap[child]:
+                break
+            heap[index] = heap[child]
+            heap[index][2]._log_leaf_index = index
+            index = child
+        heap[index] = item
+        item[2]._log_leaf_index = index
 
     def _checkpoint_successor(self, entry: LogStateEntry) -> LogStateEntry | None:
         if entry.kind is not LogStateKind.CHECKPOINT or self.slot_is_fragmented(entry.slot):

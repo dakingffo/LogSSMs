@@ -26,6 +26,7 @@ class BatchIndices:
     max_extend_len     : int
     max_pages          : int
     token_table_ids    : torch.Tensor | None = None
+    page_indices      : torch.Tensor | None = None
 
     @classmethod
     def make(cls, batch, device, page_size: int):

@@ -1926,31 +1926,20 @@ class LogStateCacheManager(BaseCacheManager):
                 self._profile_allocation_samples.append(profile)
             return
 
-        pages, states, checkpoint_slots = self._allocate(
+        kv_pages, state_slots, direct_slots = self._allocate(
             needed, needed_logs, needed_checkpoints, profile=profile
         )
         if profile is not None:
             now = perf_counter_ns()
             profile["timing_ms"]["core_allocate_ms"] = (now - stage) / 1e6
             stage = now
-        kv_pages = pages.tolist()
-        state_slots = states.tolist()
-        direct_slots = checkpoint_slots.tolist()
-        if profile is not None:
-            now = perf_counter_ns()
-            profile["timing_ms"]["ids_to_host_ms"] = (now - stage) / 1e6
-            stage = now
         offset = 0
         log_offset = 0
         checkpoint_offset = 0
-        token_offsets = torch.arange(
-            self.page_size, dtype=torch.int32, device=self.device
-        )
+        regions = []
         for req, begin, count, direct in allocation_info:
             live_pages = self._live_pages[req.table_idx]
             restore = self._recycled_restores.get(req.table_idx)
-            page_state_slots = []
-            mapped_pages = []
             logical_begin = begin
             for index in range(count):
                 logical_end = align_ceil(logical_begin + 1, self.page_size)
@@ -1968,14 +1957,11 @@ class LogStateCacheManager(BaseCacheManager):
                         state_slot = int(direct_slots[checkpoint_offset])
                         checkpoint_offset += 1
                         restore.slots[logical_end] = state_slot
-                    page_state_slots.append(-1)
                 elif inside_checkpoint:
                     state_slot = None
-                    page_state_slots.append(-1)
                 else:
                     state_slot = int(state_slots[log_offset])
                     log_offset += 1
-                    page_state_slots.append(state_slot)
                 live_pages.append(
                     _LivePage(
                         begin=logical_begin,
@@ -1985,37 +1971,28 @@ class LogStateCacheManager(BaseCacheManager):
                         checkpoint_begin=checkpoint_begin,
                     )
                 )
-                mapped_pages.append((kv_page, logical_end - logical_begin))
+                regions.append((
+                    req.table_idx, logical_begin,
+                    min(logical_end, req.max_device_len, self.page_table.shape[1]),
+                    kv_page, state_slot if checkpoint_begin is None and not inside_checkpoint else -1,
+                ))
                 logical_begin = logical_end
             mapped_end = min(
                 logical_begin,
                 req.max_device_len,
                 self.page_table.shape[1],
             )
-            mapped_len = mapped_end - begin
             assert live_pages[-1].begin < mapped_end <= live_pages[-1].end
-            kv_mapping = torch.cat([
-                kv_page + token_offsets[:span]
-                for kv_page, span in mapped_pages
-            ])[:mapped_len]
-            state_mapping = torch.cat([
-                torch.full((span,), slot, dtype=torch.int32, device=self.device)
-                for slot, (_kv_page, span) in zip(
-                    page_state_slots, mapped_pages, strict=True
-                )
-            ])[:mapped_len]
-            self.page_table[req.table_idx, begin:mapped_end].copy_(kv_mapping)
-            state_table[req.table_idx, begin:mapped_end].copy_(state_mapping)
+        from logssms.kernel.metadata import write_cache_mapping
+
+        write_cache_mapping(regions, self.page_table, state_table, self.page_size)
         assert offset == needed
         assert log_offset == needed_logs
         assert checkpoint_offset == needed_checkpoints
         if profile is not None:
             now = perf_counter_ns()
             profile["timing_ms"]["mapping_write_ms"] = (now - stage) / 1e6
-            profile["timing_ms"]["mapping_ms"] = (
-                profile["timing_ms"]["ids_to_host_ms"]
-                + profile["timing_ms"]["mapping_write_ms"]
-            )
+            profile["timing_ms"]["mapping_ms"] = profile["timing_ms"]["mapping_write_ms"]
             profile["timing_ms"]["total_ms"] = (now - start) / 1e6
             self._profile_allocation_samples.append(profile)
 
@@ -2811,7 +2788,7 @@ class LogStateCacheManager(BaseCacheManager):
         needed_states: int,
         needed_works : int = 0,
         profile     : dict | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[list[int], list[int], list[int]]:
         own_profile = profile is None and self._profile_enabled
         if own_profile:
             profile = {
@@ -2936,20 +2913,13 @@ class LogStateCacheManager(BaseCacheManager):
                     "released_state_slots_from_eviction"
                 ] += len(released_slots)
 
-        tensor_start = perf_counter_ns() if profile is not None else 0
-        pages = torch.tensor(
-            reserved[0], dtype=torch.int32, device=self.device
-        ) * self.page_size
-        states = torch.tensor(
-            reserved[1], dtype=torch.int32, device=self.device
-        )
-        works = torch.tensor(
-            reserved[2], dtype=torch.int32, device=self.device
-        )
+        ids_start = perf_counter_ns() if profile is not None else 0
+        pages = [page * self.page_size for page in reserved[0]]
+        states, works = reserved[1:]
         if profile is not None:
             now = perf_counter_ns()
-            profile["timing_ms"]["tensor_build_ms"] = (
-                now - tensor_start
+            profile["timing_ms"]["ids_prepare_ms"] = (
+                now - ids_start
             ) / 1e6
             profile["timing_ms"]["core_total_ms"] = (now - start) / 1e6
             if own_profile:
@@ -2969,7 +2939,8 @@ class LogStateCacheManager(BaseCacheManager):
             )
             if not nodes:
                 continue
-            slot_ids = {entry.slot for node in nodes for entry in node.entries}
+            node_slots = [node.eviction_slots for node in nodes]
+            slot_ids = {slot for row in node_slots for slot in row}
             slots = []
             decay_frames = set()
             for slot in slot_ids:
@@ -2987,7 +2958,7 @@ class LogStateCacheManager(BaseCacheManager):
                 [[value for frame, count in node._kv_page_counts.items() for value in (
                     frame, count, self._cached_page_tokens[frame * self.page_size],
                 )] for node in nodes],
-                [[entry.slot for entry in node.entries] for node in nodes],
+                node_slots,
                 slots,
                 [(frame, allocator._decay_masks[frame].bit_count()) for frame in decay_frames],
                 (allocator.free_frames, allocator._free_decay_records,

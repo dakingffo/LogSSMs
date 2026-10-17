@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from array import array
+from itertools import chain
 from typing import TYPE_CHECKING, Sequence, TypeAlias
 
 import torch
@@ -65,9 +66,9 @@ def eviction_candidates(nodes: Rows) -> list[int]:
 
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
                   occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]]:
+    groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
     return _unpack(_load_logstate_module().plan_eviction(
-        _pack(nodes), _pack(kv), _pack(node_slots), _pack(slots), _pack(occupied), config,
-        _pack(checkpoint_actions),
+        _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
     ))
 
 

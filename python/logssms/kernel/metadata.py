@@ -6,10 +6,95 @@ import triton.language as tl
 
 
 @triton.jit
+def _cache_mapping_kernel(
+    regions, page_table, state_table,
+    page_stride: tl.constexpr, state_stride: tl.constexpr, BLOCK: tl.constexpr,
+):
+    region = tl.program_id(0) * 5
+    row = tl.load(regions + region).to(tl.int64)
+    begin = tl.load(regions + region + 1)
+    end = tl.load(regions + region + 2)
+    page = tl.load(regions + region + 3)
+    state = tl.load(regions + region + 4)
+    offset = tl.arange(0, BLOCK)
+    mask = begin + offset < end
+    tl.store(page_table + row * page_stride + begin + offset, page + offset, mask=mask)
+    tl.store(state_table + row * state_stride + begin + offset, state, mask=mask)
+
+
+def write_cache_mapping(regions, page_table, state_table, page_size):
+    if not regions:
+        return
+    if page_table.is_cuda:
+        host = torch.tensor(regions, dtype=torch.int32, pin_memory=True)
+        packet = host.to(page_table.device, non_blocking=True)
+        _cache_mapping_kernel[(len(regions),)](
+            packet, page_table, state_table,
+            page_stride=page_table.stride(0), state_stride=state_table.stride(0),
+            BLOCK=triton.next_power_of_2(page_size),
+        )
+    else:
+        for row, begin, end, page, state in regions:
+            page_table[row, begin:end] = torch.arange(page, page + end - begin, dtype=page_table.dtype)
+            state_table[row, begin:end] = state
+
+
+@triton.jit
+def _slot_descriptors_kernel(
+    indices, payload, conv, decay, payload_table, conv_table, decay_table,
+    PAYLOAD: tl.constexpr, CONV: tl.constexpr, CLEAR: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(indices + row).to(tl.int64)
+    column = tl.arange(0, BLOCK)
+    if CLEAR:
+        p, c, d = -1, -1, -1
+    else:
+        p = tl.load(payload + row * PAYLOAD + column, mask=column < PAYLOAD, other=-1)
+        c = tl.load(conv + row * CONV + column, mask=column < CONV, other=-1)
+        d = tl.load(decay + row * 2 + column, mask=column < 2, other=-1)
+    tl.store(payload_table + slot * PAYLOAD + column, p, mask=column < PAYLOAD)
+    tl.store(conv_table + slot * CONV + column, c, mask=column < CONV)
+    tl.store(decay_table + slot * 2 + column, d, mask=column < 2)
+
+
+def write_slot_descriptors(indices, payload, conv, decay, payload_table, conv_table, decay_table):
+    if not indices.numel():
+        return
+    width = conv_table.shape[1] * conv_table.shape[2]
+    _slot_descriptors_kernel[(indices.numel(),)](
+        indices, payload, conv, decay, payload_table, conv_table, decay_table,
+        PAYLOAD=payload_table.shape[1], CONV=width, CLEAR=payload is None,
+        BLOCK=triton.next_power_of_2(max(payload_table.shape[1], width, 2)),
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _copy_metadata_kernel(sources, outputs, count: tl.constexpr, BLOCK: tl.constexpr):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    for i in tl.static_range(len(sources)):
+        value = tl.load(sources[i] + offset, mask=offset < count, other=0)
+        tl.store(outputs[i] + offset, value, mask=offset < count)
+
+
+def copy_metadata(sources, outputs):
+    count = outputs[0].numel()
+    if outputs[0].is_cuda:
+        _copy_metadata_kernel[(triton.cdiv(count, 128),)](
+            sources, outputs, count, BLOCK=128, num_warps=1,
+        )
+    else:
+        for source, output in zip(sources, outputs, strict=True):
+            output.copy_(source)
+
+
+@triton.jit
 def _batch_mapping_kernel(
     tables, cached, cu_q, page_table,
     positions, input_rows, input_cols, out_loc,
-    table_stride: tl.constexpr, BLOCK: tl.constexpr,
+    cu_k, page_indices, table_stride: tl.constexpr, page_size: tl.constexpr,
+    PAGED: tl.constexpr, BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     start = tl.load(cu_q + req)
@@ -23,6 +108,13 @@ def _batch_mapping_kernel(
     tl.store(input_rows + start + offsets, row, mask=mask)
     tl.store(input_cols + start + offsets, column, mask=mask)
     tl.store(out_loc + start + offsets, loc, mask=mask)
+    if PAGED:
+        page_start = tl.load(cu_k + req)
+        page_end = tl.load(cu_k + req + 1)
+        page_mask = offsets < page_end - page_start
+        values = tl.load(page_table + row * table_stride + offsets * page_size,
+                         mask=page_mask, other=0)
+        tl.store(page_indices + page_start + offsets, values // page_size, mask=page_mask)
 
 
 @triton.jit
@@ -40,22 +132,29 @@ def _paged_indices_kernel(
     tl.store(indices + start + offsets, values // page_size, mask=mask)
 
 
-def make_batch_mapping(indices, page_table):
+def make_batch_mapping(indices, page_table, *, decode=False):
     device = page_table.device
     rows = indices.num_tokens
     positions = torch.empty(rows, dtype=torch.int32, device=device)
     mapping = torch.empty((2, rows), dtype=torch.int64, device=device)
     out_loc = torch.empty(rows, dtype=page_table.dtype, device=device)
+    page_indices = torch.empty(indices.num_pages, dtype=page_table.dtype, device=device) if decode else None
     if rows:
-        _batch_mapping_kernel[(len(indices.table_ids), triton.cdiv(indices.max_extend_len, 256))](
+        width = max(indices.max_extend_len, indices.max_pages) if decode else indices.max_extend_len
+        _batch_mapping_kernel[(len(indices.table_ids), triton.cdiv(width, 256))](
             indices.table_ids, indices.cached_lens, indices.cu_seqlens_q_gpu,
             page_table, positions, mapping[0], mapping[1], out_loc,
-            table_stride=page_table.stride(0), BLOCK=256,
+            indices.cu_seqlens_k_gpu, page_indices,
+            table_stride=page_table.stride(0), page_size=indices.page_size,
+            PAGED=decode, BLOCK=256,
         )
+    indices.page_indices = page_indices
     return positions, (mapping[0], mapping[1]), out_loc
 
 
 def gather_paged_indices(indices, page_table):
+    if indices.page_indices is not None:
+        return indices.page_indices
     output = torch.empty(indices.num_pages, dtype=page_table.dtype, device=page_table.device)
     if indices.num_pages:
         _paged_indices_kernel[(len(indices.table_ids), triton.cdiv(indices.max_pages, 256))](

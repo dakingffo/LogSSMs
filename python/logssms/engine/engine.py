@@ -386,7 +386,10 @@ class Engine:
         page_size = getattr(self.ctx.kv_cache, "kv_page_size", 1)
         indices = BatchIndices.make(batch, self.device, page_size)
         batch.prepared_indices = indices
-        batch.positions, mapping, batch.out_loc = make_batch_mapping(indices, self.page_table)
+        batch.positions, mapping, batch.out_loc = make_batch_mapping(
+            indices, self.page_table,
+            decode=batch.is_decode and self.attn_backend.uses_paged_indices,
+        )
         indices.token_table_ids = mapping[0]
         return mapping, indices.write_tuple
 

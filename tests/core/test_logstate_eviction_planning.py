@@ -147,3 +147,95 @@ def test_log_window_keeps_an_unselected_shared_branch_attached():
     assert_full_plan_matches(manager, 4, 4)
     nodes, _pages, _slots, _compressed = manager._plan_eviction(4, 4, 0)
     assert leaves[0] in nodes and prefix not in nodes and branch not in nodes
+
+
+def assert_log_index_matches_scan(tree, limit=8):
+    expected = sorted((
+        leaf for leaf in tree._leaves.values()
+        if not leaf.is_locked and not any(
+            entry.kind is LogStateKind.CHECKPOINT
+            or entry.slot in tree._recovery_slot_refs for entry in leaf.entries
+        )
+    ), key=lambda node: (node.timestamp, node.uuid))
+    nodes, _rows = tree.log_eviction_snapshot(limit)
+    assert [node for node in nodes if node.is_leaf()] == expected[:limit]
+    tree.check_integrity()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_log_index_tracks_access_locks_pins_and_splits(seed):
+    manager = make_pressure_tree(chains=16, checkpoints=1)
+    tree = manager.tree
+    rng = Random(seed)
+    for step in range(80):
+        leaf = rng.choice(tree.leaves())
+        action = rng.randrange(5)
+        if action == 0:
+            leaf.timestamp = rng.randrange(10)
+        elif action == 1:
+            tree.lock(leaf)
+            assert_log_index_matches_scan(tree)
+            tree.lock(leaf)
+            tree.lock(leaf, unlock=True)
+            assert_log_index_matches_scan(tree)
+            tree.lock(leaf, unlock=True)
+        elif action == 2:
+            slots = tuple(entry.slot for entry in leaf.entries)
+            tree.pin_recovery(slots)
+            tree.pin_recovery(slots)
+            assert_log_index_matches_scan(tree)
+            tree.pin_recovery(slots, release=True)
+            assert_log_index_matches_scan(tree)
+            tree.pin_recovery(slots, release=True)
+        elif action == 3 and leaf.length > 32:
+            tree.split_at(leaf, 32)
+        else:
+            tree.protect(leaf, not leaf.is_protected)
+        assert_log_index_matches_scan(tree, 1 + step % 12)
+        if step % 8 == 0:
+            assert_full_plan_matches(manager, 1, 1)
+
+
+def test_log_snapshot_reads_index_without_scanning_leaves():
+    manager = make_pressure_tree(chains=64, checkpoints=1)
+    tree = manager.tree
+    expected = signature(manager._plan_eviction(1, 1, 0))
+
+    class IndexedLeaves(dict):
+        def values(self):
+            raise AssertionError("eviction scanned every leaf")
+
+    with patch.object(tree, "_leaves", IndexedLeaves(tree._leaves)):
+        assert signature(manager._plan_eviction(1, 1, 0)) == expected
+
+
+def test_log_index_removes_checkpoint_and_retired_leaf_records():
+    manager = make_pressure_tree(chains=2, checkpoints=0)
+    tree = manager.tree
+    leaf = tree.leaves()[0]
+    entry, = leaf.entries
+    assert leaf.eviction_slots == (entry.slot,)
+    tree.detach_entry(entry.slot)
+    assert leaf.eviction_slots == ()
+    checkpoint = LogStateEntry(entry.slot, LogStateKind.CHECKPOINT,
+                               entry.begin, entry.end, span_pages=1)
+    tree.attach_entry(leaf, checkpoint)
+    assert leaf.eviction_slots == (entry.slot,)
+    assert leaf._log_leaf_index == -1
+    assert_log_index_matches_scan(tree)
+    tree.detach_entry(entry.slot)
+    tree.attach_entry(leaf, entry)
+    assert_log_index_matches_scan(tree)
+    for step in range(1000):
+        leaf.timestamp = step
+    assert len(tree._log_leaf_heap) == 2
+    tree.evict_nodes([leaf])
+    assert leaf._log_leaf_index == -1 and leaf._log_leaf_tree is None
+    leaf.timestamp = 0
+    assert_log_index_matches_scan(tree)
+    previous = tree.leaves()
+    tree.reset()
+    for node in previous:
+        node.timestamp = 0
+        assert node._log_leaf_index == -1 and node._log_leaf_tree is None
+    assert_log_index_matches_scan(tree)

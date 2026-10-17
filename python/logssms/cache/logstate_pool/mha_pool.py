@@ -320,6 +320,14 @@ class MHALogStatePool(BaseKVCachePool):
         indices, payload, conv, decay = make_device_vectors(
             [slots, payload, conv, decay], self.device
         )
+        if self.device.type == "cuda":
+            from logssms.kernel.metadata import write_slot_descriptors
+
+            write_slot_descriptors(
+                indices, payload, conv, decay, self.payload_frame_table,
+                self.conv_frame_table, self.decay_frame_table,
+            )
+            return
         indices = indices.long()
         self.payload_frame_table.index_copy_(0, indices, payload.reshape(len(slots), -1))
         self.conv_frame_table.index_copy_(0, indices, conv.reshape(
@@ -544,9 +552,17 @@ class MHALogStatePool(BaseKVCachePool):
             )
             stage = now
         indices, = make_device_vectors([slots], self.device, dtype=torch.int64)
-        self.payload_frame_table.index_fill_(0, indices, -1)
-        self.conv_frame_table.index_fill_(0, indices, -1)
-        self.decay_frame_table.index_fill_(0, indices, -1)
+        if self.device.type == "cuda":
+            from logssms.kernel.metadata import write_slot_descriptors
+
+            write_slot_descriptors(
+                indices, None, None, None, self.payload_frame_table,
+                self.conv_frame_table, self.decay_frame_table,
+            )
+        else:
+            self.payload_frame_table.index_fill_(0, indices, -1)
+            self.conv_frame_table.index_fill_(0, indices, -1)
+            self.decay_frame_table.index_fill_(0, indices, -1)
         if timings is not None:
             timings["descriptor_clear_ms"] = (
                 timings.get("descriptor_clear_ms", 0.0)
