@@ -33,6 +33,15 @@ def _env_int(name: str) -> int:
     return int(value) if value is not None else 0
 
 
+def _batch_counts(batch: Batch, phase: str) -> dict[str, int]:
+    prefill = batch.size if phase == "prefill" else int(phase == "mixed")
+    return {
+        "prefill_count": prefill,
+        "decode_count": batch.size - prefill if phase in ("decode", "mixed") else 0,
+        "verify_count": batch.size if phase == "verify" else 0,
+    }
+
+
 @dataclass
 class _PhaseProfile:
     batches        : int = 0
@@ -41,6 +50,9 @@ class _PhaseProfile:
     logical_tokens : int = 0
     padded_tokens  : int = 0
     graph_batches  : int = 0
+    prefill_count  : int = 0
+    decode_count   : int = 0
+    verify_count   : int = 0
     schedule_ns    : int = 0
     prepare_ns     : int = 0
     submit_ns      : int = 0
@@ -62,6 +74,9 @@ class _PhaseProfile:
             "logical_tokens": self.logical_tokens,
             "padded_tokens": self.padded_tokens,
             "graph_batches": self.graph_batches,
+            "prefill_count": self.prefill_count,
+            "decode_count": self.decode_count,
+            "verify_count": self.verify_count,
             "avg_logical_bs": self._ratio(self.logical_rows, self.batches),
             "avg_padded_bs": self._ratio(self.padded_rows, self.batches),
             "row_padding_efficiency": self._ratio(self.logical_rows, self.padded_rows),
@@ -104,7 +119,7 @@ class SchedulerProfiler:
         self.ar_no_batch = 0
         self.last_flushed_forward = 0
         self.phases = {
-            phase: _PhaseProfile() for phase in ("prefill", "decode", "verify")
+            phase: _PhaseProfile() for phase in ("prefill", "decode", "verify", "mixed")
         }
         self.pending_gpu: list[tuple[
             str, torch.cuda.Event, torch.cuda.Event, dict | None,
@@ -119,7 +134,7 @@ class SchedulerProfiler:
         self.prefill_forward_batches = self.batch_samples["forward"]["prefill"]
         self.prefill_process_batches = self.batch_samples["process"]["prefill"]
         self.process_stage_ns = {
-            phase: Counter() for phase in ("prefill", "decode", "verify")
+            phase: Counter() for phase in self.phases
         }
         self._current_process_sample: dict | None = None
         self._process_stage_name = ""
@@ -268,14 +283,20 @@ class SchedulerProfiler:
         profile.prepare_ns += prepare_ns
         profile.logical_bs[batch.size] += 1
         profile.padded_bs[batch.padded_size] += 1
+        counts = _batch_counts(batch, batch.phase)
+        profile.prefill_count += counts["prefill_count"]
+        profile.decode_count += counts["decode_count"]
+        profile.verify_count += counts["verify_count"]
         sample = {
             **batch_snapshot(batch),
+            **counts,
             "graph_used": graph_used,
             "schedule_ms": self.schedule_ns / 1e6,
             "prepare_ms": prepare_ns / 1e6,
         }
         if self._last_schedule_sample is not None:
             self._last_schedule_sample.update(batch_identity(batch))
+            self._last_schedule_sample.update(counts)
             sample["schedule_detail"] = self._last_schedule_sample
         self.batch_samples["prepare"][batch.phase].append(sample)
 
@@ -287,6 +308,7 @@ class SchedulerProfiler:
             return
         sample = {
             **batch_snapshot(batch),
+            **_batch_counts(batch, batch.phase),
             "submit_ms": None,
             "gpu_ms": None,
         }
@@ -298,7 +320,7 @@ class SchedulerProfiler:
             self._finish_submit(batch.phase, events, perf_counter_ns() - tic, sample)
 
     def _begin_submit(self, phase: str) -> tuple[torch.cuda.Event, torch.cuda.Event]:
-        if phase in ("decode", "verify"):
+        if phase in ("decode", "verify", "mixed"):
             self.ar_forward_count += 1
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -344,6 +366,7 @@ class SchedulerProfiler:
         if batch is not None:
             sample = {
                 **batch_identity(batch),
+                **_batch_counts(batch, phase),
                 "batch_size": batch.size,
                 "wait_ms": self._last_wait_ms,
             }

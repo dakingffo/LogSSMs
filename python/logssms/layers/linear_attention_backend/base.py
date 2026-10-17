@@ -18,6 +18,24 @@ class BaseLinearAttentionMetadata(ABC):
 
 
 class BaseLinearAttentionBackend(ABC):
+    def forward_mixed(self, batch: Batch, token_inputs: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
+        assert batch.mixed_parts is not None
+        split = batch.prefill_token_capacity
+        output = None
+        for part, begin, end in (
+            (batch.mixed_parts[0], 0, split),
+            (batch.mixed_parts[1], split, next(iter(token_inputs.values())).shape[0]),
+        ):
+            result = self.forward(
+                **{name: tensor[begin:end] for name, tensor in token_inputs.items()},
+                **kwargs, batch=part,
+            )
+            if output is None:
+                output = result.new_empty((next(iter(token_inputs.values())).shape[0],) + result.shape[1:])
+            output[begin:end].copy_(result)
+        assert output is not None
+        return output
+
     def profile_result(self) -> dict | None:
         return None
 

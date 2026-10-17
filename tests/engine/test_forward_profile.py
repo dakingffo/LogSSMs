@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from logssms.core import Batch, ChunkedRequest, Request, SamplingParams
 from logssms.engine.engine import Engine
 from logssms.engine.decode_graph import DecodeGraphCaptureBuffer, DecodeGraphRunner
 from logssms.engine.profile import EngineProfiler
@@ -26,11 +27,10 @@ class _Event:
 
 def _batch(phase="decode"):
     req = SimpleNamespace(extend_len=1, cached_len=64, profile_tag="session/turn-2")
-    return SimpleNamespace(
-        reqs=[req], padded_reqs=[req, req], size=1, padded_size=2,
-        phase=phase, is_verify=phase == "verify", is_decode=phase == "decode",
-        logstate_replay_counts=[3, 0],
-    )
+    batch = Batch([req], phase)
+    batch.padded_reqs = [req, req]
+    batch.logstate_replay_counts = [3, 0]
+    return batch
 
 
 @pytest.fixture
@@ -144,6 +144,62 @@ def test_forward_profile_does_not_change_sampling(monkeypatch, phase, enabled):
     assert result.next_tokens_cpu.tolist() == ([[3, 2]] if phase == "verify" else [3])
     expected = ("reject", torch.Size([2, 4])) if phase == "verify" else ("sample", torch.Size([1, 4]))
     assert calls == [expected]
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chunked, enabled):
+    monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", str(int(enabled)))
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    _Event.ready = True
+    prefill = (ChunkedRequest if chunked else Request)(
+        torch.arange(96), 0, 64, 8, 0, SamplingParams(), None, 128,
+        profile_tag="prefill",
+    )
+    decodes = [Request(torch.arange(65), i, 64, 8, i, SamplingParams(), None, 128,
+                       profile_tag=f"decode-{i}") for i in (1, 2)]
+    batch = Batch([prefill, *decodes], "mixed")
+    batch.padded_reqs = [*batch.reqs, decodes[-1]]
+    batch.prefill_token_capacity = 128
+    engine = object.__new__(Engine)
+    engine.profiler = EngineProfiler()
+    engine.stream = "stream"
+    engine.config = SimpleNamespace(
+        enable_specualtive_decoding=False, model_config=SimpleNamespace(is_hybrid=False),
+    )
+    @contextmanager
+    def forward_batch(_batch):
+        yield
+    engine.ctx = SimpleNamespace(forward_batch=forward_batch)
+    logits = torch.arange(16).reshape(4, 4)
+    engine.mixed_graph_runner = SimpleNamespace(
+        can_use_cuda_graph=lambda _batch: True, replay=lambda _batch: logits,
+    )
+    engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _batch: False)
+    engine.prefill_graph_runner = None
+    sampled = []
+    def sample(values, _args):
+        sampled.append(values.clone())
+        return values[:, 0]
+    engine.sampler = SimpleNamespace(sample=sample)
+    output = engine.forward_batch(batch, None)
+    torch.testing.assert_close(sampled[0], logits[int(chunked):3])
+    assert output.next_tokens_cpu.tolist() == ([-1, 4, 8] if chunked else [0, 4, 8])
+    engine.profiler.poll()
+    profile = engine.forward_profile_result()
+    if not enabled:
+        assert profile is None
+        return
+    record = profile["mixed_batches"][0]
+    assert record["graph_kind"] == "mixed" and record["graph_used"]
+    assert record["batch_size"] == 3 and record["padded_size"] == 4
+    assert record["prefill_requests"] == 1 and record["decode_requests"] == 2
+    assert record["prefill_tokens"] == 32 and record["prefill_capacity"] == 128
+    assert record["input_tokens"] == 34
+    assert record["request_tags"] == ["prefill", "decode-1", "decode-2"]
+    assert record["gpu_stages_ms"]["mixed_graph"] > 0
+    assert profile["phases"]["mixed"]["by_padded_size"]["4"]["logical_rows"] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph timing test")

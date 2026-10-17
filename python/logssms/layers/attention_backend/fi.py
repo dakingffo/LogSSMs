@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List
 
@@ -172,6 +172,13 @@ class FlashInferBackend(BaseAttnBackend):
                 cache.view(-1, 1, cache.shape[2], cache.shape[3])
                 for cache in kv_cache
             )
+        if (batch.is_prefill
+                and metadata.wrapper is getattr(self, "_mixed_eager_wrappers", (None,))[0]
+                and q.shape[0] > int(metadata.cu_seqlens_q_cpu[-1])):
+            live = int(metadata.cu_seqlens_q_cpu[-1])
+            output = metadata.wrapper.run(q=q[:live], paged_kv_cache=kv_cache)
+            return torch.cat((output, output.new_zeros(
+                (q.shape[0] - live,) + output.shape[1:])), dim=0)
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     @nvtx_annotate("FlashInfer::metadata")
@@ -247,3 +254,147 @@ class FlashInferBackend(BaseAttnBackend):
         assert self.capture is not None and bs in self.capture_bs
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
+
+    @cached_property
+    def _mixed_float_workspaces(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Eager and graph execution share scratch on the serialized model stream.
+        return (torch.zeros_like(self.float_workspace_buffer),
+                torch.zeros_like(self.float_workspace_buffer))
+
+    def prepare_mixed_metadata(self, parts: tuple[Batch, Batch]) -> None:
+        """Assign eager wrappers after both parts' metadata is prepared.
+
+        Planning is deferred to forward on the model stream. The engine must
+        order that stream after scheduler-side metadata preparation.
+        """
+        assert parts[0].is_prefill and parts[1].is_decode
+        if not hasattr(self, "_mixed_eager_wrappers"):
+            from flashinfer import (
+                BatchDecodeWithPagedKVCacheWrapper,
+                BatchPrefillWithPagedKVCacheWrapper,
+            )
+            self._mixed_eager_wrappers = (
+                BatchPrefillWithPagedKVCacheWrapper(
+                    self._mixed_float_workspaces[0],
+                    kv_layout="NHD", backend="fa2",
+                ),
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self._mixed_float_workspaces[1],
+                    kv_layout="NHD", backend="fa2",
+                    use_tensor_cores=self.use_tensor_cores,
+                ),
+            )
+        for part, wrapper in zip(parts, self._mixed_eager_wrappers):
+            assert isinstance(part.attn_metadata, FIMetadata)
+            if part.attn_metadata.wrapper is not wrapper:
+                part.attn_metadata = replace(part.attn_metadata, wrapper=wrapper,
+                                             initialized=False)
+
+    def make_mixed_capture(
+        self, prefill: Batch, decode: Batch, max_seq_len: int,
+    ) -> tuple[Batch, Batch]:
+        """Plan capture parts at P prefill rows and D decode rows on the model stream.
+
+        Wrappers own integer planning buffers and share mixed float scratch.
+        Retain these parts for the graph's lifetime. After planning L < P,
+        replay the graph directly; Python forward requires matching live rows.
+        """
+        from flashinfer import (
+            BatchDecodeWithPagedKVCacheWrapper,
+            BatchPrefillWithPagedKVCacheWrapper,
+        )
+
+        assert prefill.is_prefill and decode.is_decode and max_seq_len > 0
+        for part in (prefill, decode):
+            if not isinstance(getattr(part, "attn_metadata", None), FIMetadata):
+                self.prepare_metadata(part)
+        pm, dm = prefill.attn_metadata, decode.attn_metadata
+        assert isinstance(pm, FIMetadata) and isinstance(dm, FIMetadata)
+        assert len(pm.cu_seqlens_q_cpu) == 2, "One prefill request per mixed graph"
+        assert int(pm.cu_seqlens_q_cpu[-1]) == prefill.input_ids.shape[0]
+        assert 0 < prefill.input_ids.shape[0] <= max_seq_len
+        assert len(dm.seq_lens_cpu) == decode.input_ids.shape[0] > 0
+        assert torch.all(dm.cu_seqlens_q_cpu.diff() == 1)
+
+        for part, source, is_prefill in ((prefill, pm, True), (decode, dm, False)):
+            bs = len(source.seq_lens_cpu)
+            max_pages = (max_seq_len + source.page_size - 1) // source.page_size
+            index_args = dict(dtype=source.indices.dtype, device=self.device)
+            kv_indptr = torch.empty(bs + 1, **index_args)
+            kv_indices = torch.empty(bs * max_pages, **index_args)
+            last_len = torch.empty(bs, **index_args)
+            workspace = self._mixed_float_workspaces[0 if is_prefill else 1]
+            if is_prefill:
+                qo_indptr = torch.empty_like(source.cu_seqlens_q_gpu)
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    workspace, kv_layout="NHD", backend="fa2", use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr,
+                    paged_kv_indptr_buf=kv_indptr,
+                    paged_kv_indices_buf=kv_indices,
+                    paged_kv_last_page_len_buf=last_len,
+                )
+            else:
+                qo_indptr = source.cu_seqlens_q_gpu.clone()
+                wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                    workspace, kv_layout="NHD", backend="fa2", use_cuda_graph=True,
+                    use_tensor_cores=self.use_tensor_cores,
+                    paged_kv_indptr_buffer=kv_indptr,
+                    paged_kv_indices_buffer=kv_indices,
+                    paged_kv_last_page_len_buffer=last_len,
+                )
+            metadata = replace(source, wrapper=wrapper,
+                               cu_seqlens_q_gpu=qo_indptr, initialized=False)
+            self._initialize_metadata_once(metadata)
+            part.attn_metadata = metadata
+        return prefill, decode
+
+    def prepare_mixed_replay(
+        self, captured_parts: tuple[Batch, Batch], runtime_parts: tuple[Batch, Batch],
+    ) -> None:
+        """Plan actual lengths outside capture on the graph's execution stream.
+
+        Runtime metadata may contain d <= D decode requests. Missing attention
+        lanes read the first request's KV pages (no writes); the runner must
+        independently mask KV stores and provide safe dummy recurrent slots.
+        """
+        for i, (captured, runtime) in enumerate(zip(captured_parts, runtime_parts)):
+            target, source = captured.attn_metadata, runtime.attn_metadata
+            assert isinstance(target, FIMetadata) and isinstance(source, FIMetadata)
+            assert (source.page_size, source.dtype, source.num_qo_heads,
+                    source.num_kv_heads, source.head_dim) == (
+                        target.page_size, target.dtype, target.num_qo_heads,
+                        target.num_kv_heads, target.head_dim)
+            capacity = int(target.cu_seqlens_q_cpu[-1])
+            if i == 0:
+                assert len(source.cu_seqlens_q_cpu) == 2
+                assert 0 < int(source.cu_seqlens_q_cpu[-1]) <= capacity
+            else:
+                bs = len(target.seq_lens_cpu)
+                live = len(source.seq_lens_cpu)
+                assert 0 < live <= bs
+                assert torch.all(source.cu_seqlens_q_cpu.diff() == 1)
+                if live < bs:
+                    # Repeat an actual valid KV segment; no empty-page edge
+                    # cases or dependence on the scheduler's dummy KV table.
+                    begin, end = map(int, source.cu_seqlens_k_cpu[:2])
+                    pages = end - begin
+                    assert pages > 0
+                    extra = bs - live
+                    tail = (torch.arange(1, extra + 1,
+                                         dtype=source.cu_seqlens_k_cpu.dtype)
+                            * pages + source.cu_seqlens_k_cpu[-1])
+                    source = replace(
+                        source,
+                        cu_seqlens_k_cpu=torch.cat((source.cu_seqlens_k_cpu, tail)),
+                        indices=torch.cat((source.indices,
+                                           source.indices[begin:end].repeat(extra))),
+                        last_page_len_cpu=torch.cat((source.last_page_len_cpu,
+                                                     source.last_page_len_cpu[:1].repeat(extra))),
+                        seq_lens_cpu=torch.cat((source.seq_lens_cpu,
+                                               source.seq_lens_cpu[:1].repeat(extra))),
+                        cu_seqlens_q_cpu=target.cu_seqlens_q_cpu,
+                    )
+            # Retain capture metadata (especially its capacity) and all graph
+            # pointers. Only wrapper-owned planning buffers are updated.
+            planned = replace(source, wrapper=target.wrapper, initialized=False)
+            self._initialize_metadata_once(planned)

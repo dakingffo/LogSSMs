@@ -211,6 +211,13 @@ class MHALogStatePool(BaseKVCachePool):
             len(slots), self.layout.num_value_heads,
             self.layout.head_k_dim, self.layout.head_v_dim,
         )
+        if self.device.type == "cuda":
+            from logssms.kernel.linear_attention.masked_store import store_states
+
+            store_states(self, slots.to(self.device, non_blocking=True), layer, values)
+            return
+        active = slots >= 0
+        slots, values = slots[active], values[active]
         self.storage.view(self.dtype).flatten()[self._state_indices(slots, layer)] = (
             values.to(self.dtype).flatten(2)
         )
@@ -256,6 +263,16 @@ class MHALogStatePool(BaseKVCachePool):
         assert values.shape == (
             len(slots), self.layout.conv_dim, self.layout.state_len,
         )
+        if self.device.type == "cuda":
+            from logssms.kernel.linear_attention.masked_store import store_conv
+
+            store_conv(
+                self, slots.to(self.device, non_blocking=True),
+                granules.to(self.device, non_blocking=True), layer, values,
+            )
+            return
+        active = slots >= 0
+        slots, granules, values = slots[active], granules[active], values[active]
         self.storage.view(self.dtype).flatten()[
             self._conv_indices(slots, granules, layer)
         ] = values.to(self.dtype).flatten(1)
@@ -406,6 +423,12 @@ class MHALogStatePool(BaseKVCachePool):
     def commit_checkpoint(self, slot: int) -> None:
         self.allocator.commit_checkpoint(slot)
         self._write_descriptors((slot,))
+
+    def copy_states(self, sources: Sequence[int], destinations: Sequence[int]) -> None:
+        """Copy recurrent states between allocated slots without changing ownership."""
+        from logssms.kernel.linear_attention.logstate import copy_states
+
+        copy_states(self, sources, destinations)
 
     def coalesce_groups(self, groups: Sequence[tuple[int, ...]], works: Sequence[int]) -> None:
         from logssms.kernel.linear_attention.logstate import copy_states

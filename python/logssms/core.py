@@ -112,7 +112,7 @@ class ChunkedRequest(Request):
 @dataclass
 class Batch:
     reqs     : list[Request]
-    phase    : Literal["prefill", "decode", "verify"]
+    phase    : Literal["prefill", "decode", "verify", "mixed"]
     profile_id: int | None = field(init=False, default=None)
 
     input_ids  : torch.Tensor  = field(init=False)
@@ -132,6 +132,28 @@ class Batch:
     logstate_replay_counts: list[int] | None = field(init=False, default=None)
     logstate_checkpoint_writes: list[tuple[int, int]] = field(init=False, default_factory=list)
     logstate_checkpoint_ranges: list[tuple[int, int, int]] = field(init=False, default_factory=list)
+    mixed_parts: tuple[Batch, Batch] | None = field(init=False, default=None)
+    prefill_token_capacity: int = field(init=False, default=0)
+    sample_indices: torch.Tensor | None = field(init=False, default=None)
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.phase == "mixed"
+
+    @property
+    def prefill_count(self) -> int:
+        return self.size if self.is_prefill else int(self.is_mixed)
+
+    @property
+    def prefill_reqs(self) -> list[Request]:
+        return self.reqs[:self.prefill_count]
+
+    @property
+    def decode_reqs(self) -> list[Request]:
+        return self.reqs[self.prefill_count:] if not self.is_verify else []
+
+    def req_is_prefill(self, index: int) -> bool:
+        return index < self.prefill_count
 
     @property
     def is_prefill(self) -> bool:

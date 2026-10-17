@@ -138,7 +138,11 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--graph",
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum decode batch size for CUDA graph capture. Also enables piecewise prefill graphs. 0 disables both; None means auto-tuning based on the GPU memory.",
+        help=(
+            "Maximum request bucket for decode and mixed CUDA graphs. Also enables "
+            "piecewise prefill graphs. 0 disables all graphs; None selects sizes "
+            "based on GPU memory."
+        ),
     )
 
     parser.add_argument(
@@ -155,6 +159,19 @@ def parse_args(args: list[str]) -> ServerArgs:
         dest="max_prefill_tokens",
         default=ServerArgs.max_prefill_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
+    )
+
+    parser.add_argument(
+        "--scheduling-policy",
+        choices=["prefill-first", "mixed"],
+        default=ServerArgs.scheduling_policy,
+        help="Prefill priority or one prefill chunk mixed with decoding requests.",
+    )
+    parser.add_argument(
+        "--mixed-prefill-tokens",
+        type=int,
+        default=ServerArgs.mixed_prefill_tokens,
+        help="Mixed prefill chunk budget: positive multiple of 64, <= max-prefill-tokens.",
     )
 
     parser.add_argument(
@@ -237,6 +254,14 @@ def parse_args(args: list[str]) -> ServerArgs:
 
 
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    mixed_tokens = kwargs["mixed_prefill_tokens"]
+    if mixed_tokens <= 0 or mixed_tokens % 64:
+        parser.error("--mixed-prefill-tokens must be a positive multiple of 64")
+    if kwargs["scheduling_policy"] == "mixed" and mixed_tokens > kwargs["max_prefill_tokens"]:
+        parser.error("--mixed-prefill-tokens must be <= --max-prefill-tokens for mixed scheduling")
+    if kwargs["scheduling_policy"] == "mixed" and kwargs["speculative_algorithm"] is not None:
+        parser.error("mixed scheduling does not support speculative decoding")
 
     kwargs["cache_config"] = cache_parser.make_config(kwargs)
 

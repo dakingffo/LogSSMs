@@ -55,7 +55,16 @@ class MHAAttentionImpl(BaseOP):
         query: torch.Tensor,
     ) -> torch.Tensor:
         ctx = get_global_ctx()
-        output = ctx.attn_backend.forward(query, self._layer_id, ctx.batch)
+        batch = ctx.batch
+        if batch.is_mixed:
+            assert batch.mixed_parts is not None
+            prefill, decode = batch.mixed_parts
+            split = batch.prefill_token_capacity
+            output = torch.empty_like(query)
+            output[:split].copy_(ctx.attn_backend.forward(query[:split], self._layer_id, prefill))
+            output[split:].copy_(ctx.attn_backend.forward(query[split:], self._layer_id, decode))
+        else:
+            output = ctx.attn_backend.forward(query, self._layer_id, batch)
         return output.reshape(query.shape)
 
 

@@ -76,6 +76,11 @@ def chunk_fwd_kernel_o(
         bos, eos = i_b * T, i_b * T + T
 
 
+    # Fixed-capacity mixed graphs launch phantom chunks. Their state tiles were
+    # never produced by the actual-length recurrence; do not load them.
+    if i_t * BT >= T:
+        return
+
     q += (bos * H + i_h // (HV // H)) * K
     k += (bos * H + i_h // (HV // H)) * K
     v += (bos * HV + i_h) * V

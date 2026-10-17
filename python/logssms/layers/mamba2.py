@@ -130,6 +130,13 @@ class Mamba2(BaseOP):
     @nvtx_annotate("Mamba2", layer_id_field="_layer_idx")
     def attend(self, xbc: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
+        if ctx.batch.is_mixed:
+            return ctx.linear_attn_backend.forward_mixed(
+                ctx.batch, {"xbc": xbc, "dt": dt},
+                conv_weight=self.conv1d.weight, conv_bias=self.conv1d.bias,
+                A_log=self.A_log, dt_bias=self.dt_bias, D=self.D,
+                config=self._config,
+            )
         return ctx.linear_attn_backend.forward(
             xbc=xbc, dt=dt, conv_weight=self.conv1d.weight,
             conv_bias=self.conv1d.bias, A_log=self.A_log,

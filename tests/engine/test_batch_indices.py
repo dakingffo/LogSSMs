@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from logssms.core import Batch, Request
+from logssms.core import Batch, ChunkedRequest, Request
 from logssms.kernel.metadata import make_batch_mapping, gather_paged_indices, gather_linear_slots
 from logssms.utils.batch import BatchIndices
 
@@ -41,6 +41,66 @@ def test_packet_cpu_views_and_write_semantics(phase):
     assert packet.write_tuple[0].dtype == torch.int64
     assert packet.write_tuple[0].tolist() == ([] if phase == "verify" else [2, 0])
     assert packet.write_tuple[1].tolist() == ([] if phase == "verify" else [-1, batch.reqs[1].device_len])
+
+
+@pytest.mark.parametrize("phase", ["prefill", "mixed", "decode", "verify"])
+def test_compact_chunk_writes_match_aligned_outputs(phase):
+    from types import SimpleNamespace
+    from logssms.scheduler.prefill import PrefillManager
+
+    chunk = ChunkedRequest(torch.arange(4), 2, 0, 8, 20, None, None, 12)
+    sampled = Request(torch.arange(3), 0, 2, 8, 21, None, None, 11)
+    padding = Request(torch.arange(1), 3, 0, 8, 22, None, None, 9)
+    batch = Batch([chunk, sampled], phase)
+    batch.padded_reqs = [chunk, sampled, padding]
+    packet = BatchIndices.make(batch, torch.device("cpu"), 32)
+    expected = [] if phase == "verify" else [0]
+    assert packet.write_tuple[0].tolist() == expected
+    assert packet.write_tuple[1].tolist() == ([] if phase == "verify" else [3])
+    # Input metadata stays aligned to all padded rows, including chunks.
+    assert packet.table_ids.tolist() == [2, 0, 3]
+    assert packet.seq_lens_cpu.tolist() == [4, 3, 1]
+    pool = torch.full((4, 16), 99, dtype=torch.int32)
+    manager = PrefillManager(pool, 32)
+    output = SimpleNamespace(next_tokens_gpu=torch.tensor([-1, 7], dtype=torch.int32))
+    manager.advance_for_next_schedule(None, (batch, None, None, packet.write_tuple), output)
+    assert pool[0, 3].item() == (99 if phase == "verify" else 7)
+    assert (pool[2] == 99).all() and (pool[3] == 99).all()
+
+
+def test_all_chunk_prefill_has_empty_compact_writes():
+    from types import SimpleNamespace
+    from logssms.scheduler.prefill import PrefillManager
+
+    chunk = ChunkedRequest(torch.arange(4), 0, 0, 8, 1, None, None, 12)
+    batch = Batch([chunk], "prefill")
+    batch.padded_reqs = [chunk]
+    packet = BatchIndices.make(batch, torch.device("cpu"), 32)
+    assert all(vector.numel() == 0 for vector in packet.write_tuple)
+    pool = torch.full((1, 16), 99, dtype=torch.int32)
+    PrefillManager(pool, 32).advance_for_next_schedule(
+        None, (batch, None, None, packet.write_tuple),
+        SimpleNamespace(next_tokens_gpu=torch.tensor([-1], dtype=torch.int32)),
+    )
+    assert (pool == 99).all()
+    assert chunk.cached_len == chunk.device_len == 4
+
+
+def test_mixed_subbatch_compact_writes_concatenate_in_real_request_order():
+    chunk = ChunkedRequest(torch.arange(4), 2, 0, 8, 20, None, None, 12)
+    decode = Request(torch.arange(3), 0, 2, 8, 21, None, None, 11)
+    mixed = Batch([chunk, decode], "mixed")
+    prefill = Batch([chunk], "prefill")
+    ar = Batch([decode], "decode")
+    for batch in (mixed, prefill, ar):
+        batch.padded_reqs = batch.reqs
+    packets = [BatchIndices.make(batch, torch.device("cpu"), 32)
+               for batch in (mixed, prefill, ar)]
+    for i in (0, 1):
+        torch.testing.assert_close(
+            packets[0].write_tuple[i],
+            torch.cat([packets[1].write_tuple[i], packets[2].write_tuple[i]]),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -113,6 +113,12 @@ class GatedDeltaNet(BaseOP):
         from logssms.core import get_global_ctx
 
         ctx = get_global_ctx()
+        if ctx.batch.is_mixed:
+            return ctx.linear_attn_backend.forward_mixed(
+                ctx.batch, {"mixed_qkv": mixed_qkv, "gate": gate, "beta": beta},
+                conv_weight=self.conv1d.weight, A_log=self.A_log,
+                dt_bias=self.dt_bias, config=self._config,
+            )
         return ctx.linear_attn_backend.forward(
             mixed_qkv=mixed_qkv,
             gate=gate,

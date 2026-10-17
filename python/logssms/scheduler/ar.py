@@ -100,14 +100,15 @@ class ARManagerBase:
 
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
+                is_prefill = batch.req_is_prefill(i)
                 if isinstance(req, ChunkedRequest) or req.aborted:
                     continue
-                if not batch.is_prefill and req.uid not in self.running_reqs:
+                if not is_prefill and req.uid not in self.running_reqs:
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                if batch.is_prefill:
+                if is_prefill:
                     req.complete_n(1)
 
                 finished = req.max_device_len - (req.device_len - (req.uid in self.inflight_uids[1])) <= 0
@@ -117,16 +118,16 @@ class ARManagerBase:
                 reply.append(DetokenizeMsg(
                     uid=req.uid, next_token=next_token, finished=finished,
                     return_token_ids=req.return_token_ids,
-                    cached_tokens=req.prefix_cached_len if batch.is_prefill else None,
+                    cached_tokens=req.prefix_cached_len if is_prefill else None,
                 ))
 
                 if finished and req not in self.finished_reqs:
-                    if req not in self.inflight_uids[1]:
+                    if req.uid not in self.inflight_uids[1]:
                         self._finish_req(req)
                     else:
                         self.abort_req(req.uid)
                     new_finished.add(req)
-                elif batch.is_prefill:
+                elif is_prefill:
                     if req.can_decode:
                         self.running_reqs[req.uid] = req
                         if batch.hidden_captor is not None:

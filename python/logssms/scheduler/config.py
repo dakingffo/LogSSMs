@@ -12,6 +12,11 @@ class SchedulerConfig(EngineConfig):
     max_decode_tokens : int | None = None
     _unique_suffix    : str  = field(default_factory=lambda: f".pid={os.getpid()}")
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.scheduling_policy == "mixed" and self.mixed_prefill_tokens > self.max_prefill_tokens:
+            raise ValueError("mixed_prefill_tokens must be <= max_prefill_tokens")
+
     @property
     def zmq_backend_addr(self) -> str:
         return "ipc:///tmp/logssms_0" + self._unique_suffix

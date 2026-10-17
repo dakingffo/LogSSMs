@@ -10,7 +10,7 @@ from logssms.cache.base import BaseCacheManager
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("phase", ["prefill", "decode", "verify"])
+@pytest.mark.parametrize("phase", ["prefill", "decode", "verify", "mixed"])
 def test_process_profile_breakdown(monkeypatch, enabled: bool, phase: str):
     monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", str(int(enabled)))
     profiler = SchedulerProfiler(torch.device("cpu"), SimpleNamespace())
@@ -35,6 +35,64 @@ def test_process_profile_breakdown(monkeypatch, enabled: bool, phase: str):
     assert sample["total_ms"] >= sample["ar_process_ms"]
     assert sample["total_ms"] >= sample["send_result_ms"]
     assert profiler.process_stage_ns[phase]["ar_process"] >= 0
+
+
+def test_mixed_profile_full_lifecycle_and_counts_without_cuda(monkeypatch):
+    from logssms.core import Batch, Request, ChunkedRequest
+
+    monkeypatch.setenv("LOGSSMS_PROFILE_SCHEDULER", "1")
+    monkeypatch.setattr(
+        "logssms.scheduler.profile.get_tp_info", lambda: SimpleNamespace(rank=0),
+    )
+    class Event:
+        def __init__(self, **_kwargs):
+            pass
+
+        def record(self):
+            pass
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, _end):
+            return 2.0
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    cache = SimpleNamespace(poll_profile=lambda: None, profile_result=lambda: None)
+    profiler = SchedulerProfiler(torch.device("cpu"), cache)
+    chunk = ChunkedRequest(torch.arange(64), 0, 0, 8, 1, None, None, 128)
+    decode = Request(torch.arange(4), 1, 3, 8, 2, None, None, 12)
+    batch = Batch([chunk, decode], "mixed")
+    batch.padded_reqs = batch.reqs
+    with profiler.record_schedule() as schedule:
+        schedule["phase"] = "mixed"
+    with profiler.record_prepare(batch, graph_used=False):
+        pass
+    with profiler.record_submit(batch):
+        pass
+    with profiler.record_wait("mixed"):
+        pass
+    with profiler.record_process("mixed", batch):
+        with profiler.record_process_step("mixed", "ar_process"):
+            pass
+    profiler.poll()
+    result = profiler._make_result()
+    assert result["ar_forward_count"] == 1
+    assert result["pending_gpu_events"] == 0
+    phase = result["phases"]["mixed"]
+    assert phase["batches"] == 1
+    assert phase["logical_rows"] == 2
+    assert phase["logical_tokens"] == 65
+    assert phase["prefill_count"] == phase["decode_count"] == 1
+    assert phase["verify_count"] == 0
+    assert phase["gpu_ms"] == 2.0
+    for kind in ("prepare", "forward", "process"):
+        sample = result[f"mixed_{kind}_batches"][0]
+        assert sample["prefill_count"] == sample["decode_count"] == 1
+        assert sample["verify_count"] == 0
+    detail = result["mixed_prepare_batches"][0]["schedule_detail"]
+    assert detail["prefill_count"] == detail["decode_count"] == 1
+    assert "ar_process" in result["process_stages_ms"]["mixed"]
 
 
 def test_schedule_profile_nested_exclusive_time_and_request_identity(monkeypatch):
@@ -135,6 +193,7 @@ def test_schedule_profile_exports_batch_details_and_bounded_failures(monkeypatch
     batch = SimpleNamespace(
         profile_id=42, phase="prefill", size=1, padded_size=1,
         reqs=[req], padded_reqs=[req],
+        prefill_count=1, prefill_reqs=[req], decode_reqs=[], prefill_token_capacity=0,
     )
     with profiler.record_schedule() as sample:
         with profiler.record_schedule_step("prefill_select"):

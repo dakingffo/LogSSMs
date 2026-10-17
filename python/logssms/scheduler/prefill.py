@@ -252,7 +252,9 @@ class PrefillManager:
             for req in self.inflight_reqs.values()
         )
         
-    def schedule_next_batch(self, adder: PrefillAdder) -> Batch | None:
+    def schedule_next_batch(
+        self, adder: PrefillAdder, max_requests: int | None = None,
+    ) -> Batch | None:
         self.inflight_reqs.clear()
         if len(self.pending_list) == 0:
             return None
@@ -260,6 +262,8 @@ class PrefillManager:
         reqs: list[Request] = []
         chunked_list: list[PendingRequest] = []
         for pending_req in self.pending_list:
+            if max_requests is not None and len(reqs) >= max_requests:
+                break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedRequest):
@@ -298,10 +302,18 @@ class PrefillManager:
     ) -> None:
         batch, _, _, output_mapping = forward_input
         if not batch.is_verify:
-            self.token_pool[output_mapping] = output.next_tokens_gpu
-        if batch.is_prefill:
-            for req in batch.reqs:
-                req.complete_to_device_len()
+            tokens = output.next_tokens_gpu
+            # The engine's output is aligned to real requests; write_mapping
+            # excludes intermediate chunks, which have no sampled token.
+            if any(isinstance(req, ChunkedRequest) for req in batch.reqs):
+                sampled = [
+                    i for i, req in enumerate(batch.reqs)
+                    if not isinstance(req, ChunkedRequest)
+                ]
+                tokens = tokens[sampled]
+            self.token_pool[output_mapping] = tokens
+        for req in batch.prefill_reqs:
+            req.complete_to_device_len()
 
     @property
     def runnable(self) -> bool:

@@ -30,6 +30,8 @@ class BatchIndices:
 
     @classmethod
     def make(cls, batch, device, page_size: int):
+        from logssms.core import ChunkedRequest
+
         reqs = batch.padded_reqs
         tables = [req.table_idx for req in reqs]
         cached = [req.cached_len for req in reqs]
@@ -42,10 +44,13 @@ class BatchIndices:
         if counts is None:
             counts = [0] * len(reqs)
         assert len(counts) == len(reqs)
-        write_tables = [] if batch.is_verify else [req.table_idx for req in batch.reqs]
-        write_positions = [] if batch.is_verify else [
-            req.device_len if req.can_decode else -1 for req in batch.reqs
+        # Outputs retain one entry per real request, but intermediate prefill
+        # chunks never produce a token to write. Padding never owns a write.
+        write_reqs = [] if batch.is_verify else [
+            req for req in batch.reqs if not isinstance(req, ChunkedRequest)
         ]
+        write_tables = [req.table_idx for req in write_reqs]
+        write_positions = [req.device_len if req.can_decode else -1 for req in write_reqs]
         vectors = (tables, cached, [p - 1 for p in cached], lengths, cu_q, cu_k,
                    [(length - 1) % page_size + 1 for length in lengths],
                    counts, write_tables, write_positions)
