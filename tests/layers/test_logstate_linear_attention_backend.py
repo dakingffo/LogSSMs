@@ -6,9 +6,7 @@ from tests.logstate_helpers import head_view
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend
-from logssms.kernel.linear_attention.logstate import construct_log_state_chains
 from logssms.kernel.linear_attention.logstate import restore_log_state_chains
-from logssms.kernel.linear_attention.logstate import copy_states
 from logssms.kernel.linear_attention.vendor.fla import (
     fused_recurrent_gated_delta_rule_to_logstate,
     fused_recurrent_gated_delta_rule,
@@ -303,14 +301,14 @@ def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
     reference_req = new_req(reference, torch.arange(321, dtype=torch.int32))
     expected_output = forward(reference, reference_req).clone()
     expected_state = reference.logstate_pool.read_states(
-        torch.tensor([reference._work_slots[0]], device=device), 0,
+        torch.tensor([reference._request_states[0].work_slot], device=device), 0,
     ).clone()
 
     manager = make_manager(num_pages=32, num_states=32, device=device, granularity=32)
     first = new_req(manager, torch.arange(256, dtype=torch.int32))
     forward(manager, first)
     pool = manager.logstate_pool
-    expected_checkpoint = pool.read_states(torch.tensor([manager._work_slots[0]], device=device), 0).clone()
+    expected_checkpoint = pool.read_states(torch.tensor([manager._request_states[0].work_slot], device=device), 0).clone()
     first.cached_len = 256
     manager.cache_req(first, finished=True)
     entries = manager.tree.iter_entries()
@@ -330,7 +328,7 @@ def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
     actual_output = forward(manager, resumed)
     assert manager._recycled_restores[0].slots[256] == tail_slot
     actual_checkpoint = pool.read_states(torch.tensor([tail_slot], device=device), 0)
-    actual_state = pool.read_states(torch.tensor([manager._work_slots[0]], device=device), 0)
+    actual_state = pool.read_states(torch.tensor([manager._request_states[0].work_slot], device=device), 0)
     torch.testing.assert_close(actual_output, expected_output[192:], rtol=3e-2, atol=3e-3)
     torch.testing.assert_close(actual_checkpoint, expected_checkpoint, rtol=3e-2, atol=3e-3)
     torch.testing.assert_close(actual_state, expected_state, rtol=3e-2, atol=3e-3)
@@ -981,9 +979,9 @@ def test_logstate_model_sized_prefill_log_restores_first_granule(granularity, he
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("materialized", [False, True])
+@pytest.mark.parametrize("copy_restored_state", [False, True])
 def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
-    materialized: bool,
+    copy_restored_state: bool,
 ) -> None:
     clear_global_ctx()
     device = torch.device("cuda")
@@ -1039,15 +1037,10 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
         first = run(resumed_ctx, 0, 64)
         pool = resumed_ctx.linear_state
         expected_state = pool.read_states(torch.tensor([2], dtype=torch.int32, device=device), 0).clone()
-        checkpoint = pool.reserve(works=1)[2][0] if materialized else 2
-        construct_log_state_chains(
-            pool,
-            [(None, [(0, 0, 64)], [(
-                checkpoint,
-            )])],
-        )
-        if materialized:
-            copy_states(pool, [checkpoint], [2])
+        output = pool.reserve(works=1)[2][0] if copy_restored_state else 2
+        restore_log_state_chains(pool, [(None, [(0, 0, 64)], output)])
+        if copy_restored_state:
+            pool.copy_states([output], [2])
         source = torch.tensor([0], dtype=torch.int32, device=device)
         destination = torch.tensor([2], dtype=torch.int32, device=device)
         pool.write_conv(

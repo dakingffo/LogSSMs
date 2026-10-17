@@ -5,7 +5,6 @@ from logssms.utils import Registry
 
 from .conv_copy import copy_conv_snapshots
 from .logstate import (
-    construct_log_state_chains,
     restore_log_state_chains,
     store_log_states,
 )
@@ -15,14 +14,12 @@ from .logstate import (
 class LogStateKernels:
 
     restore  : Callable
-    construct: Callable
     copy_conv: Callable
 
 
 SUPPORTED_LOG_STATE_KERNELS = Registry[LogStateKernels]("LogState kernels")
 AFFINE_LOG_STATE_KERNELS = LogStateKernels(
     restore=restore_log_state_chains,
-    construct=construct_log_state_chains,
     copy_conv=copy_conv_snapshots,
 )
 for recurrent_type in ("gdn", "mamba2"):
@@ -30,7 +27,6 @@ for recurrent_type in ("gdn", "mamba2"):
 
 
 __all__ = [
-    "construct_log_state_chains",
     "restore_log_state_chains",
     "store_log_states",
     "LogStateKernels",

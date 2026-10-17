@@ -13,10 +13,10 @@ import torch
 
 from logssms.core import Request
 from logssms.utils import align_ceil, align_down, div_ceil, init_logger
-from logssms.utils.torch_utils import make_device_vectors
 
 from .base import BaseCacheManager, CacheResources
 from .factory import BaseCacheFactory, CachePlan, SUPPORTED_CACHE_FACTORIES
+from .logstate_construction import LogStateConstruction, RestoreTask
 from .logstate_pool.layout import (
     LOG_STATE_GRANULARITY,
     LOG_STATE_REPLAY_WINDOW,
@@ -310,22 +310,35 @@ class _LivePage:
     checkpoint_begin: int | None = None
 
 
-@dataclass(frozen=True)
-class _ReconstructionTask:
-    output_slot        : int
-    base_slot          : int | None
-    logs               : tuple[LogStateEntry, ...]
-    source_conv_slot   : int
-    source_conv_granule: int
-    output_conv_granule: int
+@dataclass(slots=True)
+class _RequestCacheState:
+    work_slot         : int
+    work_committed_pos: int
+    request_end       : int
+    live_pages        : list[_LivePage]     = field(default_factory=list)
+    recycle_match     : RecycledMatch | None = None
+    live_page_cursor  : int                 = 0
 
-
-@dataclass(frozen=True)
-class _ConstructionChain:
-    base_slot  : int | None
-    segments   : tuple[LogStateEntry, ...]
-    outputs    : tuple[tuple[int, ...], ...]
-    materialize: bool
+    def live_page_at(self, position: int) -> _LivePage | None:
+        pages = self.live_pages
+        if not pages:
+            return None
+        cursor = min(self.live_page_cursor, len(pages) - 1)
+        page = pages[cursor]
+        if page.begin <= position < page.end:
+            return page
+        # Decode normally uses the tail, including immediately after prefill.
+        if pages[-1].begin <= position < pages[-1].end:
+            self.live_page_cursor = len(pages) - 1
+            return pages[-1]
+        if position < page.begin:
+            cursor = 0
+        while cursor < len(pages) and pages[cursor].end <= position:
+            cursor += 1
+        if cursor < len(pages) and pages[cursor].begin <= position:
+            self.live_page_cursor = cursor
+            return pages[cursor]
+        return None
 
 
 class OnlineAnalysisScheduler:
@@ -1008,6 +1021,7 @@ class LogStateCacheManager(BaseCacheManager):
             default_merge_growth_rate=default_merge_growth_rate,
             profile_enabled=self._profile_enabled,
         )
+        self._construction = LogStateConstruction(pool)
         self._allocator = pool.allocator
         self.recycle_bin = (
             LogStateRecycleBin(64 * 1024 * 1024)
@@ -1015,9 +1029,7 @@ class LogStateCacheManager(BaseCacheManager):
         )
         self.num_pages = num_pages
         self.num_states = num_states
-        self._work_slots: dict[int, int] = {}
-        self._work_committed_pos: dict[int, int] = {}
-        self._recycle_matches: dict[int, RecycledMatch] = {}
+        self._request_states: dict[int, _RequestCacheState] = {}
         self._recycled_restores: dict[int, _RecycledRestore] = {}
         self._prefill_protection_key: tuple = ()
         self._prefill_protections: tuple[_PendingProtection, ...] | None = None
@@ -1026,7 +1038,6 @@ class LogStateCacheManager(BaseCacheManager):
         self._prefix_match_revision = -1
         self._prefix_matches: OrderedDict[int, tuple] = OrderedDict()
         self._protected_prefixes: dict[int, set[int]] = {}
-        self._request_ends: dict[int, int] = {}
         dummy_kv = pool.reserve(kv=1)
         assert dummy_kv is not None
         self._dummy_kv_frame = dummy_kv[0][0]
@@ -1046,10 +1057,9 @@ class LogStateCacheManager(BaseCacheManager):
         self._pending_matches: dict[int, LogStateCacheHandle] = {}
         self._recovery_pins: dict[int, tuple[LogStateCacheHandle, tuple[int, ...]]] = {}
         self.last_plan: LogStatePlan | None = None
-        self._live_pages: dict[int, list[_LivePage]] = {}
         self._cached_page_tokens: dict[int, int] = {}
-        self._lazy_free_pages: list[torch.Tensor] | None = None
-        self._lazy_free_states: list[torch.Tensor] | None = None
+        self._lazy_free_pages: list[int] | None = None
+        self._lazy_free_states: list[int] | None = None
         self._profile_stats = {
             "admission_attempts": 0,
             "admission_rejections": 0,
@@ -1287,7 +1297,7 @@ class LogStateCacheManager(BaseCacheManager):
             (req, self._recycled_restores[req.table_idx]) for req in reqs
             if req.table_idx in self._recycled_restores
             and not self._recycled_restores[req.table_idx].prepared
-            and not self._live_pages[req.table_idx]
+            and not self._request_states[req.table_idx].live_pages
         ]
         if not restores or not pending:
             return
@@ -1466,8 +1476,9 @@ class LogStateCacheManager(BaseCacheManager):
             slots = {}
             planned = False
         else:
-            end = self._request_ends[table_idx]
-            pages = self._live_pages.get(table_idx, ())
+            state = self._request_states[table_idx]
+            end = state.request_end
+            pages = state.live_pages
             begin = pages[-1].end if pages else max(0, end - token_len)
             restore = self._recycled_restores.get(table_idx)
             plan = None if restore is None else restore.plan
@@ -1802,12 +1813,14 @@ class LogStateCacheManager(BaseCacheManager):
 
     def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None:
         assert isinstance(handle, LogStateCacheHandle)
-        assert table_idx not in self._work_slots
+        assert table_idx not in self._request_states
         self._pin_recovery(handle, self._recovery_sources(handle))
         with self.record_schedule_step("work_allocate"):
             work_slot = self._allocate_work()
-        self._work_slots[table_idx] = work_slot
-        self._work_committed_pos[table_idx] = handle.cached_len
+        self._request_states[table_idx] = _RequestCacheState(
+            work_slot=work_slot, work_committed_pos=handle.cached_len,
+            request_end=handle.request_end, recycle_match=handle.recycle_match,
+        )
         work_state_table = self.work_state_table
         assert work_state_table is not None
         with self.record_schedule_step("work_mapping"):
@@ -1823,10 +1836,6 @@ class LogStateCacheManager(BaseCacheManager):
             state_table[table_idx].fill_(-1)
         self.pending_recoveries[table_idx] = handle.recovery
         self._pending_matches[table_idx] = handle
-        self._live_pages[table_idx] = []
-        self._request_ends[table_idx] = handle.request_end
-        if handle.recycle_match is not None:
-            self._recycle_matches[table_idx] = handle.recycle_match
         if handle.restore_plan is not None:
             restore = _RecycledRestore(handle.restore_plan)
             restore.slots.update({
@@ -1862,8 +1871,9 @@ class LogStateCacheManager(BaseCacheManager):
         needed_checkpoints = 0
         fresh_work_slots: list[int] = []
         for req in reqs:
-            self._request_ends[req.table_idx] = req.max_device_len
-            pages = self._live_pages.setdefault(req.table_idx, [])
+            state = self._request_states[req.table_idx]
+            state.request_end = req.max_device_len
+            pages = state.live_pages
             begin = pages[-1].end if pages else req.cached_len
             if req.device_len > begin:
                 first_span = self.page_size - begin % self.page_size
@@ -1892,7 +1902,7 @@ class LogStateCacheManager(BaseCacheManager):
 
             recovery = self.pending_recoveries.get(req.table_idx)
             if req.cached_len == 0 and (recovery is None or recovery.position == 0):
-                fresh_work_slots.append(self._work_slots[req.table_idx])
+                fresh_work_slots.append(state.work_slot)
 
         zero_start = perf_counter_ns() if profile is not None else 0
         self.logstate_pool.zero_work_slots(fresh_work_slots)
@@ -1938,7 +1948,7 @@ class LogStateCacheManager(BaseCacheManager):
         checkpoint_offset = 0
         regions = []
         for req, begin, count, direct in allocation_info:
-            live_pages = self._live_pages[req.table_idx]
+            live_pages = self._request_states[req.table_idx].live_pages
             restore = self._recycled_restores.get(req.table_idx)
             logical_begin = begin
             for index in range(count):
@@ -2037,7 +2047,7 @@ class LogStateCacheManager(BaseCacheManager):
             "checkpoint_covered_pages": sum(
                 span * count for span, count in checkpoint_spans.items()
             ),
-            "live_log_pages": sum(map(len, self._live_pages.values())),
+            "live_log_pages": sum(len(state.live_pages) for state in self._request_states.values()),
         }
 
     def _profile_request_paths(
@@ -2047,7 +2057,8 @@ class LogStateCacheManager(BaseCacheManager):
         result = []
         for req in reqs:
             recovery = self.pending_recoveries.get(req.table_idx)
-            live = self._live_pages.get(req.table_idx, ())
+            state = self._request_states.get(req.table_idx)
+            live = () if state is None else state.live_pages
             restore = self._recycled_restores.get(req.table_idx)
             handle = req.cache_handle
             cached_entries = ()
@@ -2114,20 +2125,16 @@ class LogStateCacheManager(BaseCacheManager):
             if batch.is_decode:
                 replay_counts = []
                 for req in batch.reqs:
-                    offset = next(
-                        (req.cached_len - page.begin
-                         for page in self._live_pages[req.table_idx]
-                         if page.begin <= req.cached_len < page.end),
-                        None,
-                    )
-                    assert offset is not None, "Decode token has no LogState page"
-                    committed_pos = self._work_committed_pos[req.table_idx]
-                    count = req.cached_len - committed_pos
+                    state = self._request_states[req.table_idx]
+                    page = state.live_page_at(req.cached_len)
+                    assert page is not None, "Decode token has no LogState page"
+                    offset = req.cached_len - page.begin
+                    count = req.cached_len - state.work_committed_pos
                     assert 0 <= count < LOG_STATE_REPLAY_WINDOW
                     assert count <= offset % LOG_STATE_REPLAY_WINDOW
                     replay_counts.append(count)
                     if (offset + 1) % LOG_STATE_REPLAY_WINDOW == 0:
-                        self._work_committed_pos[req.table_idx] = req.cached_len + 1
+                        state.work_committed_pos = req.cached_len + 1
                 batch.logstate_replay_counts = replay_counts + [
                     0 for _ in range(batch.padded_size - batch.size)
                 ]
@@ -2144,7 +2151,7 @@ class LogStateCacheManager(BaseCacheManager):
         first_offsets = []
         for req in batch.reqs:
             page = next(
-                (page for page in self._live_pages.get(req.table_idx, ())
+                (page for page in self._request_states[req.table_idx].live_pages
                  if page.begin <= req.cached_len < page.end),
                 None,
             )
@@ -2167,7 +2174,7 @@ class LogStateCacheManager(BaseCacheManager):
                     for checkpoint in restore.plan.checkpoints
                     if checkpoint.begin < req.device_len and req.cached_len < checkpoint.end
                 )
-            for page in self._live_pages.get(req.table_idx, ()):
+            for page in self._request_states[req.table_idx].live_pages:
                 if (
                     page.checkpoint_begin is not None
                     and req.cached_len < page.end <= req.device_len
@@ -2179,7 +2186,7 @@ class LogStateCacheManager(BaseCacheManager):
                     ))
             row_offset += req.extend_len
         for req in batch.reqs:
-            self._work_committed_pos[req.table_idx] = req.device_len
+            self._request_states[req.table_idx].work_committed_pos = req.device_len
         first_offsets_cpu_ms = (
             (perf_counter_ns() - profile_start) / 1e6
             if self._profile_enabled else 0.0
@@ -2418,7 +2425,8 @@ class LogStateCacheManager(BaseCacheManager):
         profile_start = perf_counter_ns() if self._profile_enabled else 0
         old_handle = req.cache_handle
         assert isinstance(old_handle, LogStateCacheHandle)
-        pages = self._live_pages.get(req.table_idx, [])
+        request_state = self._request_states[req.table_idx]
+        pages = request_state.live_pages
         restore = self._recycled_restores.get(req.table_idx)
         protected_endpoints = set(old_handle.protected_endpoints)
         protected_endpoints.update(self._protected_prefixes.get(req.uid, ()))
@@ -2547,16 +2555,8 @@ class LogStateCacheManager(BaseCacheManager):
         self._release_live_pages(req.table_idx, duplicates)
         if released_kv_pages or released_state_slots:
             self._return_slots(
-                torch.tensor(
-                    released_kv_pages,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                torch.tensor(
-                    released_state_slots,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
+                released_kv_pages,
+                released_state_slots,
             )
 
         if protected_endpoints:
@@ -2619,7 +2619,7 @@ class LogStateCacheManager(BaseCacheManager):
             and req.cached_len == adopted[-1].end
         ):
             stage_start = perf_counter_ns() if self._profile_enabled else 0
-            work_slot = self._work_slots[req.table_idx]
+            work_slot = request_state.work_slot
             if self._profile_enabled:
                 work_slot_lookup_ms = (perf_counter_ns() - stage_start) / 1e6
             recovery = new_handle.recovery
@@ -2636,7 +2636,8 @@ class LogStateCacheManager(BaseCacheManager):
                 self._prefill_protection_key = ()
                 self._prefill_protections = None
             self._protected_prefixes.pop(req.uid, None)
-            recycled = self._recycle_matches.pop(req.table_idx, None)
+            recycled = request_state.recycle_match
+            request_state.recycle_match = None
             if (
                 recycled is not None
                 and insert.inserted_len >= recycled.matched_len
@@ -2656,17 +2657,12 @@ class LogStateCacheManager(BaseCacheManager):
                 ]
                 if uncommitted:
                     self._return_slots(
-                        torch.empty(0, dtype=torch.int32, device=self.device),
-                        torch.tensor(uncommitted, dtype=torch.int32, device=self.device),
+                        [], uncommitted,
                     )
-            self._request_ends.pop(req.table_idx, None)
-            self._live_pages.pop(req.table_idx, None)
             state_table[req.table_idx].fill_(-1)
-            work_slot = self._work_slots.pop(req.table_idx)
-            self._work_committed_pos.pop(req.table_idx)
+            work_slot = self._request_states.pop(req.table_idx).work_slot
             self._return_slots(
-                torch.empty(0, dtype=torch.int32, device=self.device),
-                torch.tensor([work_slot], dtype=torch.int32, device=self.device),
+                [], [work_slot],
             )
             work_state_table = self.work_state_table
             assert work_state_table is not None
@@ -2681,7 +2677,8 @@ class LogStateCacheManager(BaseCacheManager):
         else:
             req.cache_handle = new_handle
             self.lock(new_handle)
-            self._live_pages[req.table_idx] = remaining
+            request_state.live_pages = remaining
+            request_state.live_page_cursor = 0
         if self._profile_enabled:
             self._cache_req_samples.append({
                 "tag": req.profile_tag,
@@ -2698,11 +2695,13 @@ class LogStateCacheManager(BaseCacheManager):
             })
 
     def free_to_cached(self, req: Request) -> None:
-        pages = self._live_pages.get(req.table_idx, [])
+        state = self._request_states[req.table_idx]
+        pages = state.live_pages
         keep = [page for page in pages if page.begin < req.cached_len]
         release = [page for page in pages if page.begin >= req.cached_len]
         self._release_live_pages(req.table_idx, release)
-        self._live_pages[req.table_idx] = keep
+        state.live_pages = keep
+        state.live_page_cursor = 0
         req.device_len = min(req.cached_len + 1, req.max_device_len)
 
     def commit_speculative(self, req: Request, C: int, num_sampled: int) -> None:
@@ -2712,7 +2711,7 @@ class LogStateCacheManager(BaseCacheManager):
 
     def check_integrity(self) -> None:
         self.tree.check_integrity()
-        live_pages = sum(len(pages) for pages in self._live_pages.values())
+        live_pages = sum(len(state.live_pages) for state in self._request_states.values())
         if live_pages != 0:
             raise RuntimeError(
                 f"LogState cache has {live_pages} request-owned pages while idle."
@@ -2724,22 +2723,20 @@ class LogStateCacheManager(BaseCacheManager):
         tree_slots = {int(entry.slot) for entry in self.tree.iter_entries()}
         work_state_table = self.work_state_table
         assert work_state_table is not None
-        work_slots = set(self._work_slots.values()) | {self._dummy_work_slot}
-        if self._work_committed_pos.keys() != self._work_slots.keys():
-            raise RuntimeError("LogState work cursor ownership disagrees with work slots.")
-        if len(work_slots) != len(self._work_slots) + 1:
+        work_slots = {state.work_slot for state in self._request_states.values()} | {self._dummy_work_slot}
+        if len(work_slots) != len(self._request_states) + 1:
             raise RuntimeError("LogState work-state table contains duplicate slots.")
-        for row, slot in self._work_slots.items():
-            if int(work_state_table[row, 0]) != slot:
+        for row, state in self._request_states.items():
+            if int(work_state_table[row, 0]) != state.work_slot:
                 raise RuntimeError("LogState work-state table disagrees with allocations.")
         kv_pages = {page // self.page_size for page in self._cached_page_tokens}
         kv_pages.update(
             page.kv_page // self.page_size
-            for pages in self._live_pages.values() for page in pages
+            for state in self._request_states.values() for page in state.live_pages
         )
         expected_kv = kv_pages | {self._dummy_kv_frame}
         expected_state = tree_slots | {self._dummy_log_slot} | {
-            page.state_slot for pages in self._live_pages.values() for page in pages
+            page.state_slot for state in self._request_states.values() for page in state.live_pages
             if page.state_slot is not None
         } | work_slots
         self.logstate_pool.poll_reclamation()
@@ -2773,14 +2770,8 @@ class LogStateCacheManager(BaseCacheManager):
             lazy_states = self._lazy_free_states
             self._lazy_free_pages = None
             self._lazy_free_states = None
-            if lazy_pages:
-                self._return_slots(
-                    torch.cat(lazy_pages), torch.empty(0, dtype=torch.int32)
-                )
-            if lazy_states:
-                self._return_slots(
-                    torch.empty(0, dtype=torch.int32), torch.cat(lazy_states)
-                )
+            if lazy_pages or lazy_states:
+                self._return_slots(lazy_pages, lazy_states)
 
     def _allocate(
         self,
@@ -2997,7 +2988,7 @@ class LogStateCacheManager(BaseCacheManager):
     def _make_restore_tasks(
         self,
         batch: Batch,
-    ) -> list[_ReconstructionTask]:
+    ) -> list[RestoreTask]:
         work_state_table = self.work_state_table
         assert work_state_table is not None
         assert work_state_table.shape[1] == 1
@@ -3010,8 +3001,8 @@ class LogStateCacheManager(BaseCacheManager):
             assert recovery.conv_granule is not None
             assert not recovery.logs or recovery.logs[-1].end == recovery.position
             tasks.append(
-                _ReconstructionTask(
-                    output_slot=self._work_slots[req.table_idx],
+                RestoreTask(
+                    output_slot=self._request_states[req.table_idx].work_slot,
                     base_slot=recovery.base_checkpoint_slot,
                     logs=recovery.logs,
                     source_conv_slot=recovery.conv_slot,
@@ -3021,170 +3012,8 @@ class LogStateCacheManager(BaseCacheManager):
             )
         return tasks
 
-    def _construct(
-        self,
-        restores   : Sequence[_ReconstructionTask],
-        materialize: Sequence[PageMaterialize],
-        *, record_cuda: bool = True,
-    ) -> dict:
-        submit_timing_ms: dict[str, float] | None = (
-            {} if self._profile_enabled else None
-        )
-        step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-        events = None
-        event_setup_cpu_ms = 0.0
-        if self._profile_enabled and record_cuda and (restores or materialize):
-            event_setup_start = perf_counter_ns()
-            events = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            events[0].record()
-            event_setup_cpu_ms = (
-                perf_counter_ns() - event_setup_start
-            ) / 1e6
-        conv_restores = list(restores)
-        direct = [task for task in restores if not task.logs]
-        if direct:
-            pool = self.logstate_pool
-            assert all(task.base_slot is not None for task in direct)
-            from logssms.kernel.linear_attention.logstate import copy_states
-
-            copy_states(pool, [task.base_slot for task in direct],
-                               [task.output_slot for task in direct])
-        if submit_timing_ms is not None:
-            submit_timing_ms["direct_state_copy_ms"] = (
-                perf_counter_ns() - step_start
-            ) / 1e6
-            step_start = perf_counter_ns()
-        restores = [task for task in restores if task.logs]
-        chains, waves = self._construction_plan(restores, materialize)
-        if submit_timing_ms is not None:
-            submit_timing_ms["chain_planning_ms"] = (
-                perf_counter_ns() - step_start
-            ) / 1e6
-        device = self.device
-        pool = self.logstate_pool
-
-        step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-
-
-        conv_vectors = make_device_vectors([
-            [task.source_conv_slot for task in conv_restores],
-            [task.source_conv_granule for task in conv_restores],
-            [task.output_slot for task in conv_restores],
-            [task.output_conv_granule for task in conv_restores],
-        ], device) if conv_restores else ()
-        if submit_timing_ms is not None:
-            submit_timing_ms["conv_metadata_submit_ms"] = (
-                perf_counter_ns() - step_start
-            ) / 1e6
-
-        if chains:
-            segments = [entry for wave in waves for chain in wave for entry in chain.segments]
-            outputs = [
-                slot
-                for wave in waves
-                for chain in wave
-                for values in chain.outputs
-                for slot in values
-            ]
-            construction = {
-                "chains": len(chains),
-                "waves": len(waves),
-                "segments": len(segments),
-                "outputs": len(outputs),
-                "direct_checkpoint_copies": len(direct),
-                "cuda_ms": None,
-            }
-            restore_submit_ms = 0.0
-            materialize_submit_ms = 0.0
-            for wave in waves:
-                restore_chains = [
-                    chain for chain in wave
-                    if not chain.materialize
-                ]
-                material_chains = [chain for chain in wave if chain.materialize]
-                if restore_chains:
-                    step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-                    pool.kernels.restore(
-                        pool,
-                        [
-                            (
-                                chain.base_slot,
-                                [
-                                    (
-                                        entry.slot,
-                                        entry.begin - entry.physical_begin,
-                                        entry.end - entry.physical_begin,
-                                    )
-                                    for entry in chain.segments
-                                ],
-                                chain.outputs[-1][0],
-                            )
-                            for chain in restore_chains
-                        ],
-                    )
-                    if submit_timing_ms is not None:
-                        restore_submit_ms += (perf_counter_ns() - step_start) / 1e6
-                if material_chains:
-                    step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-                    pool.kernels.construct(
-                        pool,
-                        [
-                            (
-                                chain.base_slot,
-                                [
-                                    (
-                                        entry.slot,
-                                        entry.begin - entry.physical_begin,
-                                        entry.end - entry.physical_begin,
-                                    )
-                                    for entry in chain.segments
-                                ],
-                                chain.outputs,
-                            )
-                            for chain in material_chains
-                        ],
-                    )
-                    if submit_timing_ms is not None:
-                        materialize_submit_ms += (perf_counter_ns() - step_start) / 1e6
-            if submit_timing_ms is not None:
-                submit_timing_ms["restore_submit_ms"] = restore_submit_ms
-                submit_timing_ms["materialize_submit_ms"] = materialize_submit_ms
-        else:
-            construction = {
-                "chains": 0,
-                "waves": 0,
-                "segments": 0,
-                "outputs": 0,
-                "direct_checkpoint_copies": len(direct),
-                "cuda_ms": 0.0,
-            }
-
-        step_start = perf_counter_ns() if submit_timing_ms is not None else 0
-        if conv_restores:
-            pool.kernels.copy_conv(pool, *conv_vectors)
-        if submit_timing_ms is not None:
-            submit_timing_ms["conv_restore_submit_ms"] = (
-                perf_counter_ns() - step_start
-            ) / 1e6
-        if events is not None:
-            event_end_setup_start = perf_counter_ns()
-            events[1].record()
-            self._profile_cuda_events.append(
-                (construction, events[0], events[1])
-            )
-            event_setup_cpu_ms += (
-                perf_counter_ns() - event_end_setup_start
-            ) / 1e6
-        construction["event_setup_cpu_ms"] = event_setup_cpu_ms
-        if submit_timing_ms is not None:
-            construction["submit_timing_ms"] = submit_timing_ms
-        return construction
-
     def _construct_checkpoints(
-        self, batch: Batch, tasks: Sequence[_ReconstructionTask], plan: LogStatePlan,
+        self, batch: Batch, tasks: Sequence[RestoreTask], plan: LogStatePlan,
     ) -> tuple[dict, tuple[int, int, dict[str, int]]]:
         pool = self.logstate_pool
         released = released_frames = merged = segments = materialized = 0
@@ -3268,11 +3097,14 @@ class LogStateCacheManager(BaseCacheManager):
                 continue
             recovery = self.tree.recovery_at(handle.node, original.position)
             assert recovery.position == original.position
-            refreshed.append(_ReconstructionTask(
-                self._work_slots[req.table_idx], recovery.base_checkpoint_slot, recovery.logs,
+            refreshed.append(RestoreTask(
+                self._request_states[req.table_idx].work_slot, recovery.base_checkpoint_slot, recovery.logs,
                 recovery.conv_slot, recovery.conv_granule, 0,
             ))
-        construction = self._construct(refreshed, (), record_cuda=False)
+        construction = self._construction.restore(
+            refreshed, profile_enabled=self._profile_enabled,
+            pending_cuda_events=self._profile_cuda_events, record_cuda=False,
+        )
         construction["chains"] += materialized
         construction["segments"] += segments
         construction["outputs"] += materialized
@@ -3284,65 +3116,6 @@ class LogStateCacheManager(BaseCacheManager):
             construction["cuda_ms"] = None
             self._profile_cuda_events.append((construction, *events))
         return construction, (released, released_frames, dict(skips))
-
-    @staticmethod
-    def _construction_plan(
-        restores   : Sequence[_ReconstructionTask],
-        materialize: Sequence[PageMaterialize],
-    ) -> tuple[tuple[_ConstructionChain, ...], tuple[tuple[_ConstructionChain, ...], ...]]:
-        from logssms.kernel import logstate as planning
-
-        if not restores and not materialize:
-            return (), ()
-        entries: list[LogStateEntry] = []
-        indices: dict[int, int] = {}
-
-        def entry_indices(logs):
-            result = []
-            for entry in logs:
-                key = id(entry)
-                index = indices.get(key)
-                if index is None:
-                    index = len(entries)
-                    entries.append(entry)
-                    indices[key] = index
-                result.append(index)
-            return result
-
-        restore_rows = [
-            [-1 if task.base_slot is None else task.base_slot, task.output_slot,
-             *entry_indices(task.logs)] for task in restores
-        ]
-        material_rows = [
-            [plan.log_slot, plan.begin, plan.end,
-             -1 if plan.base_checkpoint_slot is None else plan.base_checkpoint_slot,
-             *entry_indices(plan.replay_logs)] for plan in materialize
-        ]
-        rows = planning.construction_plan(
-            [(entry.slot, entry.begin, entry.end, entry.physical_begin) for entry in entries],
-            restore_rows, material_rows,
-        )
-        chains = []
-        waves = []
-        for row in rows:
-            wave, base, is_materialize = row[:3]
-            segments, outputs = [], []
-            cursor = 3
-            while cursor < len(row):
-                index, begin, end, count = row[cursor:cursor + 4]
-                entry = entries[index]
-                segments.append(entry if begin == entry.begin and end == entry.end
-                                else entry.slice(begin, end))
-                outputs.append(tuple(row[cursor + 4:cursor + 4 + count]))
-                cursor += 4 + count
-            chain = _ConstructionChain(
-                None if base < 0 else base, tuple(segments), tuple(outputs), bool(is_materialize)
-            )
-            chains.append(chain)
-            while len(waves) <= wave:
-                waves.append([])
-            waves[wave].append(chain)
-        return tuple(chains), tuple(tuple(wave) for wave in waves)
 
     @staticmethod
     def _merge_batch_outcome(plan: LogStatePlan, released: int) -> str:
@@ -3465,33 +3238,25 @@ class LogStateCacheManager(BaseCacheManager):
                 restore.slots.pop(page.end, None)
             released_states.append(page.state_slot)
         self._return_slots(
-            torch.tensor(
-                [page.kv_page for page in pages],
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            torch.tensor(
-                released_states,
-                dtype=torch.int32,
-                device=self.device,
-            ),
+            [page.kv_page for page in pages],
+            released_states,
         )
 
     def _return_slots(
         self,
-        pages : torch.Tensor,
-        states: torch.Tensor,
+        pages : Sequence[int],
+        states: Sequence[int],
     ) -> None:
         if self._lazy_free_pages is None:
-            page_frames = [page // self.page_size for page in pages.tolist()]
+            page_frames = [page // self.page_size for page in pages]
             self.logstate_pool.release_kv(page_frames)
-            self.logstate_pool.release_slots(states.tolist())
+            self.logstate_pool.release_slots(states)
         else:
             assert self._lazy_free_states is not None
-            if len(pages) > 0:
-                self._lazy_free_pages.append(pages)
-            if len(states) > 0:
-                self._lazy_free_states.append(states)
+            # Snapshot the IDs, but leave reclamation and event waits to the
+            # pool after the region exits, including exceptional exits.
+            self._lazy_free_pages.extend(pages)
+            self._lazy_free_states.extend(states)
 
     def _release_cached_kv(self, page_counts: Counter[int]) -> None:
         released = []

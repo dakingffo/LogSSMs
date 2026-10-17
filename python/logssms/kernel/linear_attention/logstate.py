@@ -31,7 +31,6 @@ def _load_construction_module(page_size: int, head_k_dim: int, head_v_dim: int, 
         cuda_files=["logstate_construction.cu"],
         cuda_wrappers=[
             ("restore", f"LogStateConstructionKernel<{args}>::restore"),
-            ("construct", f"LogStateConstructionKernel<{args}>::construct"),
             ("copy", f"LogStateConstructionKernel<{args}>::copy"),
         ],
     )
@@ -85,55 +84,6 @@ def restore_log_state_chains(
         *vectors,
         *_construction_dims(pool),
     )
-
-
-def construct_log_state_chains(
-    pool  : MHALogStatePool,
-    chains: Sequence[
-        tuple[int | None, Sequence[tuple[int, int, int]], Sequence[Sequence[int]]]
-    ],
-    *,
-    max_tasks: int | None = None,
-) -> None:
-    if not chains:
-        return
-    assert all(
-        pool.allocator.slot(slot).kind != "log"
-        for _base, _logs, outputs in chains for slots in outputs for slot in slots
-    ), "Checkpoint output required"
-    if max_tasks is None:
-        max_tasks = torch.cuda.get_device_properties(pool.device).multi_processor_count
-    assert max_tasks > 0
-    module = _load_construction_module(
-        pool.page_size, pool.layout.head_k_dim, pool.layout.head_v_dim, pool.layout.granularity
-    )
-    for task_begin in range(0, len(chains), max_tasks):
-        group = chains[task_begin:task_begin + max_tasks]
-        segments = []
-        output_slots = []
-        task_offsets = [0]
-        output_offsets = [0]
-        for _base, logs, outputs in group:
-            assert len(logs) == len(outputs)
-            segments.extend(logs)
-            task_offsets.append(len(segments))
-            for slots in outputs:
-                output_slots.extend(slots)
-                output_offsets.append(len(output_slots))
-        vectors = make_device_vectors([
-            [-1 if base is None else base for base, _logs, _outputs in group],
-            task_offsets,
-            [slot for slot, _begin, _end in segments],
-            [begin for _slot, begin, _end in segments],
-            [end for _slot, _begin, end in segments],
-            output_offsets,
-            output_slots,
-        ], pool.device)
-        call_cuda_ffi(module.construct,
-            *_construction_args(pool),
-            *vectors,
-            *_construction_dims(pool),
-        )
 
 
 def store_log_states(

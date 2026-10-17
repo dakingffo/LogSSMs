@@ -7,7 +7,7 @@ from enum import Enum
 from functools import cached_property
 from heapq import heappop, heappush
 from itertools import count
-from typing import Any, Callable, Iterable, Iterator, NamedTuple, TypeAlias, TYPE_CHECKING
+from typing import Any, Callable, Iterable, NamedTuple, TypeAlias, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from logssms.cache.logstate import RecycledMatch, RecycledRestorePlan
@@ -633,33 +633,6 @@ class LogRadixTree(BasePrefixCache):
         for entry in self._slot_entries[slot]:
             self.protect(self.entry_owner(entry), protected)
 
-    def evict(
-        self,
-        size         : int,
-        evicted_nodes: list[tuple[int, int, int]] | None = None,
-    ) -> LogRadixEviction:
-        if size == 0:
-            return LogRadixEviction(self.empty_tensor, ())
-        assert size <= self.evictable_size, (
-            f"Can't evict {size}, only {self.evictable_size}."
-        )
-        selected = []
-        evicted_size = 0
-        for node in self.iter_evict_candidates():
-            selected.append(node)
-            evicted_size += node.length
-            if evicted_size >= size:
-                break
-        assert evicted_size >= size
-        return self.evict_nodes(selected, evicted_nodes)
-
-    def iter_evict_candidates(self) -> Iterator[LogRadixTreeNode]:
-        from logssms.kernel import logstate as planning
-
-        nodes, rows = self.eviction_snapshot()
-        for index in planning.eviction_candidates(rows):
-            yield nodes[index]
-
     def eviction_snapshot(self) -> tuple[list[LogRadixTreeNode], list[tuple[int, ...]]]:
         nodes = self._iter_nodes()
         rows = [(
@@ -713,27 +686,6 @@ class LogRadixTree(BasePrefixCache):
 
     def slot_entry_count(self, slot: int) -> int:
         return len(self._slot_entries[slot])
-
-    def checkpoint_eviction_pairs(self) -> list[tuple[int, int, int, int]]:
-        pairs = []
-        stack = [(self.root, None)]
-        while stack:
-            node, previous = stack.pop()
-            for entry in node.entries:
-                if entry.kind is LogStateKind.LOG or self.slot_is_fragmented(entry.slot):
-                    previous = None
-                    continue
-                if (previous is not None and previous.end == entry.begin
-                    and previous.slot not in self._recovery_slot_refs
-                    and entry.slot not in self._recovery_slot_refs
-                    and not self.entry_owner(previous).is_protected):
-                    pairs.append((previous.slot, entry.slot, previous.end,
-                                  self._checkpoint_timestamps[previous.slot]))
-                previous = entry
-            if node.is_protected or len(node.children) != 1:
-                previous = None
-            stack.extend((child, previous) for child in node.children.values())
-        return pairs
 
     def checkpoint_eviction_actions(
         self, nodes: list[LogRadixTreeNode],

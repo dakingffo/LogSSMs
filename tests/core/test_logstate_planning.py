@@ -137,7 +137,6 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         nodes = [(i, parents[i], locked[i], 0, rng.randrange(100))
                  for i in range(count)]
         order = eviction_oracle(nodes)
-        assert planning.eviction_candidates(nodes) == order
 
         page_refs = [[rng.randrange(10) for _ in range(rng.randrange(4))]
                      for _ in nodes]
@@ -189,12 +188,29 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         ) == expected
 
 
-@pytest.mark.parametrize("checkpoint", [False, True])
-def test_eviction_globally_orders_cold_nodes_without_chain_rotation(checkpoint):
-    nodes = eviction_chains(6, 3, checkpoint)
-    assert planning.eviction_candidates(nodes) == [
+def assert_log_capacity_order(nodes, expected):
+    """Each Log owns one frame; pressure must reclaim exactly the coldest safe prefix."""
+    refs = [[uuid] if parent >= 0 else [] for uuid, parent, *_ in nodes]
+    slots = [(slot, 1, 1, -1, -1) for row in refs for slot in row]
+    for needed in range(1, len(expected) + 2):
+        result = planning.plan_eviction(
+            nodes, [[] for _ in nodes], refs, slots, [],
+            [0, 0, 1, 0, 1, 1, needed, 0, 0, 1, 0], (),
+        )
+        if needed > len(expected):
+            assert result == []
+        else:
+            selected, pages, released, compressed = result
+            assert [nodes[index][0] for index in selected] == expected[:needed]
+            assert released == sorted(expected[:needed])
+            assert pages == [] and compressed == []
+
+
+def test_log_pressure_globally_orders_cold_nodes_without_chain_rotation():
+    nodes = eviction_chains(6, 3)
+    assert_log_capacity_order(nodes, [
         3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10, 15, 14, 13, 18, 17, 16,
-    ]
+    ])
 
 
 def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
@@ -202,11 +218,11 @@ def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
     uuid, parent, locked, kind, _ = nodes[1]
     nodes[1] = (uuid, parent, locked, kind, 999)
     expected = [2, 4, 3, 6, 5, 8, 7, 10, 9, 1]
-    assert planning.eviction_candidates(nodes) == expected
+    assert_log_capacity_order(nodes, expected)
     # Input row order is not a chain identity or priority.
     rng = random.Random(12)
     rng.shuffle(nodes)
-    assert [nodes[i][0] for i in planning.eviction_candidates(nodes)] == expected
+    assert_log_capacity_order(nodes, expected)
 
 
 def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_locks():
@@ -214,7 +230,7 @@ def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_lock
              (2, 1, 0, 0, 1), (3, 2, 0, 0, 1),
              (4, 1, 0, 0, 2), (5, 4, 0, 0, 2),
              (6, 0, 1, 0, 0), (7, 6, 0, 0, 3)]
-    assert planning.eviction_candidates(nodes) == [3, 2, 5, 4, 7, 1]
+    assert_log_capacity_order(nodes, [3, 2, 5, 4, 7, 1])
 
 
 def test_small_capacity_requests_select_the_globally_coldest_leaf():
@@ -288,8 +304,3 @@ def test_native_protections_deduplicate_forced_and_batch_branches():
     ]
     with pytest.raises(RuntimeError, match="Invalid forced branch"):
         planning.branch_protections(inputs, [(0, 33)], 32)
-
-
-def test_native_construction_rejects_invalid_entry_index():
-    with pytest.raises(RuntimeError, match="entry index"):
-        planning.construction_plan([(4, 0, 64, 0)], [(0, 10, 2)], [])

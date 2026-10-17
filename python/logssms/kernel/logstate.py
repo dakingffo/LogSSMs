@@ -54,16 +54,6 @@ def branch_protections(inputs: Sequence[torch.Tensor], forced: Rows,
     return _unpack(_load_logstate_module().branch_protections(inputs, _pack(forced), granularity))
 
 
-def construction_plan(entries: Rows, restores: Rows, materialize: Rows) -> list[list[int]]:
-    return _unpack(_load_logstate_module().construction_plan(
-        _pack(entries), _pack(restores), _pack(materialize),
-    ))
-
-
-def eviction_candidates(nodes: Rows) -> list[int]:
-    return _unpack(_load_logstate_module().eviction_candidates(_pack(nodes)))[0]
-
-
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
                   occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]]:
     groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
