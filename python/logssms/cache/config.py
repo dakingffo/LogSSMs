@@ -10,6 +10,10 @@ LOG_STATE_GRANULARITIES = (16, 32, 64)
 
 class BaseCacheConfig:
     @property
+    def prefill_alignment(self) -> int:
+        return 64
+
+    @property
     def page_size(self) -> int:
         raise NotImplementedError
 
@@ -45,6 +49,10 @@ class LogStateCacheConfig(BaseCacheConfig):
             raise ValueError("Maximum merge intensity must be at least 2.")
         if self.default_merge_growth_rate < 1:
             raise ValueError("Default merge growth rate must be at least one.")
+
+    @property
+    def prefill_alignment(self) -> int:
+        return self.granularity
 
     @property
     def page_size(self) -> int:

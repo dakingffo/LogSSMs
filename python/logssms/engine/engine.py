@@ -25,8 +25,7 @@ from logssms.utils import (
 
 from .config import EngineConfig
 from .decode_graph import DecodeGraphRunner, get_free_memory, mem_GB
-from .prefill_graph import PrefillGraphRunner
-from .mixed_graph import MixedGraphRunner
+from .piecewise_graph import PiecewiseGraphRunner
 from .profile import EngineProfiler
 from .sample import BatchSamplingArgs, Sampler
 
@@ -159,6 +158,13 @@ class Engine:
                     config.cache_type,
                     recurrent_type=config.model_config.make_linear_cache_spec(config.tp_info.size).recurrent_type,
                     enable_eager_state=eager_state,
+                    tile_min_batch_size=(
+                        max(1, config.max_running_req
+                            - config.mixed_prefill_tokens // config.cache_config.granularity)
+                        if config.scheduling_policy == "mixed"
+                        and isinstance(config.cache_config, LogStateCacheConfig)
+                        else 32
+                    ),
                 )
             )
         if config.model_config.is_moe:
@@ -183,6 +189,8 @@ class Engine:
         )
 
         speculative_skip_graphs = config.enable_specualtive_decoding
+        if config.scheduling_policy == "mixed" and config.max_running_req > 1:
+            self.attn_backend.warmup_mixed(self.dummy_req)
         self.decode_graph_runner = DecodeGraphRunner(
             stream=self.stream,
             device=self.device,
@@ -198,13 +206,21 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
-        self.mixed_graph_runner = MixedGraphRunner(self)
-        self.prefill_graph_runner = self.ctx.prefill_graph_runner = (
-            PrefillGraphRunner(
-                self.model, config.max_forward_len, self.stream
+        piecewise_tokens = config.max_forward_len
+        if config.scheduling_policy == "mixed":
+            piecewise_tokens = max(
+                piecewise_tokens, config.mixed_prefill_tokens + config.max_running_req - 1,
+            )
+        self.piecewise_graph_runner = self.ctx.piecewise_graph_runner = (
+            PiecewiseGraphRunner(
+                self.model, piecewise_tokens, self.stream,
             )
             if self.decode_graph_runner.max_graph_bs > 0 else None
         )
+        if config.scheduling_policy == "mixed":
+            from .warmup import warmup_mixed_linear
+
+            warmup_mixed_linear(self)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         torch.distributed.init_process_group(
@@ -257,7 +273,10 @@ class Engine:
         if batch.is_mixed:
             if self.profiler.enabled:
                 with self.profiler.record_batch(
-                    batch, "prepare", graph_used=self.mixed_graph_runner.can_use_cuda_graph(batch),
+                    batch, "prepare", graph_used=(
+                        self.piecewise_graph_runner is not None
+                        and self.piecewise_graph_runner.can_use_cuda_graph(batch)
+                    ),
                 ):
                     return self._prepare_mixed_batch(batch, cache_manager)
             return self._prepare_mixed_batch(batch, cache_manager)
@@ -279,18 +298,14 @@ class Engine:
         )
 
     def _prepare_mixed_batch(self, batch: Batch, cache_manager) -> ForwardInput:
-        from logssms.layers.linear_attention_backend.mixed import prepare_mixed_linear_metadata
-
-        assert len(batch.prefill_reqs) == 1 and batch.decode_reqs
-        capacity = self.config.mixed_prefill_tokens
-        size = 1 << (batch.size - 1).bit_length()
+        assert batch.prefill_reqs and batch.decode_reqs
+        assert batch.prefill_tokens <= self.config.mixed_prefill_tokens
         prefill = Batch(batch.prefill_reqs, "prefill")
         decode = Batch(batch.decode_reqs, "decode")
         prefill.padded_reqs = prefill.reqs
-        decode.padded_reqs = decode.reqs + [self.dummy_req] * (size - batch.size)
-        batch.padded_reqs = prefill.reqs + decode.padded_reqs
+        decode.padded_reqs = decode.reqs
+        batch.padded_reqs = batch.reqs
         batch.mixed_parts = prefill, decode
-        batch.prefill_token_capacity = capacity
         stage = self.profiler.record_stage if self.profiler.enabled else lambda _: nullcontext()
         with stage("allocate"):
             cache_manager.allocate(prefill.reqs, phase="prefill")
@@ -299,46 +314,46 @@ class Engine:
             cache_manager.prepare_batch(decode)
             cache_manager.prepare_batch(prefill)
             if decode.logstate_replay_counts is not None:
-                batch.logstate_replay_counts = [0, *decode.logstate_replay_counts]
+                batch.logstate_replay_counts = [0] * prefill.size + decode.logstate_replay_counts
         with stage("positions_mappings"):
-            prefill_mapping, prefill_write = self._prepare_indices(prefill)
-            decode_mapping, decode_write = self._prepare_indices(decode)
+            from logssms.kernel.metadata import make_batch_mapping
+            from logssms.utils.batch import BatchIndices
+
+            page_size = getattr(self.ctx.kv_cache, "kv_page_size", 1)
+            packet, p_packet, d_packet = BatchIndices.make_mixed(batch, self.device, page_size)
+            batch.prepared_indices = packet
+            batch.positions, mapping, batch.out_loc = make_batch_mapping(
+                packet, self.page_table, decode=self.attn_backend.uses_paged_indices,
+            )
+            packet.token_table_ids = mapping[0]
+            token_begin = page_begin = 0
+            for part, indices in ((prefill, p_packet), (decode, d_packet)):
+                token_end = token_begin + indices.num_tokens
+                page_end = page_begin + indices.num_pages
+                part.prepared_indices = indices
+                part.positions = batch.positions[token_begin:token_end]
+                part.out_loc = batch.out_loc[token_begin:token_end]
+                indices.token_table_ids = mapping[0][token_begin:token_end]
+                if packet.page_indices is not None:
+                    indices.page_indices = packet.page_indices[page_begin:page_end]
+                token_begin, page_begin = token_end, page_end
+            writes = packet.write_tuple
         with stage("attention_metadata"):
-            for part in (prefill, decode):
-                self.attn_backend.prepare_metadata(part)
-            self.attn_backend.prepare_mixed_metadata(batch.mixed_parts)
+            self.attn_backend.prepare_mixed_metadata(batch)
         with stage("linear_metadata"):
             if self.config.model_config.is_hybrid:
                 for part in (prefill, decode):
                     self.linear_attn_backend.prepare_metadata(part)
-                prepare_mixed_linear_metadata(
-                    self.linear_attn_backend, prefill, decode, capacity,
-                )
-
-        length = prefill.reqs[0].extend_len
-        assert 0 < length <= capacity
-        padding = capacity - length
-        batch.positions = torch.cat((
-            prefill.positions, prefill.positions.new_zeros(padding), decode.positions,
-        ))
-        batch.out_loc = torch.cat((
-            prefill.out_loc, prefill.out_loc.new_full((padding,), -1), decode.out_loc,
-        ))
-        mapping = tuple(torch.cat((
-            p, p.new_full((padding,), self.dummy_req.table_idx if index == 0 else 0), d,
-        )) for index, (p, d) in enumerate(zip(prefill_mapping, decode_mapping)))
-        writes = tuple(torch.cat((p, d)) for p, d in zip(prefill_write, decode_write))
-        batch.sample_indices = torch.tensor(
-            [length - 1, *range(capacity, capacity + size - 1)],
-            dtype=torch.int64, device=self.device,
-        )
-        params = [req.sampling_params for req in batch.reqs if not isinstance(req, ChunkedRequest)]
-        return ForwardInput(batch, self.sampler.prepare_params(params), mapping, writes)
+        with stage("sampler_prepare"):
+            params = [req.sampling_params for req in batch.reqs if not isinstance(req, ChunkedRequest)]
+            batch.sample_indices, batch.sample_req_indices = packet.sample_tuple
+            sample_args = self.sampler.prepare_params(params)
+        return ForwardInput(batch, sample_args, mapping, writes)
 
     def _prepare_batch_profiled(self, batch: Batch, cache_manager) -> ForwardInput:
         profiler = self.profiler
         graph_used = self.decode_graph_runner.can_use_cuda_graph(batch)
-        prefill_runner = self.prefill_graph_runner
+        prefill_runner = self.piecewise_graph_runner
         graph_used = graph_used or (
             prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
         )
@@ -383,9 +398,7 @@ class Engine:
         if self.profiler.enabled:
             return self._forward_batch_profiled(batch, args)
         with self.ctx.forward_batch(batch):
-            if batch.is_mixed and self.mixed_graph_runner.can_use_cuda_graph(batch):
-                logits = self.mixed_graph_runner.replay(batch)
-            elif self.decode_graph_runner.can_use_cuda_graph(batch):
+            if self.decode_graph_runner.can_use_cuda_graph(batch):
                 logits = self.decode_graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -399,21 +412,25 @@ class Engine:
     def _sample_batch(self, logits: torch.Tensor, batch: Batch, args: BatchSamplingArgs) -> torch.Tensor:
         if batch.is_verify:
             return self.sampler.reject_sample(logits, batch).to(torch.int32)
-        skip = int(batch.is_mixed and isinstance(batch.reqs[0], ChunkedRequest))
-        tokens = self.sampler.sample(logits[skip:batch.size], args).to(torch.int32)
-        if skip:
-            tokens = torch.cat((tokens.new_full((1,), -1), tokens))
+        tokens = self.sampler.sample(logits[:batch.size], args).to(torch.int32)
+        if batch.is_mixed:
+            assert batch.sample_req_indices is not None
+            if len(batch.sample_req_indices) != batch.size:
+                output = tokens.new_full((batch.size,), -1)
+                output.scatter_(0, batch.sample_req_indices, tokens)
+                return output
         return tokens
 
     def _forward_batch_profiled(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         profiler = self.profiler
         decode_graph = self.decode_graph_runner.can_use_cuda_graph(batch)
-        mixed_graph = batch.is_mixed and self.mixed_graph_runner.can_use_cuda_graph(batch)
-        prefill_runner = self.prefill_graph_runner
-        prefill_graph = prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
-        graph_used = decode_graph or prefill_graph or mixed_graph
+        prefill_runner = self.piecewise_graph_runner
+        piecewise_graph = prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
+        graph_used = decode_graph or piecewise_graph
         with profiler.record_batch(batch, "forward", graph_used=graph_used) as sample:
-            sample["graph_kind"] = "mixed" if mixed_graph else "decode" if decode_graph else "piecewise_prefill" if prefill_graph else None
+            sample["graph_kind"] = "decode" if decode_graph else "piecewise" if piecewise_graph else None
+            if piecewise_graph:
+                sample["piece_bucket_tokens"] = prefill_runner.token_bucket(len(batch.input_ids))
             if self.config.model_config.is_hybrid:
                 sample["linear_backend"] = type(self.linear_attn_backend).__name__
                 if hasattr(self.linear_attn_backend, "enable_eager_state"):
@@ -427,19 +444,19 @@ class Engine:
                     else list(counts[:batch.size])
                 )
             with self.ctx.forward_batch(batch):
-                if mixed_graph:
-                    with profiler.record_stage("mixed_graph"):
-                        logits = self.mixed_graph_runner.replay(batch)
-                elif decode_graph:
+                if decode_graph:
                     logits = self.decode_graph_runner.replay(batch, profiler=profiler)
                 else:
-                    replays = prefill_runner.replays if prefill_graph else 0
-                    padded = prefill_runner.padded_tokens if prefill_graph else 0
+                    replays = prefill_runner.replays if piecewise_graph else 0
+                    padded = prefill_runner.padded_tokens if piecewise_graph else 0
                     with profiler.record_stage("model"):
                         logits = self.model.forward()
-                    if prefill_graph:
-                        sample["prefill_piece_replays"] = prefill_runner.replays - replays
-                        sample["prefill_piece_padding"] = prefill_runner.padded_tokens - padded
+                    if piecewise_graph:
+                        sample["piece_replays"] = prefill_runner.replays - replays
+                        sample["piece_padding"] = prefill_runner.padded_tokens - padded
+                    plan_cpu_ms = getattr(batch.attn_metadata, "plan_cpu_ms", None)
+                    if plan_cpu_ms is not None:
+                        sample["attention_plan_cpu_ms"] = plan_cpu_ms
             with profiler.record_stage("sampling"):
                 next_tokens_gpu = self._sample_batch(logits, batch, args)
             with profiler.record_stage("output_copy"):
@@ -449,9 +466,8 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
-        self.mixed_graph_runner.destroy_cuda_graphs()
-        if self.prefill_graph_runner is not None:
-            self.prefill_graph_runner.destroy_cuda_graphs()
+        if self.piecewise_graph_runner is not None:
+            self.piecewise_graph_runner.destroy_cuda_graphs()
         self.decode_graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -482,8 +498,6 @@ class Engine:
             override("cache_config", replace(config.cache_config, page_size=value))
 
         if config.scheduling_policy == "mixed":
-            if config.mixed_prefill_tokens > config.max_seq_len:
-                raise ValueError("Mixed prefill budget exceeds maximum sequence length")
             if config.attention_backend not in ("auto", "fi"):
                 raise ValueError("Mixed scheduling currently requires FlashInfer attention")
             override("attention_backend", "fi")

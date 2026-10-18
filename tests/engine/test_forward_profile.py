@@ -30,6 +30,7 @@ def _batch(phase="decode"):
     batch = Batch([req], phase)
     batch.padded_reqs = [req, req]
     batch.logstate_replay_counts = [3, 0]
+    batch.attn_metadata = None
     return batch
 
 
@@ -91,11 +92,12 @@ def test_piecewise_prefill_profile_does_not_use_decode_runner(monkeypatch, profi
     engine.config = SimpleNamespace(
         enable_specualtive_decoding=False, model_config=SimpleNamespace(is_hybrid=False),
     )
-    runner = SimpleNamespace(can_use_cuda_graph=lambda batch: True, replays=0, padded_tokens=0)
+    runner = SimpleNamespace(can_use_cuda_graph=lambda batch: True, replays=0, padded_tokens=0,
+                             token_bucket=lambda _: 1)
     @contextmanager
     def forward_batch(batch): yield
-    engine.ctx = SimpleNamespace(forward_batch=forward_batch, prefill_graph_runner=runner)
-    engine.prefill_graph_runner = runner
+    engine.ctx = SimpleNamespace(forward_batch=forward_batch, piecewise_graph_runner=runner)
+    engine.piecewise_graph_runner = runner
     engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
     def forward():
         runner.replays += 4
@@ -103,13 +105,15 @@ def test_piecewise_prefill_profile_does_not_use_decode_runner(monkeypatch, profi
         return torch.ones(1, 4)
     engine.model = SimpleNamespace(forward=forward)
     engine.sampler = SimpleNamespace(sample=lambda logits, args: torch.tensor([2]))
-    engine.forward_batch(_batch("prefill"), None)
+    batch = _batch("prefill")
+    batch.input_ids = torch.zeros(1, dtype=torch.int32)
+    engine.forward_batch(batch, None)
     _Event.ready = True
     profiler.poll()
     sample = profiler.result("forward")["prefill_batches"][0]
-    assert sample["graph_kind"] == "piecewise_prefill"
-    assert sample["prefill_piece_replays"] == 4
-    assert sample["prefill_piece_padding"] == 12
+    assert sample["graph_kind"] == "piecewise"
+    assert sample["piece_replays"] == 4
+    assert sample["piece_padding"] == 12
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode", "verify"])
@@ -137,7 +141,7 @@ def test_forward_profile_does_not_change_sampling(monkeypatch, phase, enabled):
         calls.append(("reject", logits.shape))
         return torch.tensor([[3, 2]])
     engine.sampler = SimpleNamespace(sample=sample, reject_sample=reject)
-    engine.prefill_graph_runner = None
+    engine.piecewise_graph_runner = None
     engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
     result = engine.forward_batch(_batch(phase), None)
     assert result.next_tokens_gpu.dtype == torch.int32
@@ -159,9 +163,10 @@ def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chun
     )
     decodes = [Request(torch.arange(65), i, 64, 8, i, SamplingParams(), None, 128,
                        profile_tag=f"decode-{i}") for i in (1, 2)]
-    batch = Batch([prefill, *decodes], "mixed")
-    batch.padded_reqs = [*batch.reqs, decodes[-1]]
-    batch.prefill_token_capacity = 128
+    batch = Batch([prefill, *decodes], "mixed", num_prefill_reqs=1)
+    batch.attn_metadata = None
+    batch.padded_reqs = batch.reqs
+    batch.sample_req_indices = torch.tensor([1, 2] if chunked else [0, 1, 2])
     engine = object.__new__(Engine)
     engine.profiler = EngineProfiler()
     engine.stream = "stream"
@@ -172,19 +177,19 @@ def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chun
     def forward_batch(_batch):
         yield
     engine.ctx = SimpleNamespace(forward_batch=forward_batch)
-    logits = torch.arange(16).reshape(4, 4)
-    engine.mixed_graph_runner = SimpleNamespace(
-        can_use_cuda_graph=lambda _batch: True, replay=lambda _batch: logits,
-    )
+    logits = torch.arange(12).reshape(3, 4)[int(chunked):]
+    engine.model = SimpleNamespace(forward=lambda: logits)
     engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _batch: False)
-    engine.prefill_graph_runner = None
+    engine.piecewise_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True, replays=0,
+                                                   padded_tokens=0, token_bucket=lambda _: 64)
+    batch.input_ids = torch.zeros(34, dtype=torch.int32)
     sampled = []
     def sample(values, _args):
         sampled.append(values.clone())
         return values[:, 0]
     engine.sampler = SimpleNamespace(sample=sample)
     output = engine.forward_batch(batch, None)
-    torch.testing.assert_close(sampled[0], logits[int(chunked):3])
+    torch.testing.assert_close(sampled[0], logits)
     assert output.next_tokens_cpu.tolist() == ([-1, 4, 8] if chunked else [0, 4, 8])
     engine.profiler.poll()
     profile = engine.forward_profile_result()
@@ -192,14 +197,14 @@ def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chun
         assert profile is None
         return
     record = profile["mixed_batches"][0]
-    assert record["graph_kind"] == "mixed" and record["graph_used"]
-    assert record["batch_size"] == 3 and record["padded_size"] == 4
+    assert record["graph_kind"] == "piecewise" and record["graph_used"]
+    assert record["batch_size"] == 3 and record["padded_size"] == 3
     assert record["prefill_requests"] == 1 and record["decode_requests"] == 2
-    assert record["prefill_tokens"] == 32 and record["prefill_capacity"] == 128
+    assert record["prefill_tokens"] == 32
     assert record["input_tokens"] == 34
     assert record["request_tags"] == ["prefill", "decode-1", "decode-2"]
-    assert record["gpu_stages_ms"]["mixed_graph"] > 0
-    assert profile["phases"]["mixed"]["by_padded_size"]["4"]["logical_rows"] == 3
+    assert record["gpu_stages_ms"]["model"] > 0
+    assert profile["phases"]["mixed"]["by_padded_size"]["3"]["logical_rows"] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph timing test")

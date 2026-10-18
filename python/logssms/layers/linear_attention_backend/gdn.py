@@ -26,20 +26,21 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         batch      : Batch,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         metadata = batch.linear_attn_metadata
         assert isinstance(metadata, LinearAttentionMetadata)
         assert metadata.phase == batch.phase
         if metadata.phase == "prefill":
             return self._forward_prefill(
-                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, batch
+                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, batch, out
             )
         elif metadata.phase == "verify":
             return self._forward_verify(
                 mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, metadata
             )
         return self._forward_decode(
-            mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, metadata
+            mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, metadata, out
         )
 
     @staticmethod
@@ -75,6 +76,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         batch      : Batch,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             ChunkStateIO, chunk_gated_delta_rule_to_cache,
@@ -136,6 +138,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
             ),
             indices.cu_seqlens,
             **indices.fla_kwargs(),
+            out=None if out is None else out.unsqueeze(0),
         )
         return output.squeeze(0)
 
@@ -220,6 +223,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         metadata   : LinearAttentionMetadata,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             fused_recurrent_gated_delta_rule_to_slots,
@@ -250,5 +254,6 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
             read_slots,
             write_slots,
             layer_idx,
+            out=None if out is None else out.unsqueeze(1),
         )
         return output.squeeze(1)

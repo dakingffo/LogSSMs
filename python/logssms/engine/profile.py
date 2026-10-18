@@ -33,7 +33,6 @@ def batch_snapshot(batch: Batch) -> dict:
         "prefill_requests": batch.prefill_count,
         "prefill_tokens": sum(req.extend_len for req in batch.prefill_reqs),
         "decode_requests": len(batch.decode_reqs),
-        "prefill_capacity": batch.prefill_token_capacity,
     }
 
 

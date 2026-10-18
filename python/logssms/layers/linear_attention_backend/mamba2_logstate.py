@@ -14,7 +14,7 @@ from .logstate import LogStateLinearAttentionBackend
 
 
 class Mamba2LogStateBackend(LogStateLinearAttentionBackend, BaseMamba2Backend):
-    def forward(self, xbc, dt, conv_weight, conv_bias, A_log, dt_bias, D, config, batch):
+    def forward(self, xbc, dt, conv_weight, conv_bias, A_log, dt_bias, D, config, batch, out=None):
         metadata = batch.linear_attn_metadata
         pool = get_global_ctx().linear_state
         if batch.is_verify:
@@ -25,7 +25,7 @@ class Mamba2LogStateBackend(LogStateLinearAttentionBackend, BaseMamba2Backend):
             )
             return mamba2_decode(
                 convolved, dt, A_log, dt_bias, D, config, metadata, pool,
-                logstate=True, eager=self.enable_eager_state,
+                logstate=True, eager=self.enable_eager_state, out=out,
             )
         history = pool.read_conv(metadata.conv_read_slots, metadata.conv_read_granules, config.layer_idx)
         snapshots = packed_conv_snapshots(
@@ -39,7 +39,7 @@ class Mamba2LogStateBackend(LogStateLinearAttentionBackend, BaseMamba2Backend):
         output, final, states = mamba2_prefill(
             convolved, keys, queries, values, decay, D,
             pool.read_states(metadata.work_slots, config.layer_idx),
-            metadata.prefill_indices, pool.layout.granularity,
+            metadata.prefill_indices, pool.layout.granularity, out=out,
         )
         rows = metadata.log_row_indices
         if rows is None:

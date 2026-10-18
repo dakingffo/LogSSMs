@@ -10,7 +10,7 @@ from logssms.cache.linear_pool.state_pool import LinearStatePool
 from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
 from logssms.core import Batch, Context, Request, SamplingParams, set_global_ctx
 from logssms.distributed import DistributedInfo, tp_override
-from logssms.engine.prefill_graph import PrefillGraphRunner
+from logssms.engine.piecewise_graph import PiecewiseGraphRunner
 from logssms.layers.linear_attention_backend import make_linear_attention_backend
 from logssms.models import make_model, make_model_config, load_target_weight
 from logssms.utils import torch_dtype
@@ -38,7 +38,7 @@ class AttentionOracle:
 
 @pytest.mark.parametrize("cache_type", ["radix", "logstate"])
 @pytest.mark.parametrize("gated_norm", [False, True])
-def test_falcon_h1_matches_transformers_and_prefill_graph(tmp_path, cache_type, gated_norm):
+def test_falcon_h1_matches_transformers_and_piecewise_graph(tmp_path, cache_type, gated_norm):
     torch.manual_seed(11)
     raw = HFConfig(
         architectures=["FalconH1ForCausalLM"], hidden_size=256, intermediate_size=512,
@@ -87,8 +87,8 @@ def test_falcon_h1_matches_transformers_and_prefill_graph(tmp_path, cache_type, 
         set_global_ctx(ctx)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
-        runner = PrefillGraphRunner(model, 64, stream)
-        ctx.prefill_graph_runner = runner
+        runner = PiecewiseGraphRunner(model, 64, stream)
+        ctx.piecewise_graph_runner = runner
         try:
             for length in (17, 47, 33):
                 ids = torch.randint(1, 128, (length,), device="cuda", dtype=torch.int32)
@@ -141,7 +141,7 @@ def test_falcon_h1_matches_transformers_and_prefill_graph(tmp_path, cache_type, 
                 with ctx.forward_batch(batch):
                     actual = model.forward()
                 torch.testing.assert_close(actual.float(), expected, rtol=6e-2, atol=4e-2)
-            assert runner.replays == 12
+            assert runner.replays == 9
         finally:
             runner.destroy_cuda_graphs()
             clear_global_ctx()

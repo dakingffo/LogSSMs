@@ -52,8 +52,9 @@ class EngineConfig:
     def __post_init__(self) -> None:
         if self.scheduling_policy not in ("prefill-first", "mixed"):
             raise ValueError("scheduling_policy must be prefill-first or mixed")
-        if self.mixed_prefill_tokens <= 0 or self.mixed_prefill_tokens % 64:
-            raise ValueError("mixed_prefill_tokens must be a positive multiple of 64")
+        alignment = self.cache_config.prefill_alignment
+        if self.mixed_prefill_tokens <= 0 or self.mixed_prefill_tokens % alignment:
+            raise ValueError(f"mixed_prefill_tokens must be a positive multiple of {alignment}")
         if self.scheduling_policy == "mixed" and self.enable_specualtive_decoding:
             raise ValueError("mixed scheduling does not support speculative decoding")
 

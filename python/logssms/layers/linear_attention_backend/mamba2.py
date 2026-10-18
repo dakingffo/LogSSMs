@@ -14,7 +14,7 @@ from .standard import StandardLinearAttentionBackend
 
 
 class Mamba2Backend(StandardLinearAttentionBackend, BaseMamba2Backend):
-    def forward(self, xbc, dt, conv_weight, conv_bias, A_log, dt_bias, D, config, batch):
+    def forward(self, xbc, dt, conv_weight, conv_bias, A_log, dt_bias, D, config, batch, out=None):
         metadata = batch.linear_attn_metadata
         pool = get_global_ctx().linear_state
         if batch.is_verify:
@@ -24,7 +24,7 @@ class Mamba2Backend(StandardLinearAttentionBackend, BaseMamba2Backend):
                 xbc, conv_weight, conv_bias, config, metadata, pool, logstate=False,
             )
             return mamba2_decode(
-                convolved, dt, A_log, dt_bias, D, config, metadata, pool, logstate=False,
+                convolved, dt, A_log, dt_bias, D, config, metadata, pool, logstate=False, out=out,
             )
         indices = metadata.prefill_indices
         slots = metadata.baseline_slots
@@ -41,7 +41,7 @@ class Mamba2Backend(StandardLinearAttentionBackend, BaseMamba2Backend):
         )
         keys, queries, values, decay = prepare_mamba2(convolved, dt, A_log, dt_bias, config)
         output, _, states = mamba2_prefill(
-            convolved, keys, queries, values, decay, D, initial, indices, 64,
+            convolved, keys, queries, values, decay, D, initial, indices, 64, out=out,
         )
         store_state(pool.conv_state[:, config.layer_idx], metadata.checkpoint_slots, snapshots)
         store_state(

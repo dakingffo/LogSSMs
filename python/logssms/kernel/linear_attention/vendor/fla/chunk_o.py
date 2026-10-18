@@ -76,11 +76,6 @@ def chunk_fwd_kernel_o(
         bos, eos = i_b * T, i_b * T + T
 
 
-    # Fixed-capacity mixed graphs launch phantom chunks. Their state tiles were
-    # never produced by the actual-length recurrence; do not load them.
-    if i_t * BT >= T:
-        return
-
     q += (bos * H + i_h // (HV // H)) * K
     k += (bos * H + i_h // (HV // H)) * K
     v += (bos * HV + i_h) * V
@@ -154,6 +149,7 @@ def chunk_fwd_o(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, H, K, V, HV = *q.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
@@ -163,7 +159,8 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    o = torch.empty_like(v) if out is None else out
+    assert o.shape == v.shape and o.dtype == v.dtype and o.is_contiguous()
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * HV)
     chunk_fwd_kernel_o[grid](
         q=q,

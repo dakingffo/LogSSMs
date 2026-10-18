@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 
 
 class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBackend):
+    def __init__(self, *, enable_eager_state: bool = False, tile_min_batch_size: int = 32) -> None:
+        super().__init__(enable_eager_state=enable_eager_state)
+        self.tile_min_batch_size = max(1, tile_min_batch_size)
+
     def forward(
         self,
         mixed_qkv  : torch.Tensor,
@@ -26,6 +30,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         batch      : Batch,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         metadata = batch.linear_attn_metadata
         assert isinstance(metadata, LogStateLinearAttentionMetadata)
@@ -41,6 +46,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
                 config,
                 batch,
                 metadata,
+                out,
             )
         if batch.is_verify:
             raise NotImplementedError(
@@ -55,6 +61,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
             dt_bias,
             config,
             metadata,
+            out,
         )
 
     @staticmethod
@@ -91,6 +98,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         config     : GatedDeltaConfig,
         batch      : Batch,
         metadata   : LogStateLinearAttentionMetadata,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             ChunkLogIO, ChunkStateIO, chunk_gated_delta_rule_to_cache,
@@ -166,6 +174,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
                     num_key_heads=pool.layout.num_key_heads,
                 ),
                 **metadata.prefill_indices.fla_kwargs(),
+                out=None if out is None else out.unsqueeze(0),
             )
         )
         return output.squeeze(0)
@@ -180,6 +189,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         metadata   : LogStateLinearAttentionMetadata,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             fused_recurrent_gated_delta_rule_to_logstate,
@@ -213,5 +223,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
             layer_idx,
             metadata.replay_counts,
             enable_eager_state=self.enable_eager_state,
+            tile_min_batch_size=self.tile_min_batch_size,
+            out=None if out is None else out.unsqueeze(1),
         )
         return output.squeeze(1)

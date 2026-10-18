@@ -1808,7 +1808,7 @@ class LogStateCacheManager(BaseCacheManager):
     def plan_prefill_chunk(self, remain_len: int, token_budget: int) -> int:
         chunk_size = min(remain_len, token_budget)
         if chunk_size < remain_len:
-            chunk_size = align_down(chunk_size, self.page_size)
+            chunk_size = align_down(chunk_size, self.granularity)
         return chunk_size
 
     def init_with_handle(self, table_idx: int, handle: BaseCacheHandle) -> None:
@@ -2395,7 +2395,7 @@ class LogStateCacheManager(BaseCacheManager):
                     )
                     self.tree.detach_entry(entry.slot)
                     restore.detached.add(entry.slot)
-                    if entry.slot != restore.slots[checkpoint.end]:
+                    if entry.slot != restore.slots.get(checkpoint.end):
                         retired.append(entry.slot)
             restore.prepared = True
         if retired:
@@ -3233,7 +3233,10 @@ class LogStateCacheManager(BaseCacheManager):
                 continue
             if restore is not None and page.checkpoint_begin is not None:
                 checkpoint = next(value for value in restore.plan.checkpoints if value.end == page.end)
-                if checkpoint.gpu_entries and page.state_slot not in restore.detached:
+                if (
+                    page.state_slot not in restore.detached
+                    and any(entry.slot == page.state_slot for entry in checkpoint.gpu_entries)
+                ):
                     continue
                 restore.slots.pop(page.end, None)
             released_states.append(page.state_slot)

@@ -10,7 +10,7 @@ from logssms.engine import ForwardInput, ForwardOutput
 from logssms.engine.config import EngineConfig
 from logssms.scheduler.config import SchedulerConfig
 from logssms.scheduler.decode import DecodeManager
-from logssms.scheduler.prefill import PendingRequest, PrefillManager
+from logssms.scheduler.prefill import PendingRequest, PrefillAdder, PrefillManager
 from logssms.scheduler.scheduler import Scheduler
 from logssms.server.args import parse_args
 
@@ -62,12 +62,13 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
     s.engine = SimpleNamespace(
         prepare_batch=lambda batch, _cache: batch,
         decode_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
-        mixed_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
+        piecewise_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
     )
     s._report_stall = lambda _adder: None
     attempts = []
 
     def add(adder, pending):
+        adder._select_budget(pending.input_len)
         attempts.append((pending.uid, adder.token_budget, adder.reserved_size))
         return request(pending.uid) if admitted else None
 
@@ -76,19 +77,20 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
 
 
 @pytest.mark.parametrize("count,limit,budget,size", [
-    (1, 8, 16, 2), (2, 8, 16, 3), (3, 8, 16, 4),
-    (8, 6, 16, 4), (15, 16, 16, 16), (8, 8, 2, 3),
-    (20, 32, 32, 21), (20, 24, 32, 16),
+    (1, 8, 16, 4), (2, 8, 16, 5), (3, 8, 16, 6),
+    (8, 6, 16, 6), (15, 16, 16, 16), (8, 8, 2, 5),
+    (20, 32, 32, 23), (20, 24, 32, 23),
 ])
-def test_mixed_bucket_capacity_and_only_selected_prefill_analyzed(monkeypatch, count, limit, budget, size):
+def test_mixed_request_capacity_and_only_selected_prefill_analyzed(monkeypatch, count, limit, budget, size):
     s, attempts = scheduler(monkeypatch, count, limit, budget)
     s.ar_manager.inflight_uids[1] = {99}
     batch = s._schedule_next_batch()
     assert batch.phase == "mixed"
     assert batch.size == size
-    assert [req.uid for req in batch.prefill_reqs] == [24]
-    assert [p.uid for p in s.prefill_manager.pending_list] == [25, 26]
-    assert len(attempts) == 1 and attempts[0][1] == 128
+    selected = min(3, limit - min(limit - 1, count, budget))
+    assert [req.uid for req in batch.prefill_reqs] == [24, 25, 26][:selected]
+    assert [p.uid for p in s.prefill_manager.pending_list] == [24, 25, 26][selected:]
+    assert len(attempts) == selected and attempts[0][1] == 128
     assert s.ar_manager.inflight_uids[0] == {99}  # Exactly one window rotation.
     assert s.ar_manager.inflight_uids[1] == {r.uid for r in batch.decode_reqs}
 
@@ -109,6 +111,92 @@ def test_unavailable_prefill_falls_back_to_decode(monkeypatch):
     assert len(s.prefill_manager.pending_list) == 3
 
 
+def test_multiple_prefills_share_one_token_budget(monkeypatch):
+    s, _ = scheduler(monkeypatch, count=2)
+    s.prefill_manager.pending_list.append(
+        PendingRequest(27, torch.arange(8), SamplingParams(max_tokens=20))
+    )
+    lengths = {24: 36, 25: 52, 26: 40, 27: 8}
+    seen = []
+    def add(adder, pending):
+        adder._select_budget(lengths[pending.uid])
+        seen.append((pending.uid, adder.token_budget))
+        length = lengths[pending.uid]
+        if length > adder.token_budget:
+            return None
+        adder.token_budget -= length
+        return Request(torch.zeros(length, dtype=torch.int32), pending.uid, 0, 20,
+                       pending.uid, pending.sampling_params, None, length + 20)
+    monkeypatch.setattr("logssms.scheduler.prefill.PrefillAdder.try_add_one", add)
+    batch = s._schedule_next_batch()
+    assert batch.prefill_count == 3 and batch.prefill_tokens == 128
+    assert len(batch.decode_reqs) == 2 and batch.size == 5
+    assert seen == [(24, 128), (25, 92), (26, 40), (27, 0)]
+    assert [p.uid for p in s.prefill_manager.pending_list] == [27]
+
+
+@pytest.mark.parametrize("head_len,tail_len,cached_len,chunked,phase,lengths,pending", [
+    (100, 30, 0, False, "mixed", [100, 28], [25]),
+    (100, 8000, 0, False, "mixed", [100, 28], [25]),
+    (128, 30, 0, False, "mixed", [128], [25]),
+    (129, 30, 0, False, "prefill", [129, 30], []),
+    (8000, 30, 0, False, "prefill", [8000, 30], []),
+    (9000, 30, 0, False, "prefill", [8192], [24, 25]),
+    (8000, 30, 7900, False, "mixed", [100, 28], [25]),
+    (8000, 30, 7800, False, "prefill", [200, 30], []),
+    (8000, 30, 7900, True, "mixed", [100, 28], [25]),
+    (8000, 30, 7800, True, "prefill", [200, 30], []),
+])
+def test_head_remaining_tokens_choose_prefill_or_mixed(
+    monkeypatch, head_len, tail_len, cached_len, chunked, phase, lengths, pending,
+):
+    try_add_one = PrefillAdder.try_add_one
+    decode_count = 3
+    s, _ = scheduler(monkeypatch, count=decode_count)
+    monkeypatch.setattr(PrefillAdder, "try_add_one", try_add_one)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    s.prefill_budget = 8192
+    s.prefill_manager.pending_list = [
+        PendingRequest(24, torch.arange(head_len, dtype=torch.int32), SamplingParams(max_tokens=20)),
+        PendingRequest(25, torch.arange(tail_len, dtype=torch.int32), SamplingParams(max_tokens=20)),
+    ]
+    if chunked:
+        head = s.prefill_manager.pending_list[0]
+        head.chunked_req = ChunkedRequest(
+            head.input_ids[:cached_len], 24, cached_len - 64, 20, 24,
+            head.sampling_params, None, head_len + 20,
+        )
+        head.chunked_req.cached_len = cached_len
+    matched = []
+    def match(req):
+        matched.append(req.uid)
+        return SimpleNamespace(cuda_handle=SimpleNamespace(
+            cached_len=cached_len if req.uid == 24 else 0,
+        ))
+    cache = s.cache_manager
+    cache.match_req = match
+    cache.plan_prefill_chunk = min
+    cache.prefill_acquire = lambda *_args, **_kwargs: True
+    cache.record_match = lambda *_args, **_kwargs: None
+    cache.record_prefill_wait = lambda *_args: None
+    cache.init_with_handle = lambda *_args: None
+    indices = iter([25] if chunked else [24, 25])
+    s.table_manager = SimpleNamespace(
+        available_size=2,
+        allocate=lambda: next(indices),
+        token_pool=torch.zeros((32, 10000), dtype=torch.int32),
+    )
+
+    batch = s._schedule_next_batch()
+    assert batch.phase == phase
+    assert [r.extend_len for r in batch.prefill_reqs] == lengths
+    assert batch.prefill_tokens == sum(lengths)
+    assert [req.uid for req in s.prefill_manager.pending_list] == pending
+    assert len(batch.decode_reqs) == (decode_count if phase == "mixed" else 0)
+    assert matched == ([24] if len(lengths) == 1 else [24, 25])[int(chunked):]
+    assert set(s.ar_manager.running_reqs) == set(range(1, decode_count + 1))
+
+
 @pytest.mark.parametrize("eligible", [False, True])
 def test_mixed_prepare_profile_uses_runner_graph_eligibility(monkeypatch, eligible):
     s, _ = scheduler(monkeypatch)
@@ -116,7 +204,7 @@ def test_mixed_prepare_profile_uses_runner_graph_eligibility(monkeypatch, eligib
     def can_use(batch):
         checked.append(batch)
         return eligible
-    s.engine.mixed_graph_runner.can_use_cuda_graph = can_use
+    s.engine.piecewise_graph_runner.can_use_cuda_graph = can_use
     def record(batch, *, graph_used):
         recorded.append((batch, graph_used))
         return nullcontext()
@@ -175,7 +263,7 @@ def test_mixed_chunk_continuation_keeps_pending_order_and_abort_frontier():
         )
 
     first = p.schedule_next_batch(SimpleNamespace(try_add_one=add), max_requests=1)
-    batch = Batch(first.reqs + [request(2)], "mixed")
+    batch = Batch(first.reqs + [request(2)], "mixed", num_prefill_reqs=1)
     mapping = (torch.tensor([2]), torch.tensor([2]))
     p.advance_for_next_schedule(
         None, (batch, None, None, mapping),
@@ -216,7 +304,7 @@ def test_unbounded_decode_retains_inflight_priority_and_insertion_order():
 def test_mixed_advance_and_process_use_per_request_phase(chunked):
     m = manager(1)
     prefill, decode = request(0, chunked=chunked), m.running_reqs[1]
-    batch = Batch([prefill, decode], "mixed")
+    batch = Batch([prefill, decode], "mixed", num_prefill_reqs=1)
     rows = [1] if chunked else [0, 1]
     mapping = (torch.tensor(rows), torch.tensor([2] * len(rows)))
     inp = ForwardInput(batch, None, (torch.empty(0), torch.empty(0)), mapping)
@@ -246,7 +334,7 @@ def test_finished_decode_in_overlapping_mixed_batch_is_aborted():
     req.sampling_params.ignore_eos = False
     previous = Batch([req], "decode")
     m.advance_for_overlap(previous)
-    ongoing = Batch([request(0), req], "mixed")
+    ongoing = Batch([request(0), req], "mixed", num_prefill_reqs=1)
     m.inflight_uids[1] = {1}
     m.advance_for_overlap(ongoing)
     inp = ForwardInput(previous, None, None, None)
@@ -261,6 +349,31 @@ def test_finished_decode_in_overlapping_mixed_batch_is_aborted():
 
 def config_kwargs():
     return dict(model_path="unused", tp_info=DistributedInfo(0, 1), dtype=torch.float32)
+
+
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+def test_logstate_mixed_budget_alignment(tmp_path, granularity):
+    from logssms.cache.config import LogStateCacheConfig
+
+    for budget in (granularity, 3 * granularity):
+        config = EngineConfig(
+            **config_kwargs(), cache_type="logstate",
+            cache_config=LogStateCacheConfig(granularity=granularity),
+            scheduling_policy="mixed", mixed_prefill_tokens=budget,
+        )
+        assert config.mixed_prefill_tokens == budget
+        args = parse_args([
+            "--model", str(tmp_path), "--dummy-weight", "--dtype", "float32",
+            "--cache-type", "logstate", "--granularity", str(granularity),
+            "--scheduling-policy", "mixed", "--mixed-prefill-tokens", str(budget),
+        ])
+        assert args.mixed_prefill_tokens == budget
+    with pytest.raises(ValueError, match="positive multiple"):
+        EngineConfig(**config_kwargs(), cache_config=LogStateCacheConfig(granularity=granularity),
+                     mixed_prefill_tokens=granularity + 1)
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "unused", "--cache-type", "logstate",
+                    "--granularity", str(granularity), "--mixed-prefill-tokens", str(granularity + 1)])
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -294,10 +407,21 @@ def test_prefill_first_allows_small_prefill_and_sequence_budgets(tmp_path):
     assert args.mixed_prefill_tokens == 128
 
 
+def test_explicit_mixed_budget_fits_64_token_prefill(tmp_path):
+    config = SchedulerConfig(
+        **config_kwargs(), scheduling_policy="mixed", mixed_prefill_tokens=64, max_prefill_tokens=64,
+    )
+    assert config.mixed_prefill_tokens == 64
+    args = parse_args([
+        "--model", str(tmp_path), "--dummy-weight", "--dtype", "float32",
+        "--scheduling-policy", "mixed", "--max-prefill-tokens", "64", "--mixed-prefill-tokens", "64",
+    ])
+    assert args.mixed_prefill_tokens == args.max_prefill_tokens == 64
+
+
 @pytest.mark.parametrize("args", [
     ["--mixed-prefill-tokens", "0"], ["--mixed-prefill-tokens", "65"],
     ["--scheduling-policy", "mixed", "--mixed-prefill-tokens", "256", "--max-prefill-tokens", "128"],
-    ["--scheduling-policy", "mixed", "--max-prefill-tokens", "64"],
     ["--scheduling-policy", "mixed", "--speculative-algorithm", "mtp"],
 ])
 def test_cli_rejects_invalid_mixed_settings_before_model_resolution(args):

@@ -71,18 +71,26 @@ def write_slot_descriptors(indices, payload, conv, decay, payload_table, conv_ta
 
 
 @triton.jit
-def _copy_metadata_kernel(sources, outputs, count: tl.constexpr, BLOCK: tl.constexpr):
+def _copy_metadata_kernel(sources, outputs, counts: tl.constexpr, BLOCK: tl.constexpr):
     offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     for i in tl.static_range(len(sources)):
+        count = counts.value[i]
         value = tl.load(sources[i] + offset, mask=offset < count, other=0)
         tl.store(outputs[i] + offset, value, mask=offset < count)
 
 
 def copy_metadata(sources, outputs):
-    count = outputs[0].numel()
+    if not outputs or len(sources) != len(outputs):
+        raise ValueError("metadata copies require equally sized nonempty source/output groups")
+    counts = tuple(output.numel() for output in outputs)
+    if any(source.numel() != count for source, count in zip(sources, counts)):
+        raise ValueError("metadata copies require matching source/output tensor lengths")
+    count = max(counts)
+    if count == 0:
+        return
     if outputs[0].is_cuda:
         _copy_metadata_kernel[(triton.cdiv(count, 128),)](
-            sources, outputs, count, BLOCK=128, num_warps=1,
+            sources, outputs, counts, BLOCK=128, num_warps=1,
         )
     else:
         for source, output in zip(sources, outputs, strict=True):
@@ -136,7 +144,7 @@ def make_batch_mapping(indices, page_table, *, decode=False):
     device = page_table.device
     rows = indices.num_tokens
     positions = torch.empty(rows, dtype=torch.int32, device=device)
-    mapping = torch.empty((2, rows), dtype=torch.int64, device=device)
+    mapping = torch.empty((2, triton.cdiv(rows, 2) * 2), dtype=torch.int64, device=device)[:, :rows]
     out_loc = torch.empty(rows, dtype=page_table.dtype, device=device)
     page_indices = torch.empty(indices.num_pages, dtype=page_table.dtype, device=device) if decode else None
     if rows:
@@ -164,10 +172,10 @@ def gather_paged_indices(indices, page_table):
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["count"], do_not_specialize_on_alignment=["out_loc"])
 def _linear_slots_kernel(
     tables, cached, state_table, work_table, out_loc,
-    output, count: tl.constexpr, table_stride: tl.constexpr,
+    output, count, output_stride: tl.constexpr, table_stride: tl.constexpr,
     table_width: tl.constexpr,
     work_stride: tl.constexpr, page_size: tl.constexpr,
     LOGSTATE: tl.constexpr, BLOCK: tl.constexpr,
@@ -181,9 +189,9 @@ def _linear_slots_kernel(
         log = tl.load(state_table + row * table_stride + pos, mask=mask, other=0)
         offset = tl.load(out_loc + req, mask=mask, other=0) % page_size
         tl.store(output + req, work, mask=mask)
-        tl.store(output + count + req, log, mask=mask)
-        tl.store(output + 2 * count + req, offset, mask=mask)
-        tl.store(output + 3 * count + req, 0, mask=mask)
+        tl.store(output + output_stride + req, log, mask=mask)
+        tl.store(output + 2 * output_stride + req, offset, mask=mask)
+        tl.store(output + 3 * output_stride + req, 0, mask=mask)
     else:
 
 
@@ -197,14 +205,15 @@ def _linear_slots_kernel(
 def gather_linear_slots(indices, state_table, *, work_table=None, out_loc=None, page_size=1):
     count = len(indices.table_ids)
     logstate = work_table is not None
-    output = torch.empty((4, count) if logstate else (count, 2),
+    stride = triton.cdiv(state_table.shape[0], 4) * 4
+    output = torch.empty((4, stride) if logstate else (count, 2),
                          dtype=torch.int32 if logstate else torch.int64,
                          device=state_table.device)
     _linear_slots_kernel[(triton.cdiv(count, 128),)](
         indices.table_ids, indices.cached_lens, state_table, work_table, out_loc, output,
-        count=count, table_stride=state_table.stride(0),
+        count=count, output_stride=stride, table_stride=state_table.stride(0),
         table_width=state_table.shape[1],
         work_stride=work_table.stride(0) if logstate else 0,
         page_size=page_size, LOGSTATE=logstate, BLOCK=128,
     )
-    return output
+    return output[:, :count] if logstate else output

@@ -25,11 +25,20 @@ class BatchIndices:
     num_pages          : int
     max_extend_len     : int
     max_pages          : int
+    sample_tuple       : tuple[torch.Tensor, torch.Tensor]
     token_table_ids    : torch.Tensor | None = None
     page_indices      : torch.Tensor | None = None
 
     @classmethod
     def make(cls, batch, device, page_size: int):
+        return cls._make(batch, device, page_size)[0]
+
+    @classmethod
+    def make_mixed(cls, batch, device, page_size: int):
+        return cls._make(batch, device, page_size, split=batch.prefill_count)
+
+    @classmethod
+    def _make(cls, batch, device, page_size: int, split: int | None = None):
         from logssms.core import ChunkedRequest
 
         reqs = batch.padded_reqs
@@ -44,28 +53,42 @@ class BatchIndices:
         if counts is None:
             counts = [0] * len(reqs)
         assert len(counts) == len(reqs)
-        # Outputs retain one entry per real request, but intermediate prefill
-        # chunks never produce a token to write. Padding never owns a write.
-        write_reqs = [] if batch.is_verify else [
-            req for req in batch.reqs if not isinstance(req, ChunkedRequest)
-        ]
-        write_tables = [req.table_idx for req in write_reqs]
-        write_positions = [req.device_len if req.can_decode else -1 for req in write_reqs]
-        vectors = (tables, cached, [p - 1 for p in cached], lengths, cu_q, cu_k,
-                   [(length - 1) % page_size + 1 for length in lengths],
-                   counts, write_tables, write_positions)
-        boundaries = [0]
+        groups = [(0, len(reqs))]
+        if split is not None:
+            groups += [(0, split), (split, len(reqs))]
+        descriptions = []
         flat = []
-        for vector in vectors:
-            flat.extend(vector)
-            boundaries.append(len(flat))
+        for begin, end in groups:
+            selected = [i for i in range(begin, min(end, len(batch.reqs)))
+                        if not batch.is_verify and not isinstance(reqs[i], ChunkedRequest)]
+            q = [v - cu_q[begin] for v in cu_q[begin:end + 1]]
+            k = [v - cu_k[begin] for v in cu_k[begin:end + 1]]
+            vectors = (tables[begin:end], cached[begin:end],
+                       [p - 1 for p in cached[begin:end]], lengths[begin:end], q, k,
+                       [(length - 1) % page_size + 1 for length in lengths[begin:end]],
+                       counts[begin:end], [tables[i] for i in selected],
+                       [reqs[i].device_len if reqs[i].can_decode else -1 for i in selected],
+                       [cu_q[i + 1] - cu_q[begin] - 1 for i in selected],
+                       [i - begin for i in selected])
+            boundaries = []
+            for vector in vectors:
+                flat.extend([0] * (-len(flat) % 4))
+                start = len(flat)
+                flat.extend(vector)
+                boundaries.append((start, len(flat)))
+            descriptions.append((begin, end, q, k, boundaries))
         host = torch.tensor(flat, dtype=torch.int32, pin_memory=device.type == "cuda")
         packed = host.to(device, non_blocking=True)
-        cpu = tuple(host[a:b] for a, b in zip(boundaries, boundaries[1:]))
-        gpu = tuple(packed[a:b] for a, b in zip(boundaries, boundaries[1:]))
-
-
-        writes = packed[boundaries[8]:].to(torch.int64).view(2, len(write_tables))
-        return cls(gpu[0], gpu[1], gpu[2], cpu[3], gpu[3], cpu[4], gpu[4],
-                   cpu[5], gpu[5], cpu[6], gpu[7], (writes[0], writes[1]),
-                   page_size, cu_q[-1], cu_k[-1], max(extended), max(pages))
+        write_packet = packed.to(torch.int64)
+        packets = []
+        for begin, end, q, k, boundaries in descriptions:
+            cpu = tuple(host[a:b] for a, b in boundaries)
+            gpu = tuple(packed[a:b] for a, b in boundaries)
+            packets.append(cls(
+                gpu[0], gpu[1], gpu[2], cpu[3], gpu[3], cpu[4], gpu[4],
+                cpu[5], gpu[5], cpu[6], gpu[7],
+                tuple(write_packet[a:b] for a, b in boundaries[8:10]),
+                page_size, q[-1], k[-1], max(extended[begin:end]), max(pages[begin:end]),
+                tuple(write_packet[a:b] for a, b in boundaries[10:12]),
+            ))
+        return tuple(packets)

@@ -17,10 +17,11 @@ from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
 from tests.logstate_helpers import decay_view
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 16, 31, 32, 48, 64, 128])
+@pytest.mark.parametrize("batch_size", [1, 2, 16, 27, 28, 31, 32, 48, 64, 128])
+@pytest.mark.parametrize("tile_min_batch_size", [1, 28, 32, 60])
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("dims", [(128, 128), (32, 32)])
-def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, dims):
+def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, dims, tile_min_batch_size):
     from logssms.kernel.linear_attention.vendor.fla import gdn_replay, fused_recurrent
 
     launches = []
@@ -52,9 +53,10 @@ def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, d
     fused_recurrent_gated_delta_rule_to_logstate(
         q, q, v, a, a, torch.empty(6), torch.empty(6), pool,
         slots, slots, slots, 0, slots, enable_eager_state=eager,
+        tile_min_batch_size=tile_min_batch_size,
     )
     name, grid, config = launches.pop()
-    tiled = not eager and dims == (128, 128) and batch_size >= 32
+    tiled = not eager and dims == (128, 128) and batch_size >= tile_min_batch_size
     assert name == ("tiled" if tiled else "full")
     assert config["BLOCK_K"] == (64 if tiled else K)
     expected_v = 64 if tiled else (8 if V < 128 else (16 if batch_size == 1 else 32))

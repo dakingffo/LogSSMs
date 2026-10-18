@@ -9,7 +9,7 @@ from logssms.core import get_global_ctx
 from logssms.layers import BaseOP, GatedMLP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from logssms.layers.attention import RotaryAttention
 from logssms.layers.mamba2 import Mamba2
-from logssms.layers.piecewise import prefill_piece
+from logssms.layers.piecewise import graph_piece
 from logssms.speculator.hidden_captor import HiddenCapturePoint, with_speculator
 from logssms.utils import div_even, nvtx_annotate
 
@@ -149,18 +149,24 @@ class FalconH1DecoderLayer(BaseOP):
     @with_speculator(HiddenCapturePoint.DECODER_INPUT, layer_id_field="_layer_id")
     def forward(self, x, residual, positions):
         query, key, value, xbc, gate, dt, residual = self._prepare_attention(x, residual)
+        return self._finish_attention(
+            *self.attend_features((query, key, value, xbc, gate, dt), positions), residual,
+        )
+
+    def attend_features(self, features, positions):
+        query, key, value, xbc, gate, dt = features
         attn = self.self_attn.attend(query, key, value, positions)
         ssm = self.mamba.attend(xbc, dt)
-        return self._finish_attention(attn, ssm, gate, residual)
+        return attn, ssm, gate
 
-    @prefill_piece
+    @graph_piece
     def _prepare_attention(self, x, residual):
         h, residual = self.input_layernorm.forward(x, residual)
         query, key, value = self.self_attn._project(h * self._config.attention_in_multiplier)
         xbc, gate, dt = self.mamba.proj(h)
         return query, key * self._config.key_multiplier, value, xbc, gate, dt, residual
 
-    @prefill_piece
+    @graph_piece
     def _finish_attention(self, attention, ssm, gate, residual):
         config = self._config
         attention = self.self_attn.o_proj.forward(attention.flatten(1))
@@ -173,7 +179,7 @@ class FalconH1DecoderLayer(BaseOP):
         h = self.feed_forward.down_proj.forward(h) * config.mlp_multipliers[1]
         return h, residual
 
-    def prefill_graph_pieces(self):
+    def piecewise_graph_pieces(self):
         weight = self.mamba.in_proj.weight
         def sample(*shape):
             return torch.empty((1,) + shape, device=weight.device, dtype=weight.dtype)
@@ -202,6 +208,10 @@ class FalconH1Model(BaseOP):
         x = self.embed_tokens.forward(input_ids) * self._embedding_multiplier
         residual = None
         positions = get_global_ctx().batch.positions
+        runner = get_global_ctx().piecewise_graph_runner
+        if runner is not None and runner.can_run_layers(get_global_ctx().batch):
+            x, residual = runner.forward_layers(x, positions)
+            return self.final_layernorm.forward(x, residual)[0]
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual, positions)
         return self.final_layernorm.forward(x, residual)[0]

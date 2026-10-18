@@ -34,7 +34,7 @@ def _env_int(name: str) -> int:
 
 
 def _batch_counts(batch: Batch, phase: str) -> dict[str, int]:
-    prefill = batch.size if phase == "prefill" else int(phase == "mixed")
+    prefill = batch.prefill_count
     return {
         "prefill_count": prefill,
         "decode_count": batch.size - prefill if phase in ("decode", "mixed") else 0,

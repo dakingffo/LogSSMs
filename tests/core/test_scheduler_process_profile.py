@@ -16,6 +16,7 @@ def test_process_profile_breakdown(monkeypatch, enabled: bool, phase: str):
     profiler = SchedulerProfiler(torch.device("cpu"), SimpleNamespace())
     batch = SimpleNamespace(
         reqs=[SimpleNamespace(profile_tag="session/turn-1")], size=1, profile_id=42,
+        prefill_count=int(phase in ("prefill", "mixed")),
     )
     with profiler.record_wait(phase):
         pass
@@ -62,7 +63,7 @@ def test_mixed_profile_full_lifecycle_and_counts_without_cuda(monkeypatch):
     profiler = SchedulerProfiler(torch.device("cpu"), cache)
     chunk = ChunkedRequest(torch.arange(64), 0, 0, 8, 1, None, None, 128)
     decode = Request(torch.arange(4), 1, 3, 8, 2, None, None, 12)
-    batch = Batch([chunk, decode], "mixed")
+    batch = Batch([chunk, decode], "mixed", num_prefill_reqs=1)
     batch.padded_reqs = batch.reqs
     with profiler.record_schedule() as schedule:
         schedule["phase"] = "mixed"
@@ -193,7 +194,7 @@ def test_schedule_profile_exports_batch_details_and_bounded_failures(monkeypatch
     batch = SimpleNamespace(
         profile_id=42, phase="prefill", size=1, padded_size=1,
         reqs=[req], padded_reqs=[req],
-        prefill_count=1, prefill_reqs=[req], decode_reqs=[], prefill_token_capacity=0,
+        prefill_count=1, prefill_reqs=[req], decode_reqs=[],
     )
     with profiler.record_schedule() as sample:
         with profiler.record_schedule_step("prefill_select"):

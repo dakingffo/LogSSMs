@@ -302,6 +302,8 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     layer        : int,
     replay_counts: torch.Tensor,
     enable_eager_state: bool = False,
+    tile_min_batch_size: int = 32,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[2]
@@ -312,9 +314,11 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     assert num_v_heads == pool.layout.num_value_heads
     assert replay_counts.shape == (batch_size,)
     assert pool.frame_bytes % pool.head_payload_bytes == 0
-    output = torch.empty_like(value)
+    output = torch.empty_like(value) if out is None else out
+    assert output.shape == value.shape and output.dtype == value.dtype and output.is_contiguous()
     full_k = triton.next_power_of_2(head_k_dim)
-    tiled = not enable_eager_state and head_k_dim == head_v_dim == 128 and batch_size >= 32
+    tiled = (not enable_eager_state and head_k_dim == head_v_dim == 128
+             and batch_size >= max(1, tile_min_batch_size))
     block_k = 64 if tiled else None
     block_v = 64 if tiled else (8 if head_v_dim < 128 else (16 if batch_size == 1 else 32))
     num_stages = 4 if tiled else 3
@@ -399,6 +403,7 @@ def fused_recurrent_gated_delta_rule_to_slots(
     read_slots  : torch.Tensor,
     write_slots : torch.Tensor,
     layer       : int,
+    out         : torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads, head_v_dim = value.shape[2:]
@@ -406,7 +411,8 @@ def fused_recurrent_gated_delta_rule_to_slots(
     assert read_slots.shape == write_slots.shape == (batch_size,)
     assert state_pool.shape[2:] == (num_v_heads, head_k_dim, head_v_dim)
     assert num_v_heads % num_k_heads == 0
-    output = torch.empty_like(value)
+    output = torch.empty_like(value) if out is None else out
+    assert output.shape == value.shape and output.dtype == value.dtype and output.is_contiguous()
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = min(32, triton.next_power_of_2(head_v_dim))
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)

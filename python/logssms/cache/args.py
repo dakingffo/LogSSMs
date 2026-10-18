@@ -52,7 +52,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             choices=LOG_STATE_GRANULARITIES,
             default=LogStateCacheConfig.granularity,
             help=(
-                "Minimum LogState prefix-match and recovery granularity in tokens. "
+                "LogState prefix-match, recovery and intermediate prefill-chunk alignment in tokens. "
                 "The physical page size remains fixed at 64 tokens."
             ),
         )

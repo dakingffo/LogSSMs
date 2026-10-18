@@ -165,13 +165,14 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--scheduling-policy",
         choices=["prefill-first", "mixed"],
         default=ServerArgs.scheduling_policy,
-        help="Prefill priority or one prefill chunk mixed with decoding requests.",
+        help="Prefill priority or prefill requests mixed with decoding requests.",
     )
     parser.add_argument(
         "--mixed-prefill-tokens",
         type=int,
         default=ServerArgs.mixed_prefill_tokens,
-        help="Mixed prefill chunk budget: positive multiple of 64, <= max-prefill-tokens.",
+        help="Total prefill token budget per mixed batch: positive multiple of LogState granularity "
+             "(64 for standard caches), <= max-prefill-tokens.",
     )
 
     parser.add_argument(
@@ -255,15 +256,15 @@ def parse_args(args: list[str]) -> ServerArgs:
 
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    kwargs["cache_config"] = cache_parser.make_config(kwargs)
+    alignment = kwargs["cache_config"].prefill_alignment
     mixed_tokens = kwargs["mixed_prefill_tokens"]
-    if mixed_tokens <= 0 or mixed_tokens % 64:
-        parser.error("--mixed-prefill-tokens must be a positive multiple of 64")
+    if mixed_tokens <= 0 or mixed_tokens % alignment:
+        parser.error(f"--mixed-prefill-tokens must be a positive multiple of {alignment}")
     if kwargs["scheduling_policy"] == "mixed" and mixed_tokens > kwargs["max_prefill_tokens"]:
         parser.error("--mixed-prefill-tokens must be <= --max-prefill-tokens for mixed scheduling")
     if kwargs["scheduling_policy"] == "mixed" and kwargs["speculative_algorithm"] is not None:
         parser.error("mixed scheduling does not support speculative decoding")
-
-    kwargs["cache_config"] = cache_parser.make_config(kwargs)
 
     assert kwargs["num_tokenizer"] >= 1, "--num-tokenizer must be >= 1"
 

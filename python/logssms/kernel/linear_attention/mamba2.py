@@ -98,10 +98,10 @@ def _mamba2_prefill_kernel(
         chunk += 1
 
 
-def mamba2_prefill(xbc, keys, queries, values, decay, D, initial_states, indices, chunk_size):
+def mamba2_prefill(xbc, keys, queries, values, decay, D, initial_states, indices, chunk_size, *, out=None):
     _, heads, state_dim = keys.shape
     head_dim = values.shape[-1]
-    output = torch.empty_like(values)
+    output = torch.empty_like(values) if out is None else out
     states = torch.empty(
         (len(indices.chunk_indices), heads, state_dim, head_dim),
         device=xbc.device, dtype=torch.float32,
@@ -280,8 +280,9 @@ def _mamba2_decode_kernel(
         tl.store(destination + k[:, None] * V + v[None, :], state, mask)
 
 
-def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, logstate, eager=False):
-    output = torch.empty((len(xbc), config.num_heads, config.head_dim), dtype=xbc.dtype, device=xbc.device)
+def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, logstate, eager=False, out=None):
+    output = (torch.empty((len(xbc), config.num_heads, config.head_dim), dtype=xbc.dtype, device=xbc.device)
+              if out is None else out)
     if logstate:
         read = write = metadata.work_slots
         log_slots, offsets, counts = metadata.log_slots, metadata.token_offsets, metadata.replay_counts

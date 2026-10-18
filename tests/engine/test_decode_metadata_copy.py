@@ -23,6 +23,58 @@ def test_metadata_copy_preserves_padding_and_converts_dtype(device, size):
         assert (output[size:] == -1).all()
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("lengths", [
+    (159, 159, 159, 32), (95, 95, 95, 32), (32, 159),
+    (0, 159, 0, 32), (1, 0, 0), (255, 257, 32),
+])
+def test_metadata_copy_handles_independent_lengths_without_overwriting_guards(device, lengths):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    sources = tuple(torch.arange(size, dtype=torch.int64, device=device) + i
+                    for i, size in enumerate(lengths))
+    outputs = tuple(torch.full((size + 8,), -777, device=device,
+                               dtype=torch.int64 if i % 2 else torch.int32)
+                    for i, size in enumerate(lengths))
+    copy_metadata(sources, tuple(value[:size] for value, size in zip(outputs, lengths)))
+    for source, output, size in zip(sources, outputs, lengths, strict=True):
+        torch.testing.assert_close(output[:size], source.to(output.dtype), rtol=0, atol=0)
+        assert (output[size:] == -777).all()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("mismatch", ["source", "output", "group"])
+def test_metadata_copy_rejects_mismatched_lengths_without_writing(device, mismatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    sources = [torch.arange(159, device=device) for _ in range(2)]
+    outputs = [torch.full((167,), -777, device=device) for _ in sources]
+    views = [value[:159] for value in outputs]
+    if mismatch == "source":
+        sources[1] = sources[1][:32]
+    elif mismatch == "output":
+        views[1] = views[1][:32]
+    else:
+        sources.pop()
+    with pytest.raises(ValueError, match="metadata copies require"):
+        copy_metadata(tuple(sources), tuple(views))
+    for value in outputs:
+        assert (value == -777).all()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_metadata_copy_accepts_empty_tensors(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    source = torch.empty(0, device=device)
+    copy_metadata((source,), (source.clone(),))
+
+
+def test_metadata_copy_rejects_empty_groups():
+    with pytest.raises(ValueError, match="nonempty"):
+        copy_metadata((), ())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_metadata_copies_update_graph_inputs_without_cross_batch_pollution():
     capture = DecodeGraphCaptureBuffer(4, 8, torch.device("cuda"))

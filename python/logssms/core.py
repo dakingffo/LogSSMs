@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
 import torch
 
 if TYPE_CHECKING:
-    from logssms.engine.prefill_graph import PrefillGraphRunner
+    from logssms.engine.piecewise_graph import PiecewiseGraphRunner
     from logssms.utils.batch import BatchIndices
     from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
@@ -113,6 +114,7 @@ class ChunkedRequest(Request):
 class Batch:
     reqs     : list[Request]
     phase    : Literal["prefill", "decode", "verify", "mixed"]
+    num_prefill_reqs: int = 0
     profile_id: int | None = field(init=False, default=None)
 
     input_ids  : torch.Tensor  = field(init=False)
@@ -133,8 +135,8 @@ class Batch:
     logstate_checkpoint_writes: list[tuple[int, int]] = field(init=False, default_factory=list)
     logstate_checkpoint_ranges: list[tuple[int, int, int]] = field(init=False, default_factory=list)
     mixed_parts: tuple[Batch, Batch] | None = field(init=False, default=None)
-    prefill_token_capacity: int = field(init=False, default=0)
     sample_indices: torch.Tensor | None = field(init=False, default=None)
+    sample_req_indices: torch.Tensor | None = field(init=False, default=None)
 
     @property
     def is_mixed(self) -> bool:
@@ -142,7 +144,11 @@ class Batch:
 
     @property
     def prefill_count(self) -> int:
-        return self.size if self.is_prefill else int(self.is_mixed)
+        return self.size if self.is_prefill else self.num_prefill_reqs
+
+    @cached_property
+    def prefill_tokens(self) -> int:
+        return sum(req.extend_len for req in self.prefill_reqs)
 
     @property
     def prefill_reqs(self) -> list[Request]:
@@ -191,7 +197,7 @@ class Context:
 
     state_table        : torch.Tensor | None = field(default=None, init=False)
     work_state_table   : torch.Tensor | None = field(default=None, init=False)
-    prefill_graph_runner: PrefillGraphRunner | None = field(default=None, init=False)
+    piecewise_graph_runner: PiecewiseGraphRunner | None = field(default=None, init=False)
 
     _batch      : Batch | None        = field(default=None, init=False)
 

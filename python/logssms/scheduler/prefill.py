@@ -56,7 +56,21 @@ class PrefillAdder:
     cache_manager: BaseCacheManager
     table_manager: TableManager
     profiler     : SchedulerProfiler | None = None
+    mixed_token_budget: int | None = None
+    use_mixed: bool = field(default=False, init=False)
+    _budget_selected: bool = field(default=False, init=False)
     rejection_reason: str | None = field(default=None, init=False)
+
+    def _select_budget(self, remain_len: int) -> None:
+        if self._budget_selected:
+            return
+        self._budget_selected = True
+        self.use_mixed = (
+            self.mixed_token_budget is not None
+            and remain_len <= self.mixed_token_budget
+        )
+        if self.use_mixed:
+            self.token_budget = min(self.token_budget, self.mixed_token_budget)
 
     def _profile_step(self, name: str):
         if self.profiler is None:
@@ -77,6 +91,7 @@ class PrefillAdder:
         handle = match.cuda_handle
         cached_len = handle.cached_len
         remain_len = req.input_len - cached_len
+        self._select_budget(remain_len)
         chunk_size = self.cache_manager.plan_prefill_chunk(
             remain_len, self.token_budget
         )
@@ -188,10 +203,15 @@ class PrefillAdder:
 
         if chunked_req := pending_req.chunked_req:
             remain_len = pending_req.input_len - chunked_req.cached_len
+            self._select_budget(remain_len)
             chunk_size = self.cache_manager.plan_prefill_chunk(
                 remain_len, self.token_budget
             )
             if chunk_size == 0:
+                self.rejection_reason = (
+                    f"zero prefill chunk: remain={remain_len}, "
+                    f"token_budget={self.token_budget}"
+                )
                 return None
             return self._add_one_req(
                 pending_req=pending_req,
@@ -254,6 +274,7 @@ class PrefillManager:
         
     def schedule_next_batch(
         self, adder: PrefillAdder, max_requests: int | None = None,
+        *, mixed_max_requests: int | None = None,
     ) -> Batch | None:
         self.inflight_reqs.clear()
         if len(self.pending_list) == 0:
@@ -262,7 +283,12 @@ class PrefillManager:
         reqs: list[Request] = []
         chunked_list: list[PendingRequest] = []
         for pending_req in self.pending_list:
-            if max_requests is not None and len(reqs) >= max_requests:
+            request_limit = (
+                mixed_max_requests
+                if mixed_max_requests is not None and adder.use_mixed
+                else max_requests
+            )
+            if request_limit is not None and len(reqs) >= request_limit:
                 break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
