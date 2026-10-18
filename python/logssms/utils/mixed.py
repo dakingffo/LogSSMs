@@ -14,3 +14,14 @@ def prefill_partitions(budget: int, granularity: int) -> tuple[tuple[int, ...], 
         parts.sort(reverse=True)
         result.append(tuple(parts))
     return tuple(result)
+
+
+@cache
+def prefill_buckets(budget: int, granularity: int) -> tuple[tuple[int, ...], ...]:
+    prefill_partitions(budget, granularity)
+    result = []
+    units = budget // granularity
+    while units:
+        result.extend(prefill_partitions(units * granularity, granularity))
+        units //= 2
+    return tuple(sorted(result, key=lambda p: (sum(p), len(p))))

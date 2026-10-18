@@ -96,10 +96,14 @@ def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch,
         mixed_prefill_tokens=128, model_config=SimpleNamespace(is_hybrid=False),
     )
     engine.piecewise_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True)
-    from logssms.utils.mixed import prefill_partitions
-    partitions = {len(p): p for p in prefill_partitions(128,32)}
-    engine.mixed_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True, padded_size=lambda n: n,
-                                                partition=partitions.__getitem__)
+    from logssms.engine.mixed_graph import MixedGraphRunner
+    from logssms.utils.mixed import prefill_buckets
+    runner = MixedGraphRunner.__new__(MixedGraphRunner)
+    runner.buckets_by_count = {count: tuple(p for p in prefill_buckets(128,32) if len(p) == count)
+                               for count in range(1,5)}
+    runner.can_use_cuda_graph = lambda _: True
+    runner.padded_size = lambda n: n
+    engine.mixed_graph_runner = runner
     prefills = [(ChunkedRequest if chunked and i % 2 == 0 else Request)(
         torch.arange(64 + length), i, 64, 8, i, SamplingParams(), None, 192,
     ) for i, length in enumerate(lengths)]
@@ -138,7 +142,10 @@ def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch,
     assert metadata == [("prefill", "decode")]
     sampled = [i for i, req in enumerate(batch.reqs) if not isinstance(req, ChunkedRequest)]
     ends = torch.tensor([req.extend_len for req in batch.reqs]).cumsum(0) - 1
-    ends[len(lengths):] += 128 - sum(lengths)
+    capacity = sum(runner.partition(lengths))
+    assert batch.prefill_token_capacity == capacity
+    assert len(batch.positions) == capacity + 2
+    ends[len(lengths):] += capacity - sum(lengths)
     assert len(params_seen) == len(sampled)
     assert result.write_tuple[0].tolist() == sampled
     assert batch.sample_req_indices.tolist() == sampled
@@ -152,6 +159,8 @@ def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch,
     assert sample["batch_size"] == batch.size and sample["padded_size"] == batch.size
     assert sample["prefill_requests"] == len(prefills) and sample["decode_requests"] == 2
     assert sample["prefill_tokens"] == sum(lengths)
+    assert sample["prefill_token_capacity"] == capacity
+    assert sample["prefill_partition"] == list(batch.prefill_partition)
     assert sample["logical_tokens"] == sum(lengths) + 2
     assert sample["graph_used"] and sample["gpu_total_ms"] is not None
     assert sample["batch_id"] == batch.profile_id

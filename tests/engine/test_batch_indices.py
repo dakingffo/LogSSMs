@@ -45,25 +45,29 @@ def test_partitioned_mapping_and_chunked_sampling(count):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("length", [1, 31, 32, 63, 128])
 @pytest.mark.parametrize("chunked", [False, True])
-def test_fixed_mixed_mapping_keeps_padding_out_of_cache_and_sampling(length, chunked):
+@pytest.mark.parametrize("alignment", [16, 32, 64])
+def test_fixed_mixed_mapping_keeps_padding_out_of_cache_and_sampling(length, chunked, alignment):
+    from logssms.utils.mixed import prefill_buckets
+
+    capacity = min(p[0] for p in prefill_buckets(128, alignment) if len(p) == 1 and p[0] >= length)
     device = torch.device("cuda")
     cls = ChunkedRequest if chunked else Request
     p = cls(torch.zeros(64 + length, dtype=torch.int32), 0, 64, 8, 0, None, None, 256)
     d = Request(torch.zeros(66, dtype=torch.int32), 1, 65, 8, 1, None, None, 256)
     dummy = Request(torch.zeros(1, dtype=torch.int32), 2, 0, 1, -1, None, None, 2)
     batch = Batch([p, d], "mixed", num_prefill_reqs=1)
-    batch.prefill_token_capacity = 128
+    batch.prefill_token_capacity = capacity
     batch.padded_reqs = [p, d, dummy]
     packet, pp, dp = BatchIndices.make_mixed(batch, device, 16)
     table = torch.arange(3 * 256, device=device, dtype=torch.int32).view(3, 256)
     positions, (rows, columns), out = make_batch_mapping(packet, table, decode=True, dummy_row=2)
     assert positions[:length].tolist() == list(range(64, 64 + length))
-    assert positions[128:].tolist() == [65, 0]
-    assert rows[length:128].tolist() == [2] * (128 - length)
-    assert columns[length:128].tolist() == [0] * (128 - length)
-    assert out[length:128].tolist() == [-1] * (128 - length)
-    assert out[128:].tolist() == [321, 512]
-    assert packet.sample_tuple[0].tolist() == ([128] if chunked else [length - 1, 128])
+    assert positions[capacity:].tolist() == [65, 0]
+    assert rows[length:capacity].tolist() == [2] * (capacity - length)
+    assert columns[length:capacity].tolist() == [0] * (capacity - length)
+    assert out[length:capacity].tolist() == [-1] * (capacity - length)
+    assert out[capacity:].tolist() == [321, 512]
+    assert packet.sample_tuple[0].tolist() == ([capacity] if chunked else [length - 1, capacity])
     assert packet.sample_tuple[1].tolist() == ([1] if chunked else [0, 1])
     assert pp.num_tokens == length and dp.num_tokens == 2
 

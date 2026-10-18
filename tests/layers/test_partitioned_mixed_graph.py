@@ -12,7 +12,7 @@ from logssms.layers.linear_attention_backend import (
 from logssms.layers.linear_attention_backend.mixed import (
     prepare_mixed_linear_metadata, copy_mixed_linear_metadata_,
 )
-from logssms.utils.mixed import prefill_partitions
+from logssms.utils.mixed import prefill_buckets
 from tests.utils import clear_global_ctx
 
 
@@ -23,8 +23,8 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
     clear_global_ctx()
     torch.manual_seed(824)
     device, dtype = torch.device("cuda"), torch.bfloat16
-    partitions = prefill_partitions(128, granularity or 64)
-    rows = len(partitions[0]) + 1
+    partitions = prefill_buckets(128, granularity or 64)
+    rows = max(map(len, partitions)) + 1
     ctx = Context(64)
     if granularity:
         pool = MHALogStatePool(
@@ -61,13 +61,13 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
     kwargs = dict(conv_weight=weight, A_log=A, dt_bias=bias, config=config)
     if mamba:
         kwargs.update(conv_bias=cb,D=D)
-    inputs = dict(xbc=x,dt=gate) if mamba else dict(mixed_qkv=x,gate=gate,beta=beta)
+    full_inputs = dict(xbc=x,dt=gate) if mamba else dict(mixed_qkv=x,gate=gate,beta=beta)
 
     def reset():
         for tensor in buffers:
             tensor.zero_()
 
-    def batch(lengths):
+    def batch(lengths, capacity):
         reqs = [Request(torch.zeros(n,dtype=torch.int32),i,0,1,i,None,None,128)
                 for i,n in enumerate([*lengths,1])]
         p,d = Batch(reqs[:-1],"prefill"),Batch(reqs[-1:],"decode")
@@ -79,13 +79,15 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
             backend.prepare_metadata(part)
         result = Batch(reqs,"mixed",num_prefill_reqs=len(lengths))
         result.mixed_parts = p,d
-        result.prefill_token_capacity = 128
+        result.prefill_token_capacity = capacity
         return result
 
     try:
         for partition in partitions:
-            captured = batch(partition)
-            target = prepare_mixed_linear_metadata(backend,*captured.mixed_parts,128)
+            capacity = sum(partition)
+            inputs = {k:v[:capacity+1] for k,v in full_inputs.items()}
+            captured = batch(partition, capacity)
+            target = prepare_mixed_linear_metadata(backend,*captured.mixed_parts,capacity)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
@@ -95,21 +97,21 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
             with torch.cuda.graph(graph):
                 output = backend.forward_mixed(captured,inputs,**kwargs)
             for lengths in (partition, [1]*len(partition), [max(1,n-1-i) for i,n in enumerate(partition)]):
-                live = batch(lengths)
+                live = batch(lengths, capacity)
                 p,d = live.mixed_parts
                 total = sum(lengths)
                 reset()
                 expected = torch.cat((
                     backend.forward(**{k:v[:total] for k,v in inputs.items()},batch=p,**kwargs),
-                    backend.forward(**{k:v[128:] for k,v in inputs.items()},batch=d,**kwargs),
+                    backend.forward(**{k:v[capacity:] for k,v in inputs.items()},batch=d,**kwargs),
                 )).clone()
                 states = tuple(t.clone() for t in buffers)
-                fresh = prepare_mixed_linear_metadata(backend,p,d,128)
+                fresh = prepare_mixed_linear_metadata(backend,p,d,capacity)
                 copy_mixed_linear_metadata_(target,fresh)
                 reset()
                 graph.replay()
                 torch.cuda.synchronize()
-                torch.testing.assert_close(torch.cat((output[:total],output[128:])),expected,rtol=0,atol=0)
+                torch.testing.assert_close(torch.cat((output[:total],output[capacity:])),expected,rtol=0,atol=0)
                 for actual,want in zip(buffers,states):
                     torch.testing.assert_close(actual,want,rtol=0,atol=0)
             graph.reset()

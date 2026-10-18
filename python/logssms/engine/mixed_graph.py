@@ -12,7 +12,7 @@ from logssms.layers.linear_attention_backend.mixed import (
 )
 from logssms.utils import init_logger
 from logssms.utils.batch import BatchIndices
-from logssms.utils.mixed import prefill_partitions
+from logssms.utils.mixed import prefill_buckets, prefill_partitions
 
 
 logger = init_logger(__name__)
@@ -33,6 +33,11 @@ class MixedGraphRunner:
         self.partitions = {len(p): p for p in prefill_partitions(
             self.capacity, engine.config.cache_config.prefill_alignment,
         )}
+        self.buckets = prefill_buckets(self.capacity, engine.config.cache_config.prefill_alignment)
+        self.buckets_by_count = {
+            count: tuple(p for p in self.buckets if len(p) == count)
+            for count in self.partitions
+        }
         self.backend = engine.attn_backend
         self.linear_backend = getattr(engine, "linear_attn_backend", None)
         maximum = min(engine.config.max_running_req, engine.decode_graph_runner.max_graph_bs)
@@ -41,7 +46,8 @@ class MixedGraphRunner:
         self.sizes = sorted({maximum, *(1 << n for n in range(1, maximum.bit_length()))})
         pool = None
         for size in reversed(self.sizes):
-            for count, partition in self.partitions.items():
+            for partition in reversed(self.buckets):
+                count = len(partition)
                 if count >= size:
                     continue
                 batch = self._capture_batch(engine, size, partition)
@@ -53,7 +59,7 @@ class MixedGraphRunner:
                         logits = engine.model.forward()
                 if pool is None:
                     pool = graph.pool()
-                self.graphs[size, count] = MixedGraph(graph, batch, logits)
+                self.graphs[size, partition] = MixedGraph(graph, batch, logits)
         logger.info_rank0(f"Captured {len(self.graphs)} mixed CUDA graphs: prefill={self.capacity}, requests={self.sizes}")
 
     def _capture_batch(self, engine, size, partition):
@@ -70,7 +76,7 @@ class MixedGraphRunner:
         batch = Batch(prefill.reqs + decode.reqs, "mixed", num_prefill_reqs=count)
         batch.padded_reqs = batch.reqs
         batch.mixed_parts = prefill, decode
-        batch.prefill_token_capacity = self.capacity
+        batch.prefill_token_capacity = sum(partition)
         batch.prefill_partition = partition
         page_size = getattr(engine.kv_cache, "kv_page_size", 1)
         packet, pp, dp = BatchIndices.make_mixed(batch, engine.device, page_size)
@@ -87,7 +93,7 @@ class MixedGraphRunner:
                 self.linear_backend.prepare_metadata(part)
             offset = end
         if self.linear_backend is not None:
-            prepare_mixed_linear_metadata(self.linear_backend, prefill, decode, self.capacity)
+            prepare_mixed_linear_metadata(self.linear_backend, prefill, decode, batch.prefill_token_capacity)
         self.backend.prepare_mixed_metadata(batch)
         batch.input_ids = torch.zeros(packet.num_tokens, dtype=torch.int32, device=engine.device)
         batch.sample_indices, batch.sample_req_indices = packet.sample_tuple
@@ -96,15 +102,22 @@ class MixedGraphRunner:
     def padded_size(self, size):
         return self.sizes[bisect_left(self.sizes, size)] if self.sizes and size <= self.sizes[-1] else size
 
-    def partition(self, count):
-        return self.partitions[count]
+    def partition(self, lengths):
+        return next(p for p in self.buckets_by_count[len(lengths)]
+                    if all(n <= capacity for n, capacity in zip(lengths, p)))
+
+    def _graph_key(self, batch):
+        partition = batch.prefill_partition or self.partition(
+            tuple(req.extend_len for req in batch.prefill_reqs)
+        )
+        return self.padded_size(batch.size), partition
 
     def can_use_cuda_graph(self, batch):
         return (batch.is_mixed and batch.hidden_captor is None
-                and (self.padded_size(batch.size), batch.prefill_count) in self.graphs)
+                and self._graph_key(batch) in self.graphs)
 
     def replay(self, batch):
-        captured = self.graphs[batch.padded_size, batch.prefill_count]
+        captured = self.graphs[self._graph_key(batch)]
         target = captured.batch
         count = len(batch.sample_indices)
         copy_metadata(

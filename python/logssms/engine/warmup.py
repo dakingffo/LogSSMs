@@ -107,8 +107,8 @@ def warmup_mixed_linear(engine):
                       min(granularity, budget), min(granularity + 1, budget), budget})
     cases = [([budget], n) for n in decode_counts]
     cases += [([n], min(2, maximum)) for n in lengths]
-    for partition in engine.mixed_graph_runner.partitions.values():
-        if 1 < len(partition) < config.max_running_req:
+    for partition in engine.mixed_graph_runner.buckets:
+        if len(partition) < config.max_running_req:
             cases.append((list(partition), 1))
             cases.append(([1] * len(partition), 1))
     pages = max(1, (max(budget, 64) + config.page_size - 1) // config.page_size)

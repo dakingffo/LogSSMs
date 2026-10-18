@@ -13,13 +13,14 @@ from tests.utils import clear_global_ctx
 @pytest.mark.parametrize("head_dim", [64, 256])
 @pytest.mark.parametrize("decodes", [1, 3])
 @pytest.mark.parametrize("prefills", [1, 2, 4, 8])
-def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills):
+@pytest.mark.parametrize("capacity", [16, 32, 64, 128])
+def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills, capacity):
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
 
     clear_global_ctx()
     torch.manual_seed(741)
     device = torch.device("cuda")
-    page, capacity, q_heads, kv_heads = 16, 64, 6, 1
+    page, q_heads, kv_heads = 16, 6, 1
     shape = ((decodes + prefills) * 512 // page, page, kv_heads, head_dim)
     k = torch.randn(shape, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
@@ -67,8 +68,8 @@ def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills):
         with torch.cuda.graph(graph):
             output = backend.forward(q, 0, static)
         before = k.clone(), v.clone()
-        for length in (64, 1, 31, 32, 63, 17, 64):
-            length = max(length, prefills)
+        for length in (capacity, 1, 31, 32, 63, 17, capacity):
+            length = min(capacity, max(length, prefills))
             runtime = batch(length)
             assert runtime.attn_metadata.prefill.wrapper is not runtime.attn_metadata.decode.wrapper
             expected_indices = torch.cat((

@@ -305,8 +305,10 @@ class Engine:
         size = self.mixed_graph_runner.padded_size(batch.size)
         decode.padded_reqs = decode.reqs + [self.dummy_req] * (size - batch.size)
         batch.padded_reqs = prefill.reqs + decode.padded_reqs
-        batch.prefill_token_capacity = self.config.mixed_prefill_tokens
-        batch.prefill_partition = self.mixed_graph_runner.partition(batch.prefill_count)
+        batch.prefill_partition = self.mixed_graph_runner.partition(
+            tuple(req.extend_len for req in prefill.reqs)
+        )
+        batch.prefill_token_capacity = sum(batch.prefill_partition)
         assert all(req.extend_len <= capacity for req, capacity in zip(prefill.reqs, batch.prefill_partition))
         batch.mixed_parts = prefill, decode
         stage = self.profiler.record_stage if self.profiler.enabled else lambda _: nullcontext()
