@@ -102,20 +102,27 @@ def _batch_mapping_kernel(
     tables, cached, cu_q, page_table,
     positions, input_rows, input_cols, out_loc,
     cu_k, page_indices, table_stride: tl.constexpr, page_size: tl.constexpr,
-    PAGED: tl.constexpr, BLOCK: tl.constexpr,
+    padding, padding_after, dummy_row, PAGED: tl.constexpr, BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     start = tl.load(cu_q + req)
     end = tl.load(cu_q + req + 1)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < end - start
+    output_start = start + tl.where(req >= padding_after, padding, 0)
     row = tl.load(tables + req).to(tl.int64)
     column = tl.load(cached + req) + offsets
     loc = tl.load(page_table + row * table_stride + column, mask=mask, other=0)
-    tl.store(positions + start + offsets, column, mask=mask)
-    tl.store(input_rows + start + offsets, row, mask=mask)
-    tl.store(input_cols + start + offsets, column, mask=mask)
-    tl.store(out_loc + start + offsets, loc, mask=mask)
+    tl.store(positions + output_start + offsets, column, mask=mask)
+    tl.store(input_rows + output_start + offsets, row, mask=mask)
+    tl.store(input_cols + output_start + offsets, column, mask=mask)
+    tl.store(out_loc + output_start + offsets, loc, mask=mask)
+    if req + 1 == padding_after:
+        pad_mask = offsets < padding
+        tl.store(positions + end + offsets, 0, mask=pad_mask)
+        tl.store(input_rows + end + offsets, dummy_row, mask=pad_mask)
+        tl.store(input_cols + end + offsets, 0, mask=pad_mask)
+        tl.store(out_loc + end + offsets, -1, mask=pad_mask)
     if PAGED:
         page_start = tl.load(cu_k + req)
         page_end = tl.load(cu_k + req + 1)
@@ -140,21 +147,23 @@ def _paged_indices_kernel(
     tl.store(indices + start + offsets, values // page_size, mask=mask)
 
 
-def make_batch_mapping(indices, page_table, *, decode=False):
+def make_batch_mapping(indices, page_table, *, decode=False, dummy_row=0):
     device = page_table.device
-    rows = indices.num_tokens
+    rows = indices.num_tokens + indices.prefill_padding
     positions = torch.empty(rows, dtype=torch.int32, device=device)
     mapping = torch.empty((2, triton.cdiv(rows, 2) * 2), dtype=torch.int64, device=device)[:, :rows]
     out_loc = torch.empty(rows, dtype=page_table.dtype, device=device)
     page_indices = torch.empty(indices.num_pages, dtype=page_table.dtype, device=device) if decode else None
     if rows:
         width = max(indices.max_extend_len, indices.max_pages) if decode else indices.max_extend_len
+        width = max(width, indices.prefill_padding)
         _batch_mapping_kernel[(len(indices.table_ids), triton.cdiv(width, 256))](
             indices.table_ids, indices.cached_lens, indices.cu_seqlens_q_gpu,
             page_table, positions, mapping[0], mapping[1], out_loc,
             indices.cu_seqlens_k_gpu, page_indices,
             table_stride=page_table.stride(0), page_size=indices.page_size,
-            PAGED=decode, BLOCK=256,
+            padding=indices.prefill_padding, padding_after=indices.padding_after,
+            dummy_row=dummy_row, PAGED=decode, BLOCK=256,
         )
     indices.page_indices = page_indices
     return positions, (mapping[0], mapping[1]), out_loc

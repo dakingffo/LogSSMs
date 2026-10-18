@@ -281,18 +281,24 @@ class Scheduler(SchedulerIOMixin):
             mixed_token_budget=(
                 self.config.mixed_prefill_tokens if mixed_decode_cap > 0 else None
             ),
+            mixed_partitions=(
+                tuple(p for p in self.engine.mixed_graph_runner.partitions.values()
+                      if len(p) < self.config.max_running_req)
+                if mixed_decode_cap > 0 else ()
+            ),
         )
         with self.profiler.record_schedule() as schedule:
             with self.profiler.record_schedule_step("prefill_select"):
                 if mixed_decode_cap > 0:
                     batch = self.prefill_manager.schedule_next_batch(
-                        adder, mixed_max_requests=self.config.max_running_req - mixed_decode_cap,
+                        adder, mixed_max_requests=self.config.max_running_req - 1,
                     )
                 else:
                     batch = self.prefill_manager.schedule_next_batch(adder)
             if not adder.use_mixed:
                 mixed_decode_cap = 0
             if batch is not None and mixed_decode_cap > 0:
+                mixed_decode_cap = min(mixed_decode_cap, self.config.max_running_req - batch.size)
                 with self.profiler.record_schedule_step("ar_select"):
                     decode = self.ar_manager.schedule_next_batch(max_requests=mixed_decode_cap)
                 if decode is not None:
@@ -322,7 +328,7 @@ class Scheduler(SchedulerIOMixin):
                         "token_budget" if adder.token_budget <= 0 else
                         adder.rejection_reason or (
                             "request_budget" if mixed_decode_cap and batch.prefill_count
-                            >= self.config.max_running_req - mixed_decode_cap else "pending_exhausted"
+                            >= self.config.max_running_req - 1 else "pending_exhausted"
                         )
                     )
         if batch is None:
@@ -337,6 +343,8 @@ class Scheduler(SchedulerIOMixin):
             and self.engine.piecewise_graph_runner.can_use_cuda_graph(batch)
         ) or (
             batch.is_decode and self.engine.decode_graph_runner.can_use_cuda_graph(batch)
+        ) or (
+            batch.is_mixed and self.engine.mixed_graph_runner.can_use_cuda_graph(batch)
         )
         with self.profiler.record_prepare(batch, graph_used=graph_used):
             forward_input = self.engine.prepare_batch(batch, self.cache_manager)

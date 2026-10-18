@@ -26,6 +26,8 @@ class BatchIndices:
     max_extend_len     : int
     max_pages          : int
     sample_tuple       : tuple[torch.Tensor, torch.Tensor]
+    prefill_padding    : int = 0
+    padding_after     : int = 0
     token_table_ids    : torch.Tensor | None = None
     page_indices      : torch.Tensor | None = None
 
@@ -49,6 +51,8 @@ class BatchIndices:
         pages = [(length + page_size - 1) // page_size for length in lengths]
         cu_q = list(accumulate(extended, initial=0))
         cu_k = list(accumulate(pages, initial=0))
+        padding_after = batch.prefill_count if batch.is_mixed else 0
+        padding = max(0, batch.prefill_token_capacity - cu_q[padding_after]) if padding_after else 0
         counts = batch.logstate_replay_counts
         if counts is None:
             counts = [0] * len(reqs)
@@ -68,7 +72,8 @@ class BatchIndices:
                        [(length - 1) % page_size + 1 for length in lengths[begin:end]],
                        counts[begin:end], [tables[i] for i in selected],
                        [reqs[i].device_len if reqs[i].can_decode else -1 for i in selected],
-                       [cu_q[i + 1] - cu_q[begin] - 1 for i in selected],
+                       [cu_q[i + 1] - cu_q[begin] - 1 + (padding if begin == 0 and i >= padding_after else 0)
+                        for i in selected],
                        [i - begin for i in selected])
             boundaries = []
             for vector in vectors:
@@ -90,5 +95,7 @@ class BatchIndices:
                 tuple(write_packet[a:b] for a, b in boundaries[8:10]),
                 page_size, q[-1], k[-1], max(extended[begin:end]), max(pages[begin:end]),
                 tuple(write_packet[a:b] for a, b in boundaries[10:12]),
+                padding if begin == 0 and end == len(reqs) else 0,
+                padding_after if begin == 0 and end == len(reqs) else 0,
             ))
         return tuple(packets)

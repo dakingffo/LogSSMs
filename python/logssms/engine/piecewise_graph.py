@@ -155,7 +155,7 @@ class PiecewiseGraphRunner:
 
     def can_use_cuda_graph(self, batch) -> bool:
         if (not self.enabled or not self.graphs
-                or not (batch.is_prefill or batch.is_mixed) or batch.hidden_captor is not None):
+                or not batch.is_prefill or batch.hidden_captor is not None):
             return False
         inputs = getattr(batch, "input_ids", None)
         tokens = len(inputs) if inputs is not None else sum(req.extend_len for req in batch.reqs)

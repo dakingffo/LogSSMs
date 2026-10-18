@@ -107,8 +107,10 @@ def warmup_mixed_linear(engine):
                       min(granularity, budget), min(granularity + 1, budget), budget})
     cases = [([budget], n) for n in decode_counts]
     cases += [([n], min(2, maximum)) for n in lengths]
-    if config.max_running_req >= 3 and budget >= 2:
-        cases.append(([1, budget - 1], 1))
+    for partition in engine.mixed_graph_runner.partitions.values():
+        if 1 < len(partition) < config.max_running_req:
+            cases.append((list(partition), 1))
+            cases.append(([1] * len(partition), 1))
     pages = max(1, (max(budget, 64) + config.page_size - 1) // config.page_size)
     started = perf_counter()
     logger.info_rank0("Preparing mixed linear-attention kernels")

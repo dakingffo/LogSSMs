@@ -209,12 +209,13 @@ class StandardCacheManager(BaseCacheManager):
             req.cache_handle = new_handle
             self.lock(new_handle)
             matched = new_handle.get_matched_indices()
+            matched_len = new_handle.cached_len
             if self.state_table is not None:
                 matched_pages, matched_states = matched
-                self.page_table[req.table_idx, :insert_len].copy_(matched_pages)
-                self.state_table[req.table_idx, :insert_len].copy_(matched_states)
+                self.page_table[req.table_idx, :matched_len].copy_(matched_pages)
+                self.state_table[req.table_idx, :matched_len].copy_(matched_states)
             else:
-                self.page_table[req.table_idx, :insert_len].copy_(matched)
+                self.page_table[req.table_idx, :matched_len].copy_(matched)
 
         if finished:
             self.record_cached_session(req, insert_len)

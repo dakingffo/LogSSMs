@@ -16,6 +16,58 @@ def test_hybrid_paged_metadata_follows_decode_backend():
     assert not HybridBackend(paged, flat).uses_paged_indices
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("count", [2, 3, 4, 8])
+def test_partitioned_mapping_and_chunked_sampling(count):
+    device = torch.device("cuda")
+    lengths = [i + 1 for i in range(count)]
+    prefills = [(ChunkedRequest if i % 2 == 0 else Request)(
+        torch.zeros(64+n,dtype=torch.int32),i,64,8,i,None,None,256,
+    ) for i,n in enumerate(lengths)]
+    d = Request(torch.zeros(66,dtype=torch.int32),count,65,8,count,None,None,256)
+    batch = Batch([*prefills,d],"mixed",num_prefill_reqs=count)
+    batch.prefill_token_capacity = 128
+    batch.padded_reqs = batch.reqs
+    packet,_,_ = BatchIndices.make_mixed(batch,device,16)
+    table = torch.arange((count+2)*256,device=device,dtype=torch.int32).view(count+2,256)
+    positions,(rows,cols),out = make_batch_mapping(packet,table,decode=True,dummy_row=count+1)
+    total = sum(lengths)
+    expected_rows = [i for i,n in enumerate(lengths) for _ in range(n)]
+    assert rows[:total].tolist() == expected_rows
+    assert positions[:total].tolist() == [64+j for n in lengths for j in range(n)]
+    assert out[total:128].tolist() == [-1]*(128-total)
+    assert rows[128].item() == count and positions[128].item() == 65
+    ends = torch.tensor(lengths).cumsum(0)-1
+    assert packet.sample_tuple[0].tolist() == [ends[i].item() for i in range(count) if i%2] + [128]
+    assert packet.sample_tuple[1].tolist() == [i for i in range(count) if i%2] + [count]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("length", [1, 31, 32, 63, 128])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_fixed_mixed_mapping_keeps_padding_out_of_cache_and_sampling(length, chunked):
+    device = torch.device("cuda")
+    cls = ChunkedRequest if chunked else Request
+    p = cls(torch.zeros(64 + length, dtype=torch.int32), 0, 64, 8, 0, None, None, 256)
+    d = Request(torch.zeros(66, dtype=torch.int32), 1, 65, 8, 1, None, None, 256)
+    dummy = Request(torch.zeros(1, dtype=torch.int32), 2, 0, 1, -1, None, None, 2)
+    batch = Batch([p, d], "mixed", num_prefill_reqs=1)
+    batch.prefill_token_capacity = 128
+    batch.padded_reqs = [p, d, dummy]
+    packet, pp, dp = BatchIndices.make_mixed(batch, device, 16)
+    table = torch.arange(3 * 256, device=device, dtype=torch.int32).view(3, 256)
+    positions, (rows, columns), out = make_batch_mapping(packet, table, decode=True, dummy_row=2)
+    assert positions[:length].tolist() == list(range(64, 64 + length))
+    assert positions[128:].tolist() == [65, 0]
+    assert rows[length:128].tolist() == [2] * (128 - length)
+    assert columns[length:128].tolist() == [0] * (128 - length)
+    assert out[length:128].tolist() == [-1] * (128 - length)
+    assert out[128:].tolist() == [321, 512]
+    assert packet.sample_tuple[0].tolist() == ([128] if chunked else [length - 1, 128])
+    assert packet.sample_tuple[1].tolist() == ([1] if chunked else [0, 1])
+    assert pp.num_tokens == length and dp.num_tokens == 2
+
+
 def make_batch(phase):
     reqs = []
     for table, cached in ((2, 0), (0, 127), (3, 64), (3, 64)):

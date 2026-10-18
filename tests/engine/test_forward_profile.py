@@ -179,8 +179,9 @@ def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chun
     engine.ctx = SimpleNamespace(forward_batch=forward_batch)
     logits = torch.arange(12).reshape(3, 4)[int(chunked):]
     engine.model = SimpleNamespace(forward=lambda: logits)
+    engine.mixed_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True, replay=lambda _: logits)
     engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _batch: False)
-    engine.piecewise_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True, replays=0,
+    engine.piecewise_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: False, replays=0,
                                                    padded_tokens=0, token_bucket=lambda _: 64)
     batch.input_ids = torch.zeros(34, dtype=torch.int32)
     sampled = []
@@ -197,13 +198,13 @@ def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chun
         assert profile is None
         return
     record = profile["mixed_batches"][0]
-    assert record["graph_kind"] == "piecewise" and record["graph_used"]
+    assert record["graph_kind"] == "mixed" and record["graph_used"]
     assert record["batch_size"] == 3 and record["padded_size"] == 3
     assert record["prefill_requests"] == 1 and record["decode_requests"] == 2
     assert record["prefill_tokens"] == 32
     assert record["input_tokens"] == 34
     assert record["request_tags"] == ["prefill", "decode-1", "decode-2"]
-    assert record["gpu_stages_ms"]["model"] > 0
+    assert record["gpu_stages_ms"]["mixed_graph_replay"] > 0
     assert profile["phases"]["mixed"]["by_padded_size"]["3"]["logical_rows"] == 3
 
 

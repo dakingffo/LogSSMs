@@ -22,7 +22,7 @@ class BaseLinearAttentionBackend(ABC):
         from logssms.layers.piecewise import attention_output_buffer
 
         assert batch.mixed_parts is not None
-        split = batch.prefill_tokens
+        split = batch.prefill_token_capacity or batch.prefill_tokens
         example = next(iter(token_inputs.values()))
         config = kwargs["config"]
         heads, dim = ((config.num_v_heads, config.head_v_dim) if isinstance(self, BaseGatedDeltaBackend)

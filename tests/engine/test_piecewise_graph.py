@@ -103,7 +103,10 @@ def test_piece_replay_handles_padding_shared_pool_and_changed_metadata(max_token
             positions = torch.arange(tokens, device="cuda", dtype=torch.int32) % 7
             expected = forward(x, positions, "prefill", False)
             for phase in ("prefill", "mixed"):
+                before = runner.replays
                 actual = forward(x, positions, phase, True)
+                if phase == "mixed":
+                    assert runner.replays == before
                 for tensor, reference in zip(actual, expected):
                     torch.testing.assert_close(tensor, reference, rtol=1e-4, atol=1e-5)
         replay_count = runner.replays

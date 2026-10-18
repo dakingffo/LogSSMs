@@ -13,6 +13,7 @@ from logssms.scheduler.decode import DecodeManager
 from logssms.scheduler.prefill import PendingRequest, PrefillAdder, PrefillManager
 from logssms.scheduler.scheduler import Scheduler
 from logssms.server.args import parse_args
+from logssms.utils.mixed import prefill_partitions
 
 
 def request(uid, *, chunked=False):
@@ -63,6 +64,8 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
         prepare_batch=lambda batch, _cache: batch,
         decode_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
         piecewise_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
+        mixed_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False,
+            partitions={len(p): p for p in prefill_partitions(128, 32)}),
     )
     s._report_stall = lambda _adder: None
     attempts = []
@@ -87,7 +90,7 @@ def test_mixed_request_capacity_and_only_selected_prefill_analyzed(monkeypatch, 
     batch = s._schedule_next_batch()
     assert batch.phase == "mixed"
     assert batch.size == size
-    selected = min(3, limit - min(limit - 1, count, budget))
+    selected = 3
     assert [req.uid for req in batch.prefill_reqs] == [24, 25, 26][:selected]
     assert [p.uid for p in s.prefill_manager.pending_list] == [24, 25, 26][selected:]
     assert len(attempts) == selected and attempts[0][1] == 128
@@ -111,7 +114,7 @@ def test_unavailable_prefill_falls_back_to_decode(monkeypatch):
     assert len(s.prefill_manager.pending_list) == 3
 
 
-def test_multiple_prefills_share_one_token_budget(monkeypatch):
+def test_mixed_admission_respects_partition_capacities(monkeypatch):
     s, _ = scheduler(monkeypatch, count=2)
     s.prefill_manager.pending_list.append(
         PendingRequest(27, torch.arange(8), SamplingParams(max_tokens=20))
@@ -122,29 +125,30 @@ def test_multiple_prefills_share_one_token_budget(monkeypatch):
         adder._select_budget(lengths[pending.uid])
         seen.append((pending.uid, adder.token_budget))
         length = lengths[pending.uid]
-        if length > adder.token_budget:
+        if length > adder._chunk_budget(length):
             return None
+        adder._mixed_lengths.append(length)
         adder.token_budget -= length
         return Request(torch.zeros(length, dtype=torch.int32), pending.uid, 0, 20,
                        pending.uid, pending.sampling_params, None, length + 20)
     monkeypatch.setattr("logssms.scheduler.prefill.PrefillAdder.try_add_one", add)
     batch = s._schedule_next_batch()
-    assert batch.prefill_count == 3 and batch.prefill_tokens == 128
-    assert len(batch.decode_reqs) == 2 and batch.size == 5
-    assert seen == [(24, 128), (25, 92), (26, 40), (27, 0)]
-    assert [p.uid for p in s.prefill_manager.pending_list] == [27]
+    assert batch.prefill_count == 2 and batch.prefill_tokens == 88
+    assert len(batch.decode_reqs) == 2 and batch.size == 4
+    assert seen == [(24, 128), (25, 92), (26, 40)]
+    assert [p.uid for p in s.prefill_manager.pending_list] == [26, 27]
 
 
 @pytest.mark.parametrize("head_len,tail_len,cached_len,chunked,phase,lengths,pending", [
-    (100, 30, 0, False, "mixed", [100, 28], [25]),
-    (100, 8000, 0, False, "mixed", [100, 28], [25]),
+    (100, 30, 0, False, "mixed", [100], [25]),
+    (100, 8000, 0, False, "mixed", [100], [25]),
     (128, 30, 0, False, "mixed", [128], [25]),
     (129, 30, 0, False, "prefill", [129, 30], []),
     (8000, 30, 0, False, "prefill", [8000, 30], []),
     (9000, 30, 0, False, "prefill", [8192], [24, 25]),
-    (8000, 30, 7900, False, "mixed", [100, 28], [25]),
+    (8000, 30, 7900, False, "mixed", [100], [25]),
     (8000, 30, 7800, False, "prefill", [200, 30], []),
-    (8000, 30, 7900, True, "mixed", [100, 28], [25]),
+    (8000, 30, 7900, True, "mixed", [100], [25]),
     (8000, 30, 7800, True, "prefill", [200, 30], []),
 ])
 def test_head_remaining_tokens_choose_prefill_or_mixed(
@@ -204,7 +208,7 @@ def test_mixed_prepare_profile_uses_runner_graph_eligibility(monkeypatch, eligib
     def can_use(batch):
         checked.append(batch)
         return eligible
-    s.engine.piecewise_graph_runner.can_use_cuda_graph = can_use
+    s.engine.mixed_graph_runner.can_use_cuda_graph = can_use
     def record(batch, *, graph_used):
         recorded.append((batch, graph_used))
         return nullcontext()

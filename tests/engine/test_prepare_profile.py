@@ -83,7 +83,7 @@ def test_prepare_profiles_all_phases(monkeypatch, phase):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-@pytest.mark.parametrize("lengths", [[32], [16, 32, 64]])
+@pytest.mark.parametrize("lengths", [[1], [32], [128], [32,16,31], [16,16,16,16]])
 def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch, chunked, lengths):
     from logssms.utils.batch import BatchIndices
 
@@ -96,12 +96,17 @@ def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch,
         mixed_prefill_tokens=128, model_config=SimpleNamespace(is_hybrid=False),
     )
     engine.piecewise_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True)
+    from logssms.utils.mixed import prefill_partitions
+    partitions = {len(p): p for p in prefill_partitions(128,32)}
+    engine.mixed_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True, padded_size=lambda n: n,
+                                                partition=partitions.__getitem__)
     prefills = [(ChunkedRequest if chunked and i % 2 == 0 else Request)(
         torch.arange(64 + length), i, 64, 8, i, SamplingParams(), None, 192,
     ) for i, length in enumerate(lengths)]
     decodes = [Request(torch.arange(65), i, 64, 8, i, SamplingParams(), None, 128)
                for i in range(len(prefills), len(prefills) + 2)]
     batch = Batch(prefills + decodes, "mixed", num_prefill_reqs=len(prefills))
+    engine.dummy_req = decodes[0]
     metadata = []
     engine.attn_backend = SimpleNamespace(
         uses_paged_indices=False,
@@ -112,11 +117,14 @@ def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch,
     engine.sampler = SimpleNamespace(prepare_params=lambda params: params_seen.extend(params))
     engine.ctx = SimpleNamespace(kv_cache=SimpleNamespace(kv_page_size=64))
     engine.page_table = torch.zeros(len(batch.reqs), 192, dtype=torch.int32)
-    def mapping(packet, table, *, decode=False):
+    def mapping(packet, table, *, decode=False, dummy_row=0):
         positions = torch.tensor([position for req in batch.reqs
                                   for position in range(req.cached_len, req.device_len)])
         rows = torch.tensor([req.table_idx for req in batch.reqs for _ in range(req.extend_len)])
-        return positions, (rows, positions), torch.arange(packet.num_tokens)
+        padding = torch.zeros(packet.prefill_padding, dtype=positions.dtype)
+        positions = torch.cat((positions[:sum(lengths)], padding, positions[sum(lengths):]))
+        rows = torch.cat((rows[:sum(lengths)], padding, rows[sum(lengths):]))
+        return positions, (rows, positions), torch.arange(packet.num_tokens + packet.prefill_padding)
     monkeypatch.setattr("logssms.kernel.metadata.make_batch_mapping", mapping)
     allocations, preparations = [], []
     cache = SimpleNamespace(
@@ -130,6 +138,7 @@ def test_mixed_prepare_profile_records_real_rows_and_compact_writes(monkeypatch,
     assert metadata == [("prefill", "decode")]
     sampled = [i for i, req in enumerate(batch.reqs) if not isinstance(req, ChunkedRequest)]
     ends = torch.tensor([req.extend_len for req in batch.reqs]).cumsum(0) - 1
+    ends[len(lengths):] += 128 - sum(lengths)
     assert len(params_seen) == len(sampled)
     assert result.write_tuple[0].tolist() == sampled
     assert batch.sample_req_indices.tolist() == sampled

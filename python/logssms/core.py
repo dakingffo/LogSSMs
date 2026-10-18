@@ -135,6 +135,8 @@ class Batch:
     logstate_checkpoint_writes: list[tuple[int, int]] = field(init=False, default_factory=list)
     logstate_checkpoint_ranges: list[tuple[int, int, int]] = field(init=False, default_factory=list)
     mixed_parts: tuple[Batch, Batch] | None = field(init=False, default=None)
+    prefill_token_capacity: int = field(init=False, default=0)
+    prefill_partition: tuple[int, ...] = field(init=False, default=())
     sample_indices: torch.Tensor | None = field(init=False, default=None)
     sample_req_indices: torch.Tensor | None = field(init=False, default=None)
 

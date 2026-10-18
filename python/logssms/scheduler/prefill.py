@@ -57,6 +57,8 @@ class PrefillAdder:
     table_manager: TableManager
     profiler     : SchedulerProfiler | None = None
     mixed_token_budget: int | None = None
+    mixed_partitions: tuple[tuple[int, ...], ...] = ()
+    _mixed_lengths: list[int] = field(default_factory=list, init=False)
     use_mixed: bool = field(default=False, init=False)
     _budget_selected: bool = field(default=False, init=False)
     rejection_reason: str | None = field(default=None, init=False)
@@ -77,6 +79,18 @@ class PrefillAdder:
             return nullcontext()
         return self.profiler.record_schedule_step(name)
 
+    def _chunk_budget(self, remain_len: int) -> int:
+        if not self.use_mixed or not self.mixed_partitions:
+            return self.token_budget
+        index = len(self._mixed_lengths)
+        candidates = [p[index] for p in self.mixed_partitions if len(p) > index
+                      and all(n <= cap for n, cap in zip(self._mixed_lengths, p))]
+        if not candidates:
+            return 0
+        desired = min(remain_len, self.token_budget)
+        complete = [cap for cap in candidates if cap >= desired]
+        return min(self.token_budget, min(complete) if complete else max(candidates))
+
     def _try_allocate_one(
         self,
         req: PendingRequest,
@@ -93,7 +107,7 @@ class PrefillAdder:
         remain_len = req.input_len - cached_len
         self._select_budget(remain_len)
         chunk_size = self.cache_manager.plan_prefill_chunk(
-            remain_len, self.token_budget
+            remain_len, self._chunk_budget(remain_len)
         )
         if chunk_size == 0:
             self.rejection_reason = (
@@ -155,6 +169,8 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
+        if self.use_mixed:
+            self._mixed_lengths.append(chunk_size)
         self.reserved_size += self.cache_manager.reservation_size(
             remain_len + pending_req.output_len, table_idx=table_idx,
         )
@@ -200,12 +216,15 @@ class PrefillAdder:
         if self.token_budget <= 0:
             self.rejection_reason = "prefill token budget exhausted"
             return None
+        if self._chunk_budget(1) == 0:
+            self.rejection_reason = "mixed partition capacity exhausted"
+            return None
 
         if chunked_req := pending_req.chunked_req:
             remain_len = pending_req.input_len - chunked_req.cached_len
             self._select_budget(remain_len)
             chunk_size = self.cache_manager.plan_prefill_chunk(
-                remain_len, self.token_budget
+                remain_len, self._chunk_budget(remain_len)
             )
             if chunk_size == 0:
                 self.rejection_reason = (
