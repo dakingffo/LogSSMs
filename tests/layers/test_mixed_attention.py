@@ -13,7 +13,7 @@ from tests.utils import clear_global_ctx
 @pytest.mark.parametrize("head_dim", [64, 256])
 @pytest.mark.parametrize("decodes", [1, 3])
 @pytest.mark.parametrize("prefills", [1, 2, 4, 8])
-def test_unified_mixed_graph_matches_separate_attention(head_dim, decodes, prefills):
+def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills):
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
 
     clear_global_ctx()
@@ -28,6 +28,7 @@ def test_unified_mixed_graph_matches_separate_attention(head_dim, decodes, prefi
     backend.device = device
     backend.config = SimpleNamespace(head_dim=head_dim)
     backend.qo_head_local, backend.kv_head_local = q_heads, kv_heads
+    backend.use_tensor_cores = True
     backend.kvcache = SimpleNamespace(k_cache=lambda _: k, v_cache=lambda _: v,
                                      dtype=k.dtype, kv_page_size=page)
     backend.float_workspace_buffer = torch.zeros(32 << 20, device=device, dtype=torch.uint8)
@@ -69,6 +70,13 @@ def test_unified_mixed_graph_matches_separate_attention(head_dim, decodes, prefi
         for length in (64, 1, 31, 32, 63, 17, 64):
             length = max(length, prefills)
             runtime = batch(length)
+            assert runtime.attn_metadata.prefill.wrapper is not runtime.attn_metadata.decode.wrapper
+            expected_indices = torch.cat((
+                runtime.prepared_indices.cu_seqlens_q_gpu[1:prefills + 1] - 1,
+                torch.arange(decodes, device=device, dtype=torch.int32) + capacity,
+            ))
+            torch.testing.assert_close(runtime.attn_metadata.get_last_indices(prefills + decodes),
+                                       expected_indices, check_dtype=False)
             q.normal_()
             backend.prepare_mixed_replay(static, runtime)
             graph.replay()
