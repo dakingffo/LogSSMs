@@ -2,6 +2,7 @@
   "dataset": "oasst2",
   "language": "en",
   "seed": 0,
+  "dispatch_policy": "serial_per_tree",
   "tree_ids": [
     "7056f73d-6684-4802-8335-adaa616033e8",
     "ca7d59d3-e558-4c9c-a521-a0a5211c4b51",
@@ -80,7 +81,7 @@
     "preserve_thinking": true,
     "date_string": "01 Jan 2024"
   },
-  "output_len": 1024,
+  "output_len": 512,
   "max_seq_len": 18432,
   "requests": [
     {

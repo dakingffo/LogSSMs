@@ -28,7 +28,7 @@ def test_mtp_speculator_config() -> None:
         speculator_config=speculator_config,
     )
 
-    assert config.decode_batch_budget == 12
+    assert config.decode_batch_budget == 4
     assert speculator_config.make_reserve(config.max_running_req) == SpeculatorReserve(
         num_draft_slots=32,
         draft_slots_per_request=4,
@@ -36,7 +36,7 @@ def test_mtp_speculator_config() -> None:
     assert make_data_plane_sizes(config, 1024, 100) == DataPlaneSizes(
         max_hidden_rows=96,
         hidden_size=1024,
-        max_prob_rows=12,
+        max_prob_rows=3,
         vocab_size=100,
     )
 
@@ -74,4 +74,4 @@ def test_mtp_argument_parser_is_independent(tmp_path) -> None:
         "--speculator-window-size", "192",
     ])
     assert server_args.speculator_config == MTPSpeculatorConfig(6, 192)
-    assert server_args.max_decode_tokens == 48
+    assert server_args.max_decode_tokens == 8

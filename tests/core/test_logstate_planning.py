@@ -50,28 +50,58 @@ def test_native_branches_preserve_token_prefixes_and_ignore_partial_granules(gra
     assert planning.batch_branch_points(inputs[:1], granularity) == []
 
 
-def test_native_log_coverage_reports_gap_and_original_entry_indices():
-    # Unsorted intervals; checkpoint does not count as a replay log.
-    path = [
-        3, 128, 192, -1, 128, 1, 0, 0,
-        1, 0, 64, -1, 0, 1, 0, 0,
-        2, 64, 128, 1, 64, 1, 0, 0,
-    ]
-    assert planning.cover_logs(path, 0, 192) == [64, 1]
-    assert planning.cover_logs(path, 128, 160) == [160, 0]
-
-
 def test_native_materialize_respects_fragmented_and_protected_slots():
     path = [
         0, 0, 64, 1, 0, 1, 0, 0,
         1, 64, 128, -1, 64, 1, 0, 0,
         2, 128, 192, -1, 128, 1, 0, 1,
     ]
-    assert planning.plan_materialize([path], [()], [(0, 1), (0, 2)], 64) == [[0, 0, 1]]
+    assert planning.plan_materialize([path], [()], [(0, 1), (0, 2)], 64) == [[0]]
     # A pending branch inside the physical page protects the entire Log.
     assert planning.plan_materialize([path], [(96,)], [(0, 1)], 64) == []
     path[8 + 6] = 1
     assert planning.plan_materialize([path], [()], [(0, 1)], 64) == []
+
+
+def test_materialize_eligibility_matches_serial_recovery_oracle():
+    rng = random.Random(188)
+    for _ in range(200):
+        values = []
+        position = 0
+        for slot in range(rng.randint(1, 80)):
+            position += rng.choice((0, 0, 32, 64))
+            size = rng.choice((32, 64, 128))
+            values.append((slot, position, position + size,
+                           size // 64 if rng.random() < .25 else -1,
+                           position, int(rng.random() > .1),
+                           int(rng.random() < .1), int(rng.random() < .1)))
+            position += size
+        boundaries = sorted({rng.randrange(position + 1) for _ in range(4)})
+        expected = []
+        for i, entry in enumerate(values):
+            _, begin, end, span, _, eligible, protected, fragmented = entry
+            if (not eligible or span >= 0 or fragmented or (end - begin) % 64
+                or any(begin < p < end for p in boundaries)
+                or any(v[6] and begin <= v[1] and v[2] <= end for v in values)):
+                continue
+            cursor = max((v[2] for v in values if v[3] >= 0 and v[2] <= begin), default=0)
+            for value in values:
+                if value[3] >= 0 or value[2] <= cursor or value[1] > cursor:
+                    continue
+                cursor = min(end, value[2])
+                if cursor == end:
+                    break
+            if cursor == end:
+                expected.append([i])
+        path = [v for entry in values for v in entry]
+        actual = planning.plan_materialize([path], [boundaries], [(0, i) for i in range(len(values))], 64)
+        assert actual == expected
+
+
+def test_materialize_returns_bounded_metadata_for_long_log_chain():
+    path = [v for i in range(128) for v in (i, i * 64, (i + 1) * 64, -1, i * 64, 1, 0, 0)]
+    result = planning.plan_materialize([path], [()], [(0, i) for i in range(128)], 64)
+    assert result == [[i] for i in range(128)]
 
 
 def test_native_coalesce_matches_nondecreasing_group_oracle():

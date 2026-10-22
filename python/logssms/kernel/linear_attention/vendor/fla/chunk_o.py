@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
+from .config import prefill_config
 from .runtime import fla_cache_autotune
 from .op import exp2
 from .runtime import (
@@ -22,22 +23,8 @@ BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('a
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-@fla_cache_autotune(
-    configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
-def chunk_fwd_kernel_o(
+def _chunk_fwd_kernel_o(
     q,
     k,
     v,
@@ -137,6 +124,26 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
+chunk_fwd_kernel_o_configured = triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})(_chunk_fwd_kernel_o)
+chunk_fwd_kernel_o = triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})(fla_cache_autotune(
+    configs=[
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
+    **autotune_cache_kwargs,
+)(_chunk_fwd_kernel_o))
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -161,8 +168,13 @@ def chunk_fwd_o(
 
     o = torch.empty_like(v) if out is None else out
     assert o.shape == v.shape and o.dtype == v.dtype and o.is_contiguous()
+    kernel = chunk_fwd_kernel_o
+    config = {}
+    if BT == 32 and K == V == 128:
+        kernel = chunk_fwd_kernel_o_configured
+        config = prefill_config("output", B * NT)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * HV)
-    chunk_fwd_kernel_o[grid](
+    kernel[grid](
         q=q,
         k=k,
         v=v,
@@ -180,5 +192,6 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        **config,
     )
     return o

@@ -32,39 +32,56 @@ def test_partitions_preserve_budget_and_cover_every_count(budget, alignment):
 
 
 @pytest.mark.parametrize("cache_config,expected", [
-    (LogStateCacheConfig(granularity=16), 57),
-    (LogStateCacheConfig(granularity=32), 30),
-    (LogStateCacheConfig(granularity=64), 14),
-    (StandardCacheConfig(page_size=64), 14),
-    (StandardCacheConfig(page_size=128), 14),
-    (StandardCacheConfig(page_size=256), 14),
+    (LogStateCacheConfig(granularity=16), 72),
+    (LogStateCacheConfig(granularity=32), 37),
+    (LogStateCacheConfig(granularity=64), 17),
+    (StandardCacheConfig(page_size=64), 17),
+    (StandardCacheConfig(page_size=128), 17),
+    (StandardCacheConfig(page_size=256), 17),
 ])
-def test_graph_enumeration(monkeypatch, cache_config, expected):
+@pytest.mark.parametrize("maximum", [16, 24, 32])
+def test_graph_enumeration(monkeypatch, cache_config, expected, maximum):
     from contextlib import nullcontext
     import torch
     made = []
     def capture(self, engine, size, partition):
         made.append((size, partition))
-        return None
+        tokens = sum(partition) + size - len(partition)
+        return SimpleNamespace(
+            input_ids=torch.zeros(tokens, dtype=torch.int32),
+            positions=torch.zeros(tokens, dtype=torch.int32),
+            out_loc=torch.zeros(tokens, dtype=torch.int32),
+            sample_indices=torch.zeros(size, dtype=torch.int64),
+        )
     monkeypatch.setattr(MixedGraphRunner, "_capture_batch", capture)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: SimpleNamespace(pool=lambda: None))
     monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: nullcontext())
     monkeypatch.setattr("logssms.engine.mixed_graph.logger.info_rank0", lambda _: None)
     engine = SimpleNamespace(
         config=SimpleNamespace(mixed_prefill_tokens=128, cache_config=cache_config,
-                               max_running_req=32, scheduling_policy="mixed"),
-        decode_graph_runner=SimpleNamespace(max_graph_bs=32),
+                               max_running_req=maximum, scheduling_policy="mixed"),
+        decode_graph_runner=SimpleNamespace(max_graph_bs=maximum),
         attn_backend=SimpleNamespace(make_mixed_capture=lambda *a: None),
         ctx=SimpleNamespace(forward_batch=lambda _: nullcontext()),
         model=SimpleNamespace(forward=lambda: None), max_seq_len=1024, stream=None,
     )
     runner = MixedGraphRunner(engine)
-    assert len(runner.graphs) == expected
+    if maximum == 32:
+        assert len(runner.graphs) == expected
     assert all(size > len(p) for size, p in made)
     assert {p for s,p in made if s == 2} == {
         p for p in prefill_buckets(128, cache_config.prefill_alignment) if len(p) == 1
     }
     assert set(runner.graphs) == set(made)
+    assert runner.sizes == {16:[2,4,8,16], 24:[2,4,8,16,24], 32:[2,4,8,16,24,32]}[maximum]
+    assert all(size <= maximum for size,_ in made)
+    if maximum >= 24:
+        assert runner.padded_size(17) == runner.padded_size(24) == 24
+        assert {24-len(p) for s,p in made if s == 24} == set(
+            range(24 - 128 // cache_config.prefill_alignment,24)
+        )
+    if maximum == 32:
+        assert runner.padded_size(25) == 32
     for _, partition in made:
         assert runner.partition(partition) == partition
 

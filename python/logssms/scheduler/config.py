@@ -53,9 +53,6 @@ class SchedulerConfig(EngineConfig):
     def decode_batch_budget(self) -> int:
         if self.max_decode_tokens is not None:
             return self.max_decode_tokens
-        base = max(1, self.max_running_req // 2)
         if self.enable_specualtive_decoding:
-            assert self.speculator_config is not None
-            return base * self.speculator_config.num_draft_tokens
-        else:
-            return base
+            return self.max_running_req // 2
+        return self.max_running_req

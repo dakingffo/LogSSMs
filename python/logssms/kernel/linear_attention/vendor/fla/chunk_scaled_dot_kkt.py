@@ -10,26 +10,13 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
+from .config import prefill_config
 from .op import exp2
 from .runtime import autotune_cache_kwargs
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['H', 'HV', 'K', 'BT', 'IS_VARLEN'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
-def chunk_scaled_dot_kkt_fwd_kernel(
+def _chunk_scaled_dot_kkt_fwd_kernel(
     k,
     g,
     beta,
@@ -79,6 +66,25 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), mask=m_t[:, None])
 
 
+chunk_scaled_dot_kkt_fwd_kernel_configured = triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})(_chunk_scaled_dot_kkt_fwd_kernel)
+chunk_scaled_dot_kkt_fwd_kernel = triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})(triton.autotune(
+    configs=[
+        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['H', 'HV', 'K', 'BT', 'IS_VARLEN'],
+    **autotune_cache_kwargs,
+)(_chunk_scaled_dot_kkt_fwd_kernel))
+
+
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     g: torch.Tensor | None = None,
@@ -94,7 +100,12 @@ def chunk_scaled_dot_kkt_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, HV, BT, device=k.device, dtype=output_dtype)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * HV)](
+    kernel = chunk_scaled_dot_kkt_fwd_kernel
+    config = {}
+    if BT == 32 and K == 128:
+        kernel = chunk_scaled_dot_kkt_fwd_kernel_configured
+        config = prefill_config("kkt", B * NT)
+    kernel[(NT, B * HV)](
         k=k,
         g=g,
         beta=beta,
@@ -106,5 +117,6 @@ def chunk_scaled_dot_kkt_fwd(
         HV=HV,
         K=K,
         BT=BT,
+        **config,
     )
     return A

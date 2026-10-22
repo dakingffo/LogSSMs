@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -43,16 +45,18 @@ def _reference(x, weight, history):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("read_slots,write_slots", [([0, 2], [0, 2]), ([0, 2], [1, 2])])
 @pytest.mark.parametrize("fused_input", [False, True])
-def test_standard_decode_conv_matches_reference(read_slots, write_slots, fused_input):
+@pytest.mark.parametrize("width", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_standard_decode_conv_matches_reference(read_slots, write_slots, fused_input, width, dtype):
     torch.manual_seed(93)
-    config = _config()
-    x = torch.randn(2, config.conv_dim, device="cuda", dtype=torch.bfloat16)
+    config = replace(_config(), state_len=width - 1)
+    x = torch.randn(2, config.conv_dim, device="cuda", dtype=dtype)
     if fused_input:
         projected = torch.randn(2, config.conv_dim + config.value_dim, device="cuda", dtype=x.dtype)
         projected[:, :config.conv_dim].copy_(x)
         x = projected[:, :config.conv_dim]
-    weight = torch.randn(config.conv_dim, 1, 4, device="cuda", dtype=x.dtype) * 0.1
-    state = torch.randn(3, 2, config.conv_dim, 3, device="cuda", dtype=x.dtype)
+    weight = torch.randn(config.conv_dim, 1, width, device="cuda", dtype=x.dtype) * 0.1
+    state = torch.randn(3, 2, config.conv_dim, width - 1, device="cuda", dtype=x.dtype)
     before = state.clone()
     reads = torch.tensor(read_slots, device="cuda", dtype=torch.int64)
     writes = torch.tensor(write_slots, device="cuda", dtype=torch.int64)
@@ -66,14 +70,19 @@ def test_standard_decode_conv_matches_reference(read_slots, write_slots, fused_i
     for row, slot in enumerate(write_slots):
         expected_state = torch.cat([before[read_slots[row], 1, :, 1:], x[row, :, None]], -1)
         torch.testing.assert_close(state[slot, 1], expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(state[:, 0], before[:, 0], rtol=0, atol=0)
+    for slot in set(range(3)) - set(write_slots):
+        torch.testing.assert_close(state[slot], before[slot], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fused_input", [False, True])
-def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input):
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+@pytest.mark.parametrize("read_log", [False, True])
+def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input, granularity, read_log):
     config = _config()
     pool = MHALogStatePool(
-        num_frames=64, page_size=64, granularity=16,
+        num_frames=64, page_size=64, granularity=granularity,
         num_attention_layers=1, num_kv_heads=1, head_dim=64,
         num_linear_layers=2, num_key_heads=2, num_value_heads=2,
         head_k_dim=32, head_v_dim=32, conv_dim=192, state_len=3,
@@ -83,7 +92,9 @@ def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input)
     slots = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
     logs = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     zeros = torch.zeros(2, device="cuda", dtype=torch.int32)
-    granules = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    granules = torch.tensor([0, 64 // granularity - 1], device="cuda", dtype=torch.int32)
+    read_slots = logs if read_log else slots
+    read_granules = granules if read_log else zeros
     torch.manual_seed(94)
     x = torch.randn(2, 192, device="cuda", dtype=torch.bfloat16)
     if fused_input:
@@ -92,12 +103,12 @@ def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input)
         x = projected[:, :192]
     weight = torch.randn(192, 1, 4, device="cuda", dtype=x.dtype) * 0.1
     history = torch.randn(2, 192, 3, device="cuda", dtype=x.dtype)
-    pool.write_conv(slots, zeros, 1, history)
+    pool.write_conv(read_slots, read_granules, 1, history)
     expected = _reference(x, weight, history)
 
     def run():
         return conv_decode_qkv(
-            x, weight, config, read_slots=slots, read_granules=zeros,
+            x, weight, config, read_slots=read_slots, read_granules=read_granules,
             write_slots=logs, write_granules=granules, work_slots=slots,
             pool=pool,
         )
@@ -114,7 +125,7 @@ def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input)
     with torch.cuda.graph(graph):
         graph_output = run()
     x.copy_(torch.randn_like(x))
-    pool.write_conv(slots, zeros, 1, history)
+    pool.write_conv(read_slots, read_granules, 1, history)
     graph.replay()
     torch.cuda.synchronize()
     expected_replay = _reference(x, weight, history)
@@ -122,6 +133,9 @@ def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input)
         [tensor.flatten(2) for tensor in graph_output], dim=-1
     )[:, 0]
     torch.testing.assert_close(actual_replay, expected_replay, rtol=2e-2, atol=2e-2)
+    shifted = torch.cat([history[:, :, 1:], x[:, :, None]], -1)
+    torch.testing.assert_close(pool.read_conv(logs, granules, 1), shifted, rtol=0, atol=0)
+    torch.testing.assert_close(pool.read_conv(slots, zeros, 1), shifted, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

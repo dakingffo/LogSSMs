@@ -13,7 +13,7 @@ from logssms.layers.linear_attention_backend import (
     GatedDeltaBackend, GatedDeltaLogStateBackend, Mamba2Backend, Mamba2LogStateBackend,
 )
 from logssms.layers.linear_attention_backend.mixed import (
-    copy_mixed_linear_metadata_, prepare_mixed_linear_metadata,
+    MixedLinearCopyPlan, prepare_mixed_linear_metadata,
 )
 from tests.layers.test_logstate_linear_attention_backend import _make_context, _make_request
 from tests.utils import clear_global_ctx
@@ -119,7 +119,10 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
     graph = None
     try:
         capture_batch, decode = batches(128)
+        capture_batch.prefill_token_capacity = 128
+        backend.prepare_metadata(capture_batch)
         captured = prepare_mixed_linear_metadata(backend, capture_batch, decode, 128)
+        copy_plan = MixedLinearCopyPlan(captured)
         # Compile/autotune before capture on a side stream, using fixed shapes.
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -137,8 +140,10 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
             reset()
             expected = forward(eager_batch, (x[:length], gate[:length], beta[:length])).clone()
             expected_buffers = tuple(t.clone() for t in buffers)
+            eager_batch.prefill_token_capacity = 128
+            backend.prepare_metadata(eager_batch)
             fresh = prepare_mixed_linear_metadata(backend, eager_batch, decode, 128)
-            copy_mixed_linear_metadata_(captured, fresh)
+            copy_plan.copy(fresh)
             for dst, src in ((static_x, x), (static_gate, gate), (static_beta, beta)):
                 dst.copy_(src)
                 dst[length:].fill_(float("nan"))  # padding must never affect live state

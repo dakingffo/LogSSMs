@@ -100,7 +100,7 @@ class RecycledRestorePlan:
     matched_len        : int
     checkpoints        : tuple[RecycledCheckpoint, ...]
     protected_endpoints: frozenset[int]
-    gpu_materialize    : tuple[PageMaterialize, ...] = ()
+    gpu_materialize    : tuple[MaterializeCandidate, ...] = ()
     gpu_coalesce       : tuple[CheckpointCoalesce, ...] = ()
     intensity          : int = 2
     lock_boundaries    : frozenset[int] = frozenset()
@@ -202,6 +202,8 @@ class LogStateCachePlan(CachePlan):
 @dataclass(frozen=True)
 class LogStateRound:
     eligible_slots: frozenset[int]
+    analysis_nodes: tuple[LogRadixTreeNode, ...]
+    endpoints     : tuple[_AnalysisEndpoint, ...]
 
 
 @dataclass(frozen=True)
@@ -256,12 +258,10 @@ class BranchProtection:
 
 
 @dataclass(frozen=True)
-class PageMaterialize:
-    log_slot            : int
-    begin               : int
-    end                 : int
-    base_checkpoint_slot: int | None
-    replay_logs         : tuple[LogStateEntry, ...]
+class MaterializeCandidate:
+    log_slot: int
+    begin   : int
+    end     : int
 
 @dataclass(frozen=True)
 class CheckpointCoalesce:
@@ -283,7 +283,7 @@ class CheckpointCoalesce:
 @dataclass(frozen=True)
 class LogStatePlan:
     protections      : tuple[BranchProtection, ...]
-    materialize      : tuple[PageMaterialize, ...]
+    materialize      : tuple[MaterializeCandidate, ...]
     coalesce         : tuple[CheckpointCoalesce, ...]
     merge_diagnostics: tuple[tuple[str, int], ...] = ()
 
@@ -543,9 +543,13 @@ class OnlineAnalysisScheduler:
             )
         return min(self.max_merge_intensity, max(2, fitted))
 
-    def begin_round(self, tree: LogRadixTree) -> LogStateRound:
+    def begin_round(
+        self, tree: LogRadixTree, traces: Sequence[LogRadixTrace],
+    ) -> LogStateRound:
+        nodes, endpoints = self._analysis_paths(tree, traces)
         return LogStateRound(
-            frozenset(tree.unique_slots())
+            frozenset(entry.slot for node in nodes for entry in node.entries),
+            nodes, endpoints,
         )
 
     def analyze(
@@ -561,9 +565,6 @@ class OnlineAnalysisScheduler:
     ) -> LogStatePlan:
         assert tree.page_size == self.page_size
         assert tree.granularity == self.granularity
-        if round_info is None:
-            round_info = self.begin_round(tree)
-
         step_start = perf_counter_ns() if step_timing_ms is not None else 0
         if traces is None:
             traces = tuple(
@@ -571,7 +572,9 @@ class OnlineAnalysisScheduler:
                 for values in input_ids
             )
         assert len(traces) == len(input_ids)
-        analysis_nodes, endpoints = self._analysis_paths(tree, traces)
+        if round_info is None:
+            round_info = self.begin_round(tree, traces)
+        analysis_nodes, endpoints = round_info.analysis_nodes, round_info.endpoints
         if step_timing_ms is not None:
             step_timing_ms["matched_paths_ms"] = (
                 perf_counter_ns() - step_start
@@ -788,7 +791,7 @@ class OnlineAnalysisScheduler:
         pending       : tuple[_PendingProtection, ...],
         analysis_nodes: tuple[LogRadixTreeNode, ...],
         path_cache    : dict,
-    ) -> tuple[PageMaterialize, ...]:
+    ) -> tuple[MaterializeCandidate, ...]:
         from logssms.kernel import logstate as planning
 
         candidates = []
@@ -825,14 +828,8 @@ class OnlineAnalysisScheduler:
         )
         result = []
         for row in rows:
-            candidate, base_slot, *logs = row
-            entry = source_entries[candidate]
-            path = paths[candidates[candidate][0]][0]
-            result.append(PageMaterialize(
-                entry.slot, entry.begin, entry.end,
-                None if base_slot < 0 else base_slot,
-                tuple(path[index] for index in logs),
-            ))
+            entry = source_entries[row[0]]
+            result.append(MaterializeCandidate(entry.slot, entry.begin, entry.end))
         result.sort(key=lambda value: (value.begin, value.end, value.log_slot))
         return tuple(result)
 
@@ -841,7 +838,7 @@ class OnlineAnalysisScheduler:
         tree          : LogRadixTree,
         eligible_slots: frozenset[int],
         pending       : tuple[_PendingProtection, ...],
-        materialize   : tuple[PageMaterialize, ...],
+        materialize   : tuple[MaterializeCandidate, ...],
         endpoints     : tuple[_AnalysisEndpoint, ...],
         diagnostics   : dict[str, int] | None,
         path_cache    : dict,
@@ -953,22 +950,6 @@ class OnlineAnalysisScheduler:
         entries.sort(key=lambda entry: (entry.begin, entry.end, entry.slot))
         return entries
 
-    @staticmethod
-    def _cover_with_logs(
-        entries: Sequence[LogStateEntry],
-        begin  : int,
-        end    : int,
-    ) -> tuple[list[LogStateEntry], int]:
-        from logssms.kernel import logstate as planning
-
-        row = [value for entry in entries for value in (
-            entry.slot, entry.begin, entry.end,
-            -1 if entry.span_pages is None else entry.span_pages,
-            entry.physical_begin, 1, 0, 0,
-        )]
-        cursor, *indices = planning.cover_logs(row, begin, end)
-        return [entries[index] for index in indices], cursor
-
 
 class LogStateCacheManager(BaseCacheManager):
 
@@ -1072,6 +1053,9 @@ class LogStateCacheManager(BaseCacheManager):
             "total_admission_wait_ms": 0.0,
             "max_admission_wait_ms": 0.0,
             "eviction_rounds": 0,
+            "eviction_candidate_windows": 0,
+            "eviction_full_snapshots": 0,
+            "eviction_serialized_nodes": 0,
             "pressure_dropped_checkpoints": 0,
             "pressure_pruned_checkpoints": 0,
             "evicted_kv_tokens": 0,
@@ -1431,17 +1415,24 @@ class LogStateCacheManager(BaseCacheManager):
             for index, (begin, end, entry, eligible) in enumerate(pieces)
             if index not in consumed and entry is None and eligible
         )
-        gpu_materialize = []
+        gpu_candidates = []
         for index, (begin, end, entry, eligible) in enumerate(pieces):
             if index in consumed or entry is None or not eligible or entry.kind is not LogStateKind.LOG:
                 continue
-            base = max((value for value in gpu if value.kind is LogStateKind.CHECKPOINT
-                        and value.end <= begin), key=lambda value: value.end, default=None)
-            logs, covered = self.analyzer._cover_with_logs(gpu, 0 if base is None else base.end, end)
-            assert covered == end
-            gpu_materialize.append(PageMaterialize(
-                entry.slot, begin, end, None if base is None else base.slot, tuple(logs),
-            ))
+            gpu_candidates.append(entry)
+        if gpu_candidates:
+            indices = {entry: i for i, entry in enumerate(gpu)}
+            rows = [value for entry in gpu for value in (
+                entry.slot, entry.begin, entry.end,
+                -1 if entry.span_pages is None else entry.span_pages,
+                entry.physical_begin, 1, 0, 0,
+            )]
+            reachable = planning.plan_materialize(
+                [rows], [()], [(0, indices[entry]) for entry in gpu_candidates], self.page_size,
+            )
+            assert len(reachable) == len(gpu_candidates)
+        gpu_materialize = tuple(MaterializeCandidate(entry.slot, entry.begin, entry.end)
+                                for entry in gpu_candidates)
         return RecycledRestorePlan(
             cached_len, match.matched_len,
             tuple(sorted(checkpoints, key=lambda entry: entry.end)), protected,
@@ -2196,9 +2187,10 @@ class LogStateCacheManager(BaseCacheManager):
             {} if self._profile_enabled else None
         )
         round_start = perf_counter_ns() if self._profile_enabled else 0
-        round_info = self.analyzer.begin_round(self.tree)
+        traces = self._prefill_traces(batch.reqs)
+        round_info = self.analyzer.begin_round(self.tree, traces)
         if analysis_step_timing_ms is not None:
-            analysis_step_timing_ms["eligible_tree_scan_ms"] = (
+            analysis_step_timing_ms["eligible_paths_ms"] = (
                 perf_counter_ns() - round_start
             ) / 1e6
         recycle_start = perf_counter_ns() if self._profile_enabled else 0
@@ -2228,13 +2220,7 @@ class LogStateCacheManager(BaseCacheManager):
                 perf_counter_ns() - recycle_start
             ) / 1e6
         if blocked:
-            round_info = LogStateRound(round_info.eligible_slots - blocked)
-        trace_start = perf_counter_ns() if self._profile_enabled else 0
-        traces = self._prefill_traces(batch.reqs)
-        trace_cpu_ms = (
-            (perf_counter_ns() - trace_start) / 1e6
-            if self._profile_enabled else 0.0
-        )
+            round_info = replace(round_info, eligible_slots=round_info.eligible_slots - blocked)
         plan = self.analyzer.analyze(
             self.tree,
             [req.input_ids for req in batch.reqs],
@@ -2254,13 +2240,11 @@ class LogStateCacheManager(BaseCacheManager):
                     item for restore in recycled for item in restore.plan.gpu_coalesce
                 ),
             )
-        if analysis_step_timing_ms is not None:
-            analysis_step_timing_ms["matched_paths_ms"] += trace_cpu_ms
         self._apply_protections(plan.protections)
 
         self.last_plan = plan
         task_start = perf_counter_ns() if self._profile_enabled else 0
-        tasks = self._make_restore_tasks(batch)
+        restore_works = self._restore_work_slots(batch)
         if analysis_step_timing_ms is not None:
             analysis_step_timing_ms["restore_tasks_ms"] = (
                 perf_counter_ns() - task_start
@@ -2290,7 +2274,7 @@ class LogStateCacheManager(BaseCacheManager):
                 },
                 "plan": {
                     "protections": len(plan.protections),
-                    "restores": len(tasks),
+                    "restores": len(restore_works),
                     "materialize": len(plan.materialize),
                     "coalesce": len(plan.coalesce),
                     "planned_merge_releases": sum(
@@ -2304,7 +2288,7 @@ class LogStateCacheManager(BaseCacheManager):
                 perf_counter_ns() - profile_before_start
             ) / 1e6
         construction_start = perf_counter_ns() if self._profile_enabled else 0
-        construction, merge_commit = self._construct_checkpoints(batch, tasks, plan)
+        construction, merge_commit = self._construct_checkpoints(batch, restore_works, plan)
         handles = tuple(id(self._pending_matches[req.table_idx]) for req in batch.reqs
                         if req.table_idx in self._pending_matches
                         and id(self._pending_matches[req.table_idx]) in self._recovery_pins)
@@ -2465,6 +2449,8 @@ class LogStateCacheManager(BaseCacheManager):
             req.input_ids[: req.cached_len],
             self.page_table[req.table_idx, : req.cached_len],
             cache_len=insert_len,
+            kv_page_spans=((page.begin, committed_ends[page], page.kv_page // self.page_size)
+                           for page in full_pages),
         )
         tree_insert_ms = (
             (perf_counter_ns() - stage_start) / 1e6
@@ -2476,6 +2462,7 @@ class LogStateCacheManager(BaseCacheManager):
             if old_handle.cached_len <= page.begin
             and committed_ends[page] <= insert.inserted_len
         ]
+        adopted_set = set(adopted)
         stage_start = perf_counter_ns() if self._profile_enabled else 0
         existing = self.tree.recovery_at(insert.node, insert.inserted_len)
         tree_match_ms = (
@@ -2550,7 +2537,7 @@ class LogStateCacheManager(BaseCacheManager):
         duplicates = [
             page
             for page in full_pages
-            if page not in adopted and committed_ends[page] <= insert.previous_len
+            if page not in adopted_set and committed_ends[page] <= insert.previous_len
         ]
         self._release_live_pages(req.table_idx, duplicates)
         if released_kv_pages or released_state_slots:
@@ -2608,9 +2595,8 @@ class LogStateCacheManager(BaseCacheManager):
             if self._profile_enabled else 0.0
         )
 
-        remaining = [
-            page for page in pages if page not in adopted and page not in duplicates
-        ]
+        removed_pages = adopted_set.union(duplicates)
+        remaining = [page for page in pages if page not in removed_pages]
         conv_copy_ms = 0.0
         work_slot_lookup_ms = 0.0
         if (
@@ -2923,13 +2909,13 @@ class LogStateCacheManager(BaseCacheManager):
         from logssms.kernel import logstate as planning
 
         allocator = self._allocator
-        for log_only in (True, False):
-            nodes, topology = (
-                self.tree.log_eviction_snapshot() if log_only
-                else self.tree.eviction_snapshot()
-            )
+        for nodes, topology, log_only in self.tree.eviction_candidates():
             if not nodes:
                 continue
+            if self._profile_enabled:
+                self._profile_stats["eviction_candidate_windows"] += int(log_only)
+                self._profile_stats["eviction_full_snapshots"] += int(not log_only)
+                self._profile_stats["eviction_serialized_nodes"] += len(nodes)
             node_slots = [node.eviction_slots for node in nodes]
             slot_ids = {slot for row in node_slots for slot in row}
             slots = []
@@ -2985,14 +2971,11 @@ class LogStateCacheManager(BaseCacheManager):
         _pages, _logs, works = self._allocate(0, 0, 1)
         return int(works[0])
 
-    def _make_restore_tasks(
+    def _restore_work_slots(
         self,
         batch: Batch,
-    ) -> list[RestoreTask]:
-        work_state_table = self.work_state_table
-        assert work_state_table is not None
-        assert work_state_table.shape[1] == 1
-        tasks = []
+    ) -> tuple[int, ...]:
+        works = []
         for req in batch.reqs:
             recovery = self.pending_recoveries.get(req.table_idx)
             if recovery is None or recovery.position == 0:
@@ -3000,33 +2983,23 @@ class LogStateCacheManager(BaseCacheManager):
             assert recovery.conv_slot is not None
             assert recovery.conv_granule is not None
             assert not recovery.logs or recovery.logs[-1].end == recovery.position
-            tasks.append(
-                RestoreTask(
-                    output_slot=self._request_states[req.table_idx].work_slot,
-                    base_slot=recovery.base_checkpoint_slot,
-                    logs=recovery.logs,
-                    source_conv_slot=recovery.conv_slot,
-                    source_conv_granule=recovery.conv_granule,
-                    output_conv_granule=0,
-                )
-            )
-        return tasks
+            works.append(self._request_states[req.table_idx].work_slot)
+        return tuple(dict.fromkeys(works))
 
     def _construct_checkpoints(
-        self, batch: Batch, tasks: Sequence[RestoreTask], plan: LogStatePlan,
+        self, batch: Batch, works: Sequence[int], plan: LogStatePlan,
     ) -> tuple[dict, tuple[int, int, dict[str, int]]]:
         pool = self.logstate_pool
         released = released_frames = merged = segments = materialized = 0
         skips: Counter[str] = Counter()
         events = None
-        if self._profile_enabled and (tasks or plan.coalesce):
+        if self._profile_enabled and (works or plan.coalesce):
             events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             events[0].record()
 
 
         for req in batch.reqs:
             self._release_recovery(id(self._pending_matches.get(req.table_idx)))
-        works = tuple(dict.fromkeys(task.output_slot for task in tasks))
         groups = iter(plan.coalesce)
         wave_count = 0
         while True:
@@ -3494,5 +3467,5 @@ __all__ = [
     "LogStateCacheFactory",
     "LogStateCachePlan",
     "OnlineAnalysisScheduler",
-    "PageMaterialize",
+    "MaterializeCandidate",
 ]

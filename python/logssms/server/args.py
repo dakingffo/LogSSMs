@@ -182,8 +182,8 @@ def parse_args(args: list[str]) -> ServerArgs:
         default=None,
         help=(
             "Max total tokens (positions) in a single decode/verify batch. "
-            "Default: max_running_req // 2, scaled by the selected speculator's "
-            "number of draft tokens."
+            "Default: max_running_req for autoregressive decoding, "
+            "max_running_req // 2 for speculative decoding."
         ),
     )
 
@@ -273,11 +273,9 @@ def parse_args(args: list[str]) -> ServerArgs:
 
 
     if kwargs["max_decode_tokens"] is None:
-        base = max(1, kwargs["max_running_req"] // 2)
-        speculator_config = kwargs.get("speculator_config")
         kwargs["max_decode_tokens"] = (
-            base * speculator_config.num_draft_tokens
-            if speculator_config is not None else base
+            kwargs["max_running_req"] // 2
+            if kwargs["speculative_algorithm"] is not None else kwargs["max_running_req"]
         )
 
     from logssms.utils import resolve_model_path

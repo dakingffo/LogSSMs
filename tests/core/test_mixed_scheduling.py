@@ -390,27 +390,6 @@ def test_engine_config_rejects_invalid_mixed_settings(kwargs):
         EngineConfig(**config_kwargs(), **kwargs)
 
 
-def test_scheduler_config_checks_prefill_budget():
-    assert SchedulerConfig(**config_kwargs()).scheduling_policy == "prefill-first"
-    assert EngineConfig(**config_kwargs()).mixed_prefill_tokens == 128
-    with pytest.raises(ValueError, match="max_prefill_tokens"):
-        SchedulerConfig(**config_kwargs(), scheduling_policy="mixed",
-                        mixed_prefill_tokens=256, max_prefill_tokens=128)
-
-
-def test_prefill_first_allows_small_prefill_and_sequence_budgets(tmp_path):
-    config = SchedulerConfig(**config_kwargs(), max_prefill_tokens=64, max_seq_len_override=64)
-    assert config.scheduling_policy == "prefill-first"
-    assert config.mixed_prefill_tokens == 128
-    args = parse_args([
-        "--model", str(tmp_path), "--dummy-weight", "--dtype", "float32",
-        "--max-prefill-tokens", "64", "--max-seq-len-override", "64",
-    ])
-    assert args.scheduling_policy == "prefill-first"
-    assert args.max_prefill_tokens == args.max_seq_len == 64
-    assert args.mixed_prefill_tokens == 128
-
-
 def test_explicit_mixed_budget_fits_64_token_prefill(tmp_path):
     config = SchedulerConfig(
         **config_kwargs(), scheduling_policy="mixed", mixed_prefill_tokens=64, max_prefill_tokens=64,

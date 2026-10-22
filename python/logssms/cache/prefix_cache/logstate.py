@@ -419,6 +419,8 @@ class LogRadixTree(BasePrefixCache):
         kv_indices: torch.Tensor,
         entries   : tuple[LogStateEntry, ...] = (),
         cache_len : int | None = None,
+        *,
+        kv_page_spans: Iterable[tuple[int, int, int]] | None = None,
     ) -> LogRadixInsert:
         assert len(input_ids) == len(kv_indices)
         usable_len = align_down(len(input_ids), self.granularity)
@@ -442,9 +444,23 @@ class LogRadixTree(BasePrefixCache):
             node = self._node_at_depth(node, inserted_len)
         elif previous_len < inserted_len:
             new_node = LogRadixTreeNode(self.key_fn, self.granularity)
+            kv_pages = None
+            if kv_page_spans is not None:
+                kv_pages = torch.empty(inserted_len - previous_len, dtype=torch.int32)
+                covered = previous_len
+                for begin, end, page in kv_page_spans:
+                    begin, end = max(begin, previous_len), min(end, inserted_len)
+                    if begin >= end:
+                        continue
+                    assert begin == covered
+                    kv_pages[begin - previous_len:end - previous_len].fill_(page)
+                    covered = end
+                assert covered == inserted_len
             new_node.set(
-                previous_len, inserted_len, input_ids, kv_indices,
-                self.page_size,
+                0, inserted_len - previous_len,
+                input_ids[previous_len:inserted_len],
+                kv_indices[previous_len:inserted_len],
+                self.page_size, kv_pages,
             )
             new_node.set_parent(node)
             self._remove_leaf(node)
@@ -528,16 +544,29 @@ class LogRadixTree(BasePrefixCache):
         assert pos % self.granularity == 0
         parent = node.parent
         split_depth = node.begin + pos
-        self._update_kv_refs(node, -1)
-
         prefix = LogRadixTreeNode(
             self.key_fn, self.granularity, node.timestamp
         )
-        kv_pages = node._kv_pages
-        prefix.set(0, pos, node.key, node.kv, self.page_size, kv_pages)
+        prefix._key = node._key[:pos]
+        prefix._kv = node._kv[:pos]
+        prefix._kv_pages = node._kv_pages[:pos]
+        counts = node._kv_page_counts
+        if pos <= node.length - pos:
+            prefix._kv_page_counts = dict(Counter(prefix._kv_pages.tolist()))
+            small_counts = prefix._kv_page_counts
+        else:
+            prefix._kv_page_counts = counts
+            node._kv_page_counts = dict(Counter(node._kv_pages[pos:].tolist()))
+            small_counts = node._kv_page_counts
+        for frame, tokens in small_counts.items():
+            remaining = counts[frame] - tokens
+            if remaining:
+                counts[frame] = remaining
+                self._update_kv_frame(frame, 1, int(node.is_locked))
+            else:
+                del counts[frame]
         prefix.set_parent(parent)
         prefix.ref_count = node.ref_count
-        self._update_kv_refs(prefix, 1)
 
         old_entries = node._entries
         node._entries = []
@@ -559,9 +588,10 @@ class LogRadixTree(BasePrefixCache):
             else:
                 self._register_entry(node, entry, checkpoint_timestamp)
 
-        node.set(pos, node.length, node.key, node.kv, self.page_size, kv_pages)
+        node._key = node._key[pos:]
+        node._kv = node._kv[pos:]
+        node._kv_pages = node._kv_pages[pos:]
         node.set_parent(prefix)
-        self._update_kv_refs(node, 1)
         for part in (parent, prefix, node):
             self._refresh_checkpoint_neighbors(part)
         self.revision += 1
@@ -683,6 +713,21 @@ class LogRadixTree(BasePrefixCache):
             0, node.timestamp,
         ) for node in nodes]
         return nodes, rows
+
+    def eviction_candidates(
+        self,
+    ) -> Iterable[tuple[list[LogRadixTreeNode], list[tuple[int, ...]], bool]]:
+        limit = 8
+        while True:
+            nodes, rows = self.log_eviction_snapshot(limit)
+            if not nodes:
+                break
+            yield nodes, rows, True
+            if limit >= len(self._log_leaf_heap):
+                break
+            limit *= 4
+        nodes, rows = self.eviction_snapshot()
+        yield nodes, rows, False
 
     def slot_entry_count(self, slot: int) -> int:
         return len(self._slot_entries[slot])
@@ -852,9 +897,6 @@ class LogRadixTree(BasePrefixCache):
 
     def slot_is_fragmented(self, slot: int) -> bool:
         return len(self._slot_entries[slot]) > 1
-
-    def unique_slots(self) -> tuple[int, ...]:
-        return tuple(self._slot_entries)
 
     def evictable_slots(self) -> tuple[int, ...]:
         return tuple(self._evictable_slots)

@@ -161,6 +161,11 @@ class PiecewiseGraphRunner:
         tokens = len(inputs) if inputs is not None else sum(req.extend_len for req in batch.reqs)
         return 0 < tokens <= self.buckets[-1]
 
+    def warmup(self, engine) -> None:
+        from .prefill_warmup import warmup_prefill
+
+        warmup_prefill(engine)
+
     def token_bucket(self, tokens: int) -> int:
         return self.buckets[bisect_left(self.buckets, tokens)]
 

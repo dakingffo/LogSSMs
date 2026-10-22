@@ -75,6 +75,52 @@ def make_history() -> tuple[LogRadixTree, torch.Tensor]:
     return tree, input_ids
 
 
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("position", [16, 112])
+def test_split_owns_one_mapping_snapshot_and_preserves_shared_page_refs(locked, position):
+    tree = LogRadixTree(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    tokens = ids(128)
+    mapping = torch.cat((ids(32, 640), ids(64, 1280), ids(32, 672)))
+    original = mapping.clone()
+    leaf = tree.insert(tokens, mapping).node
+    storage = leaf.kv.untyped_storage().data_ptr()
+    if locked:
+        tree.lock(leaf)
+    mapping.fill_(-1)
+    prefix = tree.split_at(leaf, position)
+    assert prefix.kv.untyped_storage().data_ptr() == storage
+    assert leaf.kv.untyped_storage().data_ptr() == storage
+    torch.testing.assert_close(torch.cat((prefix.kv, leaf.kv)), original)
+    for node in (prefix, leaf):
+        from collections import Counter
+        assert node._kv_page_counts == dict(Counter((node.kv // PAGE_SIZE).tolist()))
+    tree.check_integrity()
+    if locked:
+        tree.lock(leaf, unlock=True)
+    tree.check_integrity()
+
+
+def test_attach_many_logs_does_not_recopy_mapping_suffixes():
+    tree = LogRadixTree(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    tokens = ids(8192)
+    leaf = tree.insert(tokens, tokens).node
+    with patch.object(LogRadixTreeNode, "set", side_effect=AssertionError("mapping copied")):
+        for i in range(128):
+            tree.attach_entry(leaf, LogStateEntry(i, LogStateKind.LOG, i * 64, (i + 1) * 64))
+    assert len({node.kv.untyped_storage().data_ptr() for node in tree.path(leaf)}) == 1
+    tree.check_integrity()
+
+
+def test_insert_accepts_cpu_page_spans_without_reading_mapping_back():
+    tree = LogRadixTree(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
+    tokens = ids(128)
+    mapping = torch.cat((ids(64, 640), ids(64, 1280)))
+    with patch.object(torch.Tensor, "to", side_effect=AssertionError("mapping readback")):
+        leaf = tree.insert(tokens, mapping, kv_page_spans=[(0, 64, 10), (64, 128, 20)]).node
+    assert leaf._kv_page_counts == {10: 64, 20: 64}
+    tree.check_integrity()
+
+
 def test_edge_split_does_not_protect_a_node_without_a_branch():
     tree, _history = make_history()
     leaf = tree.leaves()[0]
@@ -87,8 +133,8 @@ def test_edge_split_does_not_protect_a_node_without_a_branch():
 def test_branch_inside_log_page_restores_work_state_and_protects_page():
     tree, history = make_history()
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
-    round_info = scheduler.begin_round(tree)
     request = torch.cat([history[:80], ids(32, 1000)])
+    round_info = scheduler.begin_round(tree, [tree.trace(request)])
 
     plan = scheduler.analyze(tree, [request], round_info)
 
@@ -369,7 +415,7 @@ def test_branch_between_checkpoints_blocks_coalesce_without_covering_log():
 def test_new_log_pages_are_not_touched_in_their_birth_round():
     tree, _history = make_history()
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
-    round_info = scheduler.begin_round(tree)
+    round_info = scheduler.begin_round(tree, [tree.trace(_history)])
     leaf = tree.leaves()[0]
     tree.detach_entry(3)
     tree.attach_entry(leaf, LogStateEntry(6, LogStateKind.LOG, 192, 256))
@@ -830,14 +876,16 @@ def test_analysis_matches_each_request_only_once():
     assert len(plan.materialize) == 3
 
 
-def test_round_snapshots_unique_slots_without_scanning_entries():
+def test_round_snapshots_only_matched_paths():
     tree, history = make_history()
     # Splitting a log creates two logical entries with one physical slot.
     tree.match_prefix(torch.cat([history[:80], ids(32, 10000)]))
     expected = frozenset(entry.slot for entry in tree.iter_entries())
     assert tree.slot_is_fragmented(1)
+    tree.insert(ids(64, 20000), ids(64, 10000),
+                (LogStateEntry(999, LogStateKind.LOG, 0, 64),))
     with patch.object(tree, "iter_entries", side_effect=AssertionError):
-        actual = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).begin_round(tree)
+        actual = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY).begin_round(tree, [tree.trace(history)])
     assert actual.eligible_slots == expected
 
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass, replace
+from contextlib import nullcontext
 
 import torch
 
 from logssms.core import Batch
 from logssms.kernel.metadata import copy_metadata, make_batch_mapping
 from logssms.layers.linear_attention_backend.mixed import (
-    copy_mixed_linear_metadata_, prepare_mixed_linear_metadata,
+    MixedLinearCopyPlan, prepare_mixed_linear_metadata,
 )
 from logssms.utils import init_logger
 from logssms.utils.batch import BatchIndices
@@ -23,6 +24,7 @@ class MixedGraph:
     graph : torch.cuda.CUDAGraph
     batch : Batch
     logits: torch.Tensor
+    linear_copy: MixedLinearCopyPlan | None = None
 
 
 class MixedGraphRunner:
@@ -44,6 +46,8 @@ class MixedGraphRunner:
         if engine.config.scheduling_policy != "mixed" or maximum < 2:
             return
         self.sizes = sorted({maximum, *(1 << n for n in range(1, maximum.bit_length()))})
+        if maximum >= 24 and 24 not in self.sizes:
+            self.sizes.insert(bisect_left(self.sizes, 24), 24)
         pool = None
         for size in reversed(self.sizes):
             for partition in reversed(self.buckets):
@@ -59,7 +63,15 @@ class MixedGraphRunner:
                         logits = engine.model.forward()
                 if pool is None:
                     pool = graph.pool()
-                self.graphs[size, partition] = MixedGraph(graph, batch, logits)
+                linear_copy = (MixedLinearCopyPlan(tuple(part.linear_attn_metadata for part in batch.mixed_parts))
+                               if self.linear_backend is not None else None)
+                copy_metadata(
+                    (batch.input_ids, batch.positions, batch.out_loc, batch.sample_indices),
+                    (batch.input_ids, batch.positions, batch.out_loc, batch.sample_indices),
+                )
+                if linear_copy is not None:
+                    linear_copy.copy(tuple(part.linear_attn_metadata for part in batch.mixed_parts))
+                self.graphs[size, partition] = MixedGraph(graph, batch, logits, linear_copy)
         logger.info_rank0(f"Captured {len(self.graphs)} mixed CUDA graphs: prefill={self.capacity}, requests={self.sizes}")
 
     def _capture_batch(self, engine, size, partition):
@@ -77,6 +89,7 @@ class MixedGraphRunner:
         batch.padded_reqs = batch.reqs
         batch.mixed_parts = prefill, decode
         batch.prefill_token_capacity = sum(partition)
+        prefill.prefill_token_capacity = batch.prefill_token_capacity
         batch.prefill_partition = partition
         page_size = getattr(engine.kv_cache, "kv_page_size", 1)
         packet, pp, dp = BatchIndices.make_mixed(batch, engine.device, page_size)
@@ -116,21 +129,23 @@ class MixedGraphRunner:
         return (batch.is_mixed and batch.hidden_captor is None
                 and self._graph_key(batch) in self.graphs)
 
-    def replay(self, batch):
+    def replay(self, batch, profiler=None):
         captured = self.graphs[self._graph_key(batch)]
         target = captured.batch
         count = len(batch.sample_indices)
-        copy_metadata(
-            (batch.input_ids, batch.positions, batch.out_loc, batch.sample_indices),
-            (target.input_ids, target.positions, target.out_loc, target.sample_indices[:count]),
-        )
-        self.backend.prepare_mixed_replay(target, batch)
-        if self.linear_backend is not None:
-            copy_mixed_linear_metadata_(
-                tuple(part.linear_attn_metadata for part in target.mixed_parts),
-                tuple(part.linear_attn_metadata for part in batch.mixed_parts),
+        stage = profiler.record_stage if profiler is not None else lambda _: nullcontext()
+        with stage("mixed_input_copy"):
+            copy_metadata(
+                (batch.input_ids, batch.positions, batch.out_loc, batch.sample_indices),
+                (target.input_ids, target.positions, target.out_loc, target.sample_indices[:count]),
             )
-        captured.graph.replay()
+        with stage("mixed_attention_plan"):
+            self.backend.prepare_mixed_replay(target, batch)
+        with stage("mixed_linear_copy"):
+            if self.linear_backend is not None:
+                captured.linear_copy.copy(tuple(part.linear_attn_metadata for part in batch.mixed_parts))
+        with stage("mixed_graph_launch"):
+            captured.graph.replay()
         return captured.logits[:count]
 
     def destroy_cuda_graphs(self):

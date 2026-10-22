@@ -398,7 +398,7 @@ def test_match_and_prefill_reuse_trace_until_tree_revision_changes():
             manager.tree, [tokens], traces=manager._prefill_traces([continuation]),
         )
     assert actual == expected
-    owner = manager.tree.entry_owner(manager.tree.unique_slots()[-1])
+    owner = manager.tree.entry_owner(max(manager.tree.iter_entries(), key=lambda entry: entry.end))
     manager.tree.protect(owner)
     with patch.object(manager.tree, "trace", wraps=manager.tree.trace) as trace:
         traces = manager._prefill_traces([continuation])
@@ -602,17 +602,18 @@ def test_partial_log_hit_restores_only_matched_granule():
     ])
     req = new_req(manager, input_ids, table_idx=1)
     assert req.cached_len == 16
-    tasks = manager._make_restore_tasks(Batch(reqs=[req], phase="prefill"))
-    assert len(tasks) == 1
-    assert tasks[0].logs[-1].end == 16
+    works = manager._restore_work_slots(Batch(reqs=[req], phase="prefill"))
+    assert len(works) == 1
+    recovery = manager.pending_recoveries[req.table_idx]
+    assert recovery.logs[-1].end == 16
 
     # Restore metadata must not pull a scalar from the device table. The CPU
     # ownership map already contains the same work slot.
     original_table = manager.resources.work_state_table
     manager.resources.work_state_table = SimpleNamespace(shape=original_table.shape)
     try:
-        repeated = manager._make_restore_tasks(Batch(reqs=[req], phase="prefill"))
-        assert repeated[0].output_slot == manager._request_states[req.table_idx].work_slot
+        repeated = manager._restore_work_slots(Batch(reqs=[req], phase="prefill"))
+        assert repeated[0] == manager._request_states[req.table_idx].work_slot
     finally:
         manager.resources.work_state_table = original_table
 
@@ -630,7 +631,7 @@ def test_partial_log_hit_restores_only_matched_granule():
     assert submit.call_args.kwargs["pending_cuda_events"] is manager._profile_cuda_events
     restore.assert_called_once()
     assert restore.call_args.args[1] == [
-        (tasks[0].base_slot, [(tasks[0].logs[0].slot, 0, 16)], tasks[0].output_slot),
+        (recovery.base_checkpoint_slot, [(recovery.logs[0].slot, 0, 16)], works[0]),
     ]
 
 

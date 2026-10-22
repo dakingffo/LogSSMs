@@ -179,7 +179,9 @@ def test_mixed_forward_profile_preserves_sampling_and_metadata(monkeypatch, chun
     engine.ctx = SimpleNamespace(forward_batch=forward_batch)
     logits = torch.arange(12).reshape(3, 4)[int(chunked):]
     engine.model = SimpleNamespace(forward=lambda: logits)
-    engine.mixed_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: True, replay=lambda _: logits)
+    engine.mixed_graph_runner = SimpleNamespace(
+        can_use_cuda_graph=lambda _: True, replay=lambda _, profiler=None: logits,
+    )
     engine.decode_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _batch: False)
     engine.piecewise_graph_runner = SimpleNamespace(can_use_cuda_graph=lambda _: False, replays=0,
                                                    padded_tokens=0, token_bucket=lambda _: 64)

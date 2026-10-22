@@ -98,8 +98,18 @@ def test_log_window_respects_hot_ancestor_and_excluded_cold_leaf():
     assert_full_plan_matches(manager, 9, 9)
     with patch.object(tree, "eviction_snapshot", wraps=tree.eviction_snapshot) as full:
         nodes, _pages, _slots, _compressed = manager._plan_eviction(9, 9, 0)
-    assert full.call_count == 1
+    assert full.call_count == 0
     assert nodes[:9] == leaves[:9]
+
+
+def test_log_window_expands_before_full_tree_planning():
+    manager = make_pressure_tree(chains=128, pages=4, checkpoints=3)
+    with patch.object(manager.tree, "eviction_snapshot", side_effect=AssertionError), patch.object(
+        manager.tree, "log_eviction_snapshot", wraps=manager.tree.log_eviction_snapshot,
+    ) as window:
+        nodes, _pages, _slots, compressed = manager._plan_eviction(16, 16, 0)
+    assert len(nodes) > 8 and not compressed
+    assert [call.args[0] for call in window.call_args_list] == [8, 32]
 
 
 def test_leaf_index_tracks_split_branch_prune_and_reset():

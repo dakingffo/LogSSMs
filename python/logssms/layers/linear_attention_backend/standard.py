@@ -56,15 +56,19 @@ class PackedLinearIndices:
             conv_chunks.extend((req_idx, chunk) for chunk in range((length + 63) // 64))
             endings.append(chunk_offsets[-1] - 1)
 
-        def tensor(values) -> torch.Tensor:
-            return torch.tensor(values, dtype=torch.int64, device=device)
-
+        vectors = (offsets, [v for pair in chunks for v in pair], chunk_offsets,
+                   endings, [v for pair in conv_chunks for v in pair])
+        sizes = [len(values) for values in vectors]
+        host = torch.tensor([v for values in vectors for v in values], dtype=torch.int64,
+                            pin_memory=device.type == "cuda")
+        packet = host.to(device, non_blocking=device.type == "cuda")
+        cu, chunks_tensor, chunk_offsets_tensor, endings_tensor, conv_tensor = packet.split(sizes)
         return cls(
-            cu_seqlens=tensor(offsets),
-            chunk_indices=tensor(chunks),
-            chunk_offsets=tensor(chunk_offsets),
-            endings=tensor(endings),
-            conv_chunks=tensor(conv_chunks),
+            cu_seqlens=cu,
+            chunk_indices=chunks_tensor.view(-1, 2),
+            chunk_offsets=chunk_offsets_tensor,
+            endings=endings_tensor,
+            conv_chunks=conv_tensor.view(-1, 2),
         )
 
     def fla_kwargs(self) -> dict[str, torch.Tensor]:

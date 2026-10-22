@@ -17,11 +17,10 @@ from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
 from tests.logstate_helpers import decay_view
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 16, 27, 28, 31, 32, 48, 64, 128])
-@pytest.mark.parametrize("tile_min_batch_size", [1, 28, 32, 60])
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 7, 8, 15, 16, 20, 23, 24, 27, 28, 31, 32, 48, 64, 128])
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("dims", [(128, 128), (32, 32)])
-def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, dims, tile_min_batch_size):
+def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, dims):
     from logssms.kernel.linear_attention.vendor.fla import gdn_replay, fused_recurrent
 
     launches = []
@@ -53,19 +52,18 @@ def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, d
     fused_recurrent_gated_delta_rule_to_logstate(
         q, q, v, a, a, torch.empty(6), torch.empty(6), pool,
         slots, slots, slots, 0, slots, enable_eager_state=eager,
-        tile_min_batch_size=tile_min_batch_size,
     )
     name, grid, config = launches.pop()
-    tiled = not eager and dims == (128, 128) and batch_size >= tile_min_batch_size
+    tiled = not eager and dims == (128, 128)
     assert name == ("tiled" if tiled else "full")
-    assert config["BLOCK_K"] == (64 if tiled else K)
+    assert config["BLOCK_K"] == ((32 if batch_size < 8 else 64) if tiled else K)
     expected_v = 64 if tiled else (8 if V < 128 else (16 if batch_size == 1 else 32))
     if not eager:
         expected_v = max(expected_v, 16)
     assert config["BLOCK_V"] == expected_v
     assert grid == ((V + expected_v - 1) // expected_v, batch_size * 6)
-    assert config["num_warps"] == (1 if eager or tiled else 4)
-    assert config["num_stages"] == (4 if tiled else 3)
+    assert config["num_warps"] == ((4 if batch_size < 8 else 1) if tiled else (1 if eager else 4))
+    assert config["num_stages"] == ((1 if 8 <= batch_size < 16 or 24 <= batch_size < 32 else 4) if tiled else 3)
 
 
 @triton.jit
@@ -545,7 +543,7 @@ def test_logstate_decode_mixed_flush_matches_fp32_recurrence(dtype, use_graph, d
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("batch_size", [32, 64])
+@pytest.mark.parametrize("batch_size", [1, 7, 8, 15, 16, 20, 21, 22, 23, 24, 31, 32, 64])
 def test_shared_key_tiled_replay_matches_fp32_recurrence_with_graph(batch_size):
     test_logstate_decode_mixed_flush_matches_fp32_recurrence(
         torch.bfloat16, True, (128, 128), batch_size=batch_size,

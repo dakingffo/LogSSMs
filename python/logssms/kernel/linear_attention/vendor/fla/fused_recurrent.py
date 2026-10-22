@@ -302,7 +302,6 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     layer        : int,
     replay_counts: torch.Tensor,
     enable_eager_state: bool = False,
-    tile_min_batch_size: int = 32,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
@@ -317,11 +316,25 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     output = torch.empty_like(value) if out is None else out
     assert output.shape == value.shape and output.dtype == value.dtype and output.is_contiguous()
     full_k = triton.next_power_of_2(head_k_dim)
-    tiled = (not enable_eager_state and head_k_dim == head_v_dim == 128
-             and batch_size >= max(1, tile_min_batch_size))
-    block_k = 64 if tiled else None
-    block_v = 64 if tiled else (8 if head_v_dim < 128 else (16 if batch_size == 1 else 32))
-    num_stages = 4 if tiled else 3
+    tiled = not enable_eager_state and head_k_dim == head_v_dim == 128
+    if tiled:
+        block_v = 64
+        if batch_size < 8:
+            block_k, num_warps, num_stages = 32, 4, 4
+        elif batch_size < 16:
+            block_k, num_warps, num_stages = 64, 1, 1
+        elif batch_size < 24:
+            block_k, num_warps, num_stages = 64, 1, 4
+        elif batch_size < 32:
+            block_k, num_warps, num_stages = 64, 1, 1
+        elif batch_size < 48:
+            block_k, num_warps, num_stages = 64, 1, 4
+        else:
+            block_k, num_warps, num_stages = 64, 1, 4
+    else:
+        block_k = None
+        block_v = 8 if head_v_dim < 128 else (16 if batch_size == 1 else 32)
+        num_warps, num_stages = (1 if enable_eager_state else 4), 3
     block_v = min(block_v, triton.next_power_of_2(head_v_dim))
     if not enable_eager_state:
         block_v = max(block_v, 16)
@@ -346,7 +359,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
             LAYER=layer, PAGE_SIZE=pool.page_size,
             LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
             REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
-            num_warps=1,
+            num_warps=num_warps,
             num_stages=num_stages,
         )
         return output
@@ -384,7 +397,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
         LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
         REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
         REPLAY_WORK=not enable_eager_state,
-        num_warps=4 if not enable_eager_state else 1,
+        num_warps=num_warps,
         num_stages=num_stages,
     )
     return output

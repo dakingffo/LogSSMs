@@ -9,6 +9,44 @@ from logssms.utils.batch import BatchIndices
 from tests.utils import clear_global_ctx
 
 
+def test_plan_waits_only_for_the_same_wrapper(monkeypatch):
+    class Event:
+        def __init__(self):
+            self.waits = self.records = 0
+
+        def synchronize(self):
+            self.waits += 1
+
+        def record(self):
+            self.records += 1
+
+    class Wrapper:
+        def plan(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    backend = FlashInferBackend.__new__(FlashInferBackend)
+    backend.profile_plan = False
+    wrappers = [Wrapper(), Wrapper()]
+    names = ("cu_seqlens_q_cpu", "cu_seqlens_k_cpu", "indices", "last_page_len_cpu",
+             "num_qo_heads", "num_kv_heads", "head_dim", "page_size", "pos_encoding_mode",
+             "seq_lens_cpu", "dtype")
+
+    def plan(wrapper):
+        metadata = SimpleNamespace(initialized=False, wrapper=wrapper,
+                                   **dict.fromkeys(names))
+        backend._initialize_metadata_once(metadata)
+        backend._initialize_metadata_once(metadata)
+
+    for wrapper in wrappers:
+        plan(wrapper)
+    assert all(event.waits == 0 and event.records == 1
+               for event in backend._plan_events.values())
+    plan(wrappers[0])
+    assert backend._plan_events[wrappers[0]].waits == 1
+    assert backend._plan_events[wrappers[1]].waits == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("head_dim", [64, 256])
 @pytest.mark.parametrize("decodes", [1, 3])
@@ -33,8 +71,6 @@ def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills, cap
     backend.kvcache = SimpleNamespace(k_cache=lambda _: k, v_cache=lambda _: v,
                                      dtype=k.dtype, kv_page_size=page)
     backend.float_workspace_buffer = torch.zeros(32 << 20, device=device, dtype=torch.uint8)
-    backend.last_event = torch.cuda.Event()
-    backend.last_event.record()
     backend.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(backend.float_workspace_buffer, kv_layout="NHD", backend="fa2")
     backend.decode_wrappers = BatchDecodeWithPagedKVCacheWrapper(backend.float_workspace_buffer, kv_layout="NHD", backend="fa2", use_tensor_cores=True)
     ctx = Context(page)
@@ -95,3 +131,9 @@ def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills, cap
         if graph is not None:
             graph.reset()
         clear_global_ctx()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prefills,capacity", [(1,32), (4,128)])
+def test_24_slot_mixed_graph_replays_prefill_and_decode(prefills, capacity):
+    test_mixed_graph_matches_separate_attention(256, 24-prefills, prefills, capacity)

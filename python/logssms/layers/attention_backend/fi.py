@@ -131,14 +131,14 @@ class FlashInferBackend(BaseAttnBackend):
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
-
-
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
-        self.last_event = torch.cuda.Event()
-        self.last_event.record()
+
+    @cached_property
+    def _plan_events(self):
+        return {}
 
     @nvtx_annotate("FlashInfer::plan")
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
@@ -148,10 +148,12 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
-
-
         started = perf_counter_ns() if self.profile_plan else 0
-        self.last_event.synchronize()
+        event = self._plan_events.get(metadata.wrapper)
+        if event is not None:
+            event.synchronize()
+        else:
+            event = self._plan_events[metadata.wrapper] = torch.cuda.Event()
         ready = perf_counter_ns() if self.profile_plan else 0
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
@@ -186,7 +188,7 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
                 causal=True,
             )
-        self.last_event.record()
+        event.record()
         if self.profile_plan:
             metadata.plan_cpu_ms = {
                 "workspace_wait": (ready - started) / 1e6,

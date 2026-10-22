@@ -16,10 +16,7 @@ if TYPE_CHECKING:
 
 
 class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBackend):
-    def __init__(self, *, enable_eager_state: bool = False, tile_min_batch_size: int = 32) -> None:
-        super().__init__(enable_eager_state=enable_eager_state)
-        self.tile_min_batch_size = max(1, tile_min_batch_size)
-
+    direct_prefill_metadata = True
     def forward(
         self,
         mixed_qkv  : torch.Tensor,
@@ -223,7 +220,6 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
             layer_idx,
             metadata.replay_counts,
             enable_eager_state=self.enable_eager_state,
-            tile_min_batch_size=self.tile_min_batch_size,
             out=None if out is None else out.unsqueeze(1),
         )
         return output.squeeze(1)

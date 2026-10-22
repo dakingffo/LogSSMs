@@ -180,12 +180,10 @@ def test_recycled_checkpoint_prefill_metadata_skips_log_writes() -> None:
         clear_global_ctx()
 
     metadata = batch.linear_attn_metadata
-    assert metadata.log_row_indices.numel() == 0
-    assert metadata.conv_snapshot_rows.tolist() == [127]
-    assert metadata.conv_write_slots.numel() == 0
-    assert metadata.checkpoint_slots.tolist() == [checkpoint_slot]
-    assert metadata.checkpoint_state_indices.tolist() == [7]
-    assert metadata.checkpoint_snapshot_indices.tolist() == [0]
+    assert metadata.log_write_slots.tolist() == [-1] * 128
+    assert metadata.conv_token_slots.tolist() == [-1] * 127 + [checkpoint_slot]
+    assert metadata.conv_token_granules[-1].item() == 0
+    assert metadata.chunk_write_slots.tolist() == [-1] * 7 + [checkpoint_slot]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

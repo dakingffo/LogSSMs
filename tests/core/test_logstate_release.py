@@ -99,3 +99,50 @@ def test_release_waits_for_pending_materialization(lazy):
     assert not pool._retired_materializations
     assert logs[0] not in pool.allocator.allocated_slots
     manager.check_integrity()
+
+
+class _PendingEvent:
+    def __init__(self):
+        self.ready = False
+        self.waits = 0
+        self.queries = 0
+
+    def synchronize(self):
+        self.waits += 1
+        self.ready = True
+
+    def query(self):
+        self.queries += 1
+        return self.ready
+
+
+def test_reserve_waits_only_for_enough_retired_capacity():
+    pool = make_manager().logstate_pool
+    _, _, works = pool.reserve(works=2)
+    pool.reserve(kv=pool.allocator.free_frames)
+    first, second = _PendingEvent(), _PendingEvent()
+    pool._retiring_slots.update(works)
+    pool._retired_releases.extend(((first, (works[0],)), (second, (works[1],))))
+    assert pool.reserve(kv=1) is not None
+    assert first.waits == 1 and second.waits == 0
+    assert works[1] in pool.allocator.allocated_slots
+    assert pool._retired_releases == [(second, (works[1],))]
+    second.synchronize()
+    pool.poll_reclamation()
+    pool.allocator.check_integrity()
+
+
+def test_rebinding_batch_queries_one_event_and_releases_all_records():
+    pool = make_manager().logstate_pool
+    event = _PendingEvent()
+    records = tuple(object() for _ in range(128))
+    pool._retired_rebindings.append((event, records))
+    with patch.object(pool.allocator, "release_retirement") as release:
+        pool.poll_reclamation()
+        assert event.queries == 1
+        release.assert_not_called()
+        event.synchronize()
+        pool.poll_reclamation()
+        assert event.queries == 2
+        assert release.call_count == 128
+        assert not pool._retired_rebindings

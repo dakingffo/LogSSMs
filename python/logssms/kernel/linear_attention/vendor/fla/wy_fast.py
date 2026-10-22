@@ -10,26 +10,14 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
+from .config import prefill_config
 from .runtime import fla_cache_autotune
 from .op import exp2
 from .runtime import autotune_cache_kwargs
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-@fla_cache_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
-def recompute_w_u_fwd_kernel(
+def _recompute_w_u_fwd_kernel(
     k,
     v,
     beta,
@@ -95,6 +83,24 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_k)
 
 
+recompute_w_u_fwd_kernel_configured = triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})(_recompute_w_u_fwd_kernel)
+recompute_w_u_fwd_kernel = triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})(fla_cache_autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    **autotune_cache_kwargs,
+)(_recompute_w_u_fwd_kernel))
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -115,7 +121,12 @@ def recompute_w_u_fwd(
 
     w = k.new_empty(B, T, HV, K)
     u = torch.empty_like(v)
-    recompute_w_u_fwd_kernel[(NT, B*HV)](
+    kernel = recompute_w_u_fwd_kernel
+    config = {}
+    if BT == 32 and K == V == 128:
+        kernel = recompute_w_u_fwd_kernel_configured
+        config = prefill_config("wy", B * NT)
+    kernel[(NT, B*HV)](
         k=k,
         v=v,
         beta=beta,
@@ -133,5 +144,6 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        **config,
     )
     return w, u

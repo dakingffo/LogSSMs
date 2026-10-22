@@ -10,7 +10,7 @@ from logssms.layers.linear_attention_backend import (
     GatedDeltaBackend, GatedDeltaLogStateBackend, Mamba2Backend, Mamba2LogStateBackend,
 )
 from logssms.layers.linear_attention_backend.mixed import (
-    prepare_mixed_linear_metadata, copy_mixed_linear_metadata_,
+    prepare_mixed_linear_metadata, MixedLinearCopyPlan,
 )
 from logssms.utils.mixed import prefill_buckets
 from tests.utils import clear_global_ctx
@@ -87,7 +87,10 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
             capacity = sum(partition)
             inputs = {k:v[:capacity+1] for k,v in full_inputs.items()}
             captured = batch(partition, capacity)
+            captured.mixed_parts[0].prefill_token_capacity = capacity
+            backend.prepare_metadata(captured.mixed_parts[0])
             target = prepare_mixed_linear_metadata(backend,*captured.mixed_parts,capacity)
+            copy_plan = MixedLinearCopyPlan(target)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
@@ -106,8 +109,10 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
                     backend.forward(**{k:v[capacity:] for k,v in inputs.items()},batch=d,**kwargs),
                 )).clone()
                 states = tuple(t.clone() for t in buffers)
+                p.prefill_token_capacity = capacity
+                backend.prepare_metadata(p)
                 fresh = prepare_mixed_linear_metadata(backend,p,d,capacity)
-                copy_mixed_linear_metadata_(target,fresh)
+                copy_plan.copy(fresh)
                 reset()
                 graph.replay()
                 torch.cuda.synchronize()

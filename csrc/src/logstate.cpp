@@ -138,45 +138,74 @@ Rows batch_branch_points(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int gr
 Rows plan_materialize(const Rows& paths, const Rows& boundaries,
                       const Rows& candidates, Int page_size) {
   check(paths.size() == boundaries.size() && page_size > 0, "Invalid materialize metadata");
-  std::vector<std::vector<Entry>> unpacked;
-  for (const auto& path : paths) {
-    unpacked.push_back(entries(path));
+  struct PathIndex {
+    std::vector<Entry> values;
+    Vector checkpoints, boundaries, protected_begins, protected_ends;
+    std::vector<std::pair<Int, Int>> logs;
+  };
+  std::vector<PathIndex> unpacked(paths.size());
+  for (size_t p = 0; p < paths.size(); ++p) {
+    auto& index = unpacked[p];
+    index.values = entries(paths[p]);
+    index.boundaries.assign(boundaries[p].begin(), boundaries[p].end());
+    std::sort(index.boundaries.begin(), index.boundaries.end());
+    std::vector<std::pair<Int, Int>> logs, protected_intervals;
+    for (const auto& value : index.values) {
+      if (value.span >= 0) {
+        index.checkpoints.push_back(value.end);
+      } else {
+        logs.emplace_back(value.begin, value.end);
+      }
+      if (value.protected_entry) {
+        protected_intervals.emplace_back(value.begin, value.end);
+      }
+    }
+    std::sort(index.checkpoints.begin(), index.checkpoints.end());
+    std::sort(logs.begin(), logs.end());
+    for (const auto& interval : logs) {
+      if (!index.logs.empty() && interval.first <= index.logs.back().second) {
+        index.logs.back().second = std::max(index.logs.back().second, interval.second);
+      } else {
+        index.logs.push_back(interval);
+      }
+    }
+    std::sort(protected_intervals.begin(), protected_intervals.end());
+    for (const auto& interval : protected_intervals) {
+      index.protected_begins.push_back(interval.first);
+      index.protected_ends.push_back(interval.second);
+    }
+    for (size_t i = index.protected_ends.size(); i > 1; --i) {
+      index.protected_ends[i - 2] = std::min(index.protected_ends[i - 2], index.protected_ends[i - 1]);
+    }
   }
   Rows result;
   for (Int candidate = 0; candidate < static_cast<Int>(candidates.size()); ++candidate) {
     const auto& row = candidates[candidate];
     check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(paths.size()),
           "Invalid materialize candidate path");
-    const auto& path = unpacked[row[0]];
-    check(row[1] >= 0 && row[1] < static_cast<Int>(path.size()), "Invalid candidate entry");
-    const auto& entry = path[row[1]];
+    const auto& index = unpacked[row[0]];
+    check(row[1] >= 0 && row[1] < static_cast<Int>(index.values.size()), "Invalid candidate entry");
+    const auto& entry = index.values[row[1]];
     if (!entry.eligible || entry.span >= 0 || entry.fragmented
-        || (entry.end - entry.begin) % page_size
-        || protected_interval(path, boundaries[row[0]], entry.begin, entry.end)) {
+        || (entry.end - entry.begin) % page_size) {
       continue;
     }
-    Int base_slot = -1, cursor = 0;
-    for (const auto& value : path) {
-      if (value.span >= 0 && value.end <= entry.begin
-          && (base_slot == -1 || value.end > cursor)) {
-        base_slot = value.slot;
-        cursor = value.end;
-      }
+    const auto boundary = std::upper_bound(index.boundaries.begin(), index.boundaries.end(), entry.begin);
+    const auto protected_index = std::lower_bound(
+        index.protected_begins.begin(), index.protected_begins.end(), entry.begin)
+        - index.protected_begins.begin();
+    if ((boundary != index.boundaries.end() && *boundary < entry.end)
+        || (protected_index < static_cast<Int>(index.protected_ends.size())
+            && index.protected_ends[protected_index] <= entry.end)) {
+      continue;
     }
-    Vector output{candidate, base_slot};
-    for (Int i = 0; i < static_cast<Int>(path.size()); ++i) {
-      const auto& value = path[i];
-      if (value.span >= 0 || value.end <= cursor || value.begin > cursor) {
-        continue;
-      }
-      output.push_back(i);
-      cursor = std::min(entry.end, value.end);
-      if (cursor == entry.end) {
-        break;
-      }
-    }
-    if (cursor == entry.end) {
-      result.push_back(List(output.begin(), output.end()));
+    auto checkpoint = std::upper_bound(index.checkpoints.begin(), index.checkpoints.end(), entry.begin);
+    const Int base = checkpoint == index.checkpoints.begin() ? 0 : *std::prev(checkpoint);
+    auto log = std::upper_bound(
+        index.logs.begin(), index.logs.end(), base,
+        [](Int position, const auto& interval) { return position < interval.first; });
+    if (log != index.logs.begin() && std::prev(log)->second >= entry.end) {
+      result.push_back(List({candidate}));
     }
   }
   return result;
@@ -964,35 +993,6 @@ struct Planner {
     return result;
   }
 
-  static tvm::ffi::Tensor cover(tvm::ffi::TensorView path, Int begin, Int end) {
-    const auto rows = read_rows(path);
-    check(rows.size() == 1 && begin <= end, "Invalid log coverage interval");
-    const auto values = entries(rows[0]);
-    Vector order;
-    for (Int i = 0; i < static_cast<Int>(values.size()); ++i) {
-      if (values[i].span < 0) {
-        order.push_back(i);
-      }
-    }
-    std::stable_sort(order.begin(), order.end(), [&](Int a, Int b) {
-      return std::tie(values[a].begin, values[a].end) < std::tie(values[b].begin, values[b].end);
-    });
-    Vector selected;
-    Int cursor = begin;
-    for (const auto i : order) {
-      const auto& entry = values[i];
-      if (entry.end <= cursor || entry.begin > cursor) {
-        continue;
-      }
-      selected.push_back(i);
-      cursor = std::min(end, entry.end);
-      if (cursor == end) {
-        break;
-      }
-    }
-    selected.insert(selected.begin(), cursor);
-    return write_rows(Rows({List(selected.begin(), selected.end())}));
-  }
 };
 
 }
@@ -1001,7 +1001,6 @@ struct Planner {
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_branch_points, logssms::Planner::branches);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_coalesce, logssms::Planner::coalesce);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(cover_logs, logssms::Planner::cover);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_eviction, logssms::Planner::eviction);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_recycle_bin, logssms::make_recycle_bin);

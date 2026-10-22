@@ -269,25 +269,26 @@ class Scheduler(SchedulerIOMixin):
                 self.ar_manager.candidate_count,
                 self.ar_manager.token_budget,
             )
-        adder = PrefillAdder(
-            token_budget=self.prefill_budget,
-            reserved_size=(
-                (self.ar_manager.need_capacity + self.prefill_manager.need_capacity)
-                if self.prefill_manager.runnable else 0
-            ),
-            cache_manager=self.cache_manager,
-            table_manager=self.table_manager,
-            profiler=self.profiler if self.profiler.enabled else None,
-            mixed_token_budget=(
-                self.config.mixed_prefill_tokens if mixed_decode_cap > 0 else None
-            ),
-            mixed_partitions=(
-                tuple(p for p in self.engine.mixed_graph_runner.partitions.values()
-                      if len(p) < self.config.max_running_req)
-                if mixed_decode_cap > 0 else ()
-            ),
-        )
         with self.profiler.record_schedule() as schedule:
+            with self.profiler.record_schedule_step("reservation"):
+                adder = PrefillAdder(
+                    token_budget=self.prefill_budget,
+                    reserved_size=(
+                        (self.ar_manager.need_capacity + self.prefill_manager.need_capacity)
+                        if self.prefill_manager.runnable else 0
+                    ),
+                    cache_manager=self.cache_manager,
+                    table_manager=self.table_manager,
+                    profiler=self.profiler if self.profiler.enabled else None,
+                    mixed_token_budget=(
+                        self.config.mixed_prefill_tokens if mixed_decode_cap > 0 else None
+                    ),
+                    mixed_partitions=(
+                        tuple(p for p in self.engine.mixed_graph_runner.partitions.values()
+                              if len(p) < self.config.max_running_req)
+                        if mixed_decode_cap > 0 else ()
+                    ),
+                )
             with self.profiler.record_schedule_step("prefill_select"):
                 if mixed_decode_cap > 0:
                     batch = self.prefill_manager.schedule_next_batch(

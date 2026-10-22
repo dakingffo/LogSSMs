@@ -159,13 +159,6 @@ class Engine:
                     config.cache_type,
                     recurrent_type=config.model_config.make_linear_cache_spec(config.tp_info.size).recurrent_type,
                     enable_eager_state=eager_state,
-                    tile_min_batch_size=(
-                        max(1, config.max_running_req
-                            - config.mixed_prefill_tokens // config.cache_config.granularity)
-                        if config.scheduling_policy == "mixed"
-                        and isinstance(config.cache_config, LogStateCacheConfig)
-                        else 32
-                    ),
                 )
             )
         if config.model_config.is_moe:
@@ -214,11 +207,9 @@ class Engine:
             )
             if self.decode_graph_runner.max_graph_bs > 0 else None
         )
+        if self.piecewise_graph_runner is not None and self.piecewise_graph_runner.pieces:
+            self.piecewise_graph_runner.warmup(self)
         self.mixed_graph_runner = MixedGraphRunner(self)
-        if config.scheduling_policy == "mixed":
-            from .warmup import warmup_mixed_linear
-
-            warmup_mixed_linear(self)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         torch.distributed.init_process_group(
@@ -309,6 +300,7 @@ class Engine:
             tuple(req.extend_len for req in prefill.reqs)
         )
         batch.prefill_token_capacity = sum(batch.prefill_partition)
+        prefill.prefill_token_capacity = batch.prefill_token_capacity
         assert all(req.extend_len <= capacity for req, capacity in zip(prefill.reqs, batch.prefill_partition))
         batch.mixed_parts = prefill, decode
         stage = self.profiler.record_stage if self.profiler.enabled else lambda _: nullcontext()
@@ -459,7 +451,10 @@ class Engine:
             with self.ctx.forward_batch(batch):
                 if mixed_graph:
                     with profiler.record_stage("mixed_graph_replay"):
-                        logits = self.mixed_graph_runner.replay(batch)
+                        logits = self.mixed_graph_runner.replay(batch, profiler=profiler)
+                    plan_cpu_ms = getattr(batch.attn_metadata, "plan_cpu_ms", None)
+                    if plan_cpu_ms is not None:
+                        sample["attention_plan_cpu_ms"] = plan_cpu_ms
                 elif decode_graph:
                     logits = self.decode_graph_runner.replay(batch, profiler=profiler)
                 else:

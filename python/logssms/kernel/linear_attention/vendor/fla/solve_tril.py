@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
+from .config import prefill_config
 from .op import make_tensor_descriptor
 from .runtime import IS_TMA_SUPPORTED, autotune_cache_kwargs, input_guard
 
@@ -93,16 +94,6 @@ def solve_tril_16x16_kernel(
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
-    ],
-    key=['H', 'BT', 'IS_VARLEN'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def merge_16x16_to_32x32_inverse_kernel(
     A,
@@ -365,10 +356,12 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
+    config = {}
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
         merge_fn = merge_16x16_to_32x32_inverse_kernel
+        config = prefill_config("solve", B * NT)
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
 
@@ -381,5 +374,6 @@ def solve_tril(
         H=H,
         BT=BT,
         USE_TMA=IS_TMA_SUPPORTED,
+        **config,
     )
     return Ai

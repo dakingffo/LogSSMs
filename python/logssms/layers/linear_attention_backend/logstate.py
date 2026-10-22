@@ -73,6 +73,7 @@ class LogStateLinearAttentionCaptureData:
 
 
 class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
+    direct_prefill_metadata = False
 
     def __init__(self, *, enable_eager_state: bool = False) -> None:
         self.capture: LogStateLinearAttentionCaptureData | None = None
@@ -207,7 +208,12 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             conv_read_granules=conv_read_granules,
             replay_counts=replay_counts,
         )
-        if batch.is_prefill:
+        item_calls = item_cpu_ns = 0
+        direct = (batch.is_prefill and batch.logstate_first_offsets is not None
+                  and self.direct_prefill_metadata)
+        if direct:
+            self._prepare_direct_prefill(batch, metadata, pool)
+        elif batch.is_prefill:
             offsets = [0]
             snapshot_rows = []
             snapshot_reqs = []
@@ -369,6 +375,59 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 "item_calls": item_calls,
                 "item_cpu_ms": item_cpu_ns / 1e6,
             })
+
+    def _prepare_direct_prefill(self, batch, metadata, pool):
+        from logssms.kernel.metadata import make_logstate_prefill_writes
+
+        lengths = [req.extend_len for req in batch.reqs]
+        granularity = pool.layout.granularity
+        metadata.prefill_indices = PackedLinearIndices.from_lengths(lengths, pool.device, granularity)
+        metadata.cu_seqlens = metadata.prefill_indices.cu_seqlens
+        total = sum(lengths)
+        host = torch.empty(3 * total + len(metadata.prefill_indices.chunk_indices),
+                           dtype=torch.int32, pin_memory=pool.device.type == "cuda")
+        conv_slots, conv_granules, log_mask = host[:3 * total].view(3, total).numpy()
+        chunk_writes = host[3 * total:].numpy()
+        conv_slots.fill(-1)
+        conv_granules.fill(0)
+        log_mask.fill(1)
+        chunk_writes.fill(-1)
+        checkpoints = iter(sorted(batch.logstate_checkpoint_writes))
+        checkpoint = next(checkpoints, None)
+        ranges = {}
+        for req, begin, end in batch.logstate_checkpoint_ranges:
+            ranges.setdefault(req, []).append((begin, end))
+        token_begin = chunk_begin = 0
+        for i, req in enumerate(batch.reqs):
+            length, first = lengths[i], batch.logstate_first_offsets[i]
+            token_end = token_begin + length
+            conv_slots[token_begin + granularity - 1 - first % granularity:token_end:granularity] = -2
+            if length:
+                conv_slots[token_end - 1] = -2
+            for begin, end in ranges.get(i, ()):
+                begin = max(0, begin - req.cached_len)
+                end = min(length, end - req.cached_len)
+                if begin < end:
+                    log_mask[token_begin + begin:token_begin + end] = 0
+                    conv_slots[token_begin + begin:token_begin + end] = -1
+            while checkpoint is not None and checkpoint[0] < token_end:
+                global_row, slot = checkpoint
+                row = global_row - token_begin
+                assert row >= 0
+                if (first + row + 1) % granularity == 0 or row + 1 == length:
+                    conv_slots[global_row] = slot
+                    conv_granules[global_row] = (
+                        0 if pool.allocator.slot(slot).kind == "work" else pool.layout.num_granules - 1
+                    )
+                    chunk_writes[chunk_begin + row // granularity] = slot
+                checkpoint = next(checkpoints, None)
+            token_begin += length
+            chunk_begin += (length + granularity - 1) // granularity
+        packet = host.to(pool.device, non_blocking=pool.device.type == "cuda")
+        metadata.chunk_write_slots = packet[3 * total:]
+        metadata.log_write_slots, metadata.conv_token_slots, metadata.conv_token_granules = (
+            make_logstate_prefill_writes(metadata.log_slots, metadata.token_offsets, packet, granularity)
+        )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
         del max_seq_len

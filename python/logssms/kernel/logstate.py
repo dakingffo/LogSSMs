@@ -81,7 +81,3 @@ def plan_coalesce(paths: Rows, boundaries: Rows, locks: Rows, anchors: Rows,
         materialized, page_size, diagnostics,
     )
     return _unpack(result["groups"]), dict(result["diagnostics"].items())
-
-
-def cover_logs(path: Sequence[int], begin: int, end: int) -> list[int]:
-    return _unpack(_load_logstate_module().cover_logs(_pack([path]), begin, end))[0]

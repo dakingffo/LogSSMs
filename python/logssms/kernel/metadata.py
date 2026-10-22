@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import linecache
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
@@ -70,13 +73,34 @@ def write_slot_descriptors(indices, payload, conv, decay, payload_table, conv_ta
     )
 
 
-@triton.jit
-def _copy_metadata_kernel(sources, outputs, counts: tl.constexpr, BLOCK: tl.constexpr):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    for i in tl.static_range(len(sources)):
-        count = counts.value[i]
-        value = tl.load(sources[i] + offset, mask=offset < count, other=0)
-        tl.store(outputs[i] + offset, value, mask=offset < count)
+@cache
+def _metadata_kernel(padding: bool, fields: int):
+    names = ("src", "dst", "length", "capacity", "fill", "tail") if padding else (
+        "src", "dst", "length", "src_stride", "dst_stride",
+    )
+    arguments = [f"{name}{i}" for i in range(fields) for name in names]
+    name = f"metadata_{'pad' if padding else 'copy'}_{fields}"
+    lines = [f"def {name}({', '.join(arguments)}, BLOCK: tl.constexpr):",
+             "    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)"]
+    for i in range(fields):
+        if padding:
+            lines.extend([
+                f"    value = tl.load(src{i} + offset, offset < length{i}, other=0)",
+                f"    fill = tl.where(tail{i} >= 0, tl.where(offset % 2 == 1, tail{i}, 0), fill{i})",
+                f"    value = tl.where(offset < length{i}, value, fill)",
+                f"    tl.store(dst{i} + offset, value, offset < capacity{i})",
+            ])
+        else:
+            lines.extend([
+                f"    value = tl.load(src{i} + offset * src_stride{i}, offset < length{i}, other=0)",
+                f"    tl.store(dst{i} + offset * dst_stride{i}, value, offset < length{i})",
+            ])
+    source = "\n".join(lines) + "\n"
+    filename = f"<logssms.{name}>"
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    namespace = {"tl": tl, "__name__": __name__}
+    exec(compile(source, filename, "exec"), namespace)
+    return triton.jit(namespace[name], do_not_specialize=arguments)
 
 
 def copy_metadata(sources, outputs):
@@ -89,12 +113,69 @@ def copy_metadata(sources, outputs):
     if count == 0:
         return
     if outputs[0].is_cuda:
-        _copy_metadata_kernel[(triton.cdiv(count, 128),)](
-            sources, outputs, counts, BLOCK=128, num_warps=1,
+        def stride(tensor):
+            if tensor.is_contiguous():
+                return 1
+            if tensor.ndim == 1:
+                return tensor.stride(0)
+            raise ValueError("metadata copies require contiguous tensors or strided vectors")
+        arguments = tuple(value for src, dst, n in zip(sources, outputs, counts)
+                          for value in (src, dst, n, stride(src), stride(dst)))
+        _metadata_kernel(False, len(outputs))[(triton.cdiv(count, 128),)](
+            *arguments, BLOCK=128, num_warps=1,
         )
     else:
         for source, output in zip(sources, outputs, strict=True):
             output.copy_(source)
+
+
+def pad_metadata(sources, outputs, fills, chunk_tails):
+    if not outputs:
+        return
+    counts = tuple(t.numel() for t in outputs)
+    if outputs[0].is_cuda:
+        arguments = tuple(value for src, dst, n, fill, tail in zip(sources, outputs, counts, fills, chunk_tails)
+                          for value in (src, dst, src.numel(), n, fill, tail))
+        _metadata_kernel(True, len(outputs))[(triton.cdiv(max(counts), 128),)](
+            *arguments, BLOCK=128, num_warps=1,
+        )
+    else:
+        for src, dst, fill, tail in zip(sources, outputs, fills, chunk_tails):
+            dst.fill_(fill)
+            if tail >= 0:
+                dst[:, 1] = tail
+            dst[:len(src)].copy_(src)
+
+
+@triton.jit(do_not_specialize=["count"])
+def _logstate_prefill_writes_kernel(logs, offsets, plan, output, count,
+                                    GRANULARITY: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = row < count
+    slot = tl.load(logs + row, mask, other=-1)
+    position = tl.load(offsets + row, mask, other=0)
+    conv = tl.load(plan + row, mask, other=-1)
+    granule = tl.load(plan + count + row, mask, other=0)
+    write_log = tl.load(plan + 2 * count + row, mask, other=0)
+    tl.store(output + row, tl.where(write_log != 0, slot, -1), mask)
+    tl.store(output + count + row, tl.where(conv == -2, slot, conv), mask)
+    tl.store(output + 2 * count + row,
+             tl.where(conv == -2, position // GRANULARITY, granule), mask)
+
+
+def make_logstate_prefill_writes(logs, offsets, plan, granularity):
+    count = logs.numel()
+    output = torch.empty((3, count), dtype=logs.dtype, device=logs.device)
+    if logs.is_cuda:
+        _logstate_prefill_writes_kernel[(triton.cdiv(count, 128),)](
+            logs, offsets, plan, output, count, GRANULARITY=granularity, BLOCK=128, num_warps=1,
+        )
+    else:
+        conv, granules, enabled = plan[:3 * count].view(3, count)
+        output[0] = torch.where(enabled != 0, logs, -1)
+        output[1] = torch.where(conv == -2, logs, conv)
+        output[2] = torch.where(conv == -2, offsets // granularity, granules)
+    return output.unbind(0)
 
 
 @triton.jit

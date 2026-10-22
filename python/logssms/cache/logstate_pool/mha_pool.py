@@ -107,7 +107,7 @@ class MHALogStatePool(BaseKVCachePool):
         self._retired_materializations: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
         self._retired_releases: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
         self._retiring_slots: set[int] = set()
-        self._retired_rebindings: list[tuple[torch.cuda.Event, RetiredResources]] = []
+        self._retired_rebindings: list[tuple[torch.cuda.Event, tuple[RetiredResources, ...]]] = []
 
     @property
     def device(self) -> torch.device:
@@ -367,31 +367,40 @@ class MHALogStatePool(BaseKVCachePool):
             now = perf_counter_ns()
             timings["allocator_reserve_ms"] = (now - stage) / 1e6
             stage = now
-        if allocated is None and (self._retired_materializations or self._retired_releases or self._retired_rebindings):
+        while allocated is None and (self._retired_materializations or self._retired_releases or self._retired_rebindings):
             if timings is not None:
-                timings["waited_materializations"] = sum(
-                    len(slots) for _event, slots in self._retired_materializations
-                )
-                timings["waited_merge_slots"] = len(self._retiring_slots)
-            for event, _slots in self._retired_materializations:
-                event.synchronize()
-            for event, _slots in self._retired_releases:
-                event.synchronize()
-            for event, _record in self._retired_rebindings:
-                event.synchronize()
+                timings.setdefault("waited_materializations", 0)
+                timings.setdefault("waited_merge_slots", 0)
+            if self._retired_rebindings:
+                event, _records = self._retired_rebindings[0]
+            elif self._retired_materializations:
+                event, slots = self._retired_materializations[0]
+                if timings is not None:
+                    timings["waited_materializations"] += len(slots)
+            else:
+                event, slots = self._retired_releases[0]
+                if timings is not None:
+                    timings["waited_merge_slots"] += len(slots)
+            event.synchronize()
             if timings is not None:
                 now = perf_counter_ns()
-                timings["wait_materialization_ms"] = (now - stage) / 1e6
+                timings["wait_materialization_ms"] = (
+                    timings.get("wait_materialization_ms", 0.0) + (now - stage) / 1e6
+                )
                 stage = now
             self.poll_reclamation(timings)
             if timings is not None:
                 now = perf_counter_ns()
-                timings["retry_poll_reclamation_ms"] = (now - stage) / 1e6
+                timings["retry_poll_reclamation_ms"] = (
+                    timings.get("retry_poll_reclamation_ms", 0.0) + (now - stage) / 1e6
+                )
                 stage = now
             allocated = self.allocator.reserve(kv=kv, logs=logs, states=works)
             if timings is not None:
                 now = perf_counter_ns()
-                timings["retry_allocator_reserve_ms"] = (now - stage) / 1e6
+                timings["retry_allocator_reserve_ms"] = (
+                    timings.get("retry_allocator_reserve_ms", 0.0) + (now - stage) / 1e6
+                )
                 stage = now
         if allocated is None:
             if timings is not None:
@@ -434,6 +443,8 @@ class MHALogStatePool(BaseKVCachePool):
         from logssms.kernel.linear_attention.logstate import copy_states
 
         assert len(groups) == len(works)
+        if not groups:
+            return
         retirements = [self.allocator.coalesce_to_checkpoint(slots) for slots in groups]
         destinations = [slots[-1] for slots in groups]
         self._write_descriptors(destinations)
@@ -441,7 +452,7 @@ class MHALogStatePool(BaseKVCachePool):
         if self.device.type == "cuda":
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(self.device))
-            self._retired_rebindings.extend((event, retirement) for retirement in retirements)
+            self._retired_rebindings.append((event, tuple(retirements)))
         else:
             for retirement in retirements:
                 self.allocator.release_retirement(retirement)
@@ -467,11 +478,12 @@ class MHALogStatePool(BaseKVCachePool):
 
     def poll_reclamation(self, timings: dict[str, float] | None = None) -> None:
         rebindings = []
-        for event, record in self._retired_rebindings:
+        for event, records in self._retired_rebindings:
             if event.query():
-                self.allocator.release_retirement(record)
+                for record in records:
+                    self.allocator.release_retirement(record)
             else:
-                rebindings.append((event, record))
+                rebindings.append((event, records))
         self._retired_rebindings = rebindings
         remaining = []
         completed = []

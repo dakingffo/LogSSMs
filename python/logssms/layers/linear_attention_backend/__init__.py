@@ -26,11 +26,8 @@ SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("mamba2/logstate")(Mamba2LogStateBa
 
 def make_linear_attention_backend(
     cache_type: str, *, recurrent_type: str = "gdn", enable_eager_state: bool = False,
-    tile_min_batch_size: int = 32,
 ) -> BaseLinearAttentionBackend:
     backend = SUPPORTED_LINEAR_ATTENTION_BACKENDS[f"{recurrent_type}/{cache_type}"]
-    if cache_type == "logstate" and recurrent_type == "gdn":
-        return backend(enable_eager_state=enable_eager_state, tile_min_batch_size=tile_min_batch_size)
     return backend(enable_eager_state=enable_eager_state) if cache_type == "logstate" else backend()
 
 __all__ = [
