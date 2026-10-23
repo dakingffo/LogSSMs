@@ -158,7 +158,7 @@ def test_mixed_variable_prefills_preserve_outputs_and_pool(mamba, logstate):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             for actual, expected in zip(buffers, expected_buffers):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            from logssms.engine.warmup import record_kernel_variants
+            from tests.kernel_variants import record_kernel_variants
 
             reset()
             with record_kernel_variants(strict=True):

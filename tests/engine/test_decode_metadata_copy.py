@@ -12,7 +12,7 @@ from logssms.layers.linear_attention_backend.logstate import (
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_metadata_dynamic_lengths_and_strides_do_not_compile():
-    from logssms.engine.warmup import record_kernel_variants
+    from tests.kernel_variants import record_kernel_variants
 
     def run(n, step):
         source = torch.arange(2048, device="cuda", dtype=torch.int64)[1:1 + n * step:step]
@@ -30,7 +30,7 @@ def test_metadata_dynamic_lengths_and_strides_do_not_compile():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_metadata_padding_has_fixed_fields_and_dynamic_sizes():
-    from logssms.engine.warmup import record_kernel_variants
+    from tests.kernel_variants import record_kernel_variants
     from logssms.layers.linear_attention_backend.mixed import _MetadataPadding
 
     def run(length, capacity):

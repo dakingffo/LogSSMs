@@ -118,7 +118,7 @@ def test_mixed_packet_matches_independent_packets(lengths, decode_count):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_linear_slot_metadata_reuses_variants_across_decode_counts():
-    from logssms.engine.warmup import record_kernel_variants
+    from tests.kernel_variants import record_kernel_variants
 
     device = torch.device("cuda")
     table = torch.arange(32 * 128, device=device, dtype=torch.int32).reshape(32, 128)
