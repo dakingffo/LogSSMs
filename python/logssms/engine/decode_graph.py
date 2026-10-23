@@ -14,7 +14,7 @@ from logssms.utils import init_logger, nvtx_annotate
 if TYPE_CHECKING:
     from .profile import EngineProfiler
     from logssms.layers.attention_backend import BaseAttnBackend
-    from logssms.layers.linear_attention_backend import BaseLinearAttentionBackend
+    from logssms.layers.linear_attention_backend import BaseLinearAttnBackend
     from logssms.models import BaseLLMModel
 
 logger = init_logger(__name__)
@@ -83,7 +83,7 @@ class DecodeGraphRunner:
         device             : torch.device,
         model              : BaseLLMModel,
         attn_backend       : BaseAttnBackend,
-        linear_attn_backend: BaseLinearAttentionBackend | None,
+        linear_attn_backend: BaseLinearAttnBackend | None,
         cuda_graph_bs      : list[int] | None,
         cuda_graph_max_bs  : int | None,
         free_memory        : int,

@@ -19,7 +19,16 @@ class BaseCacheConfig:
 
 
 @dataclass(frozen=True)
-class StandardCacheConfig(BaseCacheConfig):
+class NaiveCacheConfig(BaseCacheConfig):
+    page_size: int = 256
+
+    def __post_init__(self) -> None:
+        if self.page_size <= 0:
+            raise ValueError("Cache page size must be positive.")
+
+
+@dataclass(frozen=True)
+class RadixCacheConfig(BaseCacheConfig):
     page_size: int = 256
 
     def __post_init__(self) -> None:
@@ -76,6 +85,7 @@ __all__ = [
     "LOG_STATE_GRANULARITIES",
     "LOG_STATE_PAGE_SIZE",
     "LogStateCacheConfig",
-    "StandardCacheConfig",
+    "NaiveCacheConfig",
+    "RadixCacheConfig",
     "MarconiCacheConfig",
 ]

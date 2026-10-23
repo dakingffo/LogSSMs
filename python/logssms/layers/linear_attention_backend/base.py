@@ -13,11 +13,11 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class BaseLinearAttentionMetadata(ABC):
+class BaseLinearAttnMetadata(ABC):
     phase: Literal["prefill", "decode", "verify"]
 
 
-class BaseLinearAttentionBackend(ABC):
+class BaseLinearAttnBackend(ABC):
     def forward_mixed(self, batch: Batch, token_inputs: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         from logssms.layers.piecewise import attention_output_buffer
 
@@ -57,7 +57,7 @@ class BaseLinearAttentionBackend(ABC):
     def prepare_for_replay(self, batch: Batch) -> None: ...
 
 
-class BaseGatedDeltaBackend(BaseLinearAttentionBackend):
+class BaseGatedDeltaBackend(BaseLinearAttnBackend):
 
     @abstractmethod
     def forward(
@@ -74,7 +74,7 @@ class BaseGatedDeltaBackend(BaseLinearAttentionBackend):
     ) -> torch.Tensor: ...
 
 
-class BaseMamba2Backend(BaseLinearAttentionBackend):
+class BaseMamba2Backend(BaseLinearAttnBackend):
     @abstractmethod
     def forward(
         self,
@@ -92,6 +92,6 @@ class BaseMamba2Backend(BaseLinearAttentionBackend):
 
 
 __all__ = [
-    "BaseLinearAttentionBackend", "BaseLinearAttentionMetadata",
+    "BaseLinearAttnBackend", "BaseLinearAttnMetadata",
     "BaseGatedDeltaBackend", "BaseMamba2Backend",
 ]

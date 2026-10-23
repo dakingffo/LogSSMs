@@ -1,13 +1,13 @@
 from logssms.utils import Registry
 
-from .base import BaseGatedDeltaBackend, BaseMamba2Backend, BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from .base import BaseGatedDeltaBackend, BaseMamba2Backend, BaseLinearAttnBackend, BaseLinearAttnMetadata
 from .standard import (
-    LinearAttentionCaptureData,
-    LinearAttentionMetadata,
+    LinearAttnCaptureData,
+    LinearAttnMetadata,
 )
 from .logstate import (
-    LogStateLinearAttentionCaptureData,
-    LogStateLinearAttentionMetadata,
+    LogStateLinearAttnCaptureData,
+    LogStateLinearAttnMetadata,
 )
 from .gdn import GatedDeltaBackend
 from .gdn_logstate import GatedDeltaLogStateBackend
@@ -15,7 +15,7 @@ from .mamba2 import Mamba2Backend
 from .mamba2_logstate import Mamba2LogStateBackend
 
 
-SUPPORTED_LINEAR_ATTENTION_BACKENDS = Registry[type[BaseLinearAttentionBackend]]("linear attention backend")
+SUPPORTED_LINEAR_ATTENTION_BACKENDS = Registry[type[BaseLinearAttnBackend]]("linear attention backend")
 for cache_type in ("naive", "radix", "marconi"):
     SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"gdn/{cache_type}")(GatedDeltaBackend)
 SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("gdn/logstate")(GatedDeltaLogStateBackend)
@@ -26,23 +26,23 @@ SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("mamba2/logstate")(Mamba2LogStateBa
 
 def make_linear_attention_backend(
     cache_type: str, *, recurrent_type: str = "gdn", enable_eager_state: bool = False,
-) -> BaseLinearAttentionBackend:
+) -> BaseLinearAttnBackend:
     backend = SUPPORTED_LINEAR_ATTENTION_BACKENDS[f"{recurrent_type}/{cache_type}"]
     return backend(enable_eager_state=enable_eager_state) if cache_type == "logstate" else backend()
 
 __all__ = [
-    "BaseLinearAttentionBackend",
+    "BaseLinearAttnBackend",
     "BaseGatedDeltaBackend",
     "BaseMamba2Backend",
     "SUPPORTED_LINEAR_ATTENTION_BACKENDS",
-    "BaseLinearAttentionMetadata",
+    "BaseLinearAttnMetadata",
     "GatedDeltaBackend",
-    "LinearAttentionCaptureData",
-    "LinearAttentionMetadata",
+    "LinearAttnCaptureData",
+    "LinearAttnMetadata",
     "GatedDeltaLogStateBackend",
     "Mamba2Backend",
     "Mamba2LogStateBackend",
-    "LogStateLinearAttentionCaptureData",
-    "LogStateLinearAttentionMetadata",
+    "LogStateLinearAttnCaptureData",
+    "LogStateLinearAttnMetadata",
     "make_linear_attention_backend",
 ]

@@ -103,7 +103,7 @@ class MarconiPrefixCache(BasePrefixCache):
     def match_prefix(self, input_ids):
         tokens = tuple(input_ids.tolist()) if isinstance(input_ids, torch.Tensor) else tuple(input_ids)
         matched, best = self._walk(tokens)
-        # Snapshot positions use the standard prefill kernel's chunk boundaries.
+        # Snapshot positions use the prefill kernel's chunk boundaries.
         branch = best.end + ((matched - best.end) // 64) * 64
         if branch == best.end:
             branch = 0

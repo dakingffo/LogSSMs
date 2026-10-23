@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from logssms.engine.decode_graph import DecodeGraphCaptureBuffer
 from logssms.kernel.metadata import copy_metadata
 from logssms.layers.linear_attention_backend.logstate import (
-    LogStateLinearAttentionBackend, LogStateLinearAttentionCaptureData,
-    LogStateLinearAttentionMetadata,
+    LogStateLinearAttnBackend, LogStateLinearAttnCaptureData,
+    LogStateLinearAttnMetadata,
 )
 
 
@@ -121,8 +121,8 @@ def test_metadata_copy_rejects_empty_groups():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_metadata_copies_update_graph_inputs_without_cross_batch_pollution():
     capture = DecodeGraphCaptureBuffer(4, 8, torch.device("cuda"))
-    backend = LogStateLinearAttentionBackend()
-    backend.capture = LogStateLinearAttentionCaptureData.make(4, torch.device("cuda"))
+    backend = LogStateLinearAttnBackend()
+    backend.capture = LogStateLinearAttnCaptureData.make(4, torch.device("cuda"))
     linear = backend.capture
     graph = torch.cuda.CUDAGraph()
     result = torch.empty(4, device="cuda", dtype=torch.int32)
@@ -146,7 +146,7 @@ def test_metadata_copies_update_graph_inputs_without_cross_batch_pollution():
             forward.wait_event(ready)
             capture.copy_from(SimpleNamespace(input_ids=sources[0], positions=sources[1],
                                               out_loc=sources[2], padded_size=4))
-            metadata = LogStateLinearAttentionMetadata("decode", *sources[3:])
+            metadata = LogStateLinearAttnMetadata("decode", *sources[3:])
             backend._copy_to_capture(metadata, 4)
             graph.replay()
             snapshots.append(result.clone())

@@ -8,14 +8,14 @@ from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.core import get_global_ctx
 from logssms.kernel import prepare_gdn
 from .base import BaseGatedDeltaBackend
-from .logstate import LogStateLinearAttentionBackend, LogStateLinearAttentionMetadata
+from .logstate import LogStateLinearAttnBackend, LogStateLinearAttnMetadata
 
 if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.layers.gated_delta import GatedDeltaConfig
 
 
-class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBackend):
+class GatedDeltaLogStateBackend(LogStateLinearAttnBackend, BaseGatedDeltaBackend):
     direct_prefill_metadata = True
     def forward(
         self,
@@ -30,7 +30,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         metadata = batch.linear_attn_metadata
-        assert isinstance(metadata, LogStateLinearAttentionMetadata)
+        assert isinstance(metadata, LogStateLinearAttnMetadata)
         assert metadata.phase == batch.phase
         if batch.is_prefill:
             return self._forward_prefill(
@@ -94,7 +94,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         batch      : Batch,
-        metadata   : LogStateLinearAttentionMetadata,
+        metadata   : LogStateLinearAttnMetadata,
         out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
@@ -185,7 +185,7 @@ class GatedDeltaLogStateBackend(LogStateLinearAttentionBackend, BaseGatedDeltaBa
         A_log      : torch.Tensor,
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
-        metadata   : LogStateLinearAttentionMetadata,
+        metadata   : LogStateLinearAttnMetadata,
         out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (

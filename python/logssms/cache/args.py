@@ -10,7 +10,8 @@ from logssms.cache.config import (
     BaseCacheConfig,
     LOG_STATE_GRANULARITIES,
     LogStateCacheConfig,
-    StandardCacheConfig,
+    NaiveCacheConfig,
+    RadixCacheConfig,
     MarconiCacheConfig,
 )
 
@@ -29,19 +30,34 @@ class CacheArgumentParserBase(ABC):
     def make_config(kwargs: dict) -> BaseCacheConfig: ...
 
 
-class StandardCacheArgumentParser(CacheArgumentParserBase):
+class NaiveCacheArgumentParser(CacheArgumentParserBase):
     @staticmethod
     def add_arguments(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--page-size",
             type=int,
-            default=StandardCacheConfig.page_size,
+            default=NaiveCacheConfig.page_size,
             help="Physical cache page size in tokens.",
         )
 
     @staticmethod
-    def make_config(kwargs: dict) -> StandardCacheConfig:
-        return StandardCacheConfig(page_size=kwargs.pop("page_size"))
+    def make_config(kwargs: dict) -> NaiveCacheConfig:
+        return NaiveCacheConfig(page_size=kwargs.pop("page_size"))
+
+
+class RadixCacheArgumentParser(CacheArgumentParserBase):
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--page-size",
+            type=int,
+            default=RadixCacheConfig.page_size,
+            help="Physical cache page size in tokens.",
+        )
+
+    @staticmethod
+    def make_config(kwargs: dict) -> RadixCacheConfig:
+        return RadixCacheConfig(page_size=kwargs.pop("page_size"))
 
 
 class MarconiCacheArgumentParser(CacheArgumentParserBase):
@@ -128,8 +144,8 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
 SUPPORTED_CACHE_ARGUMENT_PARSERS = Registry[
     type[CacheArgumentParserBase]
 ]("Cache Argument Parser")
-SUPPORTED_CACHE_ARGUMENT_PARSERS.register("naive")(StandardCacheArgumentParser)
-SUPPORTED_CACHE_ARGUMENT_PARSERS.register("radix")(StandardCacheArgumentParser)
+SUPPORTED_CACHE_ARGUMENT_PARSERS.register("naive")(NaiveCacheArgumentParser)
+SUPPORTED_CACHE_ARGUMENT_PARSERS.register("radix")(RadixCacheArgumentParser)
 SUPPORTED_CACHE_ARGUMENT_PARSERS.register("logstate")(LogStateCacheArgumentParser)
 SUPPORTED_CACHE_ARGUMENT_PARSERS.register("marconi")(MarconiCacheArgumentParser)
 
@@ -142,6 +158,7 @@ __all__ = [
     "CacheArgumentParserBase",
     "LogStateCacheArgumentParser",
     "SUPPORTED_CACHE_ARGUMENT_PARSERS",
-    "StandardCacheArgumentParser",
+    "NaiveCacheArgumentParser",
+    "RadixCacheArgumentParser",
     "make_cache_argument_parser",
 ]

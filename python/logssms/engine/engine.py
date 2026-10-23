@@ -510,9 +510,9 @@ class Engine:
             object.__setattr__(config, attr, value)
 
         def override_page_size(value: int) -> None:
-            from logssms.cache import StandardCacheConfig
+            from logssms.cache import NaiveCacheConfig, RadixCacheConfig
 
-            assert isinstance(config.cache_config, StandardCacheConfig)
+            assert isinstance(config.cache_config, (NaiveCacheConfig, RadixCacheConfig))
             override("cache_config", replace(config.cache_config, page_size=value))
 
         if config.scheduling_policy == "mixed":

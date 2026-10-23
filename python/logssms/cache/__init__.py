@@ -14,7 +14,8 @@ from logssms.cache.config import (
     LOG_STATE_GRANULARITIES,
     LOG_STATE_PAGE_SIZE,
     LogStateCacheConfig,
-    StandardCacheConfig,
+    NaiveCacheConfig,
+    RadixCacheConfig,
     MarconiCacheConfig,
 )
 from logssms.cache.factory import (
@@ -62,7 +63,8 @@ __all__ = [
     "MatchResult",
     "SUPPORTED_CACHE_FACTORIES",
     "SUPPORTED_CACHE_ARGUMENT_PARSERS",
-    "StandardCacheConfig",
+    "NaiveCacheConfig",
+    "RadixCacheConfig",
     "MarconiCacheConfig",
     "MarconiCacheManager",
     "MarconiCacheFactory",

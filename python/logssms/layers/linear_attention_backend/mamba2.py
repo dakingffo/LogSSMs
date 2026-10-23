@@ -11,10 +11,10 @@ from logssms.kernel.linear_attention.mamba2 import (
 from logssms.kernel.linear_attention.packed_conv import packed_causal_conv1d, packed_conv_snapshots
 
 from .base import BaseMamba2Backend
-from .standard import StandardLinearAttentionBackend
+from .standard import StandardLinearAttnBackend
 
 
-class Mamba2Backend(StandardLinearAttentionBackend, BaseMamba2Backend):
+class Mamba2Backend(StandardLinearAttnBackend, BaseMamba2Backend):
     def forward(self, xbc, dt, conv_weight, conv_bias, A_log, dt_bias, D, config, batch, out=None):
         metadata = batch.linear_attn_metadata
         pool = get_global_ctx().linear_state

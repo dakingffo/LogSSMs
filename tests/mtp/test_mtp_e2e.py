@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import torch
 
 from logssms.core import Batch, SamplingParams
-from logssms.cache import StandardCacheConfig
+from logssms.cache import RadixCacheConfig
 from logssms.distributed import DistributedInfo
 from logssms.message import UserMsg
 from logssms.scheduler.config import SchedulerConfig
@@ -136,7 +136,7 @@ def make_config(enable_specualtive_decoding: bool, num_pages: int = 256) -> Sche
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
         max_running_req=8,
-        cache_config=StandardCacheConfig(page_size=1),
+        cache_config=RadixCacheConfig(page_size=1),
         num_page_override=num_pages,
         cache_type="radix",
         cuda_graph_max_bs=0,

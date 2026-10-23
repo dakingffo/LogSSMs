@@ -9,14 +9,14 @@ import torch.nn.functional as F
 from logssms.core import get_global_ctx
 from logssms.kernel import prepare_gdn, store_state
 from .base import BaseGatedDeltaBackend
-from .standard import StandardLinearAttentionBackend, LinearAttentionMetadata
+from .standard import StandardLinearAttnBackend, LinearAttnMetadata
 
 if TYPE_CHECKING:
     from logssms.core import Batch
     from logssms.layers.gated_delta import GatedDeltaConfig
 
 
-class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
+class GatedDeltaBackend(StandardLinearAttnBackend, BaseGatedDeltaBackend):
     def forward(
         self,
         mixed_qkv  : torch.Tensor,
@@ -34,7 +34,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         if hasattr(pool, "group_table"):
             metadata, lane = pool.map_metadata(metadata, config.layer_idx)
             config = replace(config, layer_idx=lane)
-        assert isinstance(metadata, LinearAttentionMetadata)
+        assert isinstance(metadata, LinearAttnMetadata)
         assert metadata.phase == batch.phase
         if metadata.phase == "prefill":
             return self._forward_prefill(
@@ -82,7 +82,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         config     : GatedDeltaConfig,
         batch      : Batch,
         out        : torch.Tensor | None = None,
-        metadata   : LinearAttentionMetadata | None = None,
+        metadata   : LinearAttnMetadata | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             ChunkStateIO, chunk_gated_delta_rule_to_cache,
@@ -95,7 +95,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         pool = ctx.linear_state
         layer_idx = config.layer_idx
         metadata = batch.linear_attn_metadata if metadata is None else metadata
-        assert isinstance(metadata, LinearAttentionMetadata)
+        assert isinstance(metadata, LinearAttnMetadata)
         indices = metadata.prefill_indices
         slots = metadata.baseline_slots
         assert indices is not None and slots is not None
@@ -157,7 +157,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         A_log      : torch.Tensor,
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
-        metadata   : LinearAttentionMetadata,
+        metadata   : LinearAttnMetadata,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             fused_recurrent_gated_delta_rule,
@@ -228,7 +228,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         A_log      : torch.Tensor,
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
-        metadata   : LinearAttentionMetadata,
+        metadata   : LinearAttnMetadata,
         out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (

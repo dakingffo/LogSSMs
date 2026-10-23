@@ -452,11 +452,11 @@ class RadixCacheFactory(BaseCacheFactory):
         available_memory  : int,
         speculator_reserve: SpeculatorReserve | None,
     ) -> RadixCachePlan:
-        from logssms.cache.config import StandardCacheConfig
+        from logssms.cache.config import RadixCacheConfig
         from logssms.distributed import try_get_tp_info
         from logssms.utils import div_even
 
-        assert isinstance(config.cache_config, StandardCacheConfig)
+        assert isinstance(config.cache_config, RadixCacheConfig)
         tp_info = try_get_tp_info()
         assert tp_info is not None
         cache_per_page = (

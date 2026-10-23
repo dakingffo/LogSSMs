@@ -7,14 +7,14 @@ import torch
 
 from logssms.core import get_global_ctx
 from logssms.cache.marconi.metadata import MarconiCacheMetadata
-from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from .base import BaseLinearAttnBackend, BaseLinearAttnMetadata
 
 if TYPE_CHECKING:
     from logssms.core import Batch
 
 
 @dataclass
-class LinearAttentionMetadata(BaseLinearAttentionMetadata):
+class LinearAttnMetadata(BaseLinearAttnMetadata):
     slots        : torch.Tensor | None = None
     read_slots   : torch.Tensor | None = None
     write_slots  : torch.Tensor | None = None
@@ -80,7 +80,7 @@ class PackedLinearIndices:
 
 
 @dataclass
-class LinearAttentionCaptureData:
+class LinearAttnCaptureData:
     slots: torch.Tensor
 
     @property
@@ -92,19 +92,19 @@ class LinearAttentionCaptureData:
         return self.slots[:, 1]
 
     @classmethod
-    def make(cls, max_bs: int, device: torch.device) -> LinearAttentionCaptureData:
+    def make(cls, max_bs: int, device: torch.device) -> LinearAttnCaptureData:
         return cls(
             slots=torch.zeros(max_bs, 2, dtype=torch.int64, device=device),
         )
 
 
-class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
+class StandardLinearAttnBackend(BaseLinearAttnBackend):
     def __init__(self) -> None:
-        self.capture: LinearAttentionCaptureData | None = None
+        self.capture: LinearAttnCaptureData | None = None
         self.capture_bs: list[int] = []
 
     def prepare_metadata(self, batch: Batch) -> None:
-        metadata = LinearAttentionMetadata(phase=batch.phase)
+        metadata = LinearAttnMetadata(phase=batch.phase)
         ctx = get_global_ctx()
         state_table = ctx.state_table
         assert state_table is not None
@@ -254,7 +254,7 @@ class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
         del max_seq_len
         assert self.capture is None, "Capture already initialized."
-        self.capture = LinearAttentionCaptureData.make(
+        self.capture = LinearAttnCaptureData.make(
             max(bs_list), get_global_ctx().linear_state.device
         )
         self.capture_bs = sorted(bs_list)
@@ -266,7 +266,7 @@ class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
         metadata = batch.linear_attn_metadata
         assert metadata.slots is not None
         self.capture.slots[:bs].copy_(metadata.slots)
-        batch.linear_attn_metadata = LinearAttentionMetadata(
+        batch.linear_attn_metadata = LinearAttnMetadata(
             phase="decode",
             slots=self.capture.slots[:bs],
             read_slots=self.capture.read_slots[:bs],

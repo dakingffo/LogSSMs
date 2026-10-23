@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from logssms.cache.base import KVCachePool, StateCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from logssms.layers.linear_attention_backend import (
-        BaseLinearAttentionBackend,
-        BaseLinearAttentionMetadata,
+        BaseLinearAttnBackend,
+        BaseLinearAttnMetadata,
     )
     from logssms.layers.moe_backend import BaseMoeBackend
     from logssms.speculator.hidden_captor import HiddenCaptorBase
@@ -114,30 +114,39 @@ class ChunkedRequest(Request):
 
 @dataclass
 class Batch:
-    reqs     : list[Request]
-    phase    : Literal["prefill", "decode", "verify", "mixed"]
+    # Requests
+    reqs            : list[Request]
+    phase           : Literal["prefill", "decode", "verify", "mixed"]
     num_prefill_reqs: int = 0
-    profile_id: int | None = field(init=False, default=None)
+    padded_reqs     : list[Request] = field(init=False)
 
-    input_ids  : torch.Tensor  = field(init=False)
-    positions  : torch.Tensor  = field(init=False)
-    out_loc    : torch.Tensor  = field(init=False)
-    padded_reqs: list[Request] = field(init=False)
+    # Mixed-batch layout
+    mixed_parts           : tuple[Batch, Batch] | None = field(init=False, default=None)
+    prefill_partition     : tuple[int, ...] = field(init=False, default=())
+    prefill_token_capacity: int = field(init=False, default=0)
+
+    # Model inputs and cache-write mapping
+    input_ids       : torch.Tensor = field(init=False)
+    positions       : torch.Tensor = field(init=False)
+    out_loc         : torch.Tensor = field(init=False)
     prepared_indices: BatchIndices | None = field(init=False, default=None)
 
-    attn_metadata: BaseAttnMetadata = field(init=False)
+    # Backend metadata
+    attn_metadata       : BaseAttnMetadata = field(init=False)
+    linear_attn_metadata: BaseLinearAttnMetadata = field(init=False)
+    cache_metadata      : CacheMetadata | None = field(init=False, default=None)
 
-
-    draft_tokens: torch.Tensor | None = field(init=False, default=None)
-    draft_probs : torch.Tensor | None = field(init=False, default=None)
-    hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
-    linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
-    cache_metadata: CacheMetadata | None = field(init=False, default=None)
-    mixed_parts: tuple[Batch, Batch] | None = field(init=False, default=None)
-    prefill_token_capacity: int = field(init=False, default=0)
-    prefill_partition: tuple[int, ...] = field(init=False, default=())
-    sample_indices: torch.Tensor | None = field(init=False, default=None)
+    # Sampling
+    sample_indices    : torch.Tensor | None = field(init=False, default=None)
     sample_req_indices: torch.Tensor | None = field(init=False, default=None)
+
+    # Speculative decoding
+    draft_tokens : torch.Tensor | None = field(init=False, default=None)
+    draft_probs  : torch.Tensor | None = field(init=False, default=None)
+    hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
+
+    # Profiling
+    profile_id: int | None = field(init=False, default=None)
 
     @property
     def is_mixed(self) -> bool:
@@ -188,7 +197,7 @@ class Context:
     page_size: int
     page_table         : torch.Tensor               = field(init=False)
     attn_backend       : BaseAttnBackend            = field(init=False)
-    linear_attn_backend: BaseLinearAttentionBackend = field(
+    linear_attn_backend: BaseLinearAttnBackend = field(
         default_factory=_make_default_linear_attention_backend,
         init=False,
     )

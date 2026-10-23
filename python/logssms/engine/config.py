@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -14,12 +14,6 @@ from logssms.models import ModelConfig, make_model_config
 if TYPE_CHECKING:
     from logssms.cache import BaseCacheConfig
     from logssms.speculator import BaseSpeculatorConfig
-
-
-def _make_default_cache_config() -> BaseCacheConfig:
-    from logssms.cache import StandardCacheConfig
-
-    return StandardCacheConfig()
 
 
 @dataclass(frozen=True)
@@ -40,9 +34,7 @@ class EngineConfig:
     max_seq_len_override    : int | None       = None
     num_page_override       : int | None       = None
     cache_type              : str              = "radix"
-    cache_config            : BaseCacheConfig  = field(
-        default_factory=_make_default_cache_config
-    )
+    cache_config            : BaseCacheConfig | None = None
 
     speculative_algorithm        : str | None                  = None
     speculative_draft_model_path : str | None                  = None
@@ -50,6 +42,12 @@ class EngineConfig:
     speculator_config            : BaseSpeculatorConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.cache_config is None:
+            from logssms.cache import make_cache_argument_parser
+
+            parser = make_cache_argument_parser(self.cache_type)
+            defaults = vars(parser.parser.parse_args([]))
+            object.__setattr__(self, "cache_config", parser.make_config(defaults))
         if self.scheduling_policy not in ("prefill-first", "mixed"):
             raise ValueError("scheduling_policy must be prefill-first or mixed")
         alignment = self.cache_config.prefill_alignment

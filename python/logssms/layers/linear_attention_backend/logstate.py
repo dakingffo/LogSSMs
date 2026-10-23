@@ -11,7 +11,7 @@ from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.cache.logstate.metadata import LogStateCacheMetadata
 from logssms.core import get_global_ctx
 
-from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
+from .base import BaseLinearAttnBackend, BaseLinearAttnMetadata
 from .standard import PackedLinearIndices
 
 if TYPE_CHECKING:
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class LogStateLinearAttentionMetadata(BaseLinearAttentionMetadata):
+class LogStateLinearAttnMetadata(BaseLinearAttnMetadata):
     work_slots         : torch.Tensor
     log_slots          : torch.Tensor
     token_offsets      : torch.Tensor
@@ -46,7 +46,7 @@ class LogStateLinearAttentionMetadata(BaseLinearAttentionMetadata):
 
 
 @dataclass
-class LogStateLinearAttentionCaptureData:
+class LogStateLinearAttnCaptureData:
     work_slots        : torch.Tensor
     log_slots         : torch.Tensor
     token_offsets     : torch.Tensor
@@ -59,7 +59,7 @@ class LogStateLinearAttentionCaptureData:
         cls,
         max_bs: int,
         device: torch.device,
-    ) -> LogStateLinearAttentionCaptureData:
+    ) -> LogStateLinearAttnCaptureData:
         def tensor() -> torch.Tensor:
             return torch.zeros(max_bs, dtype=torch.int32, device=device)
 
@@ -73,11 +73,11 @@ class LogStateLinearAttentionCaptureData:
         )
 
 
-class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
+class LogStateLinearAttnBackend(BaseLinearAttnBackend):
     direct_prefill_metadata = False
 
     def __init__(self, *, enable_eager_state: bool = False) -> None:
-        self.capture: LogStateLinearAttentionCaptureData | None = None
+        self.capture: LogStateLinearAttnCaptureData | None = None
         self.capture_bs: list[int] = []
         self.enable_eager_state = enable_eager_state
         self._profile_enabled = os.getenv(
@@ -131,7 +131,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 packet, state_table, work_table=work_state_table,
                 out_loc=batch.out_loc, page_size=pool.page_size,
             )
-            batch.linear_attn_metadata = LogStateLinearAttentionMetadata(
+            batch.linear_attn_metadata = LogStateLinearAttnMetadata(
                 phase=batch.phase, work_slots=slots[0], log_slots=slots[1],
                 token_offsets=slots[2], conv_read_slots=slots[0],
                 conv_read_granules=slots[3], replay_counts=packet.replay_counts,
@@ -203,7 +203,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
                 0,
             ).to(torch.int32)
 
-        metadata = LogStateLinearAttentionMetadata(
+        metadata = LogStateLinearAttnMetadata(
             phase=batch.phase,
             work_slots=work_slots,
             log_slots=log_slots,
@@ -438,7 +438,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         assert self.capture is None, "Capture already initialized."
         pool = get_global_ctx().linear_state
         assert isinstance(pool, MHALogStatePool)
-        self.capture = LogStateLinearAttentionCaptureData.make(
+        self.capture = LogStateLinearAttnCaptureData.make(
             max(bs_list), pool.device
         )
         self.capture_bs = sorted(bs_list)
@@ -448,21 +448,21 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         assert self.capture is not None and bs in self.capture_bs
         self.prepare_metadata(batch)
         metadata = batch.linear_attn_metadata
-        assert isinstance(metadata, LogStateLinearAttentionMetadata)
+        assert isinstance(metadata, LogStateLinearAttnMetadata)
         batch.linear_attn_metadata = self._copy_to_capture(metadata, bs)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata = batch.linear_attn_metadata
         bs = batch.padded_size
         assert self.capture is not None and bs in self.capture_bs
-        assert isinstance(metadata, LogStateLinearAttentionMetadata)
+        assert isinstance(metadata, LogStateLinearAttnMetadata)
         self._copy_to_capture(metadata, bs)
 
     def _copy_to_capture(
         self,
-        metadata: LogStateLinearAttentionMetadata,
+        metadata: LogStateLinearAttnMetadata,
         bs      : int,
-    ) -> LogStateLinearAttentionMetadata:
+    ) -> LogStateLinearAttnMetadata:
         assert self.capture is not None
         from logssms.kernel.metadata import copy_metadata
 
@@ -478,7 +478,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             tuple(getattr(metadata, name) for name in names),
             tuple(getattr(self.capture, name)[:bs] for name in names),
         )
-        return LogStateLinearAttentionMetadata(
+        return LogStateLinearAttnMetadata(
             phase="decode",
             work_slots=self.capture.work_slots[:bs],
             log_slots=self.capture.log_slots[:bs],

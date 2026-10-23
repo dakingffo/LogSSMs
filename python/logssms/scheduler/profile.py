@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from logssms.cache import BaseCacheManager
     from logssms.core import Batch
     from logssms.engine import Engine
-    from logssms.layers.linear_attention_backend import BaseLinearAttentionBackend
+    from logssms.layers.linear_attention_backend import BaseLinearAttnBackend
 
 
 logger = init_logger(__name__)
@@ -105,7 +105,7 @@ class SchedulerProfiler:
         self,
         device       : torch.device,
         cache_manager: BaseCacheManager,
-        linear_backend: BaseLinearAttentionBackend | None = None,
+        linear_backend: BaseLinearAttnBackend | None = None,
         engine       : Engine | None = None,
     ) -> None:
         self.enabled = _env_bool("LOGSSMS_PROFILE_SCHEDULER")

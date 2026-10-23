@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from logssms.cache.config import LogStateCacheConfig, StandardCacheConfig
+from logssms.cache.config import LogStateCacheConfig, NaiveCacheConfig, RadixCacheConfig
 from logssms.engine.mixed_graph import MixedGraphRunner
 from logssms.scheduler.prefill import PrefillAdder
 from logssms.utils.mixed import prefill_buckets, prefill_partitions
@@ -35,9 +35,12 @@ def test_partitions_preserve_budget_and_cover_every_count(budget, alignment):
     (LogStateCacheConfig(granularity=16), 72),
     (LogStateCacheConfig(granularity=32), 37),
     (LogStateCacheConfig(granularity=64), 17),
-    (StandardCacheConfig(page_size=64), 17),
-    (StandardCacheConfig(page_size=128), 17),
-    (StandardCacheConfig(page_size=256), 17),
+    (NaiveCacheConfig(page_size=64), 17),
+    (NaiveCacheConfig(page_size=128), 17),
+    (NaiveCacheConfig(page_size=256), 17),
+    (RadixCacheConfig(page_size=64), 17),
+    (RadixCacheConfig(page_size=128), 17),
+    (RadixCacheConfig(page_size=256), 17),
 ])
 @pytest.mark.parametrize("maximum", [16, 24, 32])
 def test_graph_enumeration(monkeypatch, cache_config, expected, maximum):

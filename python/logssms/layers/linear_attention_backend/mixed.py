@@ -13,12 +13,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from .base import BaseMamba2Backend
-from .logstate import LogStateLinearAttentionMetadata
-from .standard import LinearAttentionMetadata, PackedLinearIndices
+from .logstate import LogStateLinearAttnMetadata
+from .standard import LinearAttnMetadata, PackedLinearIndices
 
 if TYPE_CHECKING:
     from logssms.core import Batch
-    from .base import BaseLinearAttentionBackend
+    from .base import BaseLinearAttnBackend
 
 
 class _MetadataPadding:
@@ -59,12 +59,12 @@ def _packed_pad(
 
 
 def prepare_mixed_linear_metadata(
-    backend: BaseLinearAttentionBackend,
+    backend: BaseLinearAttnBackend,
     prefill: Batch,
     decode: Batch,
     prefill_capacity: int,
-) -> tuple[LinearAttentionMetadata | LogStateLinearAttentionMetadata,
-           LinearAttentionMetadata | LogStateLinearAttentionMetadata]:
+) -> tuple[LinearAttnMetadata | LogStateLinearAttnMetadata,
+           LinearAttnMetadata | LogStateLinearAttnMetadata]:
     """Normalize already-prepared metadata, install it, and return both dataclasses.
 
     Inputs to the prefill forward must have exactly ``prefill_capacity`` rows;
@@ -77,7 +77,7 @@ def prepare_mixed_linear_metadata(
     metadata before each replay, then copy into the captured dataclasses.
     """
     pm, dm = prefill.linear_attn_metadata, decode.linear_attn_metadata
-    if not isinstance(pm, (LinearAttentionMetadata, LogStateLinearAttentionMetadata)):
+    if not isinstance(pm, (LinearAttnMetadata, LogStateLinearAttnMetadata)):
         raise TypeError("mixed prefill requires prepared linear metadata")
     if type(dm) is not type(pm) or pm.phase != "prefill" or dm.phase != "decode":
         raise ValueError("mixed metadata requires matching prefill/decode backends")
@@ -90,7 +90,7 @@ def prepare_mixed_linear_metadata(
     if indices is None or len(indices.cu_seqlens) != len(lengths) + 1:
         raise ValueError("prepare ordinary actual-length metadata before normalization")
 
-    if isinstance(pm, LogStateLinearAttentionMetadata):
+    if isinstance(pm, LogStateLinearAttnMetadata):
         from logssms.core import get_global_ctx
 
         chunk_size = get_global_ctx().linear_state.layout.granularity
@@ -106,7 +106,7 @@ def prepare_mixed_linear_metadata(
         chunk_write_slots=pad(pm.chunk_write_slots, chunk_capacity, -1),
         conv_token_slots=pad(pm.conv_token_slots, prefill_capacity, -1),
     )
-    if isinstance(pm, LinearAttentionMetadata):
+    if isinstance(pm, LinearAttnMetadata):
         # Checkpoints are at most one per chunk. Index padding reads the first
         # real snapshot/state; sentinel destinations suppress all padded writes.
         for name in ("checkpoint_slots", "checkpoint_chunks", "snapshot_rows", "snapshot_reqs"):
@@ -160,7 +160,7 @@ def prepare_mixed_linear_metadata(
             # Using it avoids a variable-size log_row_indices gather entirely.
             updates["log_slots"] = updates["log_write_slots"]
     decode_updates = {}
-    if isinstance(dm, LinearAttentionMetadata):
+    if isinstance(dm, LinearAttnMetadata):
         for name in ("slots", "read_slots", "write_slots"):
             tensor = getattr(dm, name)
             if tensor is not None:
