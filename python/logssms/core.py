@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
 import torch
 
 if TYPE_CHECKING:
-    from logssms.engine.prefill_graph import PrefillGraphRunner
+    from logssms.cache.metadata import CacheMetadata
+    from logssms.engine.piecewise_graph import PiecewiseGraphRunner
     from logssms.utils.batch import BatchIndices
-    from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearCachePool
+    from logssms.cache import BaseCacheHandle
+    from logssms.cache.base import KVCachePool, StateCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from logssms.layers.linear_attention_backend import (
         BaseLinearAttentionBackend,
@@ -112,7 +115,8 @@ class ChunkedRequest(Request):
 @dataclass
 class Batch:
     reqs     : list[Request]
-    phase    : Literal["prefill", "decode", "verify"]
+    phase    : Literal["prefill", "decode", "verify", "mixed"]
+    num_prefill_reqs: int = 0
     profile_id: int | None = field(init=False, default=None)
 
     input_ids  : torch.Tensor  = field(init=False)
@@ -128,10 +132,35 @@ class Batch:
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
     linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
-    logstate_first_offsets: list[int] | None = field(init=False, default=None)
-    logstate_replay_counts: list[int] | None = field(init=False, default=None)
-    logstate_checkpoint_writes: list[tuple[int, int]] = field(init=False, default_factory=list)
-    logstate_checkpoint_ranges: list[tuple[int, int, int]] = field(init=False, default_factory=list)
+    cache_metadata: CacheMetadata | None = field(init=False, default=None)
+    mixed_parts: tuple[Batch, Batch] | None = field(init=False, default=None)
+    prefill_token_capacity: int = field(init=False, default=0)
+    prefill_partition: tuple[int, ...] = field(init=False, default=())
+    sample_indices: torch.Tensor | None = field(init=False, default=None)
+    sample_req_indices: torch.Tensor | None = field(init=False, default=None)
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.phase == "mixed"
+
+    @property
+    def prefill_count(self) -> int:
+        return self.size if self.is_prefill else self.num_prefill_reqs
+
+    @cached_property
+    def prefill_tokens(self) -> int:
+        return sum(req.extend_len for req in self.prefill_reqs)
+
+    @property
+    def prefill_reqs(self) -> list[Request]:
+        return self.reqs[:self.prefill_count]
+
+    @property
+    def decode_reqs(self) -> list[Request]:
+        return self.reqs[self.prefill_count:] if not self.is_verify else []
+
+    def req_is_prefill(self, index: int) -> bool:
+        return index < self.prefill_count
 
     @property
     def is_prefill(self) -> bool:
@@ -164,12 +193,12 @@ class Context:
         init=False,
     )
     moe_backend        : BaseMoeBackend             = field(init=False)
-    kv_cache           : BaseKVCachePool            = field(init=False)
-    linear_state       : LinearCachePool            = field(init=False)
+    kv_cache           : KVCachePool            = field(init=False)
+    linear_state       : StateCachePool            = field(init=False)
 
     state_table        : torch.Tensor | None = field(default=None, init=False)
     work_state_table   : torch.Tensor | None = field(default=None, init=False)
-    prefill_graph_runner: PrefillGraphRunner | None = field(default=None, init=False)
+    piecewise_graph_runner: PiecewiseGraphRunner | None = field(default=None, init=False)
 
     _batch      : Batch | None        = field(default=None, init=False)
 

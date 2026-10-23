@@ -138,45 +138,74 @@ Rows batch_branch_points(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int gr
 Rows plan_materialize(const Rows& paths, const Rows& boundaries,
                       const Rows& candidates, Int page_size) {
   check(paths.size() == boundaries.size() && page_size > 0, "Invalid materialize metadata");
-  std::vector<std::vector<Entry>> unpacked;
-  for (const auto& path : paths) {
-    unpacked.push_back(entries(path));
+  struct PathIndex {
+    std::vector<Entry> values;
+    Vector checkpoints, boundaries, protected_begins, protected_ends;
+    std::vector<std::pair<Int, Int>> logs;
+  };
+  std::vector<PathIndex> unpacked(paths.size());
+  for (size_t p = 0; p < paths.size(); ++p) {
+    auto& index = unpacked[p];
+    index.values = entries(paths[p]);
+    index.boundaries.assign(boundaries[p].begin(), boundaries[p].end());
+    std::sort(index.boundaries.begin(), index.boundaries.end());
+    std::vector<std::pair<Int, Int>> logs, protected_intervals;
+    for (const auto& value : index.values) {
+      if (value.span >= 0) {
+        index.checkpoints.push_back(value.end);
+      } else {
+        logs.emplace_back(value.begin, value.end);
+      }
+      if (value.protected_entry) {
+        protected_intervals.emplace_back(value.begin, value.end);
+      }
+    }
+    std::sort(index.checkpoints.begin(), index.checkpoints.end());
+    std::sort(logs.begin(), logs.end());
+    for (const auto& interval : logs) {
+      if (!index.logs.empty() && interval.first <= index.logs.back().second) {
+        index.logs.back().second = std::max(index.logs.back().second, interval.second);
+      } else {
+        index.logs.push_back(interval);
+      }
+    }
+    std::sort(protected_intervals.begin(), protected_intervals.end());
+    for (const auto& interval : protected_intervals) {
+      index.protected_begins.push_back(interval.first);
+      index.protected_ends.push_back(interval.second);
+    }
+    for (size_t i = index.protected_ends.size(); i > 1; --i) {
+      index.protected_ends[i - 2] = std::min(index.protected_ends[i - 2], index.protected_ends[i - 1]);
+    }
   }
   Rows result;
   for (Int candidate = 0; candidate < static_cast<Int>(candidates.size()); ++candidate) {
     const auto& row = candidates[candidate];
     check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(paths.size()),
           "Invalid materialize candidate path");
-    const auto& path = unpacked[row[0]];
-    check(row[1] >= 0 && row[1] < static_cast<Int>(path.size()), "Invalid candidate entry");
-    const auto& entry = path[row[1]];
+    const auto& index = unpacked[row[0]];
+    check(row[1] >= 0 && row[1] < static_cast<Int>(index.values.size()), "Invalid candidate entry");
+    const auto& entry = index.values[row[1]];
     if (!entry.eligible || entry.span >= 0 || entry.fragmented
-        || (entry.end - entry.begin) % page_size
-        || protected_interval(path, boundaries[row[0]], entry.begin, entry.end)) {
+        || (entry.end - entry.begin) % page_size) {
       continue;
     }
-    Int base_slot = -1, cursor = 0;
-    for (const auto& value : path) {
-      if (value.span >= 0 && value.end <= entry.begin
-          && (base_slot == -1 || value.end > cursor)) {
-        base_slot = value.slot;
-        cursor = value.end;
-      }
+    const auto boundary = std::upper_bound(index.boundaries.begin(), index.boundaries.end(), entry.begin);
+    const auto protected_index = std::lower_bound(
+        index.protected_begins.begin(), index.protected_begins.end(), entry.begin)
+        - index.protected_begins.begin();
+    if ((boundary != index.boundaries.end() && *boundary < entry.end)
+        || (protected_index < static_cast<Int>(index.protected_ends.size())
+            && index.protected_ends[protected_index] <= entry.end)) {
+      continue;
     }
-    Vector output{candidate, base_slot};
-    for (Int i = 0; i < static_cast<Int>(path.size()); ++i) {
-      const auto& value = path[i];
-      if (value.span >= 0 || value.end <= cursor || value.begin > cursor) {
-        continue;
-      }
-      output.push_back(i);
-      cursor = std::min(entry.end, value.end);
-      if (cursor == entry.end) {
-        break;
-      }
-    }
-    if (cursor == entry.end) {
-      result.push_back(List(output.begin(), output.end()));
+    auto checkpoint = std::upper_bound(index.checkpoints.begin(), index.checkpoints.end(), entry.begin);
+    const Int base = checkpoint == index.checkpoints.begin() ? 0 : *std::prev(checkpoint);
+    auto log = std::upper_bound(
+        index.logs.begin(), index.logs.end(), base,
+        [](Int position, const auto& interval) { return position < interval.first; });
+    if (log != index.logs.begin() && std::prev(log)->second >= entry.end) {
+      result.push_back(List({candidate}));
     }
   }
   return result;
@@ -338,113 +367,6 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
   return result;
 }
 
-struct Segment {
-  Int slot, end;
-  Vector outputs;
-};
-
-struct Chain {
-  Int base;
-  std::vector<Segment> segments;
-};
-
-Rows schedule_construction_waves(tvm::ffi::TensorView chain_rows, tvm::ffi::TensorView plans) {
-
-
-  std::vector<Chain> chains;
-  std::unordered_map<Int, Int> ends, writers;
-  const auto plan_data = cpu_ints(plans);
-  check(plans.size(0) % 2 == 0, "Invalid materialize output");
-  for (Int i = 0; i < plans.size(0); i += 2) {
-    ends[plan_data[i]] = plan_data[i + 1];
-  }
-  const auto data = cpu_ints(chain_rows);
-  for (Int i = 0; i < chain_rows.size(0);) {
-    const auto size = data[i++];
-    check(size >= 1 && size <= chain_rows.size(0) - i, "Invalid construction chain");
-    const auto end = i + size;
-    Chain chain{data[i++], {}};
-    while (i < end) {
-      check(i + 3 <= end && data[i + 2] >= 0
-            && data[i + 2] <= end - i - 3, "Invalid construction segment");
-      const auto n = data[i + 2];
-      chain.segments.push_back({data[i], data[i + 1], Vector(data + i + 3, data + i + 3 + n)});
-      i += 3 + n;
-    }
-    chains.push_back(std::move(chain));
-  }
-  for (Int i = 0; i < static_cast<Int>(chains.size()); ++i) {
-    for (const auto& entry : chains[i].segments) {
-      for (const auto slot : entry.outputs) {
-        if (ends.contains(slot)) {
-          check(!writers.contains(slot), "Checkpoint has multiple writers");
-          writers[slot] = i;
-        }
-      }
-    }
-  }
-  check(writers.size() == ends.size(), "Missing Checkpoint writer");
-  Vector starts(chains.size(), 0);
-  for (Int i = 0; i < static_cast<Int>(chains.size()); ++i) {
-    bool has_outputs = false;
-    for (Int j = 0; j < static_cast<Int>(chains[i].segments.size()); ++j) {
-      const auto& entry = chains[i].segments[j];
-      if (writers.contains(entry.slot) && writers[entry.slot] != i
-          && entry.end == ends[entry.slot] && !has_outputs && entry.outputs.empty()) {
-        starts[i] = j + 1;
-      }
-      has_outputs |= !entry.outputs.empty();
-    }
-    if (starts[i]) {
-      chains[i].base = chains[i].segments[starts[i] - 1].slot;
-    }
-  }
-  std::vector<std::set<Int>> successors(chains.size());
-  Vector indegree(chains.size());
-  auto depend = [&](Int before, Int after) {
-    if (before != after && successors[before].insert(after).second) {
-      ++indegree[after];
-    }
-  };
-  for (Int i = 0; i < static_cast<Int>(chains.size()); ++i) {
-
-    if (writers.contains(chains[i].base)) {
-      depend(writers[chains[i].base], i);
-    }
-    for (size_t j = starts[i]; j < chains[i].segments.size(); ++j) {
-      const auto slot = chains[i].segments[j].slot;
-      if (writers.contains(slot)) {
-        depend(i, writers[slot]);
-      }
-    }
-  }
-  Rows result;
-  Vector ready;
-  for (Int i = 0; i < static_cast<Int>(chains.size()); ++i) {
-    if (!indegree[i]) {
-      ready.push_back(i);
-    }
-  }
-  Int completed = 0, wave = 0;
-  while (!ready.empty()) {
-    std::sort(ready.begin(), ready.end());
-    Vector next;
-    for (const auto i : ready) {
-      result.push_back(List({wave, i, starts[i], chains[i].base}));
-      ++completed;
-      for (const auto after : successors[i]) {
-        if (!--indegree[after]) {
-          next.push_back(after);
-        }
-      }
-    }
-    ready = std::move(next);
-    ++wave;
-  }
-  check(completed == static_cast<Int>(chains.size()), "Cyclic LogState construction dependencies");
-  return result;
-}
-
 Rows read_rows(tvm::ffi::TensorView tensor) {
   const auto data = cpu_ints(tensor);
   Rows result;
@@ -471,16 +393,6 @@ tvm::ffi::Tensor write_rows(const Rows& rows) {
     *data++ = row.size();
     data = std::copy(row.begin(), row.end(), data);
   }
-  return result;
-}
-
-tvm::ffi::Tensor write_vector(const Vector& values) {
-  Int size = values.size();
-  auto result = tvm::ffi::Tensor::FromEnvAlloc(
-    TVMFFIEnvTensorAlloc, tvm::ffi::ShapeView(&size, 1),
-    DLDataType{kDLInt, 64, 1}, DLDevice{kDLCPU, 0}
-  );
-  std::copy(values.begin(), values.end(), static_cast<Int*>(result.data_ptr()));
   return result;
 }
 
@@ -523,162 +435,6 @@ Rows branch_protections(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs,
   return result;
 }
 
-struct ConstructionSegment {
-  Int entry, begin, end;
-  Vector outputs;
-};
-
-struct ConstructionChain {
-  Int base;
-  bool materialize;
-  std::vector<ConstructionSegment> segments;
-};
-
-Rows construction_plan(tvm::ffi::TensorView entry_rows, tvm::ffi::TensorView restore_rows,
-                       tvm::ffi::TensorView material_rows) {
-  const auto entries = read_rows(entry_rows);
-  const auto restores = read_rows(restore_rows);
-  const auto materials = read_rows(material_rows);
-  for (const auto& entry : entries) {
-    check(entry.size() == 4 && entry[1] < entry[2], "Invalid construction entry");
-  }
-  auto entry_at = [&](Int index) -> List {
-    check(index >= 0 && index < static_cast<Int>(entries.size()), "Invalid construction entry index");
-    return entries[index];
-  };
-  for (const auto& row : restores) {
-    check(row.size() >= 2, "Invalid restore task");
-    for (size_t i = 2; i < row.size(); ++i) {
-      entry_at(row[i]);
-    }
-  }
-  Vector order(materials.size());
-  std::iota(order.begin(), order.end(), 0);
-  std::unordered_set<Int> remaining;
-  for (const auto& row : materials) {
-    check(row.size() >= 4, "Invalid materialize task");
-    check(remaining.insert(row[0]).second, "Duplicate materialize slot");
-    for (size_t i = 4; i < row.size(); ++i) {
-      entry_at(row[i]);
-    }
-  }
-  std::stable_sort(order.begin(), order.end(), [&](Int a, Int b) {
-    return materials[a][2] > materials[b][2];
-  });
-
-
-  auto covered = [&](const Vector& a, const Vector& b) {
-    std::unordered_map<Int, std::vector<std::pair<Int, Int>>> by_slot;
-    for (const auto i : b) {
-      const auto& e = entry_at(i);
-      by_slot[e[0]].emplace_back(e[1], e[2]);
-    }
-    for (const auto i : a) {
-      const auto& e = entry_at(i);
-      const auto found = by_slot.find(e[0]);
-      if (found == by_slot.end() || !std::any_of(found->second.begin(), found->second.end(),
-          [&](const auto& range) { return range.first <= e[1] && e[2] <= range.second; })) {
-        return false;
-      }
-    }
-    return true;
-  };
-  std::vector<bool> used(restores.size());
-  std::vector<ConstructionChain> chains;
-  for (const auto index : order) {
-    const auto& plan = materials[index];
-    if (!remaining.contains(plan[0])) {
-      continue;
-    }
-    Vector logs(plan.begin() + 4, plan.end());
-    std::map<Int, Vector> events;
-    bool has_target = false;
-    for (const auto i : logs) {
-      const auto& e = entry_at(i);
-      if (remaining.contains(e[0])) {
-        events[e[2]].push_back(e[0]);
-        has_target |= e[0] == plan[0];
-      }
-    }
-    check(has_target, "Missing materialize target in replay logs");
-    for (const auto i : logs) {
-      remaining.erase(entry_at(i)[0]);
-    }
-    for (size_t i = 0; i < restores.size(); ++i) {
-      const auto& task = restores[i];
-      if (used[i] || task[0] != plan[3] || task.size() == 2) {
-        continue;
-      }
-      Vector task_logs(task.begin() + 2, task.end());
-      const auto source_covered = covered(logs, task_logs);
-      if (!source_covered && !covered(task_logs, logs)) {
-        continue;
-      }
-      if (source_covered) {
-        logs = std::move(task_logs);
-      }
-      events[entry_at(task[task.size() - 1])[2]].push_back(task[1]);
-      used[i] = true;
-    }
-    ConstructionChain chain{plan[3], true, {}};
-    for (const auto i : logs) {
-      const auto& e = entry_at(i);
-      Int begin = e[1];
-      for (auto it = events.upper_bound(begin); it != events.end() && it->first <= e[2]; ++it) {
-        chain.segments.push_back({i, begin, it->first, it->second});
-        begin = it->first;
-      }
-      if (begin < e[2]) {
-        chain.segments.push_back({i, begin, e[2], {}});
-      }
-    }
-    chains.push_back(std::move(chain));
-  }
-  check(remaining.empty(), "Unplanned materialize slots");
-  for (size_t i = 0; i < restores.size(); ++i) {
-    if (used[i]) {
-      continue;
-    }
-    const auto& task = restores[i];
-    ConstructionChain chain{task[0], false, {}};
-    for (size_t j = 2; j < task.size(); ++j) {
-      const auto& e = entry_at(task[j]);
-      chain.segments.push_back({task[j], e[1], e[2], j + 1 == task.size() ? Vector{task[1]} : Vector{}});
-    }
-    chains.push_back(std::move(chain));
-  }
-  Rows packed_chains;
-  Vector plan_ends;
-  for (const auto& chain : chains) {
-    Vector row{chain.base};
-    for (const auto& segment : chain.segments) {
-      row.insert(row.end(), {entry_at(segment.entry)[0], segment.end,
-                             static_cast<Int>(segment.outputs.size())});
-      row.insert(row.end(), segment.outputs.begin(), segment.outputs.end());
-    }
-    packed_chains.push_back(List(row.begin(), row.end()));
-  }
-  for (const auto& plan : materials) {
-    plan_ends.insert(plan_ends.end(), {plan[0], plan[2]});
-  }
-  auto chain_tensor = write_rows(packed_chains);
-  auto ends_tensor = write_vector(plan_ends);
-  const auto wave_rows = schedule_construction_waves(chain_tensor, ends_tensor);
-  Rows result;
-  for (const auto& wave : wave_rows) {
-    const auto& chain = chains[wave[1]];
-    Vector row{wave[0], wave[3], Int(chain.materialize)};
-    for (size_t j = wave[2]; j < chain.segments.size(); ++j) {
-      const auto& segment = chain.segments[j];
-      row.insert(row.end(), {segment.entry, segment.begin, segment.end,
-                             static_cast<Int>(segment.outputs.size())});
-      row.insert(row.end(), segment.outputs.begin(), segment.outputs.end());
-    }
-    result.push_back(List(row.begin(), row.end()));
-  }
-  return result;
-}
-
 template <typename NodeRows>
 class EvictionQueue {
 public:
@@ -699,17 +455,6 @@ public:
     }
   }
 
-  Int pop() {
-    clean();
-    if (heap_.empty()) {
-      return -1;
-    }
-    const auto index = std::get<3>(heap_.top());
-    heap_.pop();
-    take(index);
-    return index;
-  }
-
   Int take(Int index) {
     check(leaves_.erase(index) == 1, "Eviction node is not an unlocked leaf");
     const auto parent = indices_.find(nodes_[index][1]);
@@ -724,15 +469,7 @@ public:
   const std::unordered_set<Int>& leaves() const { return leaves_; }
 
 private:
-  void clean() {
-    while (!heap_.empty() && !leaves_.contains(std::get<3>(heap_.top()))) {
-      heap_.pop();
-    }
-  }
-
   void push(Int index) {
-    const auto& row = nodes_[index];
-    heap_.emplace(row[3], row[4], row[0], index);
     leaves_.insert(index);
   }
 
@@ -740,18 +477,7 @@ private:
   Vector children_;
   std::unordered_map<Int, Int> indices_;
   std::unordered_set<Int> leaves_;
-  using Priority = std::tuple<Int, Int, Int, Int>;
-  std::priority_queue<Priority, std::vector<Priority>, std::greater<Priority>> heap_;
 };
-
-Rows eviction_order(const Rows& nodes) {
-  EvictionQueue queue(nodes);
-  Vector order;
-  for (Int index; (index = queue.pop()) >= 0;) {
-    order.push_back(index);
-  }
-  return Rows({List(order.begin(), order.end())});
-}
 
 template <typename NodeRows>
 Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& node_slots,
@@ -1230,11 +956,6 @@ struct Planner {
     return write_rows(branch_protections(inputs, read_rows(forced), granularity));
   }
 
-  static tvm::ffi::Tensor construction(tvm::ffi::TensorView entries, tvm::ffi::TensorView restores,
-                                     tvm::ffi::TensorView materialize) {
-    return write_rows(construction_plan(entries, restores, materialize));
-  }
-
   static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List& counts,
                                  const List& config) {
     check(counts.size() == 6, "Invalid eviction metadata groups");
@@ -1258,10 +979,6 @@ struct Planner {
                                     groups[4], config, groups[5]));
   }
 
-  static tvm::ffi::Tensor eviction_candidates(tvm::ffi::TensorView nodes) {
-    return write_rows(eviction_order(read_rows(nodes)));
-  }
-
   static tvm::ffi::Tensor materialize(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
                                     tvm::ffi::TensorView candidates, Int page_size) {
     return write_rows(plan_materialize(read_rows(paths), read_rows(boundaries), read_rows(candidates), page_size));
@@ -1276,35 +993,6 @@ struct Planner {
     return result;
   }
 
-  static tvm::ffi::Tensor cover(tvm::ffi::TensorView path, Int begin, Int end) {
-    const auto rows = read_rows(path);
-    check(rows.size() == 1 && begin <= end, "Invalid log coverage interval");
-    const auto values = entries(rows[0]);
-    Vector order;
-    for (Int i = 0; i < static_cast<Int>(values.size()); ++i) {
-      if (values[i].span < 0) {
-        order.push_back(i);
-      }
-    }
-    std::stable_sort(order.begin(), order.end(), [&](Int a, Int b) {
-      return std::tie(values[a].begin, values[a].end) < std::tie(values[b].begin, values[b].end);
-    });
-    Vector selected;
-    Int cursor = begin;
-    for (const auto i : order) {
-      const auto& entry = values[i];
-      if (entry.end <= cursor || entry.begin > cursor) {
-        continue;
-      }
-      selected.push_back(i);
-      cursor = std::min(end, entry.end);
-      if (cursor == end) {
-        break;
-      }
-    }
-    selected.insert(selected.begin(), cursor);
-    return write_rows(Rows({List(selected.begin(), selected.end())}));
-  }
 };
 
 }
@@ -1313,9 +1001,6 @@ struct Planner {
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_branch_points, logssms::Planner::branches);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_coalesce, logssms::Planner::coalesce);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(cover_logs, logssms::Planner::cover);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(construction_plan, logssms::Planner::construction);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_eviction, logssms::Planner::eviction);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(eviction_candidates, logssms::Planner::eviction_candidates);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_recycle_bin, logssms::make_recycle_bin);

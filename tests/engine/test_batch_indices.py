@@ -1,7 +1,8 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
-from logssms.core import Batch, Request
+from logssms.core import Batch, ChunkedRequest, Request
 from logssms.kernel.metadata import make_batch_mapping, gather_paged_indices, gather_linear_slots
 from logssms.utils.batch import BatchIndices
 
@@ -16,6 +17,62 @@ def test_hybrid_paged_metadata_follows_decode_backend():
     assert not HybridBackend(paged, flat).uses_paged_indices
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("count", [2, 3, 4, 8])
+def test_partitioned_mapping_and_chunked_sampling(count):
+    device = torch.device("cuda")
+    lengths = [i + 1 for i in range(count)]
+    prefills = [(ChunkedRequest if i % 2 == 0 else Request)(
+        torch.zeros(64+n,dtype=torch.int32),i,64,8,i,None,None,256,
+    ) for i,n in enumerate(lengths)]
+    d = Request(torch.zeros(66,dtype=torch.int32),count,65,8,count,None,None,256)
+    batch = Batch([*prefills,d],"mixed",num_prefill_reqs=count)
+    batch.prefill_token_capacity = 128
+    batch.padded_reqs = batch.reqs
+    packet,_,_ = BatchIndices.make_mixed(batch,device,16)
+    table = torch.arange((count+2)*256,device=device,dtype=torch.int32).view(count+2,256)
+    positions,(rows,cols),out = make_batch_mapping(packet,table,decode=True,dummy_row=count+1)
+    total = sum(lengths)
+    expected_rows = [i for i,n in enumerate(lengths) for _ in range(n)]
+    assert rows[:total].tolist() == expected_rows
+    assert positions[:total].tolist() == [64+j for n in lengths for j in range(n)]
+    assert out[total:128].tolist() == [-1]*(128-total)
+    assert rows[128].item() == count and positions[128].item() == 65
+    ends = torch.tensor(lengths).cumsum(0)-1
+    assert packet.sample_tuple[0].tolist() == [ends[i].item() for i in range(count) if i%2] + [128]
+    assert packet.sample_tuple[1].tolist() == [i for i in range(count) if i%2] + [count]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("length", [1, 31, 32, 63, 128])
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("alignment", [16, 32, 64])
+def test_fixed_mixed_mapping_keeps_padding_out_of_cache_and_sampling(length, chunked, alignment):
+    from logssms.utils.mixed import prefill_buckets
+
+    capacity = min(p[0] for p in prefill_buckets(128, alignment) if len(p) == 1 and p[0] >= length)
+    device = torch.device("cuda")
+    cls = ChunkedRequest if chunked else Request
+    p = cls(torch.zeros(64 + length, dtype=torch.int32), 0, 64, 8, 0, None, None, 256)
+    d = Request(torch.zeros(66, dtype=torch.int32), 1, 65, 8, 1, None, None, 256)
+    dummy = Request(torch.zeros(1, dtype=torch.int32), 2, 0, 1, -1, None, None, 2)
+    batch = Batch([p, d], "mixed", num_prefill_reqs=1)
+    batch.prefill_token_capacity = capacity
+    batch.padded_reqs = [p, d, dummy]
+    packet, pp, dp = BatchIndices.make_mixed(batch, device, 16)
+    table = torch.arange(3 * 256, device=device, dtype=torch.int32).view(3, 256)
+    positions, (rows, columns), out = make_batch_mapping(packet, table, decode=True, dummy_row=2)
+    assert positions[:length].tolist() == list(range(64, 64 + length))
+    assert positions[capacity:].tolist() == [65, 0]
+    assert rows[length:capacity].tolist() == [2] * (capacity - length)
+    assert columns[length:capacity].tolist() == [0] * (capacity - length)
+    assert out[length:capacity].tolist() == [-1] * (capacity - length)
+    assert out[capacity:].tolist() == [321, 512]
+    assert packet.sample_tuple[0].tolist() == ([capacity] if chunked else [length - 1, capacity])
+    assert packet.sample_tuple[1].tolist() == ([1] if chunked else [0, 1])
+    assert pp.num_tokens == length and dp.num_tokens == 2
+
+
 def make_batch(phase):
     reqs = []
     for table, cached in ((2, 0), (0, 127), (3, 64), (3, 64)):
@@ -24,8 +81,63 @@ def make_batch(phase):
                             table, cached, 1, table, None, None, cached + length + 16))
     batch = Batch(reqs[:2], phase)
     batch.padded_reqs = reqs
-    batch.logstate_replay_counts = [0, 15, 0, 0]
+    batch.cache_metadata = LogStateCacheMetadata(replay_counts=[0, 15, 0, 0])
     return batch
+
+
+@pytest.mark.parametrize("lengths", [[1], [31, 1], [32, 33], [7, 17, 65]])
+@pytest.mark.parametrize("decode_count", [1, 2, 3, 7])
+def test_mixed_packet_matches_independent_packets(lengths, decode_count):
+    reqs = [Request(torch.zeros(length + i * 32, dtype=torch.int32), i, i * 32,
+                    8, i, None, None, 1024)
+            for i, length in enumerate(lengths + [1] * decode_count)]
+    batch = Batch(reqs, "mixed", num_prefill_reqs=len(lengths))
+    batch.padded_reqs = reqs
+    batch.cache_metadata = LogStateCacheMetadata(replay_counts=[i % 16 for i in range(len(reqs))])
+    combined = BatchIndices.make_mixed(batch, torch.device("cpu"), 16)
+    for packet, start, end, phase in (
+        (combined[0], 0, len(reqs), "mixed"),
+        (combined[1], 0, len(lengths), "prefill"),
+        (combined[2], len(lengths), len(reqs), "decode"),
+    ):
+        part = Batch(reqs[start:end], phase, num_prefill_reqs=len(lengths) if phase == "mixed" else 0)
+        part.padded_reqs = part.reqs
+        part.cache_metadata = LogStateCacheMetadata(replay_counts=batch.cache_metadata.replay_counts[start:end])
+        expected = BatchIndices.make(part, torch.device("cpu"), 16)
+        for name, value in vars(expected).items():
+            actual = getattr(packet, name)
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(actual, value)
+                assert actual.data_ptr() % 16 == 0
+            elif name in ("write_tuple", "sample_tuple"):
+                for a, b in zip(actual, value):
+                    torch.testing.assert_close(a, b)
+            else:
+                assert actual == value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_linear_slot_metadata_reuses_variants_across_decode_counts():
+    from logssms.engine.warmup import record_kernel_variants
+
+    device = torch.device("cuda")
+    table = torch.arange(32 * 128, device=device, dtype=torch.int32).reshape(32, 128)
+    work = torch.arange(32, device=device, dtype=torch.int32)[:, None]
+    packets = []
+    for count in range(1, 33):
+        reqs = [Request(torch.zeros(18, dtype=torch.int32), i, 17, 1, i, None, None, 64)
+                for i in range(count)]
+        batch = Batch(reqs, "decode")
+        batch.padded_reqs = reqs
+        packet = BatchIndices.make(batch, device, 16)
+        out_loc = torch.arange(count + 1, device=device, dtype=torch.int32)[1:]
+        packets.append((packet, out_loc))
+    for packet, out_loc in (packets[0], packets[1], packets[-1]):
+        gather_linear_slots(packet, table, work_table=work, out_loc=out_loc, page_size=64)
+    with record_kernel_variants(strict=True):
+        for packet, out_loc in packets:
+            slots = gather_linear_slots(packet, table, work_table=work, out_loc=out_loc, page_size=64)
+            torch.testing.assert_close(slots[0], work[:len(packet.table_ids), 0])
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode", "verify"])
@@ -41,6 +153,66 @@ def test_packet_cpu_views_and_write_semantics(phase):
     assert packet.write_tuple[0].dtype == torch.int64
     assert packet.write_tuple[0].tolist() == ([] if phase == "verify" else [2, 0])
     assert packet.write_tuple[1].tolist() == ([] if phase == "verify" else [-1, batch.reqs[1].device_len])
+
+
+@pytest.mark.parametrize("phase", ["prefill", "mixed", "decode", "verify"])
+def test_compact_chunk_writes_match_aligned_outputs(phase):
+    from types import SimpleNamespace
+    from logssms.scheduler.prefill import PrefillManager
+
+    chunk = ChunkedRequest(torch.arange(4), 2, 0, 8, 20, None, None, 12)
+    sampled = Request(torch.arange(3), 0, 2, 8, 21, None, None, 11)
+    padding = Request(torch.arange(1), 3, 0, 8, 22, None, None, 9)
+    batch = Batch([chunk, sampled], phase)
+    batch.padded_reqs = [chunk, sampled, padding]
+    packet = BatchIndices.make(batch, torch.device("cpu"), 32)
+    expected = [] if phase == "verify" else [0]
+    assert packet.write_tuple[0].tolist() == expected
+    assert packet.write_tuple[1].tolist() == ([] if phase == "verify" else [3])
+    # Input metadata stays aligned to all padded rows, including chunks.
+    assert packet.table_ids.tolist() == [2, 0, 3]
+    assert packet.seq_lens_cpu.tolist() == [4, 3, 1]
+    pool = torch.full((4, 16), 99, dtype=torch.int32)
+    manager = PrefillManager(pool, 32)
+    output = SimpleNamespace(next_tokens_gpu=torch.tensor([-1, 7], dtype=torch.int32))
+    manager.advance_for_next_schedule(None, (batch, None, None, packet.write_tuple), output)
+    assert pool[0, 3].item() == (99 if phase == "verify" else 7)
+    assert (pool[2] == 99).all() and (pool[3] == 99).all()
+
+
+def test_all_chunk_prefill_has_empty_compact_writes():
+    from types import SimpleNamespace
+    from logssms.scheduler.prefill import PrefillManager
+
+    chunk = ChunkedRequest(torch.arange(4), 0, 0, 8, 1, None, None, 12)
+    batch = Batch([chunk], "prefill")
+    batch.padded_reqs = [chunk]
+    packet = BatchIndices.make(batch, torch.device("cpu"), 32)
+    assert all(vector.numel() == 0 for vector in packet.write_tuple)
+    pool = torch.full((1, 16), 99, dtype=torch.int32)
+    PrefillManager(pool, 32).advance_for_next_schedule(
+        None, (batch, None, None, packet.write_tuple),
+        SimpleNamespace(next_tokens_gpu=torch.tensor([-1], dtype=torch.int32)),
+    )
+    assert (pool == 99).all()
+    assert chunk.cached_len == chunk.device_len == 4
+
+
+def test_mixed_subbatch_compact_writes_concatenate_in_real_request_order():
+    chunk = ChunkedRequest(torch.arange(4), 2, 0, 8, 20, None, None, 12)
+    decode = Request(torch.arange(3), 0, 2, 8, 21, None, None, 11)
+    mixed = Batch([chunk, decode], "mixed", num_prefill_reqs=1)
+    prefill = Batch([chunk], "prefill")
+    ar = Batch([decode], "decode")
+    for batch in (mixed, prefill, ar):
+        batch.padded_reqs = batch.reqs
+    packets = [BatchIndices.make(batch, torch.device("cpu"), 32)
+               for batch in (mixed, prefill, ar)]
+    for i in (0, 1):
+        torch.testing.assert_close(
+            packets[0].write_tuple[i],
+            torch.cat([packets[1].write_tuple[i], packets[2].write_tuple[i]]),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

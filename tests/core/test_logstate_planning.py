@@ -50,28 +50,58 @@ def test_native_branches_preserve_token_prefixes_and_ignore_partial_granules(gra
     assert planning.batch_branch_points(inputs[:1], granularity) == []
 
 
-def test_native_log_coverage_reports_gap_and_original_entry_indices():
-    # Unsorted intervals; checkpoint does not count as a replay log.
-    path = [
-        3, 128, 192, -1, 128, 1, 0, 0,
-        1, 0, 64, -1, 0, 1, 0, 0,
-        2, 64, 128, 1, 64, 1, 0, 0,
-    ]
-    assert planning.cover_logs(path, 0, 192) == [64, 1]
-    assert planning.cover_logs(path, 128, 160) == [160, 0]
-
-
 def test_native_materialize_respects_fragmented_and_protected_slots():
     path = [
         0, 0, 64, 1, 0, 1, 0, 0,
         1, 64, 128, -1, 64, 1, 0, 0,
         2, 128, 192, -1, 128, 1, 0, 1,
     ]
-    assert planning.plan_materialize([path], [()], [(0, 1), (0, 2)], 64) == [[0, 0, 1]]
+    assert planning.plan_materialize([path], [()], [(0, 1), (0, 2)], 64) == [[0]]
     # A pending branch inside the physical page protects the entire Log.
     assert planning.plan_materialize([path], [(96,)], [(0, 1)], 64) == []
     path[8 + 6] = 1
     assert planning.plan_materialize([path], [()], [(0, 1)], 64) == []
+
+
+def test_materialize_eligibility_matches_serial_recovery_oracle():
+    rng = random.Random(188)
+    for _ in range(200):
+        values = []
+        position = 0
+        for slot in range(rng.randint(1, 80)):
+            position += rng.choice((0, 0, 32, 64))
+            size = rng.choice((32, 64, 128))
+            values.append((slot, position, position + size,
+                           size // 64 if rng.random() < .25 else -1,
+                           position, int(rng.random() > .1),
+                           int(rng.random() < .1), int(rng.random() < .1)))
+            position += size
+        boundaries = sorted({rng.randrange(position + 1) for _ in range(4)})
+        expected = []
+        for i, entry in enumerate(values):
+            _, begin, end, span, _, eligible, protected, fragmented = entry
+            if (not eligible or span >= 0 or fragmented or (end - begin) % 64
+                or any(begin < p < end for p in boundaries)
+                or any(v[6] and begin <= v[1] and v[2] <= end for v in values)):
+                continue
+            cursor = max((v[2] for v in values if v[3] >= 0 and v[2] <= begin), default=0)
+            for value in values:
+                if value[3] >= 0 or value[2] <= cursor or value[1] > cursor:
+                    continue
+                cursor = min(end, value[2])
+                if cursor == end:
+                    break
+            if cursor == end:
+                expected.append([i])
+        path = [v for entry in values for v in entry]
+        actual = planning.plan_materialize([path], [boundaries], [(0, i) for i in range(len(values))], 64)
+        assert actual == expected
+
+
+def test_materialize_returns_bounded_metadata_for_long_log_chain():
+    path = [v for i in range(128) for v in (i, i * 64, (i + 1) * 64, -1, i * 64, 1, 0, 0)]
+    result = planning.plan_materialize([path], [()], [(0, i) for i in range(128)], 64)
+    assert result == [[i] for i in range(128)]
 
 
 def test_native_coalesce_matches_nondecreasing_group_oracle():
@@ -137,7 +167,6 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         nodes = [(i, parents[i], locked[i], 0, rng.randrange(100))
                  for i in range(count)]
         order = eviction_oracle(nodes)
-        assert planning.eviction_candidates(nodes) == order
 
         page_refs = [[rng.randrange(10) for _ in range(rng.randrange(4))]
                      for _ in nodes]
@@ -189,12 +218,29 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
         ) == expected
 
 
-@pytest.mark.parametrize("checkpoint", [False, True])
-def test_eviction_globally_orders_cold_nodes_without_chain_rotation(checkpoint):
-    nodes = eviction_chains(6, 3, checkpoint)
-    assert planning.eviction_candidates(nodes) == [
+def assert_log_capacity_order(nodes, expected):
+    """Each Log owns one frame; pressure must reclaim exactly the coldest safe prefix."""
+    refs = [[uuid] if parent >= 0 else [] for uuid, parent, *_ in nodes]
+    slots = [(slot, 1, 1, -1, -1) for row in refs for slot in row]
+    for needed in range(1, len(expected) + 2):
+        result = planning.plan_eviction(
+            nodes, [[] for _ in nodes], refs, slots, [],
+            [0, 0, 1, 0, 1, 1, needed, 0, 0, 1, 0], (),
+        )
+        if needed > len(expected):
+            assert result == []
+        else:
+            selected, pages, released, compressed = result
+            assert [nodes[index][0] for index in selected] == expected[:needed]
+            assert released == sorted(expected[:needed])
+            assert pages == [] and compressed == []
+
+
+def test_log_pressure_globally_orders_cold_nodes_without_chain_rotation():
+    nodes = eviction_chains(6, 3)
+    assert_log_capacity_order(nodes, [
         3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10, 15, 14, 13, 18, 17, 16,
-    ]
+    ])
 
 
 def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
@@ -202,11 +248,11 @@ def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
     uuid, parent, locked, kind, _ = nodes[1]
     nodes[1] = (uuid, parent, locked, kind, 999)
     expected = [2, 4, 3, 6, 5, 8, 7, 10, 9, 1]
-    assert planning.eviction_candidates(nodes) == expected
+    assert_log_capacity_order(nodes, expected)
     # Input row order is not a chain identity or priority.
     rng = random.Random(12)
     rng.shuffle(nodes)
-    assert [nodes[i][0] for i in planning.eviction_candidates(nodes)] == expected
+    assert_log_capacity_order(nodes, expected)
 
 
 def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_locks():
@@ -214,7 +260,7 @@ def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_lock
              (2, 1, 0, 0, 1), (3, 2, 0, 0, 1),
              (4, 1, 0, 0, 2), (5, 4, 0, 0, 2),
              (6, 0, 1, 0, 0), (7, 6, 0, 0, 3)]
-    assert planning.eviction_candidates(nodes) == [3, 2, 5, 4, 7, 1]
+    assert_log_capacity_order(nodes, [3, 2, 5, 4, 7, 1])
 
 
 def test_small_capacity_requests_select_the_globally_coldest_leaf():
@@ -288,8 +334,3 @@ def test_native_protections_deduplicate_forced_and_batch_branches():
     ]
     with pytest.raises(RuntimeError, match="Invalid forced branch"):
         planning.branch_protections(inputs, [(0, 33)], 32)
-
-
-def test_native_construction_rejects_invalid_entry_index():
-    with pytest.raises(RuntimeError, match="entry index"):
-        planning.construction_plan([(4, 0, 64, 0)], [(0, 10, 2)], [])

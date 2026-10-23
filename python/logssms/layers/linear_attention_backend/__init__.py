@@ -16,10 +16,10 @@ from .mamba2_logstate import Mamba2LogStateBackend
 
 
 SUPPORTED_LINEAR_ATTENTION_BACKENDS = Registry[type[BaseLinearAttentionBackend]]("linear attention backend")
-for cache_type in ("naive", "radix"):
+for cache_type in ("naive", "radix", "marconi"):
     SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"gdn/{cache_type}")(GatedDeltaBackend)
 SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("gdn/logstate")(GatedDeltaLogStateBackend)
-for cache_type in ("naive", "radix"):
+for cache_type in ("naive", "radix", "marconi"):
     SUPPORTED_LINEAR_ATTENTION_BACKENDS.register(f"mamba2/{cache_type}")(Mamba2Backend)
 SUPPORTED_LINEAR_ATTENTION_BACKENDS.register("mamba2/logstate")(Mamba2LogStateBackend)
 

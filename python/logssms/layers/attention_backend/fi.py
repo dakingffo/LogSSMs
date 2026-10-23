@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
+import os
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from logssms.core import Batch, get_global_ctx
 from logssms.distributed import get_tp_info
 from logssms.env import ENV
-from logssms.utils import div_even, init_logger, nvtx_annotate
+from logssms.utils import div_ceil, div_even, init_logger, nvtx_annotate
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
         CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     )
     from logssms.models import ModelConfig
+    from logssms.core import Request
 
 
 logger = init_logger(__name__)
@@ -53,6 +56,7 @@ class FIMetadata(BaseAttnMetadata):
     dtype:              torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
+    plan_cpu_ms:        dict | None = None
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -70,6 +74,27 @@ class FIMetadata(BaseAttnMetadata):
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
 
+@dataclass
+class FIMixedMetadata(BaseAttnMetadata):
+    prefill: FIMetadata
+    decode: FIMetadata
+    prefill_capacity: int
+
+    def get_last_indices(self, bs: int) -> torch.Tensor:
+        count = len(self.prefill.seq_lens_cpu) - 1
+        indices = self.prefill.get_last_indices(min(count, bs))
+        if bs <= count:
+            return indices
+        decode_indices = torch.arange(bs - count, device=indices.device, dtype=indices.dtype)
+        return torch.cat((indices, decode_indices + self.prefill_capacity))
+
+    @property
+    def plan_cpu_ms(self) -> dict | None:
+        timings = [m.plan_cpu_ms for m in (self.prefill, self.decode) if m.plan_cpu_ms]
+        return {key: sum(t.get(key, 0) for t in timings)
+                for key in {k for t in timings for k in t}} if timings else None
+
+
 class FlashInferBackend(BaseAttnBackend):
     uses_paged_indices = True
 
@@ -80,6 +105,7 @@ class FlashInferBackend(BaseAttnBackend):
         )
 
         self.config = config
+        self.profile_plan = os.getenv("LOGSSMS_PROFILE_SCHEDULER", "0").lower() in ("1", "true", "yes")
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
         self.float_workspace_buffer = torch.empty(
@@ -105,14 +131,14 @@ class FlashInferBackend(BaseAttnBackend):
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
-
-
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
-        self.last_event = torch.cuda.Event()
-        self.last_event.record()
+
+    @cached_property
+    def _plan_events(self):
+        return {}
 
     @nvtx_annotate("FlashInfer::plan")
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
@@ -122,9 +148,13 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
-
-
-        self.last_event.synchronize()
+        started = perf_counter_ns() if self.profile_plan else 0
+        event = self._plan_events.get(metadata.wrapper)
+        if event is not None:
+            event.synchronize()
+        else:
+            event = self._plan_events[metadata.wrapper] = torch.cuda.Event()
+        ready = perf_counter_ns() if self.profile_plan else 0
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
@@ -158,16 +188,36 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
                 causal=True,
             )
-        self.last_event.record()
+        event.record()
+        if self.profile_plan:
+            metadata.plan_cpu_ms = {
+                "workspace_wait": (ready - started) / 1e6,
+                "plan": (perf_counter_ns() - ready) / 1e6,
+            }
 
     def forward(
         self, q: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
+        if isinstance(metadata, FIMixedMetadata):
+            from logssms.layers.piecewise import attention_output_buffer
+
+            out = attention_output_buffer(q, q.shape)
+            boundary = metadata.prefill_capacity
+            for part, begin, end in ((metadata.prefill, 0, boundary),
+                                     (metadata.decode, boundary, q.shape[0])):
+                self._initialize_metadata_once(part)
+                kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
+                if part.page_size == 1:
+                    kv_cache = tuple(cache.view(-1, 1, cache.shape[2], cache.shape[3])
+                                     for cache in kv_cache)
+                part.wrapper.run(q=q[begin:end], paged_kv_cache=kv_cache, out=out[begin:end])
+            return out
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
-        if metadata.page_size == 1:
+        page_size = metadata.page_size
+        if page_size == 1:
             kv_cache = tuple(
                 cache.view(-1, 1, cache.shape[2], cache.shape[3])
                 for cache in kv_cache
@@ -247,3 +297,103 @@ class FlashInferBackend(BaseAttnBackend):
         assert self.capture is not None and bs in self.capture_bs
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
+
+    @cached_property
+    def _mixed_float_workspaces(self):
+        return (torch.empty_like(self.float_workspace_buffer),
+                torch.empty_like(self.float_workspace_buffer))
+
+    @cached_property
+    def _mixed_wrappers(self):
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
+
+        return (
+            BatchPrefillWithPagedKVCacheWrapper(
+                self._mixed_float_workspaces[0], kv_layout="NHD", backend="fa2"),
+            BatchDecodeWithPagedKVCacheWrapper(
+                self._mixed_float_workspaces[1], kv_layout="NHD", backend="fa2",
+                use_tensor_cores=self.use_tensor_cores),
+        )
+
+    def prepare_mixed_metadata(self, batch: Batch) -> None:
+        from logssms.kernel.metadata import gather_paged_indices
+        from logssms.utils.batch import BatchIndices
+
+        assert batch.is_mixed and batch.prefill_count > 0
+        page_size = getattr(self.kvcache, "kv_page_size", 1)
+        packet = batch.prepared_indices
+        if packet is None:
+            packet = BatchIndices.make(batch, self.device, page_size)
+        pages = gather_paged_indices(packet, get_global_ctx().page_table)
+        q = packet.cu_seqlens_q_cpu
+        k = packet.cu_seqlens_k_cpu
+        count = batch.prefill_count
+        first_pages = int(k[count])
+        padding = packet.prefill_padding
+        qo = torch.cat((q[:count + 1], q[count:count + 1] + padding))
+        kv = torch.cat((k[:count + 1], k[count:count + 1] + 1))
+        indices = torch.cat((pages[:first_pages], pages[:1]))
+        seq = torch.cat((packet.seq_lens_cpu[:count], packet.seq_lens_cpu.new_ones(1)))
+        last = torch.cat((packet.last_page_len_cpu[:count], packet.last_page_len_cpu.new_ones(1)))
+        prefill = FIMetadata(
+            qo, kv, qo.to(self.device, non_blocking=True), indices, last,
+            self.qo_head_local, self.kv_head_local, self.config.head_dim,
+            page_size, "NONE", seq, self.kvcache.dtype, self._mixed_wrappers[0],
+        )
+        decode_q = q[count:] - q[count]
+        decode = FIMetadata(
+            decode_q, k[count:] - first_pages, packet.cu_seqlens_q_gpu[count:],
+            pages[first_pages:], packet.last_page_len_cpu[count:],
+            self.qo_head_local, self.kv_head_local, self.config.head_dim,
+            page_size, "NONE", packet.seq_lens_cpu[count:], self.kvcache.dtype,
+            self._mixed_wrappers[1],
+        )
+        batch.attn_metadata = FIMixedMetadata(prefill, decode, int(qo[-1]))
+
+    def make_mixed_capture(self, batch: Batch, max_seq_len: int) -> None:
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
+
+        metadata = batch.attn_metadata
+        for index, field in enumerate(("prefill", "decode")):
+            source = getattr(metadata, field)
+            size = len(source.seq_lens_cpu)
+            kwargs = dict(dtype=torch.int32, device=self.device)
+            qo = torch.empty(size + 1, **kwargs)
+            kv = torch.empty(size + 1, **kwargs)
+            pages = torch.empty(size * div_ceil(max_seq_len, source.page_size), **kwargs)
+            last = torch.empty(size, **kwargs)
+            common = dict(kv_layout="NHD", backend="fa2", use_cuda_graph=True)
+            workspace = self._mixed_float_workspaces[index]
+            if field == "prefill":
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    workspace, **common, qo_indptr_buf=qo, paged_kv_indptr_buf=kv,
+                    paged_kv_indices_buf=pages, paged_kv_last_page_len_buf=last)
+            else:
+                qo.copy_(source.cu_seqlens_q_cpu)
+                wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                    workspace, **common, use_tensor_cores=self.use_tensor_cores,
+                    paged_kv_indptr_buffer=kv, paged_kv_indices_buffer=pages,
+                    paged_kv_last_page_len_buffer=last)
+            planned = replace(source, wrapper=wrapper, cu_seqlens_q_gpu=qo, initialized=False)
+            setattr(metadata, field, planned)
+            self._initialize_metadata_once(planned)
+
+    def prepare_mixed_replay(self, captured: Batch, runtime: Batch) -> None:
+        for field in ("prefill", "decode"):
+            source = getattr(runtime.attn_metadata, field)
+            target = getattr(captured.attn_metadata, field)
+            planned = replace(source, wrapper=target.wrapper, initialized=False)
+            self._initialize_metadata_once(planned)
+            source.plan_cpu_ms = planned.plan_cpu_ms
+
+    def warmup_mixed(self, dummy_req: Request) -> None:
+        logger.info_rank0("Preparing mixed attention kernels")
+        batch = Batch([dummy_req, dummy_req], "mixed", num_prefill_reqs=1)
+        batch.padded_reqs = batch.reqs
+        self.prepare_mixed_metadata(batch)
+        q = torch.zeros(
+            (2, self.qo_head_local, self.config.head_dim),
+            dtype=self.kvcache.dtype, device=self.device,
+        )
+        self.forward(q, 0, batch)
+        torch.cuda.current_stream(self.device).synchronize()

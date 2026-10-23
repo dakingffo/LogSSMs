@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from logssms.core import get_global_ctx
+from logssms.cache.marconi.metadata import MarconiCacheMetadata
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
 
 if TYPE_CHECKING:
@@ -56,15 +57,19 @@ class PackedLinearIndices:
             conv_chunks.extend((req_idx, chunk) for chunk in range((length + 63) // 64))
             endings.append(chunk_offsets[-1] - 1)
 
-        def tensor(values) -> torch.Tensor:
-            return torch.tensor(values, dtype=torch.int64, device=device)
-
+        vectors = (offsets, [v for pair in chunks for v in pair], chunk_offsets,
+                   endings, [v for pair in conv_chunks for v in pair])
+        sizes = [len(values) for values in vectors]
+        host = torch.tensor([v for values in vectors for v in values], dtype=torch.int64,
+                            pin_memory=device.type == "cuda")
+        packet = host.to(device, non_blocking=device.type == "cuda")
+        cu, chunks_tensor, chunk_offsets_tensor, endings_tensor, conv_tensor = packet.split(sizes)
         return cls(
-            cu_seqlens=tensor(offsets),
-            chunk_indices=tensor(chunks),
-            chunk_offsets=tensor(chunk_offsets),
-            endings=tensor(endings),
-            conv_chunks=tensor(conv_chunks),
+            cu_seqlens=cu,
+            chunk_indices=chunks_tensor.view(-1, 2),
+            chunk_offsets=chunk_offsets_tensor,
+            endings=endings_tensor,
+            conv_chunks=conv_tensor.view(-1, 2),
         )
 
     def fla_kwargs(self) -> dict[str, torch.Tensor]:
@@ -148,10 +153,20 @@ class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
             snapshot_reqs = []
             chunk_offset = 0
             token_offset = 0
+            explicit_slots = []
+            sparse = (batch.cache_metadata.checkpoint_writes
+                      if isinstance(batch.cache_metadata, MarconiCacheMetadata) else None)
             for req_idx, req in enumerate(batch.reqs):
-                assert req.cached_len % 64 == 0
-                ends = list(range(ctx_page_size, req.extend_len, ctx_page_size))
-                ends.append(req.extend_len)
+                if sparse is None and hasattr(ctx.linear_state, "group_table"):
+                    ends = [req.extend_len]
+                elif sparse is None:
+                    assert req.cached_len % 64 == 0
+                    ends = list(range(ctx_page_size, req.extend_len, ctx_page_size))
+                    ends.append(req.extend_len)
+                else:
+                    ends = [end for end, slot in sparse[req_idx]]
+                    explicit_slots.extend(slot for end, slot in sparse[req_idx])
+                    assert all(end == req.extend_len or end % 64 == 0 for end in ends)
                 for end in ends:
                     checkpoint_tables.append(req.table_idx)
                     checkpoint_positions.append(req.cached_len + end - 1)
@@ -168,7 +183,9 @@ class StandardLinearAttentionBackend(BaseLinearAttentionBackend):
             )
             metadata.checkpoint_slots = state_table[
                 checkpoint_tables_tensor, checkpoint_positions_tensor
-            ].to(torch.int64)
+            ].to(torch.int64) if sparse is None else torch.tensor(
+                explicit_slots, dtype=torch.int64, device=state_table.device
+            )
             metadata.checkpoint_chunks = torch.tensor(
                 checkpoint_chunks, dtype=torch.int64, device=state_table.device
             )

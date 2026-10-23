@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -50,11 +49,6 @@ LOGSSMS_DEVICE T *payload_pointer(
     params.frame_storage + frame * params.frame_bytes + bytes % params.frame_bytes
   ) + element;
 }
-
-struct LogStateConstructionParams : LogStateKernelParams {
-  const std::int32_t *__restrict__ output_offsets;
-  const std::int32_t *__restrict__ construction_output_slots;
-};
 
 struct LogStateRestoreParams : LogStateKernelParams {
   const std::int32_t *__restrict__ output_slots;
@@ -269,19 +263,14 @@ __device__ void write_state_tiles(
   }
 }
 
-template <bool kConstruct, typename T, int kHeadKDim, int kHeadVDim>
-__global__ __launch_bounds__((kConstruct ? 8 : 4) * 32)
-void log_state_kernel(
-  const __grid_constant__ std::conditional_t<kConstruct,
-    LogStateConstructionParams, LogStateRestoreParams> params
-) {
+template <typename T, int kHeadKDim, int kHeadVDim>
+__global__ __launch_bounds__(128)
+void log_state_kernel(const __grid_constant__ LogStateRestoreParams params) {
   using namespace nvcuda;
-  constexpr int kWarps = kConstruct ? 8 : 4;
-  constexpr int kTileK = kConstruct ? kHeadKDim : 64;
-  constexpr int kTileV = kConstruct ? kHeadVDim : 64;
-  constexpr auto kPrefetchBytes = 2 * 32 * (kHeadKDim + kHeadVDim) * sizeof(T)
-                               + 65 * sizeof(float);
-  constexpr int kChunk = kConstruct && kPrefetchBytes <= 48 * 1024 ? 32 : 16;
+  constexpr int kWarps = 4;
+  constexpr int kTileK = 64;
+  constexpr int kTileV = 64;
+  constexpr int kChunk = 16;
   constexpr int kBuffers = 2;
   constexpr int tiles_v = kTileV / 16, tile_count = kTileK / 16 * tiles_v;
   constexpr int steps = (tile_count + kWarps - 1) / kWarps;
@@ -400,19 +389,10 @@ void log_state_kernel(
       }
       __syncthreads();
     }
-    if constexpr (kConstruct) {
-      for (int output = params.output_offsets[segment]; output < params.output_offsets[segment + 1]; ++output) {
-        write_state_tiles<T, kHeadKDim, kHeadVDim, kTileK, kTileV, kWarps, steps>(params,
-          params.construction_output_slots[output], layer, head, k_begin, v_begin, state, scratch.tiles);
-        __syncthreads();
-      }
-    }
     __syncthreads();
   }
-  if constexpr (!kConstruct) {
-    write_state_tiles<T, kHeadKDim, kHeadVDim, kTileK, kTileV, kWarps, steps>(params,
-      params.output_slots[task], layer, head, k_begin, v_begin, state, scratch.tiles);
-  }
+  write_state_tiles<T, kHeadKDim, kHeadVDim, kTileK, kTileV, kWarps, steps>(params,
+    params.output_slots[task], layer, head, k_begin, v_begin, state, scratch.tiles);
 }
 
 

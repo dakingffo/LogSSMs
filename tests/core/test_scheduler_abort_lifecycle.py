@@ -16,8 +16,9 @@ class _Event:
 
 
 @pytest.mark.parametrize("tracked", [True, False])
+@pytest.mark.parametrize("phase", ["decode", "mixed"])
 def test_abort_waits_for_submitted_forward_before_reusing_resources(
-    tracked: bool, monkeypatch: pytest.MonkeyPatch
+    tracked: bool, phase: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
         "logssms.scheduler.scheduler.logger.debug_rank0", lambda *_args: None
@@ -26,7 +27,7 @@ def test_abort_waits_for_submitted_forward_before_reusing_resources(
     req = SimpleNamespace(uid=7, table_idx=3, aborted=False)
     event = _Event(calls)
     last_data = (
-        SimpleNamespace(batch=SimpleNamespace(reqs=[req], phase="decode")),
+        SimpleNamespace(batch=SimpleNamespace(reqs=[req], phase=phase)),
         SimpleNamespace(copy_done_event=event),
     )
     scheduler = object.__new__(Scheduler)
@@ -152,6 +153,7 @@ def test_finished_requests_release_in_uid_order() -> None:
 def test_scheduler_cache_profile_sampling_is_opt_in(enabled: bool) -> None:
     calls = []
     scheduler = object.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(scheduling_policy="prefill-first")
     scheduler.profiler = SimpleNamespace(
         enabled=enabled,
         record_schedule=lambda: nullcontext(),

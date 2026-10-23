@@ -23,14 +23,10 @@ sys.path.insert(0, str(_REPO))
 import torch
 
 from logssms.core import Context, Request, SamplingParams, set_global_ctx
-from logssms.cache import (
-    CacheResources,
-    StandardCacheManager,
-    StandardPrefixValue,
-)
+from logssms.cache import CacheResources, RadixCacheManager, RadixPrefixValue
 from logssms.scheduler.prefill import PendingRequest
-from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.prefix_cache.radix import HybridRadixTreeNode, RadixPrefixCache
+from logssms.cache.radix.state_pool import LinearStatePool
+from logssms.cache.radix.prefix_cache import HybridRadixTreeNode, RadixPrefixCache
 
 
 def make_req(input_len, table_idx, output_len=10):
@@ -67,10 +63,10 @@ def make_cm(
         state_table=state_table,
         work_state_table=None,
     )
-    return StandardCacheManager(
+    return RadixCacheManager(
         num_pages=num_pages, page_size=page_size,
         resources=resources,
-        prefix_cache_type="hybrid_radix", num_states=num_states,
+        num_states=num_states,
     )
 
 
@@ -81,7 +77,7 @@ def test1_hybrid_radix():
     hc = RadixPrefixCache(device=torch.device("cpu"), node_type=HybridRadixTreeNode)
     ids = torch.arange(192, dtype=torch.int32)       # 3 pages
     state = torch.tensor([10] * 64 + [11] * 64 + [12] * 64, dtype=torch.int32)
-    res = hc.insert_prefix(ids, StandardPrefixValue(ids.clone(), state))
+    res = hc.insert_prefix(ids, RadixPrefixValue(ids.clone(), state))
     assert res.handle.cached_len == 192
     matched_indices, matched_state = res.handle.get_matched_indices()
     assert matched_indices.tolist() == list(range(192))
@@ -97,7 +93,7 @@ def test1_hybrid_radix():
         [10] * 64 + [11] * 64 + [12] * 64 + [13] * 64,
         dtype=torch.int32,
     )
-    hc.insert_prefix(ids2, StandardPrefixValue(ids2.clone(), state2))
+    hc.insert_prefix(ids2, RadixPrefixValue(ids2.clone(), state2))
     m2 = hc.match_prefix(ids2)
     assert m2.cuda_handle.get_matched_indices()[1].tolist() == state2.tolist()
     # evict 2 pages -> returns 2 state slots

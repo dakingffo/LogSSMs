@@ -18,6 +18,29 @@ class BaseLinearAttentionMetadata(ABC):
 
 
 class BaseLinearAttentionBackend(ABC):
+    def forward_mixed(self, batch: Batch, token_inputs: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
+        from logssms.layers.piecewise import attention_output_buffer
+
+        assert batch.mixed_parts is not None
+        split = batch.prefill_token_capacity or batch.prefill_tokens
+        example = next(iter(token_inputs.values()))
+        config = kwargs["config"]
+        heads, dim = ((config.num_v_heads, config.head_v_dim) if isinstance(self, BaseGatedDeltaBackend)
+                      else (config.num_heads, config.head_dim))
+        output = attention_output_buffer(
+            example, (len(example), heads, dim),
+            "attention_output" if isinstance(self, BaseGatedDeltaBackend) else "ssm_output",
+        )
+        for part, begin, end in (
+            (batch.mixed_parts[0], 0, split),
+            (batch.mixed_parts[1], split, next(iter(token_inputs.values())).shape[0]),
+        ):
+            self.forward(
+                **{name: tensor[begin:end] for name, tensor in token_inputs.items()},
+                **kwargs, batch=part, out=output[begin:end],
+            )
+        return output
+
     def profile_result(self) -> dict | None:
         return None
 
@@ -47,6 +70,7 @@ class BaseGatedDeltaBackend(BaseLinearAttentionBackend):
         dt_bias    : torch.Tensor,
         config     : GatedDeltaConfig,
         batch      : Batch,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor: ...
 
 
@@ -63,6 +87,7 @@ class BaseMamba2Backend(BaseLinearAttentionBackend):
         D          : torch.Tensor,
         config     : Mamba2Config,
         batch      : Batch,
+        out        : torch.Tensor | None = None,
     ) -> torch.Tensor: ...
 
 

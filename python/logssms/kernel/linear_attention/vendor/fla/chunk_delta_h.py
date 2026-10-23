@@ -429,7 +429,10 @@ def chunk_gated_delta_rule_fwd_h(
         assert log_io.num_key_heads > 0
         assert H % log_io.num_key_heads == HV % log_io.num_key_heads == 0
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, 32), N * HV)](
+    tuned = BT == 32 and K == V == 128
+    BV = 64 if tuned and N >= 4 else 32
+    num_warps = 4 if tuned else 2
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, BV), N * HV)](
         k=k, v=u, w=w, v_new=v_new, g=g, h=h,
         state_storage=state_io.storage,
         read_slots=state_io.read_slots,
@@ -441,7 +444,7 @@ def chunk_gated_delta_rule_fwd_h(
         decay_frames=log_io.decay_frames if log_io is not None else None,
         log_gate=log_io.gate if log_io is not None else None,
         cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets,
-        T=T, H=H, HV=HV, K=K, V=V, BT=BT, BV=32,
+        T=T, H=H, HV=HV, K=K, V=V, BT=BT, BV=BV,
         LOGSTATE=logstate,
         STATE_SLOT_STRIDE=state_io.storage.stride(0) if not logstate else 0,
         STATE_LAYER_STRIDE=state_io.storage.stride(1) if not logstate else 0,
@@ -456,6 +459,6 @@ def chunk_gated_delta_rule_fwd_h(
         PAGE_SIZE=state_io.page_size,
         LOG_KEY_HEADS=H if log_io is None else log_io.num_key_heads,
         DECAY_RECORD_BYTES=log_io.decay_record_bytes if log_io is not None else 0,
-        num_warps=2, num_stages=2,
+        num_warps=num_warps, num_stages=2,
     )
     return h, v_new

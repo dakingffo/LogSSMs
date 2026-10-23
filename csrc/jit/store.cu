@@ -171,9 +171,12 @@ void store_state_kernel(
   PDL::wait<kUsePDL>();
   if (warp_id < length) {
     const auto position = static_cast<const IndexType *>(indices_raw)[warp_id];
-    const auto destination = pointer::offset(pool, position * pool_stride);
-    const auto source = pointer::offset(states, warp_id * state_stride);
-    warp::copy<kElementSize>(destination, source);
+    // Mixed graph checkpoint arrays use negative slots for padding.
+    if (position >= 0) {
+      const auto destination = pointer::offset(pool, position * pool_stride);
+      const auto source = pointer::offset(states, warp_id * state_stride);
+      warp::copy<kElementSize>(destination, source);
+    }
   }
   PDL::launch<kUsePDL>();
 }

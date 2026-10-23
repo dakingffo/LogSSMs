@@ -73,11 +73,11 @@ def main():
 
     from logssms.core import Batch, Context, Request, set_global_ctx
     from logssms.cache import make_kvcache_pool
-    from logssms.cache.linear_pool.state_pool import LinearStatePool
+    from logssms.cache.radix.state_pool import LinearStatePool
     from logssms.layers.attention_backend import make_attention_backend
     from logssms.models.qwen3_next import Qwen3NextForCausalLM
     from logssms.models.weight import load_target_weight
-    from logssms.cache import CacheResources, StandardCacheManager
+    from logssms.cache import CacheResources, RadixCacheManager
 
     loaded = {k: v for k, v in load_target_weight(MODEL_PATH, "cpu")}
     with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -135,10 +135,10 @@ def main():
         state_table=st,
         work_state_table=reserve,
     )
-    cm = StandardCacheManager(
+    cm = RadixCacheManager(
         num_pages=num_pages, page_size=PS, num_states=num_pages,
         resources=resources,
-        prefix_cache_type="hybrid_radix", num_draft_states=reserve.numel(),
+        num_draft_states=reserve.numel(),
     )
 
     from transformers import AutoTokenizer

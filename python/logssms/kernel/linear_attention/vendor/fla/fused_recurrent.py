@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
+from logssms.cache.logstate.layout import LOG_STATE_REPLAY_WINDOW
 from ...layout import log_pointer, state_pointer
 
 from .op import exp
@@ -302,6 +302,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     layer        : int,
     replay_counts: torch.Tensor,
     enable_eager_state: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[2]
@@ -312,12 +313,28 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     assert num_v_heads == pool.layout.num_value_heads
     assert replay_counts.shape == (batch_size,)
     assert pool.frame_bytes % pool.head_payload_bytes == 0
-    output = torch.empty_like(value)
+    output = torch.empty_like(value) if out is None else out
+    assert output.shape == value.shape and output.dtype == value.dtype and output.is_contiguous()
     full_k = triton.next_power_of_2(head_k_dim)
-    tiled = not enable_eager_state and head_k_dim == head_v_dim == 128 and batch_size >= 32
-    block_k = 64 if tiled else None
-    block_v = 64 if tiled else (8 if head_v_dim < 128 else (16 if batch_size == 1 else 32))
-    num_stages = 4 if tiled else 3
+    tiled = not enable_eager_state and head_k_dim == head_v_dim == 128
+    if tiled:
+        block_v = 64
+        if batch_size < 8:
+            block_k, num_warps, num_stages = 32, 4, 4
+        elif batch_size < 16:
+            block_k, num_warps, num_stages = 64, 1, 1
+        elif batch_size < 24:
+            block_k, num_warps, num_stages = 64, 1, 4
+        elif batch_size < 32:
+            block_k, num_warps, num_stages = 64, 1, 1
+        elif batch_size < 48:
+            block_k, num_warps, num_stages = 64, 1, 4
+        else:
+            block_k, num_warps, num_stages = 64, 1, 4
+    else:
+        block_k = None
+        block_v = 8 if head_v_dim < 128 else (16 if batch_size == 1 else 32)
+        num_warps, num_stages = (1 if enable_eager_state else 4), 3
     block_v = min(block_v, triton.next_power_of_2(head_v_dim))
     if not enable_eager_state:
         block_v = max(block_v, 16)
@@ -342,7 +359,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
             LAYER=layer, PAGE_SIZE=pool.page_size,
             LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
             REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
-            num_warps=1,
+            num_warps=num_warps,
             num_stages=num_stages,
         )
         return output
@@ -380,7 +397,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
         LAYERS=pool.layout.num_linear_layers, GRANULARITY=pool.layout.granularity,
         REPLAY_WINDOW=LOG_STATE_REPLAY_WINDOW,
         REPLAY_WORK=not enable_eager_state,
-        num_warps=4 if not enable_eager_state else 1,
+        num_warps=num_warps,
         num_stages=num_stages,
     )
     return output
@@ -399,6 +416,7 @@ def fused_recurrent_gated_delta_rule_to_slots(
     read_slots  : torch.Tensor,
     write_slots : torch.Tensor,
     layer       : int,
+    out         : torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, seq_len, num_k_heads, head_k_dim = query.shape
     num_v_heads, head_v_dim = value.shape[2:]
@@ -406,7 +424,8 @@ def fused_recurrent_gated_delta_rule_to_slots(
     assert read_slots.shape == write_slots.shape == (batch_size,)
     assert state_pool.shape[2:] == (num_v_heads, head_k_dim, head_v_dim)
     assert num_v_heads % num_k_heads == 0
-    output = torch.empty_like(value)
+    output = torch.empty_like(value) if out is None else out
+    assert output.shape == value.shape and output.dtype == value.dtype and output.is_contiguous()
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = min(32, triton.next_power_of_2(head_v_dim))
     grid = (triton.cdiv(head_v_dim, block_v), batch_size * num_v_heads)

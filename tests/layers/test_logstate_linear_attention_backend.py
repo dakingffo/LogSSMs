@@ -1,14 +1,13 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from tests.logstate_helpers import head_view
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend
-from logssms.kernel.linear_attention.logstate import construct_log_state_chains
 from logssms.kernel.linear_attention.logstate import restore_log_state_chains
-from logssms.kernel.linear_attention.logstate import copy_states
 from logssms.kernel.linear_attention.vendor.fla import (
     fused_recurrent_gated_delta_rule_to_logstate,
     fused_recurrent_gated_delta_rule,
@@ -30,11 +29,11 @@ def _make_request(cached_len: int, device_len: int) -> Request:
     )
 
 
-def _make_pool(device: torch.device) -> MHALogStatePool:
+def _make_pool(device: torch.device, granularity: int = 16) -> MHALogStatePool:
     pool = MHALogStatePool(
         num_frames=64,
         page_size=64,
-        granularity=16,
+        granularity=granularity,
         num_attention_layers=1,
         num_kv_heads=1,
         head_dim=64,
@@ -54,9 +53,9 @@ def _make_pool(device: torch.device) -> MHALogStatePool:
     return pool
 
 
-def _make_context(device: torch.device) -> Context:
+def _make_context(device: torch.device, granularity: int = 16) -> Context:
     ctx = Context(page_size=64)
-    ctx.linear_state = _make_pool(device)
+    ctx.linear_state = _make_pool(device, granularity)
     ctx.page_table = torch.arange(128, dtype=torch.int32, device=device).repeat(2, 1)
     ctx.state_table = torch.full(
         (2, 128), -1, dtype=torch.int32, device=device
@@ -171,9 +170,9 @@ def test_recycled_checkpoint_prefill_metadata_skips_log_writes() -> None:
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(128, dtype=torch.int32, device=device)
     batch.out_loc = ctx.page_table[0]
-    batch.logstate_first_offsets = [0]
-    batch.logstate_checkpoint_writes = [(127, checkpoint_slot)]
-    batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+    batch.cache_metadata = LogStateCacheMetadata(first_offsets=[0])
+    batch.cache_metadata.checkpoint_writes = [(127, checkpoint_slot)]
+    batch.cache_metadata.checkpoint_ranges = [(0, 0, 128)]
 
     set_global_ctx(ctx)
     try:
@@ -182,18 +181,16 @@ def test_recycled_checkpoint_prefill_metadata_skips_log_writes() -> None:
         clear_global_ctx()
 
     metadata = batch.linear_attn_metadata
-    assert metadata.log_row_indices.numel() == 0
-    assert metadata.conv_snapshot_rows.tolist() == [127]
-    assert metadata.conv_write_slots.numel() == 0
-    assert metadata.checkpoint_slots.tolist() == [checkpoint_slot]
-    assert metadata.checkpoint_state_indices.tolist() == [7]
-    assert metadata.checkpoint_snapshot_indices.tolist() == [0]
+    assert metadata.log_write_slots.tolist() == [-1] * 128
+    assert metadata.conv_token_slots.tolist() == [-1] * 127 + [checkpoint_slot]
+    assert metadata.conv_token_granules[-1].item() == 0
+    assert metadata.chunk_write_slots.tolist() == [-1] * 7 + [checkpoint_slot]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("reuse", [False, True])
-@pytest.mark.parametrize("chunk_size", [64, 128])
-def test_direct_checkpoint_prefill_matches_log_prefill(reuse, chunk_size) -> None:
+@pytest.mark.parametrize("granularity,chunk_size", [(16, 16), (16, 64), (32, 32), (32, 64), (64, 64), (64, 128)])
+def test_direct_checkpoint_prefill_matches_log_prefill(reuse, granularity, chunk_size) -> None:
     device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(213)
@@ -205,9 +202,9 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, chunk_size) -> Non
     A_log = torch.zeros(2, device=device)
     dt_bias = torch.zeros(2, device=device)
 
-    def run(direct: bool):
+    def run(direct: bool, step: int):
         clear_global_ctx()
-        ctx = _make_context(device)
+        ctx = _make_context(device, granularity)
         pool = ctx.linear_state
         checkpoint_slot = None
         if direct:
@@ -222,16 +219,16 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, chunk_size) -> Non
         set_global_ctx(ctx)
         try:
             outputs = []
-            for begin in range(0, 128, chunk_size):
-                end = begin + chunk_size
+            for begin in range(0, 128, step):
+                end = begin + step
                 batch = Batch(reqs=[_make_request(begin, end)], phase="prefill")
                 batch.positions = torch.arange(begin, end, device=device, dtype=torch.int32)
                 batch.out_loc = ctx.page_table[0, begin:end]
-                batch.logstate_first_offsets = [0]
+                batch.cache_metadata = LogStateCacheMetadata(first_offsets=[begin % 64])
                 if direct:
-                    batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+                    batch.cache_metadata.checkpoint_ranges = [(0, 0, 128)]
                     if end == 128:
-                        batch.logstate_checkpoint_writes = [(chunk_size - 1, checkpoint_slot)]
+                        batch.cache_metadata.checkpoint_writes = [(step - 1, checkpoint_slot)]
                 backend.prepare_metadata(batch)
                 outputs.append(backend.forward(
                     mixed_qkv[begin:end], gate[begin:end], beta[begin:end],
@@ -242,7 +239,8 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, chunk_size) -> Non
             state = pool.read_states(
                 torch.tensor([state_slot], device=device), 0
             ).clone()
-            conv_slot, conv_granule = (1, 3) if not direct else (checkpoint_slot, 3 if reuse else 0)
+            last_granule = 64 // granularity - 1
+            conv_slot, conv_granule = (1, last_granule) if not direct else (checkpoint_slot, last_granule if reuse else 0)
             conv = pool.read_conv(
                 torch.tensor([conv_slot], device=device),
                 torch.tensor([conv_granule], device=device), 0,
@@ -252,18 +250,21 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, chunk_size) -> Non
         finally:
             clear_global_ctx()
 
-    log_output, log_state, log_conv = run(False)
-    direct_output, direct_state, direct_conv = run(True)
+    log_output, log_state, log_conv = run(False, chunk_size)
+    direct_output, direct_state, direct_conv = run(True, chunk_size)
     torch.testing.assert_close(direct_output, log_output, rtol=0, atol=0)
     torch.testing.assert_close(direct_state, log_state, rtol=0, atol=0)
     torch.testing.assert_close(direct_conv, log_conv, rtol=0, atol=0)
+    for actual, expected in zip((log_output, log_state, log_conv), run(False, 128)):
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
+@pytest.mark.parametrize("granularity", [16, 32, 64])
+def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state(granularity):
     from collections import Counter
     from tests.core.test_logstate_cache_manager import make_manager, new_req
-    from logssms.cache.prefix_cache.logstate import LogStateKind
+    from logssms.cache.logstate.prefix_cache import LogStateKind
 
     torch.manual_seed(321)
     device = torch.device("cuda")
@@ -299,18 +300,18 @@ def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
         finally:
             clear_global_ctx()
 
-    reference = make_manager(num_pages=32, num_states=32, device=device, granularity=32)
+    reference = make_manager(num_pages=32, num_states=32, device=device, granularity=granularity)
     reference_req = new_req(reference, torch.arange(321, dtype=torch.int32))
     expected_output = forward(reference, reference_req).clone()
     expected_state = reference.logstate_pool.read_states(
-        torch.tensor([reference._work_slots[0]], device=device), 0,
+        torch.tensor([reference._request_states[0].work_slot], device=device), 0,
     ).clone()
 
-    manager = make_manager(num_pages=32, num_states=32, device=device, granularity=32)
+    manager = make_manager(num_pages=32, num_states=32, device=device, granularity=granularity)
     first = new_req(manager, torch.arange(256, dtype=torch.int32))
     forward(manager, first)
     pool = manager.logstate_pool
-    expected_checkpoint = pool.read_states(torch.tensor([manager._work_slots[0]], device=device), 0).clone()
+    expected_checkpoint = pool.read_states(torch.tensor([manager._request_states[0].work_slot], device=device), 0).clone()
     first.cached_len = 256
     manager.cache_req(first, finished=True)
     entries = manager.tree.iter_entries()
@@ -327,10 +328,16 @@ def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
 
     resumed = new_req(manager, torch.arange(321, dtype=torch.int32))
     assert resumed.cached_len == 192
-    actual_output = forward(manager, resumed)
+    outputs = []
+    while resumed.cached_len < 321:
+        size = manager.plan_prefill_chunk(321 - resumed.cached_len, granularity)
+        resumed.device_len = resumed.cached_len + size
+        outputs.append(forward(manager, resumed))
+        resumed.cached_len = resumed.device_len
+    actual_output = torch.cat(outputs)
     assert manager._recycled_restores[0].slots[256] == tail_slot
     actual_checkpoint = pool.read_states(torch.tensor([tail_slot], device=device), 0)
-    actual_state = pool.read_states(torch.tensor([manager._work_slots[0]], device=device), 0)
+    actual_state = pool.read_states(torch.tensor([manager._request_states[0].work_slot], device=device), 0)
     torch.testing.assert_close(actual_output, expected_output[192:], rtol=3e-2, atol=3e-3)
     torch.testing.assert_close(actual_checkpoint, expected_checkpoint, rtol=3e-2, atol=3e-3)
     torch.testing.assert_close(actual_state, expected_state, rtol=3e-2, atol=3e-3)
@@ -342,6 +349,9 @@ def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state():
     ]
     manager.logstate_pool.poll_reclamation()
     manager.check_integrity()
+    followup = new_req(manager, torch.arange(337, dtype=torch.int32), table_idx=1)
+    assert followup.cached_len == 320
+    manager.cache_req(followup, finished=True)
 
 
 def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,7 +364,7 @@ def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> N
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(16, 32, dtype=torch.int32, device=device)
     batch.out_loc = ctx.page_table[0, 16:32]
-    batch.logstate_first_offsets = [16]
+    batch.cache_metadata = LogStateCacheMetadata(first_offsets=[16])
 
     set_global_ctx(ctx)
     try:
@@ -699,7 +709,7 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
         )
         batch.out_loc = batch.positions
         if phase == "decode":
-            batch.logstate_replay_counts = [req.cached_len - 20]
+            batch.cache_metadata = LogStateCacheMetadata(replay_counts=[req.cached_len - 20])
         length = req.extend_len
         mixed_qkv = torch.randn(length, 192, dtype=dtype, device=device)
         gate = torch.randn(length, 2, dtype=dtype, device=device)
@@ -806,9 +816,9 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
         batch.positions = torch.arange(begin, end, dtype=torch.int32, device=device)
         batch.out_loc = batch.positions
         if phase == "decode":
-            batch.logstate_replay_counts = [
+            batch.cache_metadata = LogStateCacheMetadata(replay_counts=[
                 begin - max(35, (begin // 16) * 16)
-            ]
+            ])
         backend.prepare_metadata(batch)
         backend.forward(
             mixed_qkv[begin:end], gate[begin:end], beta[begin:end],
@@ -981,9 +991,11 @@ def test_logstate_model_sized_prefill_log_restores_first_granule(granularity, he
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("materialized", [False, True])
-def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
-    materialized: bool,
+@pytest.mark.parametrize("copy_restored_state", [False, True])
+@pytest.mark.parametrize("prefix_len", [32, 64])
+def test_logstate_prefix_restore_resumes_prefill(
+    copy_restored_state: bool,
+    prefix_len: int,
 ) -> None:
     clear_global_ctx()
     device = torch.device("cuda")
@@ -1036,29 +1048,24 @@ def test_logstate_prefix_restore_resumes_prefill_at_page_boundary(
     resumed_ctx.linear_attn_backend = GatedDeltaLogStateBackend()
     set_global_ctx(resumed_ctx)
     try:
-        first = run(resumed_ctx, 0, 64)
+        first = run(resumed_ctx, 0, prefix_len)
         pool = resumed_ctx.linear_state
         expected_state = pool.read_states(torch.tensor([2], dtype=torch.int32, device=device), 0).clone()
-        checkpoint = pool.reserve(works=1)[2][0] if materialized else 2
-        construct_log_state_chains(
-            pool,
-            [(None, [(0, 0, 64)], [(
-                checkpoint,
-            )])],
-        )
-        if materialized:
-            copy_states(pool, [checkpoint], [2])
+        output = pool.reserve(works=1)[2][0] if copy_restored_state else 2
+        restore_log_state_chains(pool, [(None, [(0, 0, prefix_len)], output)])
+        if copy_restored_state:
+            pool.copy_states([output], [2])
         source = torch.tensor([0], dtype=torch.int32, device=device)
         destination = torch.tensor([2], dtype=torch.int32, device=device)
         pool.write_conv(
             destination, torch.tensor([0], dtype=torch.int32, device=device), 0,
-            pool.read_conv(source, torch.tensor([3], dtype=torch.int32, device=device), 0),
+            pool.read_conv(source, torch.tensor([prefix_len // 16 - 1], dtype=torch.int32, device=device), 0),
         )
         torch.testing.assert_close(
             pool.read_states(destination, 0), expected_state, rtol=2e-2, atol=4e-2
         )
-        resumed_ctx.state_table[0, :64].fill_(-1)
-        second = run(resumed_ctx, 64, 81)
+        resumed_ctx.state_table[0, :prefix_len].fill_(-1)
+        second = run(resumed_ctx, prefix_len, 81)
         resumed = torch.cat([first, second])
     finally:
         clear_global_ctx()

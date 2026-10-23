@@ -18,7 +18,7 @@ from logssms.layers import (
     VocabParallelEmbedding,
 )
 from logssms.speculator.hidden_captor import HiddenCapturePoint, with_speculator
-from logssms.layers.piecewise import prefill_piece
+from logssms.layers.piecewise import graph_piece
 from logssms.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
@@ -237,23 +237,23 @@ class Qwen3NextDecoderLayer(BaseOP):
         residual : torch.Tensor | None,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        *features, residual = self._prepare_attention(
-            x, residual, None if self.block_type == "linear_attention" else positions
-        )
+        *features, residual = self._prepare_attention(x, residual)
+        return self._finish_attention(*self.attend_features(features, positions), residual)
+
+    def attend_features(self, features, positions):
         if self.block_type == "linear_attention":
             mixed_qkv, output_gate, beta, gate = features
             h = self.linear_attn.attend(mixed_qkv, beta, gate)
         else:
             query, output_gate, key, value = features
             h = self.self_attn.attend(query, key, value, positions)
-        return self._finish_attention(h, output_gate, residual)
+        return h, output_gate
 
-    @prefill_piece
+    @graph_piece
     def _prepare_attention(
         self,
         x        : torch.Tensor,
         residual : torch.Tensor | None,
-        positions: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         h, residual = self.input_layernorm.forward(x, residual)
         features = (
@@ -262,7 +262,7 @@ class Qwen3NextDecoderLayer(BaseOP):
         )
         return (*features, residual)
 
-    @prefill_piece
+    @graph_piece
     def _finish_attention(
         self,
         h       : torch.Tensor,
@@ -276,18 +276,14 @@ class Qwen3NextDecoderLayer(BaseOP):
         h, residual = self.post_attention_layernorm.forward(h, residual)
         return self.mlp.forward(h), residual
 
-    def prefill_graph_pieces(self):
+    def piecewise_graph_pieces(self):
         weight = self.mlp.router.weight if isinstance(self.mlp, MoEMLP) else self.mlp.gate_up_proj.weight
         def sample(*shape):
             return torch.empty((1,) + shape, device=weight.device, dtype=weight.dtype)
         hidden = sample(weight.shape[1])
         residual = None if self._layer_id == 0 else sample(weight.shape[1])
-        positions = (
-            None if self.block_type == "linear_attention"
-            else torch.zeros(1, dtype=torch.int32, device=weight.device)
-        )
-        pieces = [(self._prepare_attention, (hidden, residual, positions),
-                   ("hidden", "residual", "positions"),
+        pieces = [(self._prepare_attention, (hidden, residual),
+                   ("hidden", "residual"),
                    (("qkv", "gate", "beta", "decay", "residual")
                     if self.block_type == "linear_attention"
                     else ("query", "gate", "key", "value", "residual")))]
@@ -332,6 +328,10 @@ class Qwen3NextModel(BaseOP):
         x = self.embed_tokens.forward(input_ids)
         positions = get_global_ctx().batch.positions
         residual: torch.Tensor | None = None
+        runner = get_global_ctx().piecewise_graph_runner
+        if runner is not None and runner.can_run_layers(get_global_ctx().batch):
+            x, residual = runner.forward_layers(x, positions)
+            return self.norm.forward(x, residual)[0]
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual, positions)
         return self.norm.forward(x, residual)[0]

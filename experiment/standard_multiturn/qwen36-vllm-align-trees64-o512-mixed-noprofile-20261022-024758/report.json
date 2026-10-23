@@ -1,0 +1,121 @@
+{
+  "api": "vllm",
+  "base_url": "http://127.0.0.1:28300",
+  "model": "/root/autodl-tmp/models/Qwen3.6-27B",
+  "ignore_eos": false,
+  "manifest": "/root/LogSSMs/experiment/standard_multiturn/qwen36-vllm-align-trees64-o512-mixed-noprofile-20261022-024758/manifest.json",
+  "manifest_sha256": "7367da7f393ff63bd214c0ebdcd9fb4cd1f35a66ec9faa12f80de0a53f4161cd",
+  "status": "complete",
+  "warmup": {
+    "n": 32,
+    "ignore_eos": false,
+    "in_tokens": 3012,
+    "requested_out": 2048,
+    "early_stops": 0,
+    "out_tokens": 2048,
+    "duration_s": 18.671910310164094,
+    "output_tok_per_s": 109.68347458723422,
+    "decode_tok_per_s": 109.68347458723422,
+    "req_per_s": 1.7138042904255346,
+    "ttft_ms": [
+      412.5916894990951,
+      151.09013579785824,
+      1648.4554596245289,
+      2557.9374618828297,
+      2557.9374618828297
+    ],
+    "tpot_ms": [
+      21.937362336930597,
+      21.22328391978665,
+      23.06638637350665,
+      34.73088464566639,
+      34.73088464566639
+    ],
+    "ttft_requests": 32,
+    "tpot_requests": 32,
+    "e2e_s": [
+      1.7946455167257227,
+      1.4794935695827007,
+      3.8365011923015118,
+      3.874403230845928,
+      3.874403230845928
+    ],
+    "rounds": 0,
+    "avg_accept": 0.0,
+    "is_mtp": false,
+    "chunks_ok": true,
+    "trees": 4,
+    "peak_inflight": 4,
+    "dispatch_policy": "serial_per_tree",
+    "cache": {
+      "source": "response.usage.prompt_tokens_details.cached_tokens",
+      "continuations": 20,
+      "expected_reusable_tokens": 1982,
+      "admitted_cached_tokens": 0,
+      "admitted_hit_fraction": 0.0,
+      "total_cached_tokens": 0,
+      "overall_hit_fraction": 0.0
+    },
+    "exact_continuations": 20,
+    "single_token_responses": 0,
+    "empty_responses": 0,
+    "input_trace_sha256": "9df36b515a4197b23b865a7d0d44181244e55eee184ae30bd1a6947b087f11e8",
+    "output_trace_sha256": "d31b6ee0f3b267e1a3310ad9bd26b68ff0398664e81989fd38ed54946379fc3e"
+  },
+  "stats": {
+    "n": 595,
+    "ignore_eos": false,
+    "in_tokens": 223260,
+    "requested_out": 304640,
+    "early_stops": 227,
+    "out_tokens": 235033,
+    "duration_s": 181.80191928893328,
+    "output_tok_per_s": 1292.797132831518,
+    "decode_tok_per_s": 1292.797132831518,
+    "req_per_s": 3.272792731381352,
+    "ttft_ms": [
+      632.4698882067905,
+      288.68252970278263,
+      1498.325115069747,
+      1882.9850349575281,
+      1887.7281695604324
+    ],
+    "tpot_ms": [
+      32.851595869279755,
+      32.460105439571485,
+      35.97676871369963,
+      43.34233408527715,
+      101.99197940528393
+    ],
+    "ttft_requests": 595,
+    "tpot_requests": 595,
+    "e2e_s": [
+      13.500980462077536,
+      16.606546999886632,
+      18.403573840856552,
+      18.79501904733479,
+      18.975389013066888
+    ],
+    "rounds": 0,
+    "avg_accept": 0.0,
+    "is_mtp": false,
+    "chunks_ok": true,
+    "trees": 64,
+    "peak_inflight": 64,
+    "dispatch_policy": "serial_per_tree",
+    "cache": {
+      "source": "response.usage.prompt_tokens_details.cached_tokens",
+      "continuations": 390,
+      "expected_reusable_tokens": 199556,
+      "admitted_cached_tokens": 20384,
+      "admitted_hit_fraction": 0.10214676582012067,
+      "total_cached_tokens": 20384,
+      "overall_hit_fraction": 0.09130162142793156
+    },
+    "exact_continuations": 390,
+    "single_token_responses": 0,
+    "empty_responses": 0,
+    "input_trace_sha256": "bf302aa7496d294d37fb028b6786e994b33ff8e6240068f1801060208d07b6f4",
+    "output_trace_sha256": "8efd2d53aa7fd96701c81a1a4994cc6132d13943088dcddec37785a58349d090"
+  }
+}

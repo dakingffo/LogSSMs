@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 import torch
 
-from logssms.core import Request
+from logssms.core import Batch, Request
 from logssms.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -261,26 +261,77 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.record_active_requests(
                 tuple(self.ar_manager.running_reqs.values())
             )
-        adder = PrefillAdder(
-            token_budget=self.prefill_budget,
-            reserved_size=(
-                self.ar_manager.need_capacity
-                + self.prefill_manager.need_capacity
-            ),
-            cache_manager=self.cache_manager,
-            table_manager=self.table_manager,
-            profiler=self.profiler if self.profiler.enabled else None,
-        )
+        mixed = self.config.scheduling_policy == "mixed"
+        mixed_decode_cap = 0
+        if mixed and self.config.max_running_req >= 2:
+            mixed_decode_cap = min(
+                self.config.max_running_req - 1,
+                self.ar_manager.candidate_count,
+                self.ar_manager.token_budget,
+            )
         with self.profiler.record_schedule() as schedule:
+            with self.profiler.record_schedule_step("reservation"):
+                adder = PrefillAdder(
+                    token_budget=self.prefill_budget,
+                    reserved_size=(
+                        (self.ar_manager.need_capacity + self.prefill_manager.need_capacity)
+                        if self.prefill_manager.runnable else 0
+                    ),
+                    cache_manager=self.cache_manager,
+                    table_manager=self.table_manager,
+                    profiler=self.profiler if self.profiler.enabled else None,
+                    mixed_token_budget=(
+                        self.config.mixed_prefill_tokens if mixed_decode_cap > 0 else None
+                    ),
+                    mixed_partitions=(
+                        tuple(p for p in self.engine.mixed_graph_runner.partitions.values()
+                              if len(p) < self.config.max_running_req)
+                        if mixed_decode_cap > 0 else ()
+                    ),
+                )
             with self.profiler.record_schedule_step("prefill_select"):
-                batch = self.prefill_manager.schedule_next_batch(adder)
-            if batch is not None:
+                if mixed_decode_cap > 0:
+                    batch = self.prefill_manager.schedule_next_batch(
+                        adder, mixed_max_requests=self.config.max_running_req - 1,
+                    )
+                else:
+                    batch = self.prefill_manager.schedule_next_batch(adder)
+            if not adder.use_mixed:
+                mixed_decode_cap = 0
+            if batch is not None and mixed_decode_cap > 0:
+                mixed_decode_cap = min(mixed_decode_cap, self.config.max_running_req - batch.size)
+                with self.profiler.record_schedule_step("ar_select"):
+                    decode = self.ar_manager.schedule_next_batch(max_requests=mixed_decode_cap)
+                if decode is not None:
+                    batch = Batch(
+                        reqs=batch.reqs + decode.reqs, phase="mixed",
+                        num_prefill_reqs=batch.size,
+                    )
+            elif batch is not None:
                 self.ar_manager.on_prefill_scheduled()
             else:
                 with self.profiler.record_schedule_step("ar_select"):
-                    batch = self.ar_manager.schedule_next_batch()
+                    if mixed:
+                        batch = self.ar_manager.schedule_next_batch(
+                            max_requests=self.config.max_running_req,
+                        )
+                    else:
+                        batch = self.ar_manager.schedule_next_batch()
             if schedule is not None and batch is not None:
                 schedule["phase"] = batch.phase
+                if batch.prefill_count:
+                    schedule["prefill_budget"] = (
+                        self.config.mixed_prefill_tokens if mixed_decode_cap else self.prefill_budget
+                    )
+                    schedule["prefill_tokens"] = batch.prefill_tokens
+                    schedule["prefill_budget_unused"] = adder.token_budget
+                    schedule["prefill_selection_stop"] = (
+                        "token_budget" if adder.token_budget <= 0 else
+                        adder.rejection_reason or (
+                            "request_budget" if mixed_decode_cap and batch.prefill_count
+                            >= self.config.max_running_req - 1 else "pending_exhausted"
+                        )
+                    )
         if batch is None:
             if self.ar_manager.runnable and not self.prefill_manager.runnable:
                 self.profiler.record_ar_no_batch()
@@ -288,7 +339,14 @@ class Scheduler(SchedulerIOMixin):
                 self._report_stall(adder)
             return None
 
-        graph_used = batch.is_decode and self.engine.decode_graph_runner.can_use_cuda_graph(batch)
+        graph_used = (
+            self.engine.piecewise_graph_runner is not None
+            and self.engine.piecewise_graph_runner.can_use_cuda_graph(batch)
+        ) or (
+            batch.is_decode and self.engine.decode_graph_runner.can_use_cuda_graph(batch)
+        ) or (
+            batch.is_mixed and self.engine.mixed_graph_runner.can_use_cuda_graph(batch)
+        )
         with self.profiler.record_prepare(batch, graph_used=graph_used):
             forward_input = self.engine.prepare_batch(batch, self.cache_manager)
         return forward_input

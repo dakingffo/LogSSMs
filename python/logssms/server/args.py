@@ -25,10 +25,7 @@ class ServerArgs(SchedulerConfig):
 
 def parse_args(args: list[str]) -> ServerArgs:
     from logssms.layers.attention_backend import validate_attn_backend
-    from logssms.cache import (
-        SUPPORTED_CACHE_ARGUMENT_PARSERS,
-        make_cache_argument_parser,
-    )
+    from logssms.cache import SUPPORTED_CACHE_ARGUMENT_PARSERS, make_cache_argument_parser
     from logssms.layers.moe_backend import SUPPORTED_MOE_BACKENDS
     from logssms.speculator.drafters import (
         SUPPORTED_SPECULATOR_ARGUMENT_PARSERS,
@@ -138,7 +135,11 @@ def parse_args(args: list[str]) -> ServerArgs:
         "--graph",
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum decode batch size for CUDA graph capture. Also enables piecewise prefill graphs. 0 disables both; None means auto-tuning based on the GPU memory.",
+        help=(
+            "Maximum request bucket for decode and mixed CUDA graphs. Also enables "
+            "piecewise prefill graphs. 0 disables all graphs; None selects sizes "
+            "based on GPU memory."
+        ),
     )
 
     parser.add_argument(
@@ -158,14 +159,28 @@ def parse_args(args: list[str]) -> ServerArgs:
     )
 
     parser.add_argument(
+        "--scheduling-policy",
+        choices=["prefill-first", "mixed"],
+        default=ServerArgs.scheduling_policy,
+        help="Prefill priority or prefill requests mixed with decoding requests.",
+    )
+    parser.add_argument(
+        "--mixed-prefill-tokens",
+        type=int,
+        default=ServerArgs.mixed_prefill_tokens,
+        help="Total prefill token budget per mixed batch: positive multiple of LogState granularity "
+             "(64 for standard caches), <= max-prefill-tokens.",
+    )
+
+    parser.add_argument(
         "--max-decode-tokens",
         type=int,
         dest="max_decode_tokens",
         default=None,
         help=(
             "Max total tokens (positions) in a single decode/verify batch. "
-            "Default: max_running_req // 2, scaled by the selected speculator's "
-            "number of draft tokens."
+            "Default: max_running_req for autoregressive decoding, "
+            "max_running_req // 2 for speculative decoding."
         ),
     )
 
@@ -239,6 +254,14 @@ def parse_args(args: list[str]) -> ServerArgs:
     kwargs = parser.parse_args(args).__dict__.copy()
 
     kwargs["cache_config"] = cache_parser.make_config(kwargs)
+    alignment = kwargs["cache_config"].prefill_alignment
+    mixed_tokens = kwargs["mixed_prefill_tokens"]
+    if mixed_tokens <= 0 or mixed_tokens % alignment:
+        parser.error(f"--mixed-prefill-tokens must be a positive multiple of {alignment}")
+    if kwargs["scheduling_policy"] == "mixed" and mixed_tokens > kwargs["max_prefill_tokens"]:
+        parser.error("--mixed-prefill-tokens must be <= --max-prefill-tokens for mixed scheduling")
+    if kwargs["scheduling_policy"] == "mixed" and kwargs["speculative_algorithm"] is not None:
+        parser.error("mixed scheduling does not support speculative decoding")
 
     assert kwargs["num_tokenizer"] >= 1, "--num-tokenizer must be >= 1"
 
@@ -247,11 +270,9 @@ def parse_args(args: list[str]) -> ServerArgs:
 
 
     if kwargs["max_decode_tokens"] is None:
-        base = max(1, kwargs["max_running_req"] // 2)
-        speculator_config = kwargs.get("speculator_config")
         kwargs["max_decode_tokens"] = (
-            base * speculator_config.num_draft_tokens
-            if speculator_config is not None else base
+            kwargs["max_running_req"] // 2
+            if kwargs["speculative_algorithm"] is not None else kwargs["max_running_req"]
         )
 
     from logssms.utils import resolve_model_path

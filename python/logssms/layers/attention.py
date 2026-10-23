@@ -55,7 +55,8 @@ class MHAAttentionImpl(BaseOP):
         query: torch.Tensor,
     ) -> torch.Tensor:
         ctx = get_global_ctx()
-        output = ctx.attn_backend.forward(query, self._layer_id, ctx.batch)
+        batch = ctx.batch
+        output = ctx.attn_backend.forward(query, self._layer_id, batch)
         return output.reshape(query.shape)
 
 

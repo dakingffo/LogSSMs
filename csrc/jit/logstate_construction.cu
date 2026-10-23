@@ -133,73 +133,11 @@ public:
     const auto blocks = num_tasks * num_layers * num_heads * macro_tiles;
     if (is_bfloat16) {
       LaunchKernel(blocks, 128, views.device)(
-        log_state_kernel<false, __nv_bfloat16, head_k_dim, head_v_dim>, params
+        log_state_kernel<__nv_bfloat16, head_k_dim, head_v_dim>, params
       );
     } else {
       LaunchKernel(blocks, 128, views.device)(
-        log_state_kernel<false, __half, head_k_dim, head_v_dim>, params
-      );
-    }
-  }
-
-  static void construct(
-    const tvm::ffi::TensorView storage,
-    const tvm::ffi::TensorView payload_frames,
-    const tvm::ffi::TensorView decay_frames,
-    const tvm::ffi::TensorView base_slots,
-    const tvm::ffi::TensorView task_segment_offsets,
-    const tvm::ffi::TensorView log_slots,
-    const tvm::ffi::TensorView log_begins,
-    const tvm::ffi::TensorView log_ends,
-    const tvm::ffi::TensorView output_offsets,
-    const tvm::ffi::TensorView output_slots,
-    std::int64_t num_layers,
-    std::int64_t num_heads,
-    std::int64_t head_payload_bytes,
-    std::int64_t decay_record_bytes,
-    std::int64_t num_key_heads,
-    bool is_bfloat16
-  ) {
-    using namespace host;
-    auto views = verify_views(
-      storage, payload_frames, decay_frames,
-      num_layers, num_heads, head_payload_bytes, decay_record_bytes, num_key_heads
-    );
-    for (const auto tensor : {
-           base_slots, task_segment_offsets, log_slots, log_begins,
-           log_ends, output_offsets, output_slots
-         }) {
-      verify_vector(tensor, views.device);
-    }
-    const auto num_tasks = base_slots.size(0);
-    const auto num_segments = log_slots.size(0);
-    runtime_assert(task_segment_offsets.size(0) == num_tasks + 1);
-    runtime_assert(log_begins.size(0) == num_segments);
-    runtime_assert(log_ends.size(0) == num_segments);
-    runtime_assert(output_offsets.size(0) == num_segments + 1);
-    if (num_tasks == 0 || num_segments == 0) {
-      return;
-    }
-    LogStateConstructionParams params{};
-    static_cast<LogStateKernelParams&>(params) = views.params;
-    params.base_slots = static_cast<const std::int32_t *>(base_slots.data_ptr());
-    params.task_log_offsets = static_cast<const std::int32_t *>(task_segment_offsets.data_ptr());
-    params.log_slots = static_cast<const std::int32_t *>(log_slots.data_ptr());
-    params.log_begins = static_cast<const std::int32_t *>(log_begins.data_ptr());
-    params.log_ends = static_cast<const std::int32_t *>(log_ends.data_ptr());
-    params.output_offsets = static_cast<const std::int32_t *>(output_offsets.data_ptr());
-    params.construction_output_slots = static_cast<const std::int32_t *>(output_slots.data_ptr());
-    params.num_tasks = num_tasks;
-    const auto blocks = num_tasks * num_layers * num_heads;
-    if (is_bfloat16) {
-      LaunchKernel(blocks, 256, views.device)(
-        log_state_kernel<true, __nv_bfloat16, head_k_dim, head_v_dim>,
-        params
-      );
-    } else {
-      LaunchKernel(blocks, 256, views.device)(
-        log_state_kernel<true, __half, head_k_dim, head_v_dim>,
-        params
+        log_state_kernel<__half, head_k_dim, head_v_dim>, params
       );
     }
   }

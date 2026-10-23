@@ -46,6 +46,11 @@ __global__ void log_store_kernel(
     return;
   }
   const auto slot = params.slots[token];
+  // Fixed-capacity mixed prefills leave padding/checkpoint-only rows inactive.
+  // Reject them before any payload or decay frame-table access.
+  if (slot < 0) {
+    return;
+  }
   const auto position = params.token_offsets[token];
   const auto head_granule = params.head_payload_bytes / (kPageSize / kGranularity);
   const auto key_head = head / (params.num_heads / params.num_key_heads);

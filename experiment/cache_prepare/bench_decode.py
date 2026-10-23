@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.logstate import store_log_states
 from logssms.kernel.linear_attention.vendor.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_to_logstate,

@@ -56,12 +56,40 @@ class PrefillAdder:
     cache_manager: BaseCacheManager
     table_manager: TableManager
     profiler     : SchedulerProfiler | None = None
+    mixed_token_budget: int | None = None
+    mixed_partitions: tuple[tuple[int, ...], ...] = ()
+    _mixed_lengths: list[int] = field(default_factory=list, init=False)
+    use_mixed: bool = field(default=False, init=False)
+    _budget_selected: bool = field(default=False, init=False)
     rejection_reason: str | None = field(default=None, init=False)
+
+    def _select_budget(self, remain_len: int) -> None:
+        if self._budget_selected:
+            return
+        self._budget_selected = True
+        self.use_mixed = (
+            self.mixed_token_budget is not None
+            and remain_len <= self.mixed_token_budget
+        )
+        if self.use_mixed:
+            self.token_budget = min(self.token_budget, self.mixed_token_budget)
 
     def _profile_step(self, name: str):
         if self.profiler is None:
             return nullcontext()
         return self.profiler.record_schedule_step(name)
+
+    def _chunk_budget(self, remain_len: int) -> int:
+        if not self.use_mixed or not self.mixed_partitions:
+            return self.token_budget
+        index = len(self._mixed_lengths)
+        candidates = [p[index] for p in self.mixed_partitions if len(p) > index
+                      and all(n <= cap for n, cap in zip(self._mixed_lengths, p))]
+        if not candidates:
+            return 0
+        desired = min(remain_len, self.token_budget)
+        complete = [cap for cap in candidates if cap >= desired]
+        return min(self.token_budget, min(complete) if complete else max(candidates))
 
     def _try_allocate_one(
         self,
@@ -77,8 +105,9 @@ class PrefillAdder:
         handle = match.cuda_handle
         cached_len = handle.cached_len
         remain_len = req.input_len - cached_len
+        self._select_budget(remain_len)
         chunk_size = self.cache_manager.plan_prefill_chunk(
-            remain_len, self.token_budget
+            remain_len, self._chunk_budget(remain_len)
         )
         if chunk_size == 0:
             self.rejection_reason = (
@@ -140,6 +169,8 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedRequest if is_chunked else Request
         self.token_budget -= chunk_size
+        if self.use_mixed:
+            self._mixed_lengths.append(chunk_size)
         self.reserved_size += self.cache_manager.reservation_size(
             remain_len + pending_req.output_len, table_idx=table_idx,
         )
@@ -185,13 +216,21 @@ class PrefillAdder:
         if self.token_budget <= 0:
             self.rejection_reason = "prefill token budget exhausted"
             return None
+        if self._chunk_budget(1) == 0:
+            self.rejection_reason = "mixed partition capacity exhausted"
+            return None
 
         if chunked_req := pending_req.chunked_req:
             remain_len = pending_req.input_len - chunked_req.cached_len
+            self._select_budget(remain_len)
             chunk_size = self.cache_manager.plan_prefill_chunk(
-                remain_len, self.token_budget
+                remain_len, self._chunk_budget(remain_len)
             )
             if chunk_size == 0:
+                self.rejection_reason = (
+                    f"zero prefill chunk: remain={remain_len}, "
+                    f"token_budget={self.token_budget}"
+                )
                 return None
             return self._add_one_req(
                 pending_req=pending_req,
@@ -252,7 +291,10 @@ class PrefillManager:
             for req in self.inflight_reqs.values()
         )
         
-    def schedule_next_batch(self, adder: PrefillAdder) -> Batch | None:
+    def schedule_next_batch(
+        self, adder: PrefillAdder, max_requests: int | None = None,
+        *, mixed_max_requests: int | None = None,
+    ) -> Batch | None:
         self.inflight_reqs.clear()
         if len(self.pending_list) == 0:
             return None
@@ -260,6 +302,13 @@ class PrefillManager:
         reqs: list[Request] = []
         chunked_list: list[PendingRequest] = []
         for pending_req in self.pending_list:
+            request_limit = (
+                mixed_max_requests
+                if mixed_max_requests is not None and adder.use_mixed
+                else max_requests
+            )
+            if request_limit is not None and len(reqs) >= request_limit:
+                break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedRequest):
@@ -298,10 +347,18 @@ class PrefillManager:
     ) -> None:
         batch, _, _, output_mapping = forward_input
         if not batch.is_verify:
-            self.token_pool[output_mapping] = output.next_tokens_gpu
-        if batch.is_prefill:
-            for req in batch.reqs:
-                req.complete_to_device_len()
+            tokens = output.next_tokens_gpu
+            # The engine's output is aligned to real requests; write_mapping
+            # excludes intermediate chunks, which have no sampled token.
+            if any(isinstance(req, ChunkedRequest) for req in batch.reqs):
+                sampled = [
+                    i for i, req in enumerate(batch.reqs)
+                    if not isinstance(req, ChunkedRequest)
+                ]
+                tokens = tokens[sampled]
+            self.token_pool[output_mapping] = tokens
+        for req in batch.prefill_reqs:
+            req.complete_to_device_len()
 
     @property
     def runnable(self) -> bool:

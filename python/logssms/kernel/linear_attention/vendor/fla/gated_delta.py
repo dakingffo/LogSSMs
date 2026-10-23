@@ -26,6 +26,7 @@ def chunk_gated_delta_rule_to_cache(
     chunk_offsets: torch.Tensor | None = None,
     *,
     log_io: ChunkLogIO | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert query.shape[0] == key.shape[0] == value.shape[0] == 1
     assert chunk_size in (16, 32, 64)
@@ -73,6 +74,7 @@ def chunk_gated_delta_rule_to_cache(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        out=out,
     )
 
 

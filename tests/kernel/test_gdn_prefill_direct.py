@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.logstate import store_log_states
 from logssms.kernel.linear_attention.packed_conv import (
     PackedConvStateIO, packed_causal_conv1d, packed_conv_snapshots,

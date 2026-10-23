@@ -1,5 +1,5 @@
-from logssms.cache.logstate_pool.allocator import LogStateAllocator
-from logssms.cache.logstate_pool.layout import LogStateSlotLayout
+from logssms.cache.logstate.allocator import LogStateAllocator
+from logssms.cache.logstate.layout import LogStateSlotLayout
 import random
 import pytest
 import torch

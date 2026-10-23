@@ -11,6 +11,9 @@ python experiment/launch_server/launch_logssms.py \
   --cache-type logstate --granularity 32 --port 28300
 ```
 
+For autoregressive benchmarks, set `--max-running-requests` and omit
+`--max-decode-tokens`: the decode token budget defaults to the same value.
+
 SGLang flags are passed to `sglang.launch_server` in a separate Python
 environment. Only `--sglang-python` and optional `--sglang-root` belong to
 the wrapper; the remaining flags belong to SGLang:

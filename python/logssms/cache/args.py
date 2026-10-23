@@ -6,11 +6,12 @@ from abc import ABC, abstractmethod
 from logssms.utils import Registry
 from logssms.utils.args import parse_bool
 
-from .config import (
+from logssms.cache.config import (
     BaseCacheConfig,
     LOG_STATE_GRANULARITIES,
     LogStateCacheConfig,
     StandardCacheConfig,
+    MarconiCacheConfig,
 )
 
 
@@ -43,6 +44,18 @@ class StandardCacheArgumentParser(CacheArgumentParserBase):
         return StandardCacheConfig(page_size=kwargs.pop("page_size"))
 
 
+class MarconiCacheArgumentParser(CacheArgumentParserBase):
+    @staticmethod
+    def add_arguments(parser):
+        parser.add_argument("--page-size", type=int, default=0,
+                            help="Marconi KV page size; zero selects the smallest shared block layout.")
+        parser.add_argument("--marconi-bootstrap-multiplier", type=int, default=5)
+
+    @staticmethod
+    def make_config(kwargs):
+        return MarconiCacheConfig(kwargs.pop("page_size"), kwargs.pop("marconi_bootstrap_multiplier"))
+
+
 class LogStateCacheArgumentParser(CacheArgumentParserBase):
     @staticmethod
     def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -52,7 +65,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             choices=LOG_STATE_GRANULARITIES,
             default=LogStateCacheConfig.granularity,
             help=(
-                "Minimum LogState prefix-match and recovery granularity in tokens. "
+                "LogState prefix-match, recovery and intermediate prefill-chunk alignment in tokens. "
                 "The physical page size remains fixed at 64 tokens."
             ),
         )
@@ -118,6 +131,7 @@ SUPPORTED_CACHE_ARGUMENT_PARSERS = Registry[
 SUPPORTED_CACHE_ARGUMENT_PARSERS.register("naive")(StandardCacheArgumentParser)
 SUPPORTED_CACHE_ARGUMENT_PARSERS.register("radix")(StandardCacheArgumentParser)
 SUPPORTED_CACHE_ARGUMENT_PARSERS.register("logstate")(LogStateCacheArgumentParser)
+SUPPORTED_CACHE_ARGUMENT_PARSERS.register("marconi")(MarconiCacheArgumentParser)
 
 
 def make_cache_argument_parser(cache_type: str) -> CacheArgumentParserBase:

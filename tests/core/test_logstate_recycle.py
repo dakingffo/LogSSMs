@@ -3,9 +3,16 @@ from collections import deque
 
 import torch
 
-from logssms.cache.logstate import LogStateRecycleBin, RecycledBranch, RecycledLog
-from logssms.cache.prefix_cache.logstate import (
-    LogRadixTree, LogStateEntry, LogStateKind, LogStateMergeStats,
+from logssms.cache.logstate.recycler import (
+    LogStateRecycleBin,
+    RecycledBranch,
+    RecycledLog,
+)
+from logssms.cache.logstate.prefix_cache import (
+    LogRadixTree,
+    LogStateEntry,
+    LogStateKind,
+    LogStateMergeStats,
 )
 from tests.logstate_helpers import remember_log_tail
 

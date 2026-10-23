@@ -30,6 +30,11 @@ def batch_snapshot(batch: Batch) -> dict:
         "input_tokens": sum(req.extend_len for req in batch.reqs),
         "cached_lens": [req.cached_len for req in batch.reqs],
         "extend_lens": [req.extend_len for req in batch.reqs],
+        "prefill_requests": batch.prefill_count,
+        "prefill_tokens": sum(req.extend_len for req in batch.prefill_reqs),
+        "prefill_partition": list(batch.prefill_partition),
+        "prefill_token_capacity": batch.prefill_token_capacity,
+        "decode_requests": len(batch.decode_reqs),
     }
 
 
@@ -45,7 +50,7 @@ class EngineProfiler:
         self.origin_ns = perf_counter_ns()
         self.next_batch_id = 0
         self.samples = {
-            kind: {phase: deque(maxlen=self.sample_limit) for phase in ("prefill", "decode", "verify")}
+            kind: {phase: deque(maxlen=self.sample_limit) for phase in ("prefill", "decode", "verify", "mixed")}
             for kind in ("prepare", "forward")
         }
         self.totals = {kind: {} for kind in self.samples}

@@ -28,6 +28,8 @@ class EngineConfig:
     tp_info                 : DistributedInfo
     dtype                   : torch.dtype
     max_running_req         : int              = 128
+    scheduling_policy       : str              = "prefill-first"
+    mixed_prefill_tokens    : int              = 128
     attention_backend       : str              = "auto"
     moe_backend             : str              = "auto"
     cuda_graph_bs           : list[int] | None = None
@@ -46,6 +48,15 @@ class EngineConfig:
     speculative_draft_model_path : str | None                  = None
     dt_separation                : bool                        = False
     speculator_config            : BaseSpeculatorConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.scheduling_policy not in ("prefill-first", "mixed"):
+            raise ValueError("scheduling_policy must be prefill-first or mixed")
+        alignment = self.cache_config.prefill_alignment
+        if self.mixed_prefill_tokens <= 0 or self.mixed_prefill_tokens % alignment:
+            raise ValueError(f"mixed_prefill_tokens must be a positive multiple of {alignment}")
+        if self.scheduling_policy == "mixed" and self.enable_specualtive_decoding:
+            raise ValueError("mixed scheduling does not support speculative decoding")
 
     @property
     def enable_specualtive_decoding(self) -> bool:
