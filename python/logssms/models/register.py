@@ -7,7 +7,6 @@ from .config import ModelConfig
 _MODEL_REGISTRY = {
     "FalconH1ForCausalLM"              : (".falcon_h1", "FalconH1Config", "FalconH1ForCausalLM"),
     "LlamaForCausalLM"                 : (".llama", "LlamaConfig", "LlamaForCausalLM"),
-    "Qwen2ForCausalLM"                 : (".qwen2", "Qwen2Config", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM"                 : (".qwen3", "Qwen3Config", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM"              : (".qwen3", "Qwen3MoeConfig", "Qwen3ForCausalLM"),
     "Qwen3_5ForConditionalGeneration"  : (".qwen3_next", "Qwen3_5Config", "Qwen3NextForCausalLM"),
