@@ -1,6 +1,6 @@
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 
 
 def decay_view(pool: MHALogStatePool, slot: int) -> torch.Tensor:

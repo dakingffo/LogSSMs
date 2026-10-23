@@ -1,10 +1,11 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 import torch.nn.functional as F
 from types import SimpleNamespace
 
-from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.radix.state_pool import LinearStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.mamba2 import (
     prepare_mamba2, mamba2_prefill, mamba2_decode, mamba2_conv_decode,
 )
@@ -108,11 +109,11 @@ def test_memorized_checkpoint_prefill_matches_log_state(reuse, chunk_size):
                 batch = Batch([req], "prefill")
                 batch.positions = ctx.page_table[0, begin:end]
                 batch.out_loc = batch.positions
-                batch.logstate_first_offsets = [0]
+                batch.cache_metadata = LogStateCacheMetadata(first_offsets=[0])
                 if direct:
-                    batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+                    batch.cache_metadata.checkpoint_ranges = [(0, 0, 128)]
                     if end == 128:
-                        batch.logstate_checkpoint_writes = [(chunk_size - 1, target)]
+                        batch.cache_metadata.checkpoint_writes = [(chunk_size - 1, target)]
                 backend.prepare_metadata(batch)
                 outputs.append(backend.forward(x[begin:end], dt[begin:end], weight,
                                                None, A, bias, D, config, batch))

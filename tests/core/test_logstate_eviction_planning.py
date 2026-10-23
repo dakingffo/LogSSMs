@@ -4,8 +4,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from logssms.cache.logstate import LogStateCapacityError
-from logssms.cache.prefix_cache.logstate import LogStateEntry, LogStateKind
+from logssms.cache.logstate.evictor import LogStateCapacityError
+from logssms.cache.logstate.prefix_cache import LogStateEntry, LogStateKind
 from tests.core.test_logstate_cache_manager import make_manager
 
 
@@ -34,7 +34,7 @@ def make_pressure_tree(chains=16, pages=4, checkpoints=1):
         ).node
         for part in manager.tree.path(node):
             part.timestamp = chain
-        manager._cached_page_tokens.update({frame * 64: 64 for frame in frames})
+        manager.evictor.cached_page_tokens.update({frame * 64: 64 for frame in frames})
     manager.logstate_pool.reserve(kv=manager._allocator.free_frames)
     return manager
 
@@ -47,20 +47,20 @@ def signature(plan):
 def assert_full_plan_matches(manager, pages, logs=0, works=0):
     with patch.object(manager.tree, "log_eviction_snapshot", return_value=([], [])):
         try:
-            expected = manager._plan_eviction(pages, logs, works)
+            expected = manager.evictor.plan(pages, logs, works)
         except LogStateCapacityError:
             expected = None
     if expected is None:
         with pytest.raises(LogStateCapacityError):
-            manager._plan_eviction(pages, logs, works)
+            manager.evictor.plan(pages, logs, works)
     else:
-        assert signature(manager._plan_eviction(pages, logs, works)) == signature(expected)
+        assert signature(manager.evictor.plan(pages, logs, works)) == signature(expected)
 
 
 def test_log_eviction_does_not_build_full_tree_metadata():
     manager = make_pressure_tree(chains=32)
     with patch.object(manager.tree, "eviction_snapshot", side_effect=AssertionError):
-        nodes, _pages, _slots, compressed = manager._plan_eviction(1, 1, 0)
+        nodes, _pages, _slots, compressed = manager.evictor.plan(1, 1, 0)
     assert len(nodes) == 1 and nodes[0].timestamp == 0
     assert not compressed
 
@@ -97,7 +97,7 @@ def test_log_window_respects_hot_ancestor_and_excluded_cold_leaf():
             node.timestamp = 1000
     assert_full_plan_matches(manager, 9, 9)
     with patch.object(tree, "eviction_snapshot", wraps=tree.eviction_snapshot) as full:
-        nodes, _pages, _slots, _compressed = manager._plan_eviction(9, 9, 0)
+        nodes, _pages, _slots, _compressed = manager.evictor.plan(9, 9, 0)
     assert full.call_count == 0
     assert nodes[:9] == leaves[:9]
 
@@ -107,7 +107,7 @@ def test_log_window_expands_before_full_tree_planning():
     with patch.object(manager.tree, "eviction_snapshot", side_effect=AssertionError), patch.object(
         manager.tree, "log_eviction_snapshot", wraps=manager.tree.log_eviction_snapshot,
     ) as window:
-        nodes, _pages, _slots, compressed = manager._plan_eviction(16, 16, 0)
+        nodes, _pages, _slots, compressed = manager.evictor.plan(16, 16, 0)
     assert len(nodes) > 8 and not compressed
     assert [call.args[0] for call in window.call_args_list] == [8, 32]
 
@@ -144,7 +144,7 @@ def test_log_window_keeps_an_unselected_shared_branch_attached():
     branch_kv = source.kv[:32].clone()
     branch_entry = source.entries[0].slice(224, 256)
     removed = tree.evict_nodes([source])
-    manager._cached_page_tokens.pop(int(removed.kv_indices[0]) // 64 * 64)
+    manager.evictor.cached_page_tokens.pop(int(removed.kv_indices[0]) // 64 * 64)
     prefix = tree.split_at(leaves[0], 32)
     prefix.timestamp = 0
     tokens = torch.cat([*(node.key for node in tree.path(prefix)),
@@ -152,10 +152,10 @@ def test_log_window_keeps_an_unselected_shared_branch_attached():
     indices = torch.cat([*(node.kv for node in tree.path(prefix)), branch_kv])
     branch = tree.insert(tokens, indices, (branch_entry,), cache_len=len(tokens)).node
     branch.timestamp = 1000
-    manager._cached_page_tokens[int(branch_kv[0]) // 64 * 64] = 32
+    manager.evictor.cached_page_tokens[int(branch_kv[0]) // 64 * 64] = 32
     tree.check_integrity()
     assert_full_plan_matches(manager, 4, 4)
-    nodes, _pages, _slots, _compressed = manager._plan_eviction(4, 4, 0)
+    nodes, _pages, _slots, _compressed = manager.evictor.plan(4, 4, 0)
     assert leaves[0] in nodes and prefix not in nodes and branch not in nodes
 
 
@@ -209,14 +209,14 @@ def test_log_index_tracks_access_locks_pins_and_splits(seed):
 def test_log_snapshot_reads_index_without_scanning_leaves():
     manager = make_pressure_tree(chains=64, checkpoints=1)
     tree = manager.tree
-    expected = signature(manager._plan_eviction(1, 1, 0))
+    expected = signature(manager.evictor.plan(1, 1, 0))
 
     class IndexedLeaves(dict):
         def values(self):
             raise AssertionError("eviction scanned every leaf")
 
     with patch.object(tree, "_leaves", IndexedLeaves(tree._leaves)):
-        assert signature(manager._plan_eviction(1, 1, 0)) == expected
+        assert signature(manager.evictor.plan(1, 1, 0)) == expected
 
 
 def test_log_index_removes_checkpoint_and_retired_leaf_records():

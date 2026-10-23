@@ -19,11 +19,11 @@ class LaunchRecorder:
         return launch
 
 
-def test_prefill_warmup_request_counts():
-    from logssms.engine.prefill_warmup import prefill_warmup_cases
+def test_piecewise_warmup_request_counts():
+    from logssms.engine.piecewise_graph import _warmup_cases
     from logssms.kernel.linear_attention.vendor.fla.config import prefill_config
 
-    cases = prefill_warmup_cases(32, 8192, 32)
+    cases = _warmup_cases(32, 8192, 32)
     for count in range(1, 5):
         selected = [lengths for lengths in cases if len(lengths) == count]
         assert selected
@@ -35,12 +35,12 @@ def test_prefill_warmup_request_counts():
             assert variants == expected
 
 
-def test_prefill_warmup_covers_dispatch_configs():
-    from logssms.engine.prefill_warmup import prefill_warmup_lengths
+def test_piecewise_warmup_covers_dispatch_configs():
+    from logssms.engine.piecewise_graph import _warmup_lengths
     from logssms.kernel.linear_attention.vendor.fla.config import prefill_config
 
     for budget in (64, 128, 256, 8192):
-        lengths = prefill_warmup_lengths(32, budget)
+        lengths = _warmup_lengths(32, budget)
         assert all(0 < n <= budget for n in lengths)
         for stage in ("output", "kkt", "solve", "wy"):
             variants = {tuple(prefill_config(stage, (n + 31) // 32).items()) for n in lengths}

@@ -1,8 +1,9 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
-from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.radix.state_pool import LinearStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.mamba2 import Mamba2Config
@@ -56,7 +57,7 @@ def test_logstate_granule_chunks_match_single_prefill(granularity, mamba):
             batch = Batch([req], "prefill")
             batch.positions = torch.arange(begin, end, device=device, dtype=torch.int32)
             batch.out_loc = ctx.page_table[0, begin:end]
-            batch.logstate_first_offsets = [begin % 64]
+            batch.cache_metadata = LogStateCacheMetadata(first_offsets=[begin % 64])
             backend.prepare_metadata(batch)
             if mamba:
                 output = backend.forward(x[begin:end], gate[begin:end], weight, conv_bias, A, bias, D, config, batch)

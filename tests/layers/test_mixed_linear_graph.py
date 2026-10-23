@@ -1,11 +1,12 @@
 """Small GPU correctness tests; no throughput measurements or model loading."""
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import gc
 
 import pytest
 import torch
 
-from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.radix.state_pool import LinearStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.core import Batch, Context, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.mamba2 import Mamba2Config
@@ -88,10 +89,10 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
         batch = Batch([_make_request(0, length)], "prefill")
         batch.positions = torch.arange(length, dtype=torch.int32, device=device)
         batch.out_loc = batch.positions
-        batch.logstate_first_offsets = [0]
+        batch.cache_metadata = LogStateCacheMetadata(first_offsets=[0])
         if checkpoints and length >= 64:
-            batch.logstate_checkpoint_ranges = [(0, 0, 64)]
-            batch.logstate_checkpoint_writes = [(63, 3)]
+            batch.cache_metadata.checkpoint_ranges = [(0, 0, 64)]
+            batch.cache_metadata.checkpoint_writes = [(63, 3)]
         req = _make_request(5, 6)
         req.table_idx = 1
         decode = Batch([req], "decode")

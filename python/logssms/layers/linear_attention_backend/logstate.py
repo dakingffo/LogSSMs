@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 from logssms.core import get_global_ctx
 
 from .base import BaseLinearAttentionBackend, BaseLinearAttentionMetadata
@@ -103,6 +104,9 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         }
 
     def prepare_metadata(self, batch: Batch) -> None:
+        if batch.cache_metadata is None:
+            batch.cache_metadata = LogStateCacheMetadata()
+        assert isinstance(batch.cache_metadata, LogStateCacheMetadata)
         profile = self._profile_enabled and batch.is_prefill
         metadata_start = perf_counter_ns() if profile else 0
         if batch.is_verify:
@@ -172,7 +176,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         log_slots = state_table[row_table_indices, positions]
         token_offsets = batch.out_loc.remainder(pool.page_size).to(torch.int32)
         if batch.is_decode:
-            counts = batch.logstate_replay_counts
+            counts = batch.cache_metadata.replay_counts
             if counts is None:
                 counts = [0] * len(reqs)
             assert len(counts) == len(reqs)
@@ -209,7 +213,7 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             replay_counts=replay_counts,
         )
         item_calls = item_cpu_ns = 0
-        direct = (batch.is_prefill and batch.logstate_first_offsets is not None
+        direct = (batch.is_prefill and batch.cache_metadata.first_offsets is not None
                   and self.direct_prefill_metadata)
         if direct:
             self._prepare_direct_prefill(batch, metadata, pool)
@@ -224,14 +228,14 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
             checkpoint_state_indices = []
             checkpoint_slots = []
             log_rows = []
-            checkpoint_by_row = dict(batch.logstate_checkpoint_writes)
+            checkpoint_by_row = dict(batch.cache_metadata.checkpoint_writes)
             ranges_by_req: dict[int, list[tuple[int, int]]] = {}
-            for req_index, begin, end in batch.logstate_checkpoint_ranges:
+            for req_index, begin, end in batch.cache_metadata.checkpoint_ranges:
                 ranges_by_req.setdefault(req_index, []).append((begin, end))
             chunk_offset = 0
             item_cpu_ns = 0
             item_calls = 0
-            first_offsets = batch.logstate_first_offsets
+            first_offsets = batch.cache_metadata.first_offsets
             for req_idx, req in enumerate(reqs):
                 seq_len = req.extend_len
                 checkpoint_ranges = ranges_by_req.get(req_idx, ())
@@ -392,14 +396,14 @@ class LogStateLinearAttentionBackend(BaseLinearAttentionBackend):
         conv_granules.fill(0)
         log_mask.fill(1)
         chunk_writes.fill(-1)
-        checkpoints = iter(sorted(batch.logstate_checkpoint_writes))
+        checkpoints = iter(sorted(batch.cache_metadata.checkpoint_writes))
         checkpoint = next(checkpoints, None)
         ranges = {}
-        for req, begin, end in batch.logstate_checkpoint_ranges:
+        for req, begin, end in batch.cache_metadata.checkpoint_ranges:
             ranges.setdefault(req, []).append((begin, end))
         token_begin = chunk_begin = 0
         for i, req in enumerate(batch.reqs):
-            length, first = lengths[i], batch.logstate_first_offsets[i]
+            length, first = lengths[i], batch.cache_metadata.first_offsets[i]
             token_end = token_begin + length
             conv_slots[token_begin + granularity - 1 - first % granularity:token_end:granularity] = -2
             if length:

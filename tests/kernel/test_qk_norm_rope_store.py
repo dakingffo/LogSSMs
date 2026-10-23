@@ -82,8 +82,8 @@ def test_qk_norm_rope_store_matches_reference(dtype, norm, dims, layout):
 @pytest.mark.parametrize("layout", ["radix", "frame"])
 @pytest.mark.parametrize("page_size", [1, 16, 32, 64, 128])
 def test_qk_norm_rope_store_graph_replay_updates_mapping(layout, page_size):
-    from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
-    from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+    from logssms.cache.radix.mha_pool import MHAKVCachePool
+    from logssms.cache.logstate.frame_pool import MHALogStatePool
     from logssms.distributed import DistributedInfo, tp_override
     from logssms.layers.norm import RMSNorm
     from logssms.layers.rotary import RotaryEmbedding
@@ -151,7 +151,7 @@ def test_qk_norm_rope_store_graph_replay_updates_mapping(layout, page_size):
 @pytest.mark.parametrize("normalize", [False, True])
 def test_rotary_attention_fused_path_matches_projection(monkeypatch, gated, normalize):
     import logssms.layers.attention as attention
-    from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
+    from logssms.cache.radix.mha_pool import MHAKVCachePool
     from logssms.distributed import DistributedInfo, tp_override
 
     if gated and not normalize:
@@ -205,8 +205,8 @@ def test_rotary_attention_fused_path_matches_projection(monkeypatch, gated, norm
 def test_fused_qkv_with_flashinfer_prefill_decode_verify(monkeypatch, layout):
     import logssms.layers.attention as attention
     import logssms.layers.attention_backend.fi as fi
-    from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
-    from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+    from logssms.cache.radix.mha_pool import MHAKVCachePool
+    from logssms.cache.logstate.frame_pool import MHALogStatePool
     from logssms.core import Batch, Request, SamplingParams
     from logssms.distributed import DistributedInfo, tp_override
 

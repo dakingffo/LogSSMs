@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from dataclasses import replace
 
 from logssms.core import get_global_ctx
 from logssms.kernel import store_state
@@ -17,6 +18,9 @@ class Mamba2Backend(StandardLinearAttentionBackend, BaseMamba2Backend):
     def forward(self, xbc, dt, conv_weight, conv_bias, A_log, dt_bias, D, config, batch, out=None):
         metadata = batch.linear_attn_metadata
         pool = get_global_ctx().linear_state
+        if hasattr(pool, "group_table"):
+            metadata, lane = pool.map_metadata(metadata, config.layer_idx)
+            config = replace(config, layer_idx=lane)
         if batch.is_verify:
             raise NotImplementedError("Mamba2 speculative verify is not implemented")
         if batch.is_decode:

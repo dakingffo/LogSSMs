@@ -28,9 +28,12 @@ if source_args.source_root is not None:
     assert revision is None, "Choose either --revision or --source-root"
     sys.path.insert(0, str(source_args.source_root.resolve()))
 source_paths = [
-    "python/logssms/cache/logstate.py",
-    "python/logssms/cache/prefix_cache/logstate.py",
-    "python/logssms/cache/logstate_pool/mha_pool.py",
+    "python/logssms/cache/logstate/manager.py",
+    "python/logssms/cache/logstate/evictor.py",
+    "python/logssms/cache/logstate/online_analysis_scheduler.py",
+    "python/logssms/cache/logstate/recycler.py",
+    "python/logssms/cache/logstate/prefix_cache.py",
+    "python/logssms/cache/logstate/frame_pool.py",
     "python/logssms/kernel/linear_attention/logstate.py",
     "python/logssms/utils/torch_utils.py",
 ]
@@ -57,9 +60,14 @@ if revision:
 
     sys.meta_path.insert(0, RevisionLoader())
 
-from logssms.cache.logstate import LogStateCacheManager, OnlineAnalysisScheduler
-from logssms.cache.prefix_cache.logstate import LogRadixTree, LogStateEntry, LogStateKind
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.manager import (
+    LogStateCacheManager,
+)
+from logssms.cache.logstate.online_analysis_scheduler import (
+    OnlineAnalysisScheduler,
+)
+from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry, LogStateKind
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 
 
 class TreeManager(LogStateCacheManager):

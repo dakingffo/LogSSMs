@@ -25,10 +25,7 @@ class ServerArgs(SchedulerConfig):
 
 def parse_args(args: list[str]) -> ServerArgs:
     from logssms.layers.attention_backend import validate_attn_backend
-    from logssms.cache import (
-        SUPPORTED_CACHE_ARGUMENT_PARSERS,
-        make_cache_argument_parser,
-    )
+    from logssms.cache import SUPPORTED_CACHE_ARGUMENT_PARSERS, make_cache_argument_parser
     from logssms.layers.moe_backend import SUPPORTED_MOE_BACKENDS
     from logssms.speculator.drafters import (
         SUPPORTED_SPECULATOR_ARGUMENT_PARSERS,

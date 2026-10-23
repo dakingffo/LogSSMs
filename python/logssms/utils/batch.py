@@ -53,7 +53,7 @@ class BatchIndices:
         cu_k = list(accumulate(pages, initial=0))
         padding_after = batch.prefill_count if batch.is_mixed else 0
         padding = max(0, batch.prefill_token_capacity - cu_q[padding_after]) if padding_after else 0
-        counts = batch.logstate_replay_counts
+        counts = batch.cache_metadata.replay_counts if batch.cache_metadata is not None else None
         if counts is None:
             counts = [0] * len(reqs)
         assert len(counts) == len(reqs)

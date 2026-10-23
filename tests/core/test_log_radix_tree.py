@@ -3,11 +3,7 @@ import random
 from collections import Counter
 from unittest.mock import patch
 
-from logssms.cache.prefix_cache.logstate import (
-    LogRadixTree,
-    LogStateEntry,
-    LogStateKind,
-)
+from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry, LogStateKind
 from tests.logstate_helpers import matched_kv
 from logssms.kernel import logstate as planning
 
@@ -272,12 +268,12 @@ def test_matching_refreshes_kv_path_but_only_the_selected_checkpoint():
         for slot in range(3)
     )).node
     tree._checkpoint_timestamps.update({0: 10, 1: 20, 2: 30})
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=100):
         handle = tree.match_prefix(tokens).cuda_handle
     assert handle.recovery.base_checkpoint_slot == 2
     assert all(node.timestamp == 100 for node in tree.path(leaf))
     assert tree._checkpoint_timestamps == {0: 10, 1: 20, 2: 100}
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=200):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=200):
         earlier = tree.match_prefix(tokens[:8]).cuda_handle
     assert earlier.recovery.base_checkpoint_slot == 1
     assert tree._checkpoint_timestamps == {0: 10, 1: 200, 2: 100}
@@ -295,7 +291,7 @@ def test_log_endpoint_match_touches_its_base_checkpoint_not_earlier_states():
         LogStateEntry(2, LogStateKind.LOG, 8, 12),
     ))
     tree._checkpoint_timestamps.update({0: 10, 1: 20})
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=100):
         handle = tree.match_prefix(tokens[:10]).cuda_handle
     assert handle.cached_len == 10
     assert handle.recovery.base_checkpoint_slot == 1
@@ -313,7 +309,7 @@ def test_insert_trace_split_and_handle_construction_do_not_heat_checkpoints():
         LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 8, span_pages=2),
     )).node
     tree._checkpoint_timestamps[0] = 10
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=100):
         tree.insert(tokens, tokens + 100)
         assert leaf.timestamp == 100
         tree.trace(tokens)
@@ -339,7 +335,7 @@ def test_checkpoint_eviction_uses_state_heat_not_kv_heat_and_cleans_slot_reuse()
     tree.evict_nodes(selected)
     assert plan_kv_eviction(tree) == [hot]
     assert 0 not in tree._checkpoint_timestamps
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=100):
         tree.insert(ids(4, 40), ids(4, 300), (
             LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_pages=1),
         ))

@@ -18,8 +18,8 @@ import torch
 
 import logssms.core as core
 from logssms.core import Context, Request, SamplingParams, set_global_ctx
-from logssms.cache import CacheResources, StandardCacheManager
-from logssms.cache.linear_pool.state_pool import LinearStatePool
+from logssms.cache import CacheResources, RadixCacheManager
+from logssms.cache.radix.state_pool import LinearStatePool
 
 
 def setup_ctx() -> None:
@@ -51,10 +51,10 @@ def make_cm(st, reserve, nslots):
         state_table=st,
         work_state_table=reserve,
     )
-    cm = StandardCacheManager(
+    cm = RadixCacheManager(
         num_pages=10, page_size=64,
         resources=resources,
-        prefix_cache_type="hybrid_radix", num_states=nslots,
+        num_states=nslots,
         num_draft_states=reserve.numel(),
     )
     return cm, pool
@@ -151,10 +151,10 @@ def test_stable_reserve_across_overlapping_batches():
         state_table=st,
         work_state_table=reserve,
     )
-    cm = StandardCacheManager(
+    cm = RadixCacheManager(
         num_pages=10, page_size=64,
         resources=resources,
-        prefix_cache_type="hybrid_radix", num_states=num_states,
+        num_states=num_states,
         num_draft_states=max_running_req * reserve_width,
     )
     original = reserve.clone()

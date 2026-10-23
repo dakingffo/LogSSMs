@@ -1,3 +1,4 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
@@ -48,10 +49,10 @@ def test_direct_mixed_prefill_maps_match_general_path(granularity, begin, length
     batch = Batch([_make_request(begin, begin + length)], "prefill")
     batch.positions = torch.arange(begin, begin + length, device=device, dtype=torch.int32)
     batch.out_loc = batch.positions
-    batch.logstate_first_offsets = [begin % 64]
+    batch.cache_metadata = LogStateCacheMetadata(first_offsets=[begin % 64])
     if checkpoint:
-        batch.logstate_checkpoint_ranges = [(0, begin, begin + length)]
-        batch.logstate_checkpoint_writes = [(length - 1, 3)]
+        batch.cache_metadata.checkpoint_ranges = [(0, begin, begin + length)]
+        batch.cache_metadata.checkpoint_writes = [(length - 1, 3)]
     backend = GatedDeltaLogStateBackend()
     try:
         backend.direct_prefill_metadata = False
@@ -96,9 +97,9 @@ def test_direct_prefill_variable_requests_and_checkpoint_ranges(device, granular
     batch.positions = torch.cat([torch.arange(start, start + length, device=device, dtype=torch.int32)
                                  for start, length in zip(starts, lengths)])
     batch.out_loc = batch.positions
-    batch.logstate_first_offsets = [start % 64 for start in starts]
-    batch.logstate_checkpoint_ranges = [(2, 16, 529), (3, 64, 1088), (3, 1600, 2112)]
-    batch.logstate_checkpoint_writes = [(640, 3), (1664, 3), (2688, 3)]
+    batch.cache_metadata = LogStateCacheMetadata(first_offsets=[start % 64 for start in starts])
+    batch.cache_metadata.checkpoint_ranges = [(2, 16, 529), (3, 64, 1088), (3, 1600, 2112)]
+    batch.cache_metadata.checkpoint_writes = [(640, 3), (1664, 3), (2688, 3)]
     set_global_ctx(ctx)
     backend = GatedDeltaLogStateBackend()
     try:

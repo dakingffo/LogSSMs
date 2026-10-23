@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from tests.logstate_helpers import head_view, write_head
 from logssms.kernel.linear_attention.logstate import (
     restore_log_state_chains,

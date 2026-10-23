@@ -1,3 +1,4 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
@@ -80,7 +81,7 @@ def make_batch(phase):
                             table, cached, 1, table, None, None, cached + length + 16))
     batch = Batch(reqs[:2], phase)
     batch.padded_reqs = reqs
-    batch.logstate_replay_counts = [0, 15, 0, 0]
+    batch.cache_metadata = LogStateCacheMetadata(replay_counts=[0, 15, 0, 0])
     return batch
 
 
@@ -92,7 +93,7 @@ def test_mixed_packet_matches_independent_packets(lengths, decode_count):
             for i, length in enumerate(lengths + [1] * decode_count)]
     batch = Batch(reqs, "mixed", num_prefill_reqs=len(lengths))
     batch.padded_reqs = reqs
-    batch.logstate_replay_counts = [i % 16 for i in range(len(reqs))]
+    batch.cache_metadata = LogStateCacheMetadata(replay_counts=[i % 16 for i in range(len(reqs))])
     combined = BatchIndices.make_mixed(batch, torch.device("cpu"), 16)
     for packet, start, end, phase in (
         (combined[0], 0, len(reqs), "mixed"),
@@ -101,7 +102,7 @@ def test_mixed_packet_matches_independent_packets(lengths, decode_count):
     ):
         part = Batch(reqs[start:end], phase, num_prefill_reqs=len(lengths) if phase == "mixed" else 0)
         part.padded_reqs = part.reqs
-        part.logstate_replay_counts = batch.logstate_replay_counts[start:end]
+        part.cache_metadata = LogStateCacheMetadata(replay_counts=batch.cache_metadata.replay_counts[start:end])
         expected = BatchIndices.make(part, torch.device("cpu"), 16)
         for name, value in vars(expected).items():
             actual = getattr(packet, name)

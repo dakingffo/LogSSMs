@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .logstate_pool.layout import LOG_STATE_GRANULARITY
+from logssms.cache.logstate.layout import LOG_STATE_GRANULARITY
 
 LOG_STATE_PAGE_SIZE = 64
 LOG_STATE_GRANULARITIES = (16, 32, 64)
@@ -25,6 +25,18 @@ class StandardCacheConfig(BaseCacheConfig):
     def __post_init__(self) -> None:
         if self.page_size <= 0:
             raise ValueError("Cache page size must be positive.")
+
+
+@dataclass(frozen=True)
+class MarconiCacheConfig(BaseCacheConfig):
+    page_size: int = 0
+    bootstrap_multiplier: int = 5
+
+    def __post_init__(self):
+        if self.page_size < 0 or self.page_size % 64:
+            raise ValueError("Marconi page size must be zero (auto) or a multiple of 64")
+        if self.bootstrap_multiplier < 1:
+            raise ValueError("Marconi bootstrap multiplier must be positive")
 
 
 @dataclass(frozen=True)
@@ -65,4 +77,5 @@ __all__ = [
     "LOG_STATE_PAGE_SIZE",
     "LogStateCacheConfig",
     "StandardCacheConfig",
+    "MarconiCacheConfig",
 ]

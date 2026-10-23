@@ -25,7 +25,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from logssms import core
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.engine.engine import Engine
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.layers.attention_backend.fi import FlashInferBackend
 from logssms.layers.linear_attention_backend import GatedDeltaLogStateBackend, GatedDeltaBackend
 
@@ -86,8 +86,12 @@ def metadata_case(bs, phase, page_size, linear):
     engine.linear_attn_backend = GatedDeltaLogStateBackend() if linear == "logstate" else GatedDeltaBackend()
     engine.sampler = SimpleNamespace(prepare=lambda batch: None)
     def cache_prepare(batch):
-        batch.logstate_replay_counts = [i % 16 for i in range(bs)]
-        batch.logstate_first_offsets = [req.cached_len % 64 for req in batch.reqs]
+        from logssms.cache.logstate.metadata import LogStateCacheMetadata
+
+        batch.cache_metadata = LogStateCacheMetadata(
+            replay_counts=[i % 16 for i in range(bs)],
+            first_offsets=[req.cached_len % 64 for req in batch.reqs],
+        )
     cache = SimpleNamespace(allocate=lambda *a, **kw: None, prepare_batch=cache_prepare)
     reqs = []
     for row in range(bs):

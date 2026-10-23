@@ -10,7 +10,7 @@ from logssms.tvm import call_cuda_ffi, load_jit, make_cpp_args
 from logssms.utils.torch_utils import make_device_vectors
 
 if TYPE_CHECKING:
-    from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+    from logssms.cache.logstate.frame_pool import MHALogStatePool
 
 
 @functools.cache

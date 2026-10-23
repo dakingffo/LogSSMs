@@ -4,8 +4,11 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from logssms.cache.logstate_construction import LogStateConstruction, RestoreTask
-from logssms.cache.prefix_cache.logstate import LogStateEntry, LogStateKind
+from logssms.cache.logstate.manager import (
+    LogStateConstruction,
+    RestoreTask,
+)
+from logssms.cache.logstate.prefix_cache import LogStateEntry, LogStateKind
 
 
 def make_pool():
@@ -88,7 +91,7 @@ def test_restore_records_events_only_when_requested(profile, record_cuda, has_ta
     end.record.side_effect = lambda: order.append("end")
     pool.copy_states.side_effect = lambda *_: order.append("state")
     pool.kernels.copy_conv.side_effect = lambda *_: order.append("conv")
-    with patch("logssms.cache.logstate_construction.torch.cuda.Event", side_effect=[start, end]) as event:
+    with patch("logssms.cache.logstate.manager.torch.cuda.Event", side_effect=[start, end]) as event:
         stats = construction.restore(
             tasks, profile_enabled=profile, pending_cuda_events=pending,
             record_cuda=record_cuda,
@@ -111,7 +114,7 @@ def test_restore_uses_current_event_list_without_retaining_old_list():
     construction = LogStateConstruction(make_pool())
     task = RestoreTask(20, 10, (), 10, 2, 0)
     previous, current = [], []
-    with patch("logssms.cache.logstate_construction.torch.cuda.Event", side_effect=lambda **_: Mock()):
+    with patch("logssms.cache.logstate.manager.torch.cuda.Event", side_effect=lambda **_: Mock()):
         first = construction.restore([task], profile_enabled=True, pending_cuda_events=previous)
         second = construction.restore([task], profile_enabled=True, pending_cuda_events=current)
     assert len(previous) == len(current) == 1

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.gdn_conv_decode import (
     _frame_element_offset,
     conv_decode_qkv,

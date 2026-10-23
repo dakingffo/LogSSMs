@@ -17,6 +17,7 @@ from logssms.distributed import (
     set_tp_info,
 )
 from logssms.cache import LogStateCacheConfig, get_cache_factory
+from logssms.cache.metadata import CacheMetadata
 from logssms.layers import set_rope_device
 from logssms.models import make_model, load_target_weight
 from logssms.utils import (
@@ -207,7 +208,7 @@ class Engine:
             )
             if self.decode_graph_runner.max_graph_bs > 0 else None
         )
-        if self.piecewise_graph_runner is not None and self.piecewise_graph_runner.pieces:
+        if self.piecewise_graph_runner is not None:
             self.piecewise_graph_runner.warmup(self)
         self.mixed_graph_runner = MixedGraphRunner(self)
 
@@ -310,8 +311,10 @@ class Engine:
         with stage("cache_prepare"):
             cache_manager.prepare_batch(decode)
             cache_manager.prepare_batch(prefill)
-            if decode.logstate_replay_counts is not None:
-                batch.logstate_replay_counts = [0] * prefill.size + decode.logstate_replay_counts
+            if decode.cache_metadata is not None and decode.cache_metadata.replay_counts is not None:
+                batch.cache_metadata = CacheMetadata(
+                    replay_counts=[0] * prefill.size + decode.cache_metadata.replay_counts
+                )
         with stage("positions_mappings"):
             from logssms.kernel.metadata import make_batch_mapping
             from logssms.utils.batch import BatchIndices
@@ -355,9 +358,9 @@ class Engine:
     def _prepare_batch_profiled(self, batch: Batch, cache_manager) -> ForwardInput:
         profiler = self.profiler
         graph_used = self.decode_graph_runner.can_use_cuda_graph(batch)
-        prefill_runner = self.piecewise_graph_runner
+        piecewise_runner = self.piecewise_graph_runner
         graph_used = graph_used or (
-            prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
+            piecewise_runner is not None and piecewise_runner.can_use_cuda_graph(batch)
         )
         with profiler.record_batch(batch, "prepare", graph_used=graph_used):
             with profiler.record_stage("pad_batch"):
@@ -406,6 +409,7 @@ class Engine:
                 logits = self.decode_graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+        self.cache_manager.after_forward(batch)
         next_tokens_gpu = self._sample_batch(logits, batch, args)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -429,18 +433,18 @@ class Engine:
         profiler = self.profiler
         decode_graph = self.decode_graph_runner.can_use_cuda_graph(batch)
         mixed_graph = batch.is_mixed and self.mixed_graph_runner.can_use_cuda_graph(batch)
-        prefill_runner = self.piecewise_graph_runner
-        piecewise_graph = prefill_runner is not None and prefill_runner.can_use_cuda_graph(batch)
+        piecewise_runner = self.piecewise_graph_runner
+        piecewise_graph = piecewise_runner is not None and piecewise_runner.can_use_cuda_graph(batch)
         graph_used = decode_graph or piecewise_graph or mixed_graph
         with profiler.record_batch(batch, "forward", graph_used=graph_used) as sample:
             sample["graph_kind"] = "mixed" if mixed_graph else "decode" if decode_graph else "piecewise" if piecewise_graph else None
             if piecewise_graph:
-                sample["piece_bucket_tokens"] = prefill_runner.token_bucket(len(batch.input_ids))
+                sample["piece_bucket_tokens"] = piecewise_runner.token_bucket(len(batch.input_ids))
             if self.config.model_config.is_hybrid:
                 sample["linear_backend"] = type(self.linear_attn_backend).__name__
                 if hasattr(self.linear_attn_backend, "enable_eager_state"):
                     sample["eager_state"] = self.linear_attn_backend.enable_eager_state
-            counts = batch.logstate_replay_counts
+            counts = batch.cache_metadata.replay_counts if batch.cache_metadata is not None else None
             if counts is not None:
 
                 sample["replay_counts"] = list(counts[:batch.size])
@@ -458,17 +462,18 @@ class Engine:
                 elif decode_graph:
                     logits = self.decode_graph_runner.replay(batch, profiler=profiler)
                 else:
-                    replays = prefill_runner.replays if piecewise_graph else 0
-                    padded = prefill_runner.padded_tokens if piecewise_graph else 0
+                    replays = piecewise_runner.replays if piecewise_graph else 0
+                    padded = piecewise_runner.padded_tokens if piecewise_graph else 0
                     with profiler.record_stage("model"):
                         logits = self.model.forward()
                     if piecewise_graph:
-                        sample["piece_replays"] = prefill_runner.replays - replays
-                        sample["piece_padding"] = prefill_runner.padded_tokens - padded
+                        sample["piece_replays"] = piecewise_runner.replays - replays
+                        sample["piece_padding"] = piecewise_runner.padded_tokens - padded
                     plan_cpu_ms = getattr(batch.attn_metadata, "plan_cpu_ms", None)
                     if plan_cpu_ms is not None:
                         sample["attention_plan_cpu_ms"] = plan_cpu_ms
             with profiler.record_stage("sampling"):
+                self.cache_manager.after_forward(batch)
                 next_tokens_gpu = self._sample_batch(logits, batch, args)
             with profiler.record_stage("output_copy"):
                 next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
@@ -477,6 +482,7 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
+        self.cache_manager.shutdown()
         self.mixed_graph_runner.destroy_cuda_graphs()
         if self.piecewise_graph_runner is not None:
             self.piecewise_graph_runner.destroy_cuda_graphs()
@@ -514,7 +520,17 @@ class Engine:
                 raise ValueError("Mixed scheduling currently requires FlashInfer attention")
             override("attention_backend", "fi")
 
-        if config.cache_type == "logstate":
+        if config.cache_type == "marconi":
+            from logssms.cache.marconi.manager import marconi_layout
+
+            if config.enable_specualtive_decoding:
+                raise ValueError("Marconi currently supports autoregressive decoding only")
+            layout = marconi_layout(config)
+            override("cache_config", replace(config.cache_config, page_size=layout.page_size))
+            if config.attention_backend not in ("auto", "fi"):
+                raise ValueError("Marconi shared blocks require FlashInfer attention")
+            override("attention_backend", "fi")
+        elif config.cache_type == "logstate":
             assert config.attention_backend in ("auto", "fi"), (
                 "LogState shared KV storage currently requires FlashInfer attention."
             )

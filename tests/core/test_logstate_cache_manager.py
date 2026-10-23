@@ -8,14 +8,20 @@ import pytest
 import torch
 
 from logssms.cache import CacheResources
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
-from logssms.cache.logstate import (
-    LogStateCacheManager, LogStateCapacityError, LogStatePlan,
+from logssms.cache.logstate.frame_pool import MHALogStatePool
+from logssms.cache.logstate.evictor import LogStateCapacityError
+from logssms.cache.logstate.manager import LogStateCacheManager
+from logssms.cache.logstate.online_analysis_scheduler import (
+    LogStatePlan,
 )
-from logssms.cache.prefix_cache.logstate import LogStateCacheHandle
-from logssms.cache.prefix_cache.logstate import LogStateEntry
-from logssms.cache.prefix_cache.logstate import LogStateKind
-from logssms.cache.logstate import LogStateRecycleBin, RecycledBranch, RecycledMatch
+from logssms.cache.logstate.prefix_cache import LogStateCacheHandle
+from logssms.cache.logstate.prefix_cache import LogStateEntry
+from logssms.cache.logstate.prefix_cache import LogStateKind
+from logssms.cache.logstate.recycler import (
+    LogStateRecycleBin,
+    RecycledBranch,
+    RecycledMatch,
+)
 from logssms.core import Batch, Request, SamplingParams
 from logssms.message import UserMsg
 from logssms.scheduler.prefill import PendingRequest
@@ -48,7 +54,7 @@ def test_prefill_chunks_reuse_partial_physical_page(granularity):
         manager.allocate([req], phase="prefill")
         batch = Batch([req], "prefill")
         manager.prepare_batch(batch)
-        assert batch.logstate_first_offsets == [req.cached_len % PAGE_SIZE]
+        assert batch.cache_metadata.first_offsets == [req.cached_len % PAGE_SIZE]
         pages = manager._request_states[req.table_idx].live_pages
         assert len(pages) == (req.device_len + PAGE_SIZE - 1) // PAGE_SIZE
         for page in pages:
@@ -186,9 +192,9 @@ def test_disable_memorized_evict_has_no_recycle_bin() -> None:
     ).node
     manager.tree._checkpoint_timestamps[checkpoint.entries[0].slot] = 1
     log.timestamp = 2
-    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     needed_pages = manager._allocator.free_frames + 1
-    selected, _, released, compressed = manager._plan_eviction(needed_pages, 0, 0)
+    selected, _, released, compressed = manager.evictor.plan(needed_pages, 0, 0)
     assert selected == [log]
     assert released == {slots[1]} and compressed == []
     pages, states, works = manager._allocate(needed_pages, 0)
@@ -546,13 +552,13 @@ def test_prefill_passes_physical_first_offset_without_device_sync():
     manager.allocate([req], phase="prefill")
     batch = Batch(reqs=[req], phase="prefill")
     manager.prepare_batch(batch)
-    assert batch.logstate_first_offsets == [0]
+    assert batch.cache_metadata.first_offsets == [0]
 
     # A continued chunk starts part-way through a physical 64-token page.
     req.cached_len = 70
     next_batch = Batch(reqs=[req], phase="prefill")
     manager.prepare_batch(next_batch)
-    assert next_batch.logstate_first_offsets == [6]
+    assert next_batch.cache_metadata.first_offsets == [6]
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
@@ -571,7 +577,7 @@ def test_decode_replay_count_tracks_prefill_tail_and_page_boundary(granularity):
         batch = Batch(reqs=[req], phase="decode")
         batch.padded_reqs = [req, req]
         manager.prepare_batch(batch)
-        assert batch.logstate_replay_counts == [
+        assert batch.cache_metadata.replay_counts == [
             token - max(35, (token // 16) * 16), 0,
         ]
 
@@ -677,7 +683,7 @@ def test_cache_req_profile_tracks_prefill_conv_handoff():
     assert not sample["finished"]
     assert sample["conv_copy_ms"] >= 0
     assert sample["total_ms"] >= sample["conv_copy_ms"]
-    assert all(manager._cached_page_tokens[page] == PAGE_SIZE for page in cached_pages)
+    assert all(manager.evictor.cached_page_tokens[page] == PAGE_SIZE for page in cached_pages)
 
 
 def test_adaptive_sampling_records_hit_only_after_successful_admission():
@@ -933,8 +939,8 @@ def test_recycled_checkpoint_uses_one_direct_state_slot() -> None:
 
     batch = Batch([req], "prefill")
     manager.prepare_batch(batch)
-    assert batch.logstate_checkpoint_writes == [(127, pages[1].state_slot)]
-    assert batch.logstate_checkpoint_ranges == [(0, 0, 128)]
+    assert batch.cache_metadata.checkpoint_writes == [(127, pages[1].state_slot)]
+    assert batch.cache_metadata.checkpoint_ranges == [(0, 0, 128)]
 
     checkpoint_slot = pages[1].state_slot
     assert checkpoint_slot is not None
@@ -960,7 +966,7 @@ def test_recycled_shape_participates_in_same_round_merge() -> None:
     manager.tree.insert(history[:256], kv, (
         LogStateEntry(states[0], LogStateKind.CHECKPOINT, 0, 256, span_pages=4),
     ))
-    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     ghost_tree = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     ghost_entries = (
         *(LogStateEntry(51 + i, LogStateKind.LOG, 256 + 64 * i, 320 + 64 * i)
@@ -998,7 +1004,7 @@ def test_direct_recycled_checkpoint_aligns_after_granularity_hit() -> None:
         (LogStateEntry(allocated[1][0], LogStateKind.LOG, 0, 16),),
         cache_len=16,
     )
-    manager._cached_page_tokens[allocated[0][0] * PAGE_SIZE] = len(kv)
+    manager.evictor.cached_page_tokens[allocated[0][0] * PAGE_SIZE] = len(kv)
     ghost_tree = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     ghost = ghost_tree.insert(history, history + 1000, (
         *(LogStateEntry(50 + i, LogStateKind.LOG, 256 + 64 * i, 320 + 64 * i)
@@ -1024,7 +1030,9 @@ def test_direct_recycled_checkpoint_aligns_after_granularity_hit() -> None:
 
 
 def test_recycled_log_tail_uses_current_gpu_shape_after_checkpoint_compression():
-    from logssms.cache.logstate import CheckpointCoalesce
+    from logssms.cache.logstate.online_analysis_scheduler import (
+        CheckpointCoalesce,
+    )
 
     manager = make_manager(num_pages=20, num_states=20, max_seq_len=640)
     history, _, (left, right) = cache_checkpoint_chain(manager, (2, 1))
@@ -1079,7 +1087,7 @@ def test_recycled_history_matches_unpruned_merge_layout():
         LogStateEntry(logs[0], LogStateKind.LOG, 128, 192),
         LogStateEntry(logs[1], LogStateKind.LOG, 192, 256),
     ))
-    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     node = ghost.insert(tokens[:448], tokens[:448] + 1000, tuple(
         LogStateEntry(70 + i, LogStateKind.LOG, 256 + i * 64, 320 + i * 64)
@@ -1113,7 +1121,7 @@ def test_recycled_half_page_keeps_log_storage_and_restores_only_its_suffix():
     manager.tree.insert(tokens[:32], kv, (
         LogStateEntry(logs[0], LogStateKind.LOG, 0, 32),
     ), cache_len=32)
-    manager._cached_page_tokens[frames[0] * PAGE_SIZE] = 32
+    manager.evictor.cached_page_tokens[frames[0] * PAGE_SIZE] = 32
     ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), 32)
     node = ghost.insert(tokens[:64], tokens[:64] + 1000, (
         LogStateEntry(70, LogStateKind.LOG, 32, 64),
@@ -1150,7 +1158,7 @@ def _gpu_tail_with_recycled_page(manager):
         LogStateEntry(states[0], LogStateKind.CHECKPOINT, 0, 128, span_pages=2),
         LogStateEntry(logs[0], LogStateKind.LOG, 128, 192),
     ))
-    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     node = ghost.insert(history, history + 1000, (
         LogStateEntry(40, LogStateKind.CHECKPOINT, 0, 128, span_pages=2),
@@ -1297,7 +1305,7 @@ def test_recycled_checkpoint_commit_preserves_a_late_partial_log_branch(granular
     for node in selected:
         page_counts.update(node._kv_page_counts)
         released.update(entry.slot for entry in node.entries)
-    with patch.object(manager, "_plan_eviction", return_value=(selected, page_counts, released, [])):
+    with patch.object(manager.evictor, "plan", return_value=(selected, page_counts, released, [])):
         pages, logs, works = manager._allocate(manager._allocator.free_frames + 1, 0)
     assert not logs and not works
     manager._return_slots(pages, logs)
@@ -1441,7 +1449,7 @@ def test_prefill_protects_existing_branch_before_reusing_recycled_sources(
         LogStateEntry(checkpoints[1], LogStateKind.CHECKPOINT, 128, 192, span_pages=1),
         LogStateEntry(logs[1], LogStateKind.LOG, 192, 256),
     ))
-    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     branch = torch.cat((history[:64], torch.arange(1000, 1193, dtype=torch.int32)))
     ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), granularity)
     node = ghost.insert(branch[:256], branch[:256] + 10000, (
@@ -1655,7 +1663,7 @@ def test_recycle_merges_gpu_tail_with_missing_history_and_reuses_its_slot(head_r
         patch.object(manager, "_construct_checkpoints", return_value=({}, (0, 0, {}))),
     ):
         manager.prepare_batch(batch)
-    assert batch.logstate_checkpoint_writes == [(63, destination)]
+    assert batch.cache_metadata.checkpoint_writes == [(63, destination)]
     assert not manager.tree.has_slot(tail)
     assert manager.tree.match_prefix(req.input_ids[:192]).cuda_handle.cached_len == 128
     req.cached_len = 320
@@ -1673,7 +1681,7 @@ def test_recycle_merges_gpu_tail_with_missing_history_and_reuses_its_slot(head_r
 
 @pytest.mark.parametrize("abort", [False, True])
 def test_recycled_checkpoint_spans_prefill_chunks_without_intermediate_logs(abort):
-    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+    from logssms.cache.logstate.prefix_cache import LogStateMergeStats
 
     manager = make_manager(num_pages=20, num_states=20, enable_merge_adjustment=True)
     history = torch.arange(256, dtype=torch.int32)
@@ -1692,8 +1700,8 @@ def test_recycled_checkpoint_spans_prefill_chunks_without_intermediate_logs(abor
     first = Batch([req], "prefill")
     with patch.object(manager._construction, "restore", wraps=manager._construction.restore):
         manager.prepare_batch(first)
-    assert first.logstate_checkpoint_writes == []
-    assert first.logstate_checkpoint_ranges == [(0, 0, 256)]
+    assert first.cache_metadata.checkpoint_writes == []
+    assert first.cache_metadata.checkpoint_ranges == [(0, 0, 256)]
     assert all(page.state_slot is None for page in manager._request_states[0].live_pages)
     req.cached_len = 128
     if abort:
@@ -1709,7 +1717,7 @@ def test_recycled_checkpoint_spans_prefill_chunks_without_intermediate_logs(abor
         with patch.object(manager._construction, "restore", wraps=manager._construction.restore):
             manager.prepare_batch(second)
         slot = manager._recycled_restores[0].slots[256]
-        assert second.logstate_checkpoint_writes == [(127, slot)]
+        assert second.cache_metadata.checkpoint_writes == [(127, slot)]
         req.cached_len = 256
         manager.cache_req(req, finished=True)
         assert [(entry.begin, entry.end, entry.kind) for entry in manager.tree.iter_entries()] == [
@@ -1757,7 +1765,7 @@ def test_cancel_before_construction_keeps_the_original_gpu_tail(head_ratio):
 @pytest.mark.parametrize("intensity", [4, 8, 16])
 @pytest.mark.parametrize("abort_at", ["first_chunk", "before_commit", None])
 def test_recycled_gpu_log_checkpoint_spans_prefill_chunks(head_ratio, intensity, abort_at):
-    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+    from logssms.cache.logstate.prefix_cache import LogStateMergeStats
     from tests.logstate_helpers import write_head
 
     end = 128 + PAGE_SIZE * intensity
@@ -1806,8 +1814,8 @@ def test_recycled_gpu_log_checkpoint_spans_prefill_chunks(head_ratio, intensity,
     assert restore.prepared and tail in restore.detached
     assert not manager.tree.has_slot(tail)
     assert (end in restore.slots) == (head_ratio == 1)
-    assert first.logstate_checkpoint_writes == []
-    assert first.logstate_checkpoint_ranges == [(0, 128, end)]
+    assert first.cache_metadata.checkpoint_writes == []
+    assert first.cache_metadata.checkpoint_ranges == [(0, 128, end)]
     assert all(page.state_slot is None for page in manager._request_states[0].live_pages)
     work = manager._request_states[req.table_idx].work_slot
     torch.testing.assert_close(pool.read_states(torch.tensor([work]), 0), torch.full(shape, 66.0))
@@ -1822,8 +1830,8 @@ def test_recycled_gpu_log_checkpoint_spans_prefill_chunks(head_ratio, intensity,
         if abort_at is None:
             second = Batch([req], "prefill")
             manager.prepare_batch(second)
-            assert second.logstate_checkpoint_writes == [(end - 257, destination)]
-            assert second.logstate_checkpoint_ranges == [(0, 128, end)]
+            assert second.cache_metadata.checkpoint_writes == [(end - 257, destination)]
+            assert second.cache_metadata.checkpoint_ranges == [(0, 128, end)]
             pool.write_states(torch.tensor([destination]), 0, torch.full(shape, float(end - 126)))
             req.cached_len = end
 
@@ -1867,7 +1875,7 @@ def test_shared_gpu_tail_has_only_one_recycled_slot_writer(abort_first):
     batch = Batch([first, second], "prefill")
     with patch.object(manager._construction, "restore", wraps=manager._construction.restore):
         manager.prepare_batch(batch)
-    writes = [slot for _row, slot in batch.logstate_checkpoint_writes]
+    writes = [slot for _row, slot in batch.cache_metadata.checkpoint_writes]
     assert len(writes) == len(set(writes)) == 2
     if abort_first:
         manager.free_to_cached(first)
@@ -1925,7 +1933,7 @@ def test_recycled_batch_branch_preserves_the_split_physical_log_page(head_ratio,
 
 def test_recycled_continuation_keeps_its_dynamic_merge_policy():
     from collections import deque
-    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+    from logssms.cache.logstate.prefix_cache import LogStateMergeStats
 
     manager = make_manager(num_pages=20, num_states=20, enable_merge_adjustment=True)
     ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
@@ -1945,7 +1953,7 @@ def test_recycled_continuation_keeps_its_dynamic_merge_policy():
 
 
 def test_gpu_and_cpu_groups_use_one_merge_pass_and_one_intensity():
-    from logssms.cache.prefix_cache.logstate import LogStateMergeStats
+    from logssms.cache.logstate.prefix_cache import LogStateMergeStats
 
     manager = make_manager(num_pages=20, num_states=20, enable_merge_adjustment=True)
     history = torch.arange(320, dtype=torch.int32)
@@ -1955,7 +1963,7 @@ def test_gpu_and_cpu_groups_use_one_merge_pass_and_one_intensity():
         LogStateEntry(slot, LogStateKind.LOG, index * 64, (index + 1) * 64)
         for index, slot in enumerate(logs)
     ))
-    manager._cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
+    manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     ghost = type(manager.tree)(PAGE_SIZE, torch.device("cpu"), GRANULARITY)
     leaf = ghost.insert(history, history + 1000, tuple(
         LogStateEntry(index, LogStateKind.LOG, index * 64, (index + 1) * 64)
@@ -2417,7 +2425,7 @@ def test_heat_thinning_preserves_recovery_with_nonmonotonic_endpoint_timestamps(
         for record in (pool.allocator.slot(left.slot), pool.allocator.slot(middle.slot))
     )
     needed_pages = pool.allocator.free_frames + released_frames
-    assert manager._plan_eviction(needed_pages, 0, 0)[3] == [
+    assert manager.evictor.plan(needed_pages, 0, 0)[3] == [
         (middle.slot, right.slot), (left.slot, right.slot),
     ]
     pages, states, _ = manager._allocate(needed_pages, 0)
@@ -2501,13 +2509,15 @@ def test_recovery_inputs_are_pinned_only_until_work_is_constructed():
 
 
 def test_checkpoint_coalesce_preserves_the_retained_endpoint_access_time():
-    from logssms.cache.logstate import CheckpointCoalesce
+    from logssms.cache.logstate.online_analysis_scheduler import (
+        CheckpointCoalesce,
+    )
 
     manager = make_manager()
     _, leaf, (left, right) = cache_checkpoint_chain(manager, (1, 1))
     manager.tree._checkpoint_timestamps.update({left.slot: 10, right.slot: 20})
     plan = CheckpointCoalesce((left.slot, right.slot), (1, 1), 0, 128, 2)
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=100):
         released, _, skips = manager._commit_coalesce((plan,))
     assert released == 1 and skips == {}
     assert manager.tree._checkpoint_timestamps == {right.slot: 20}
@@ -2522,14 +2532,14 @@ def test_pending_and_prefix_match_reuse_touch_only_recovery_checkpoint():
     manager.tree._checkpoint_timestamps.update(dict(zip(slots, (10, 20, 30))))
     pending = PendingRequest(77, torch.cat((tokens, torch.tensor([999], dtype=torch.int32))),
                              SamplingParams(max_tokens=16))
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=100):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=100):
         first = manager.match_req(pending)
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=200):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=200):
         assert manager.match_req(pending) is first
     assert manager.tree._checkpoint_timestamps == dict(zip(slots, (10, 20, 200)))
     # Rebuild the outer result while retaining the token-prefix match cache.
     manager._prefill_matches.clear()
-    with patch("logssms.cache.prefix_cache.logstate.time.monotonic_ns", return_value=300):
+    with patch("logssms.cache.logstate.prefix_cache.time.monotonic_ns", return_value=300):
         again = manager.match_req(pending)
     assert again.cuda_handle.recovery.base_checkpoint_slot == slots[-1]
     assert manager.tree._checkpoint_timestamps == dict(zip(slots, (10, 20, 300)))
@@ -2969,7 +2979,7 @@ def test_protected_restore_position_survives_eviction_while_pending():
     pending = PendingRequest(20, branch_ids, SamplingParams(max_tokens=16))
     first = manager.match_req(pending).cuda_handle
     assert first.protected_endpoints == (96,)
-    frames = len(manager._cached_page_tokens) + sum(
+    frames = len(manager.evictor.cached_page_tokens) + sum(
         len(record.payload) + sum(map(len, record.conv))
         for record in (manager._allocator.slot(entry.slot) for entry in checkpoints)
     )
@@ -2992,7 +3002,7 @@ def test_protected_restore_position_survives_eviction_while_pending():
 
 
 def test_recycled_protected_prefix_is_retained_when_reply_ends_before_page_boundary():
-    from logssms.cache.prefix_cache.logstate import LogRadixTree
+    from logssms.cache.logstate.prefix_cache import LogRadixTree
 
     manager = make_manager(num_pages=16, num_states=16)
     history = torch.arange(128, dtype=torch.int32)

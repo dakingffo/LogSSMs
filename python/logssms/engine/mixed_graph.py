@@ -7,6 +7,7 @@ from contextlib import nullcontext
 import torch
 
 from logssms.core import Batch
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 from logssms.kernel.metadata import copy_metadata, make_batch_mapping
 from logssms.layers.linear_attention_backend.mixed import (
     MixedLinearCopyPlan, prepare_mixed_linear_metadata,
@@ -83,8 +84,9 @@ class MixedGraphRunner:
         ], "prefill")
         decode = Batch([engine.dummy_req] * (size - count), "decode")
         prefill.padded_reqs, decode.padded_reqs = prefill.reqs, decode.reqs
-        prefill.logstate_first_offsets = [0] * count
-        decode.logstate_replay_counts = [0] * (size - count)
+        if engine.config.cache_type == "logstate":
+            prefill.cache_metadata = LogStateCacheMetadata(first_offsets=[0] * count)
+            decode.cache_metadata = LogStateCacheMetadata(replay_counts=[0] * (size - count))
         batch = Batch(prefill.reqs + decode.reqs, "mixed", num_prefill_reqs=count)
         batch.padded_reqs = batch.reqs
         batch.mixed_parts = prefill, decode

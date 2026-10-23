@@ -12,11 +12,16 @@ import torch
 from logssms.core import Request
 from logssms.utils import align_ceil
 
-from .kv_pool.base import BaseKVCachePool
-from .linear_pool.base import LinearCachePool
-from .prefix_cache.base import BaseCacheHandle, BasePrefixCache, MatchResult
+from logssms.cache.prefix_cache import BaseCacheHandle, BasePrefixCache, MatchResult
 
 if TYPE_CHECKING:
+    from .radix.mha_pool import MHAKVCachePool
+    from .radix.state_pool import LinearStatePool
+    from .logstate.frame_pool import MHALogStatePool
+    from .marconi.block_pool import HybridBlockPool
+
+    KVCachePool = MHAKVCachePool | MHALogStatePool | HybridBlockPool
+    StateCachePool = LinearStatePool | MHALogStatePool | HybridBlockPool
     from logssms.core import Batch
     from logssms.message import UserMsg
     from logssms.scheduler.prefill import PendingRequest
@@ -24,9 +29,9 @@ if TYPE_CHECKING:
 
 @dataclass
 class CacheResources:
-    kv_pool         : BaseKVCachePool
+    kv_pool         : KVCachePool
     page_table      : torch.Tensor
-    linear_state    : LinearCachePool | None
+    linear_state    : StateCachePool | None
     state_table     : torch.Tensor | None
     work_state_table: torch.Tensor | None
 
@@ -46,7 +51,7 @@ class BaseCacheManager(ABC):
             "Provide exactly one of prefix_cache_type and prefix_cache."
         )
         if prefix_cache is None:
-            from .prefix_cache import make_prefix_cache
+            from logssms.cache.prefix_cache import make_prefix_cache
 
             assert prefix_cache_type is not None
             prefix_cache = make_prefix_cache(
@@ -81,7 +86,7 @@ class BaseCacheManager(ABC):
         return self.resources.work_state_table
 
     @property
-    def linear_pool(self) -> LinearCachePool | None:
+    def linear_pool(self) -> StateCachePool | None:
         return self.resources.linear_state
 
     def match_req(self, req: PendingRequest) -> MatchResult:
@@ -137,6 +142,12 @@ class BaseCacheManager(ABC):
         return True
 
     def prepare_batch(self, batch: Batch) -> None:
+        return None
+
+    def after_forward(self, batch: Batch) -> None:
+        return None
+
+    def shutdown(self) -> None:
         return None
 
     def record_prefill_queue(

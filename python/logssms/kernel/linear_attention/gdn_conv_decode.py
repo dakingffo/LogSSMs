@@ -21,15 +21,16 @@ def _gdn_conv_decode(
     ReadSlots, ReadGranules, WriteSlots, WriteGranules, WorkSlots,
     C: tl.constexpr, KEY_DIM: tl.constexpr, STATE_LEN: tl.constexpr,
     X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
-    NUM_LAYERS: tl.constexpr, LAYER: tl.constexpr,
+    STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr, LAYER: tl.constexpr,
+    READ_STRIDE: tl.constexpr, WRITE_STRIDE: tl.constexpr,
     FRAME_ELEMS: tl.constexpr, NUM_GRANULES: tl.constexpr,
     LOGSTATE: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
 ):
     b = tl.program_id(0)
     ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
 
-    read_slot = tl.load(ReadSlots + b)
-    write_slot = tl.load(WriteSlots + b)
+    read_slot = tl.load(ReadSlots + b * READ_STRIDE)
+    write_slot = tl.load(WriteSlots + b * WRITE_STRIDE)
     if LOGSTATE:
         read_granule = tl.load(ReadGranules + b)
         write_granule = tl.load(WriteGranules + b)
@@ -47,8 +48,8 @@ def _gdn_conv_decode(
         work_base = _frame_element_offset(work_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
     else:
         state_ptr = StandardState
-        old_base = (read_slot * NUM_LAYERS + LAYER) * C * STATE_LEN
-        new_base = (write_slot * NUM_LAYERS + LAYER) * C * STATE_LEN
+        old_base = read_slot * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
+        new_base = write_slot * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
         work_base = 0
 
     KERNEL_WIDTH: tl.constexpr = STATE_LEN + 1
@@ -266,20 +267,21 @@ def conv_decode_qkv(
         table = pool.conv_frame_table
         frame_elems = pool.frame_bytes // mixed_qkv.element_size()
         num_granules = pool.layout.num_granules
-        num_layers = pool.layout.num_linear_layers
+        slot_stride = layer_stride = 0
     else:
         assert standard_state is not None
         state = standard_state
         table = standard_state
         read_granules = write_granules = work_slots = read_slots
         frame_elems = num_granules = 1
-        num_layers = standard_state.shape[1]
+        slot_stride, layer_stride = standard_state.stride()[:2]
     _gdn_conv_decode[(bs, triton.cdiv(channels, 256))](
         mixed_qkv, weight, q, k, v, state, state, table,
         read_slots, read_granules, write_slots, write_granules, work_slots,
         channels, config.key_dim, config.state_len,
         mixed_qkv.stride(0), mixed_qkv.stride(1),
-        num_layers, config.layer_idx, frame_elems, num_granules,
+        slot_stride, layer_stride, config.layer_idx,
+        read_slots.stride(0), write_slots.stride(0), frame_elems, num_granules,
         logstate, 256, triton.next_power_of_2(config.state_len),
         num_warps=4,
     )

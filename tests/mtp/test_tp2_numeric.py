@@ -313,7 +313,7 @@ def run():
     # ---------------- GatedDeltaNet (out_proj all_reduce) ----------------
     print("=" * 60)
     print("GatedDeltaNet prefill (out_proj all_reduce)")
-    from logssms.cache.linear_pool.state_pool import LinearStatePool
+    from logssms.cache.radix.state_pool import LinearStatePool
     from logssms.core import Batch, Context, Request, set_global_ctx
     from logssms.layers import GatedDeltaNet
 

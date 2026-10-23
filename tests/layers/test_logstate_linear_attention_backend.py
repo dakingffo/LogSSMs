@@ -1,7 +1,8 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from tests.logstate_helpers import head_view
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
@@ -169,9 +170,9 @@ def test_recycled_checkpoint_prefill_metadata_skips_log_writes() -> None:
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(128, dtype=torch.int32, device=device)
     batch.out_loc = ctx.page_table[0]
-    batch.logstate_first_offsets = [0]
-    batch.logstate_checkpoint_writes = [(127, checkpoint_slot)]
-    batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+    batch.cache_metadata = LogStateCacheMetadata(first_offsets=[0])
+    batch.cache_metadata.checkpoint_writes = [(127, checkpoint_slot)]
+    batch.cache_metadata.checkpoint_ranges = [(0, 0, 128)]
 
     set_global_ctx(ctx)
     try:
@@ -223,11 +224,11 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, granularity, chunk
                 batch = Batch(reqs=[_make_request(begin, end)], phase="prefill")
                 batch.positions = torch.arange(begin, end, device=device, dtype=torch.int32)
                 batch.out_loc = ctx.page_table[0, begin:end]
-                batch.logstate_first_offsets = [begin % 64]
+                batch.cache_metadata = LogStateCacheMetadata(first_offsets=[begin % 64])
                 if direct:
-                    batch.logstate_checkpoint_ranges = [(0, 0, 128)]
+                    batch.cache_metadata.checkpoint_ranges = [(0, 0, 128)]
                     if end == 128:
-                        batch.logstate_checkpoint_writes = [(step - 1, checkpoint_slot)]
+                        batch.cache_metadata.checkpoint_writes = [(step - 1, checkpoint_slot)]
                 backend.prepare_metadata(batch)
                 outputs.append(backend.forward(
                     mixed_qkv[begin:end], gate[begin:end], beta[begin:end],
@@ -263,7 +264,7 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, granularity, chunk
 def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state(granularity):
     from collections import Counter
     from tests.core.test_logstate_cache_manager import make_manager, new_req
-    from logssms.cache.prefix_cache.logstate import LogStateKind
+    from logssms.cache.logstate.prefix_cache import LogStateKind
 
     torch.manual_seed(321)
     device = torch.device("cuda")
@@ -363,7 +364,7 @@ def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> N
     batch = Batch(reqs=[req], phase="prefill")
     batch.positions = torch.arange(16, 32, dtype=torch.int32, device=device)
     batch.out_loc = ctx.page_table[0, 16:32]
-    batch.logstate_first_offsets = [16]
+    batch.cache_metadata = LogStateCacheMetadata(first_offsets=[16])
 
     set_global_ctx(ctx)
     try:
@@ -708,7 +709,7 @@ def test_logstate_prefill_then_decode_produces_lossless_update_log() -> None:
         )
         batch.out_loc = batch.positions
         if phase == "decode":
-            batch.logstate_replay_counts = [req.cached_len - 20]
+            batch.cache_metadata = LogStateCacheMetadata(replay_counts=[req.cached_len - 20])
         length = req.extend_len
         mixed_qkv = torch.randn(length, 192, dtype=dtype, device=device)
         gate = torch.randn(length, 2, dtype=dtype, device=device)
@@ -815,9 +816,9 @@ def test_logstate_multpage_decode_log_restores_work_state() -> None:
         batch.positions = torch.arange(begin, end, dtype=torch.int32, device=device)
         batch.out_loc = batch.positions
         if phase == "decode":
-            batch.logstate_replay_counts = [
+            batch.cache_metadata = LogStateCacheMetadata(replay_counts=[
                 begin - max(35, (begin // 16) * 16)
-            ]
+            ])
         backend.prepare_metadata(batch)
         backend.forward(
             mixed_qkv[begin:end], gate[begin:end], beta[begin:end],

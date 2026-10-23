@@ -3,7 +3,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from logssms.cache.logstate import _LivePage, _RequestCacheState
+from logssms.cache.logstate.manager import (
+    _LivePage,
+    _RequestCacheState,
+)
 from logssms.core import Batch, SamplingParams
 from logssms.scheduler.prefill import PendingRequest
 from tests.core.test_logstate_cache_manager import (
@@ -116,7 +119,7 @@ def test_mixed_allocate_prepare_order_only_analyzes_prefill():
         decode_batch = Batch([decoding], "decode")
         decode_batch.padded_reqs = [decoding]
         manager.prepare_batch(decode_batch)
-        assert decode_batch.logstate_replay_counts == [0]
+        assert decode_batch.cache_metadata.replay_counts == [0]
         assert manager._prefill_protections is pending
         assert manager._prefill_protection_key == key
         assert manager._request_states[1].work_committed_pos == 0

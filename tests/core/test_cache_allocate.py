@@ -10,11 +10,7 @@ from unittest.mock import patch
 import os
 
 import logssms.core as core
-from logssms.cache import (
-    CacheResources,
-    StandardCacheManager,
-    StandardPrefixValue,
-)
+from logssms.cache import CacheResources, RadixCacheManager, RadixPrefixValue
 from logssms.core import Request, SamplingParams
 from logssms.message import UserMsg
 from logssms.scheduler.prefill import PendingRequest
@@ -29,7 +25,7 @@ def reset_global_ctx():
     core._GLOBAL_CTX = old_ctx
 
 
-def _make_cache_manager(num_pages: int, page_size: int) -> StandardCacheManager:
+def _make_cache_manager(num_pages: int, page_size: int) -> RadixCacheManager:
     """Helper to create a CacheManager with radix cache on CPU."""
     page_table = torch.empty((1,))
     ctx = core.Context(page_size=page_size)
@@ -41,18 +37,18 @@ def _make_cache_manager(num_pages: int, page_size: int) -> StandardCacheManager:
         state_table=None,
         work_state_table=None,
     )
-    return StandardCacheManager(
-        num_pages, page_size, resources, prefix_cache_type="radix"
+    return RadixCacheManager(
+        num_pages, page_size, resources,
     )
 
 
 def _insert_evictable(
-    cm: StandardCacheManager,
+    cm: RadixCacheManager,
     input_ids: torch.Tensor,
     indices: torch.Tensor,
 ):
     """Insert a prefix into the radix cache so it becomes evictable."""
-    cm.prefix_cache.insert_prefix(input_ids, StandardPrefixValue(indices))
+    cm.prefix_cache.insert_prefix(input_ids, RadixPrefixValue(indices))
 
 
 def _assert_all_page_aligned(tensor: torch.Tensor, page_size: int, label: str = ""):

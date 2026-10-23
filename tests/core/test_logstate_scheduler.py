@@ -5,11 +5,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from logssms.cache.logstate import (
+from logssms.cache.logstate.online_analysis_scheduler import (
     OnlineAnalysisScheduler,
     _MergePathContext,
 )
-from logssms.cache.prefix_cache.logstate import (
+from logssms.cache.logstate.prefix_cache import (
     LogRadixTree,
     LogRadixTreeNode,
     LogStateEntry,
@@ -833,7 +833,7 @@ def test_online_merge_profile_does_not_change_fits_or_queue_retirement():
 def test_disabled_online_merge_profile_does_not_read_clock():
     scheduler = OnlineAnalysisScheduler(PAGE_SIZE, GRANULARITY)
     stats = scheduler.make_merge_stats(0)
-    with patch("logssms.cache.logstate.perf_counter_ns", side_effect=AssertionError):
+    with patch("logssms.cache.logstate.online_analysis_scheduler.perf_counter_ns", side_effect=AssertionError):
         scheduler.record_hit(stats, 0)
         scheduler.advance_merge_stats(stats, 1024)
     assert scheduler.profile_result() is None

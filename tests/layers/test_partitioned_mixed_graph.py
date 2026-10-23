@@ -1,8 +1,9 @@
+from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 
-from logssms.cache.linear_pool.state_pool import LinearStatePool
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.radix.state_pool import LinearStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.mamba2 import Mamba2Config
@@ -75,7 +76,7 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
             part.padded_reqs = part.reqs
             part.positions = torch.cat([torch.arange(r.device_len,device=device,dtype=torch.int32) for r in part.reqs])
             part.out_loc = torch.cat([ctx.page_table[r.table_idx,:r.device_len] for r in part.reqs])
-            part.logstate_first_offsets = [0]*part.size
+            part.cache_metadata = LogStateCacheMetadata(first_offsets=[0]*part.size)
             backend.prepare_metadata(part)
         result = Batch(reqs,"mixed",num_prefill_reqs=len(lengths))
         result.mixed_parts = p,d

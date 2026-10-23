@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.core import get_global_ctx
 from logssms.kernel import prepare_gdn
 from .base import BaseGatedDeltaBackend

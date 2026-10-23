@@ -5,7 +5,7 @@ from transformers import FalconH1Config as HFFalconH1Config
 from logssms.models import make_model_config
 from logssms.models.falcon_h1 import FalconH1Config
 from logssms.layers.linear_attention_backend import make_linear_attention_backend, Mamba2Backend, Mamba2LogStateBackend
-from logssms.cache.logstate_pool.layout import LogStateSlotLayout
+from logssms.cache.logstate.layout import LogStateSlotLayout
 
 
 def raw_config():

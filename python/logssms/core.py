@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 if TYPE_CHECKING:
+    from logssms.cache.metadata import CacheMetadata
     from logssms.engine.piecewise_graph import PiecewiseGraphRunner
     from logssms.utils.batch import BatchIndices
-    from logssms.cache import BaseCacheHandle, BaseKVCachePool, LinearCachePool
+    from logssms.cache import BaseCacheHandle
+    from logssms.cache.base import KVCachePool, StateCachePool
     from logssms.layers.attention_backend import BaseAttnBackend, BaseAttnMetadata
     from logssms.layers.linear_attention_backend import (
         BaseLinearAttentionBackend,
@@ -130,10 +132,7 @@ class Batch:
     draft_probs : torch.Tensor | None = field(init=False, default=None)
     hidden_captor: HiddenCaptorBase | None = field(init=False, default=None)
     linear_attn_metadata: BaseLinearAttentionMetadata = field(init=False)
-    logstate_first_offsets: list[int] | None = field(init=False, default=None)
-    logstate_replay_counts: list[int] | None = field(init=False, default=None)
-    logstate_checkpoint_writes: list[tuple[int, int]] = field(init=False, default_factory=list)
-    logstate_checkpoint_ranges: list[tuple[int, int, int]] = field(init=False, default_factory=list)
+    cache_metadata: CacheMetadata | None = field(init=False, default=None)
     mixed_parts: tuple[Batch, Batch] | None = field(init=False, default=None)
     prefill_token_capacity: int = field(init=False, default=0)
     prefill_partition: tuple[int, ...] = field(init=False, default=())
@@ -194,8 +193,8 @@ class Context:
         init=False,
     )
     moe_backend        : BaseMoeBackend             = field(init=False)
-    kv_cache           : BaseKVCachePool            = field(init=False)
-    linear_state       : LinearCachePool            = field(init=False)
+    kv_cache           : KVCachePool            = field(init=False)
+    linear_state       : StateCachePool            = field(init=False)
 
     state_table        : torch.Tensor | None = field(default=None, init=False)
     work_state_table   : torch.Tensor | None = field(default=None, init=False)

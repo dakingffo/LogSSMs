@@ -6,12 +6,10 @@ from time import perf_counter_ns
 
 import torch
 
-from logssms.cache.logstate import OnlineAnalysisScheduler
-from logssms.cache.prefix_cache.logstate import (
-    LogRadixTree,
-    LogStateEntry,
-    LogStateKind,
+from logssms.cache.logstate.online_analysis_scheduler import (
+    OnlineAnalysisScheduler,
 )
+from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry, LogStateKind
 
 
 PAGE_SIZE = 64

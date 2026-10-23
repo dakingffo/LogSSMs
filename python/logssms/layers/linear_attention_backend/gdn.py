@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -29,11 +30,15 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         out        : torch.Tensor | None = None,
     ) -> torch.Tensor:
         metadata = batch.linear_attn_metadata
+        pool = get_global_ctx().linear_state
+        if hasattr(pool, "group_table"):
+            metadata, lane = pool.map_metadata(metadata, config.layer_idx)
+            config = replace(config, layer_idx=lane)
         assert isinstance(metadata, LinearAttentionMetadata)
         assert metadata.phase == batch.phase
         if metadata.phase == "prefill":
             return self._forward_prefill(
-                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, batch, out
+                mixed_qkv, gate, beta, conv_weight, A_log, dt_bias, config, batch, out, metadata
             )
         elif metadata.phase == "verify":
             return self._forward_verify(
@@ -77,6 +82,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         config     : GatedDeltaConfig,
         batch      : Batch,
         out        : torch.Tensor | None = None,
+        metadata   : LinearAttentionMetadata | None = None,
     ) -> torch.Tensor:
         from logssms.kernel.linear_attention.vendor.fla import (
             ChunkStateIO, chunk_gated_delta_rule_to_cache,
@@ -88,7 +94,7 @@ class GatedDeltaBackend(StandardLinearAttentionBackend, BaseGatedDeltaBackend):
         ctx = get_global_ctx()
         pool = ctx.linear_state
         layer_idx = config.layer_idx
-        metadata = batch.linear_attn_metadata
+        metadata = batch.linear_attn_metadata if metadata is None else metadata
         assert isinstance(metadata, LinearAttentionMetadata)
         indices = metadata.prefill_indices
         slots = metadata.baseline_slots

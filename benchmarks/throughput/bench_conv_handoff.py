@@ -5,7 +5,7 @@ import time
 
 import torch
 
-from logssms.cache.logstate_pool.mha_pool import MHALogStatePool
+from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.conv_copy import copy_conv_snapshots
 
 

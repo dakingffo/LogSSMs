@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from logssms.cache.linear_pool.state_pool import LinearStatePool
+from logssms.cache.radix.state_pool import LinearStatePool
 from logssms.core import Batch, Context, Request, set_global_ctx
 from logssms.layers.gated_delta import GatedDeltaConfig
 from logssms.layers.linear_attention_backend import GatedDeltaBackend

@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
+from logssms.cache.logstate.layout import LOG_STATE_REPLAY_WINDOW
 from .layout import log_pointer, state_pointer
 
 
@@ -125,6 +125,7 @@ def _mamba2_conv_decode_kernel(
     LOGSTATE: tl.constexpr, HAS_BIAS: tl.constexpr,
     FRAME_ELEMS: tl.constexpr, GRANULES: tl.constexpr,
     BC: tl.constexpr, BS: tl.constexpr,
+    STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr,
 ):
     req = tl.program_id(0)
     c = tl.program_id(1) * BC + tl.arange(0, BC)
@@ -144,8 +145,8 @@ def _mamba2_conv_decode_kernel(
         work_base = work_frame.to(tl.int64) * FRAME_ELEMS + LAYER * C * S
     else:
         ptr = State
-        old_base = (read.to(tl.int64) * LAYERS + LAYER) * C * S
-        new_base = (write.to(tl.int64) * LAYERS + LAYER) * C * S
+        old_base = read.to(tl.int64) * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
+        new_base = write.to(tl.int64) * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
     old = tl.load(ptr + old_base + c[:, None] * S + s[None, :],
                   (c[:, None] < C) & (s[None, :] < S), other=0).to(tl.float32)
     w = tl.load(Weight + c[:, None] * (S + 1) + s[None, :],
@@ -190,6 +191,8 @@ def mamba2_conv_decode(xbc, weight, bias, config, metadata, pool, *, logstate):
         xbc.stride(0), xbc.stride(1), read.stride(0), write.stride(0),
         logstate, bias is not None, frame_elems, granules, 32,
         triton.next_power_of_2(config.state_len), num_warps=4,
+        STATE_SLOT_STRIDE=0 if logstate else state.stride(0),
+        STATE_LAYER_STRIDE=0 if logstate else state.stride(1),
     )
     return output
 
@@ -204,6 +207,7 @@ def _mamba2_decode_kernel(
     FRAME_BYTES: tl.constexpr, PAYLOAD_FRAMES: tl.constexpr, HEAD_BYTES: tl.constexpr,
     DECAY_BYTES: tl.constexpr, PAGE: tl.constexpr, WINDOW: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr,
+    STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr,
     GRANULARITY: tl.constexpr = 64,
 ):
     req = tl.program_id(0)
@@ -225,7 +229,7 @@ def _mamba2_decode_kernel(
         decay_head = (Storage + decay_frame.to(tl.int64) * FRAME_BYTES + decay_index * DECAY_BYTES).to(tl.pointer_type(tl.float32))
         position = tl.load(Positions + req)
     else:
-        state_head = State + (read.to(tl.int64) * LAYERS + LAYER) * H * K * V + head * K * V
+        state_head = State + read.to(tl.int64) * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE + head * K * V
         state_ptr = state_head + k[:, None] * V + v[None, :]
     state = tl.load(state_ptr, mask, other=0).to(tl.float32)
     if LOGSTATE and not EAGER:
@@ -276,7 +280,7 @@ def _mamba2_decode_kernel(
             tl.store(state_ptr, state, mask)
     else:
         write = tl.load(Write + req * WS)
-        destination = State + (write.to(tl.int64) * LAYERS + LAYER) * H * K * V + head * K * V
+        destination = State + write.to(tl.int64) * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE + head * K * V
         tl.store(destination + k[:, None] * V + v[None, :], state, mask)
 
 
@@ -303,6 +307,8 @@ def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, logstat
         layers, config.layer_idx, logstate, eager,
         frame_bytes, frames, head_bytes, decay_bytes, page, LOG_STATE_REPLAY_WINDOW,
         triton.next_power_of_2(config.state_dim), 32, num_warps=8,
+        STATE_SLOT_STRIDE=0 if logstate else state.stride(0),
+        STATE_LAYER_STRIDE=0 if logstate else state.stride(1),
         GRANULARITY=pool.layout.granularity if logstate else 64,
     )
     return output

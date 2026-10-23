@@ -127,7 +127,7 @@ def test_piece_replay_handles_padding_shared_pool_and_changed_metadata(max_token
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_layers", [1, 3])
 def test_qwen_full_attention_piece_keeps_fused_kv_writes_outside_graph(num_layers):
-    from logssms.cache.kv_pool.mha_pool import MHAKVCachePool
+    from logssms.cache.radix.mha_pool import MHAKVCachePool
     from logssms.models.qwen3_next import Qwen3NextDecoderLayer
     from logssms.utils import torch_dtype
 

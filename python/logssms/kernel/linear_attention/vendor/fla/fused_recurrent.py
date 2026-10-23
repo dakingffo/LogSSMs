@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from logssms.cache.logstate_pool.layout import LOG_STATE_REPLAY_WINDOW
+from logssms.cache.logstate.layout import LOG_STATE_REPLAY_WINDOW
 from ...layout import log_pointer, state_pointer
 
 from .op import exp
