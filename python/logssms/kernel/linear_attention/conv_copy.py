@@ -3,7 +3,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=['frame_table', 'source_slots', 'source_granules', 'output_slots', 'output_granules'],
+)
 def _copy_conv_snapshots(
     storage, frame_table,
     source_slots, source_granules, output_slots, output_granules,

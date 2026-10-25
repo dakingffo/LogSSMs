@@ -108,7 +108,7 @@ class MixedGraphRunner:
                 self.linear_backend.prepare_metadata(part)
             offset = end
         if self.linear_backend is not None:
-            prepare_mixed_linear_metadata(self.linear_backend, prefill, decode, batch.prefill_token_capacity)
+            prepare_mixed_linear_metadata(prefill, decode, batch.prefill_token_capacity)
         self.backend.prepare_mixed_metadata(batch)
         batch.input_ids = torch.zeros(packet.num_tokens, dtype=torch.int32, device=engine.device)
         batch.sample_indices, batch.sample_req_indices = packet.sample_tuple

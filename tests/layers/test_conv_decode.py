@@ -7,9 +7,9 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate.frame_pool import MHALogStatePool
-from logssms.kernel.linear_attention.gdn_conv_decode import (
+from logssms.kernel.linear_attention.conv_decode import (
     _frame_element_offset,
-    conv_decode_qkv,
+    conv_decode,
 )
 from logssms.layers.gated_delta import GatedDeltaConfig
 
@@ -61,9 +61,9 @@ def test_standard_decode_conv_matches_reference(read_slots, write_slots, fused_i
     reads = torch.tensor(read_slots, device="cuda", dtype=torch.int64)
     writes = torch.tensor(write_slots, device="cuda", dtype=torch.int64)
     expected = _reference(x, weight, before[reads, 1])
-    q, k, v = conv_decode_qkv(
+    q, k, v = conv_decode(
         x, weight, config, read_slots=reads, write_slots=writes,
-        standard_state=state,
+        split_qkv=True, standard_state=state,
     )
     actual = torch.cat([q.flatten(2), k.flatten(2), v.flatten(2)], dim=-1)[:, 0]
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
@@ -107,10 +107,10 @@ def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input,
     expected = _reference(x, weight, history)
 
     def run():
-        return conv_decode_qkv(
+        return conv_decode(
             x, weight, config, read_slots=read_slots, read_granules=read_granules,
             write_slots=logs, write_granules=granules, work_slots=slots,
-            pool=pool,
+            split_qkv=True, pool=pool,
         )
 
     q, k, v = run()
@@ -139,9 +139,9 @@ def test_logstate_decode_conv_writes_log_and_work_and_replays_graph(fused_input,
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_packed_conv_and_snapshots_read_fused_qkv_views():
+def test_packed_conv_reads_fused_qkv_views():
     from logssms.kernel.linear_attention.packed_conv import (
-        packed_causal_conv1d, packed_conv_snapshots,
+        packed_causal_conv1d,
     )
 
     torch.manual_seed(95)
@@ -151,8 +151,6 @@ def test_packed_conv_and_snapshots_read_fused_qkv_views():
     weight = torch.randn(channels, 1, state_len + 1, device="cuda", dtype=x.dtype) * 0.1
     offsets = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32)
     chunks = torch.tensor([[0, 0], [1, 0]], device="cuda", dtype=torch.int32)
-    rows = torch.tensor([0, 2, 3, 7], device="cuda", dtype=torch.int32)
-    requests = torch.tensor([0, 0, 1, 1], device="cuda", dtype=torch.int32)
     actual = packed_causal_conv1d(x, weight, history, offsets, chunks)
     expected = torch.cat([
         F.silu(F.conv1d(
@@ -161,9 +159,44 @@ def test_packed_conv_and_snapshots_read_fused_qkv_views():
         )).squeeze(0).T for i, (begin, end) in enumerate([(0, 3), (3, 8)])
     ])
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    snapshots = packed_conv_snapshots(x, history, offsets, rows, requests)
-    expected_snapshots = torch.stack([
-        torch.cat([history[i], x[begin:row + 1].T], dim=-1)[:, -state_len:]
-        for i, begin, row in [(0, 0, 0), (0, 0, 2), (1, 3, 3), (1, 3, 7)]
-    ])
-    torch.testing.assert_close(snapshots, expected_snapshots, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("decode", [False, True])
+def test_partitioned_conv_scales_current_input_once(decode):
+    from logssms.kernel.linear_attention.packed_conv import PackedConvStateIO, packed_causal_conv1d
+    from logssms.layers.mamba2 import Mamba2Config
+
+    torch.manual_seed(87)
+    config = Mamba2Config(4, 1, 64, 128, 3, 0)
+    scales, widths = (.7, .8, .9), (256, 128, 128)
+    lengths = [1, 1] if decode else [7, 16]
+    raw = torch.randn(sum(lengths), config.conv_dim + 32, device="cuda", dtype=torch.bfloat16)[:, :config.conv_dim]
+    scaled = torch.cat([part * scale for part, scale in zip(raw.split(widths, -1), scales)], -1)
+    history = torch.randn(2, config.conv_dim, 3, device="cuda", dtype=raw.dtype)
+    weight = torch.randn(config.conv_dim, 1, 4, device="cuda", dtype=raw.dtype) * .2
+    bias = torch.randn(config.conv_dim, device="cuda", dtype=raw.dtype) * .1
+    storage = torch.empty(4, 1, config.conv_dim, 3, device="cuda", dtype=raw.dtype)
+    storage[:2, 0].copy_(history)
+    reads = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    writes = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+    if decode:
+        actual = conv_decode(raw, weight, config, bias=bias, round_conv=True,
+                             read_slots=reads, write_slots=writes, standard_state=storage,
+                             input_scales=scales, input_boundaries=config.conv_boundaries)
+    else:
+        offsets = torch.tensor([0, 7, 23], device="cuda", dtype=torch.int32)
+        chunks = torch.tensor([[0, 0], [1, 0]], device="cuda", dtype=torch.int32)
+        slots = torch.full((23,), -1, device="cuda", dtype=torch.int32)
+        slots[6], slots[22] = 2, 3
+        actual = packed_causal_conv1d(raw, weight, history, offsets, chunks, bias,
+                                      state_io=PackedConvStateIO(storage, slots),
+                                      input_scales=scales, input_boundaries=config.conv_boundaries)
+    expected, snapshots, begin = [], [], 0
+    for i, length in enumerate(lengths):
+        source = torch.cat((history[i:i + 1], scaled[begin:begin + length].T[None]), -1)
+        expected.append(F.silu(F.conv1d(source, weight, bias, groups=config.conv_dim))[0].T)
+        snapshots.append(source[0, :, -3:])
+        begin += length
+    torch.testing.assert_close(actual, torch.cat(expected), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(storage[2:, 0], torch.stack(snapshots), rtol=0, atol=0)

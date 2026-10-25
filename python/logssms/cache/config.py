@@ -38,14 +38,18 @@ class RadixCacheConfig(BaseCacheConfig):
 
 @dataclass(frozen=True)
 class MarconiCacheConfig(BaseCacheConfig):
-    page_size: int = 0
+    block_size: int = 128
     bootstrap_multiplier: int = 5
 
     def __post_init__(self):
-        if self.page_size < 0 or self.page_size % 64:
-            raise ValueError("Marconi page size must be zero (auto) or a multiple of 64")
+        if self.block_size < 0 or self.block_size % 64:
+            raise ValueError("Marconi block size must be zero (auto) or a multiple of 64")
         if self.bootstrap_multiplier < 1:
             raise ValueError("Marconi bootstrap multiplier must be positive")
+
+    @property
+    def page_size(self) -> int:
+        return self.block_size
 
 
 @dataclass(frozen=True)

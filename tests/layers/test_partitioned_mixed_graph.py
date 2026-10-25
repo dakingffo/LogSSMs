@@ -90,7 +90,7 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
             captured = batch(partition, capacity)
             captured.mixed_parts[0].prefill_token_capacity = capacity
             backend.prepare_metadata(captured.mixed_parts[0])
-            target = prepare_mixed_linear_metadata(backend,*captured.mixed_parts,capacity)
+            target = prepare_mixed_linear_metadata(*captured.mixed_parts,capacity)
             copy_plan = MixedLinearCopyPlan(target)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
@@ -112,7 +112,7 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
                 states = tuple(t.clone() for t in buffers)
                 p.prefill_token_capacity = capacity
                 backend.prepare_metadata(p)
-                fresh = prepare_mixed_linear_metadata(backend,p,d,capacity)
+                fresh = prepare_mixed_linear_metadata(p,d,capacity)
                 copy_plan.copy(fresh)
                 reset()
                 graph.replay()

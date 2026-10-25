@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
 
 class GatedDeltaLogStateBackend(LogStateLinearAttnBackend, BaseGatedDeltaBackend):
-    direct_prefill_metadata = True
     def forward(
         self,
         mixed_qkv  : torch.Tensor,
@@ -191,13 +190,13 @@ class GatedDeltaLogStateBackend(LogStateLinearAttnBackend, BaseGatedDeltaBackend
         from logssms.kernel.linear_attention.vendor.fla import (
             fused_recurrent_gated_delta_rule_to_logstate,
         )
-        from logssms.kernel.linear_attention.gdn_conv_decode import conv_decode_qkv
+        from logssms.kernel.linear_attention.conv_decode import conv_decode
 
         pool = get_global_ctx().linear_state
         assert isinstance(pool, MHALogStatePool)
         layer_idx = config.layer_idx
-        query, key, value = conv_decode_qkv(
-            mixed_qkv, conv_weight, config,
+        query, key, value = conv_decode(
+            mixed_qkv, conv_weight, config, split_qkv=True,
             read_slots=metadata.conv_read_slots,
             read_granules=metadata.conv_read_granules,
             write_slots=metadata.log_slots,

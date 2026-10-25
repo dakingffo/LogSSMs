@@ -28,6 +28,7 @@ def _prepare_cached_query(
     q_norm   : RMSNorm | None,
     k_norm   : RMSNorm | None,
     layer_id : int,
+    key_scale: float = 1.,
 ) -> torch.Tensor:
     ctx = get_global_ctx()
     return qk_norm_rope_store(
@@ -39,6 +40,7 @@ def _prepare_cached_query(
         k_eps=k_norm.eps if k_norm is not None else 0.0,
         q_zero_centered=q_norm.zero_centered if q_norm is not None else False,
         k_zero_centered=k_norm.zero_centered if k_norm is not None else False,
+        k_scale=key_scale,
     )
 
 
@@ -75,12 +77,14 @@ class RotaryAttention(BaseOP):
         *,
         has_attn_bias: bool = False,
         qk_norm_eps  : float | None = None,
+        key_scale    : float = 1.,
     ):
         tp_size = get_tp_info().size
         self.head_dim = head_dim
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
         self.num_kv_heads = div_even(num_kv_heads, tp_size, allow_replicate=True)
         self._layer_id = layer_id
+        self._key_scale = key_scale
 
         self.qkv_proj = LinearColParallelPartitioned(
             input_size=hidden_size,
@@ -133,6 +137,8 @@ class RotaryAttention(BaseOP):
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query, key, value = self._project(x)
+        if self._key_scale != 1.:
+            key = key * self._key_scale
         if self.q_norm is not None:
             self.q_norm.forward_inplace(query)
         if self.k_norm is not None:
@@ -150,6 +156,7 @@ class RotaryAttention(BaseOP):
         query = _prepare_cached_query(
             query, key, value, positions,
             self.rotary, self.q_norm, self.k_norm, self._layer_id,
+            self._key_scale,
         )
         return self.attn.forward(query)
 
@@ -180,6 +187,7 @@ class GatedRotaryAttention(RotaryAttention):
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
         self.num_kv_heads = div_even(num_kv_heads, tp_size, allow_replicate=True)
         self._layer_id = layer_id
+        self._key_scale = 1.
 
         self.qkv_proj = LinearColParallelPartitioned(
             input_size=hidden_size,

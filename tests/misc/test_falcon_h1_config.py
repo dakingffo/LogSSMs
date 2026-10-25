@@ -1,5 +1,7 @@
 import pytest
 import torch
+import subprocess
+import sys
 from transformers import FalconH1Config as HFFalconH1Config
 
 from logssms.models import make_model_config
@@ -17,6 +19,13 @@ def raw_config():
         mamba_d_state=64, mamba_n_groups=1, mamba_d_conv=4,
         mamba_rms_norm=True, max_position_embeddings=512,
     )
+
+
+def test_server_import_keeps_cuda_uninitialized():
+    subprocess.run([
+        sys.executable, "-c",
+        "import torch; import logssms.server.launch; assert not torch.cuda.is_initialized()",
+    ], check=True, timeout=60)
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])

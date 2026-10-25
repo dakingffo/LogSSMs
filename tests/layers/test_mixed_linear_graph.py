@@ -122,7 +122,7 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
         capture_batch, decode = batches(128)
         capture_batch.prefill_token_capacity = 128
         backend.prepare_metadata(capture_batch)
-        captured = prepare_mixed_linear_metadata(backend, capture_batch, decode, 128)
+        captured = prepare_mixed_linear_metadata(capture_batch, decode, 128)
         copy_plan = MixedLinearCopyPlan(captured)
         # Compile/autotune before capture on a side stream, using fixed shapes.
         stream = torch.cuda.Stream()
@@ -143,7 +143,7 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
             expected_buffers = tuple(t.clone() for t in buffers)
             eager_batch.prefill_token_capacity = 128
             backend.prepare_metadata(eager_batch)
-            fresh = prepare_mixed_linear_metadata(backend, eager_batch, decode, 128)
+            fresh = prepare_mixed_linear_metadata(eager_batch, decode, 128)
             copy_plan.copy(fresh)
             for dst, src in ((static_x, x), (static_gate, gate), (static_beta, beta)):
                 dst.copy_(src)

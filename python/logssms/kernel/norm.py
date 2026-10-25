@@ -6,6 +6,111 @@ import triton.language as tl
 
 
 @triton.jit
+def _rms_norm_branches_kernel(
+    X, Other, Residual, Weight, Output0, Output1, ResidualOut,
+    WIDTH: tl.constexpr, XS: tl.constexpr, OS: tl.constexpr,
+    EPS: tl.constexpr, HAS_OTHER: tl.constexpr, HAS_RESIDUAL: tl.constexpr,
+    IN0: tl.constexpr, IN1: tl.constexpr, OUT0: tl.constexpr, OUT1: tl.constexpr,
+    TWO_OUTPUTS: tl.constexpr, ZERO_CENTERED: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    mask = col < WIDTH
+    dtype = X.dtype.element_ty
+    x = tl.load(X + row * XS + col, mask, other=0).to(tl.float32)
+    if HAS_OTHER:
+        y = tl.load(Other + row * OS + col, mask, other=0).to(tl.float32)
+        x = ((x * IN0).to(dtype).to(tl.float32)
+             + (y * IN1).to(dtype).to(tl.float32)).to(dtype).to(tl.float32)
+    if HAS_RESIDUAL:
+        x += tl.load(Residual + row * WIDTH + col, mask, other=0).to(tl.float32)
+    tl.store(ResidualOut + row * WIDTH + col, x, mask)
+    variance = tl.sum(x * x, 0) / WIDTH
+    weight = tl.load(Weight + col, mask, other=0).to(tl.float32)
+    if ZERO_CENTERED:
+        weight += 1.
+    normalized = (x * tl.rsqrt(variance + EPS) * weight).to(dtype).to(tl.float32)
+    tl.store(Output0 + row * WIDTH + col, normalized * OUT0, mask)
+    if TWO_OUTPUTS:
+        tl.store(Output1 + row * WIDTH + col, normalized * OUT1, mask)
+
+
+def rms_norm_branches(x, weight, eps, residual=None, *, other=None,
+                      input_scales=(1., 1.), output_scales=(1.,), zero_centered=False):
+    assert x.ndim == 2 and x.stride(1) == 1
+    assert 1 <= len(output_scales) <= 2
+    outputs = torch.empty((len(output_scales), *x.shape), device=x.device, dtype=x.dtype)
+    residual_out = torch.empty(x.shape, device=x.device, dtype=x.dtype) if residual is None else residual
+    _rms_norm_branches_kernel[(len(x),)](
+        x, other, residual, weight, outputs[0], outputs[-1], residual_out,
+        x.shape[1], x.stride(0), 0 if other is None else other.stride(0), eps,
+        other is not None, residual is not None, *input_scales,
+        output_scales[0], output_scales[-1], len(output_scales) == 2,
+        zero_centered,
+        triton.next_power_of_2(x.shape[1]),
+    )
+    return tuple(outputs.unbind(0)), residual_out
+
+
+@triton.jit
+def _grouped_rms_norm_gated_kernel(
+    X, Gate, Weight, Output, Variance,
+    WIDTH: tl.constexpr, GROUPS: tl.constexpr, XS: tl.constexpr, GS: tl.constexpr,
+    EPS: tl.constexpr, BEFORE_GATE: tl.constexpr, STATS_ONLY: tl.constexpr,
+    EXTERNAL_STATS: tl.constexpr, BLOCK: tl.constexpr,
+    GATE_SCALE: tl.constexpr,
+):
+    row, group = tl.program_id(0), tl.program_id(1)
+    col = tl.arange(0, BLOCK)
+    mask = col < WIDTH
+    offset = group * WIDTH + col
+    x = tl.load(X + row * XS + offset, mask, other=0).to(tl.float32)
+    gate = tl.load(Gate + row * GS + offset, mask, other=0)
+    if GATE_SCALE != 1.:
+        gate = (gate.to(tl.float32) * GATE_SCALE).to(gate.dtype)
+    z = gate.to(tl.float32)
+    z *= tl.sigmoid(z)
+    if not BEFORE_GATE:
+        x *= z
+    if EXTERNAL_STATS:
+        variance = tl.load(Variance + row * GROUPS + group)
+    else:
+        variance = tl.sum(x * x, 0) / WIDTH
+    if STATS_ONLY:
+        tl.store(Variance + row * GROUPS + group, variance)
+    else:
+        w = tl.load(Weight + offset, mask, other=0).to(tl.float32)
+        y = x * tl.rsqrt(variance + EPS) * w
+        if BEFORE_GATE:
+            y *= z
+        tl.store(Output + row * GROUPS * WIDTH + offset, y, mask)
+
+
+def grouped_rms_norm_gated(x, gate, weight, eps, groups, before_gate, *, reduce_mean=None, gate_scale=1.):
+    assert x.ndim == 2 and x.shape == gate.shape
+    assert x.stride(1) == gate.stride(1) == 1
+    assert x.shape[1] == weight.numel() and x.shape[1] % groups == 0
+    width = x.shape[1] // groups
+    block = triton.next_power_of_2(width)
+    output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    variance = None
+    args = (width, groups, x.stride(0), gate.stride(0), eps, before_gate)
+    grid = (x.shape[0], groups)
+    if reduce_mean is not None:
+        variance = torch.empty(grid, device=x.device, dtype=torch.float32)
+        _grouped_rms_norm_gated_kernel[grid](
+            x, gate, weight, output, variance, *args, True, False, block, gate_scale,
+            num_warps=8 if block >= 2048 else 4,
+        )
+        variance = reduce_mean(variance)
+    _grouped_rms_norm_gated_kernel[grid](
+        x, gate, weight, output, variance, *args, False, variance is not None, block, gate_scale,
+        num_warps=8 if block >= 2048 else 4,
+    )
+    return output
+
+
+@triton.jit
 def _rms_norm_gated_kernel(
     hidden_states,
     gate,

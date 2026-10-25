@@ -40,7 +40,8 @@ def test_logstate_granule_chunks_match_single_prefill(granularity, mamba):
     ctx.work_state_table = torch.tensor(works, device=device, dtype=torch.int32)[:, None]
     set_global_ctx(ctx)
     backend = Mamba2LogStateBackend() if mamba else GatedDeltaLogStateBackend()
-    config = Mamba2Config(2, 2, 32, 32, 3, 0) if mamba else GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0)
+    config = (Mamba2Config(2, 2, 32, 32, 3, 0, conv_scales=(.7, .8, .9), dt_scale=.6)
+              if mamba else GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0))
     x = torch.randn(129, 192, device=device, dtype=dtype) * .1
     gate = torch.randn(129, 2, device=device, dtype=dtype) * .1
     beta = torch.randn_like(gate)
@@ -82,7 +83,8 @@ def test_mixed_variable_prefills_preserve_outputs_and_pool(mamba, logstate):
     clear_global_ctx()
     device, dtype = torch.device("cuda"), torch.bfloat16
     torch.manual_seed(311)
-    config = Mamba2Config(2, 2, 32, 32, 3, 0) if mamba else GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0)
+    config = (Mamba2Config(2, 2, 32, 32, 3, 0, conv_scales=(.7, .8, .9), dt_scale=.6)
+              if mamba else GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0))
     ctx = Context(64)
     if logstate:
         pool = MHALogStatePool(

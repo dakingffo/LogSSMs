@@ -63,14 +63,16 @@ def test_qk_norm_rope_store_matches_reference(dtype, norm, dims, layout):
         expected_k, expected_v = expected_backing[:, 2], expected_backing[:, 3]
     valid = locations >= 0
     pages, offsets = locations[valid].long() // 16, locations[valid].long() % 16
+    key_scale = .390625 if norm == "none" else 1.
     expected_k[pages, offsets] = _reference(
-        key, k_weight, eps, zero_centered, positions, rotary._cos_sin_cache)[valid]
+        key * key_scale, k_weight, eps, zero_centered, positions, rotary._cos_sin_cache)[valid]
     expected_v[pages, offsets] = value[valid]
     expected_q = _reference(query, q_weight, eps, zero_centered, positions, rotary._cos_sin_cache)
     actual = qk_norm_rope_store(
         query, key, value, positions, rotary._cos_sin_cache, locations, k_cache, v_cache,
         q_weight=q_weight, k_weight=k_weight, q_eps=eps, k_eps=eps,
         q_zero_centered=zero_centered, k_zero_centered=zero_centered,
+        k_scale=key_scale,
     )
     tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-3
     torch.testing.assert_close(actual, expected_q, rtol=tolerance, atol=tolerance)

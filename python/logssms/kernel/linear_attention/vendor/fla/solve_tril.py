@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
-from .config import prefill_config
+from ...tuning import prefill_config
 from .op import make_tensor_descriptor
 from .runtime import IS_TMA_SUPPORTED, autotune_cache_kwargs, input_guard
 
@@ -34,7 +34,10 @@ DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee"
     key=['BT'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def solve_tril_16x16_kernel(
     A,
     Ai,
@@ -94,7 +97,10 @@ def solve_tril_16x16_kernel(
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def merge_16x16_to_32x32_inverse_kernel(
     A,
     Ai,
@@ -184,7 +190,10 @@ def merge_16x16_to_32x32_inverse_kernel(
     key=['H', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def merge_16x16_to_64x64_inverse_kernel(
     A,
     Ai,

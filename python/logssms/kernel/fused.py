@@ -6,6 +6,50 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
 
+@triton.jit
+def _silu_and_mul_kernel(X, Gate, Output, WIDTH: tl.constexpr,
+                         XS: tl.constexpr, GS: tl.constexpr, BLOCK: tl.constexpr, GATE_SCALE: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + row * XS + col, col < WIDTH, other=0)
+    gate = tl.load(Gate + row * GS + col, col < WIDTH, other=0)
+    if GATE_SCALE != 1.:
+        gate = (gate.to(tl.float32) * GATE_SCALE).to(gate.dtype)
+    gate = gate.to(tl.float32)
+    gate = (gate * tl.sigmoid(gate)).to(x.dtype).to(tl.float32)
+    tl.store(Output + row * WIDTH + col, x.to(tl.float32) * gate, col < WIDTH)
+
+
+def silu_and_mul(x, gate, gate_scale=1.):
+    assert x.ndim == gate.ndim == 2 and x.shape == gate.shape
+    output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    _silu_and_mul_kernel[(len(x), triton.cdiv(x.shape[1], 256))](
+        x, gate, output, x.shape[1], x.stride(0), gate.stride(0), 256, gate_scale,
+    )
+    return output
+
+
+@triton.jit
+def _scaled_silu_and_mul_kernel(X, Y, N: tl.constexpr, STRIDE: tl.constexpr,
+                                SCALE: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    gate = tl.load(X + row * STRIDE + col, col < N, other=0)
+    up = tl.load(X + row * STRIDE + N + col, col < N, other=0)
+    scaled = (gate.to(tl.float32) * SCALE).to(gate.dtype).to(tl.float32)
+    activated = (scaled * tl.sigmoid(scaled)).to(gate.dtype).to(tl.float32)
+    tl.store(Y + row * N + col, activated * up.to(tl.float32), col < N)
+
+
+def scaled_silu_and_mul(gate_up: torch.Tensor, scale: float) -> torch.Tensor:
+    width = gate_up.shape[-1] // 2
+    output = torch.empty((gate_up.shape[0], width), device=gate_up.device, dtype=gate_up.dtype)
+    _scaled_silu_and_mul_kernel[(len(gate_up), triton.cdiv(width, 256))](
+        gate_up, output, width, gate_up.stride(0), scale, 256,
+    )
+    return output
+
+
 @triton.jit(do_not_specialize=["TOKENS", "ROWS", "Q_BATCH_STRIDE", "K_BATCH_STRIDE",
                              "V_BATCH_STRIDE", "G_BATCH_STRIDE", "B_BATCH_STRIDE"])
 def _prepare_gdn_kernel(
@@ -37,6 +81,7 @@ def _prepare_gdn_kernel(
         batch = (rows // (VALUE_HEADS * TOKENS)).to(tl.int64)
     active = rows < ROWS
     key_mask = active[:, None] & (columns[None, :] < KEY_DIM)
+    key_mask &= (head % (VALUE_HEADS // KEY_HEADS) == 0)[:, None]
     q = tl.load(
         query + batch[:, None] * Q_BATCH_STRIDE + token[:, None] * Q_TOKEN_STRIDE
         + key_head[:, None] * Q_HEAD_STRIDE + columns[None, :] * Q_DIM_STRIDE,
@@ -49,8 +94,9 @@ def _prepare_gdn_kernel(
     ).to(tl.float32)
     q *= tl.rsqrt(tl.sum(q * q, 1) + 1e-6)[:, None]
     k *= tl.rsqrt(tl.sum(k * k, 1) + 1e-6)[:, None]
-    tl.store(q_out + rows[:, None].to(tl.int64) * KEY_DIM + columns[None, :], q, key_mask)
-    tl.store(k_out + rows[:, None].to(tl.int64) * KEY_DIM + columns[None, :], k, key_mask)
+    key_row = ((batch * TOKENS + token) * KEY_HEADS + key_head).to(tl.int64)
+    tl.store(q_out + key_row[:, None] * KEY_DIM + columns[None, :], q, key_mask)
+    tl.store(k_out + key_row[:, None] * KEY_DIM + columns[None, :], k, key_mask)
     value_mask = active[:, None] & (columns[None, :] < VALUE_DIM)
     v = tl.load(
         value + batch[:, None] * V_BATCH_STRIDE + token[:, None] * V_TOKEN_STRIDE
@@ -93,7 +139,7 @@ def prepare_gdn(
     for tensor in (gate, beta, A_log, dt_bias):
         assert tensor.device == query.device
         assert tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    q_out = torch.empty((batch_size, tokens, value_heads, key_dim), device=query.device, dtype=query.dtype)
+    q_out = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     k_out = torch.empty_like(q_out)
     v_out = torch.empty(value.shape, device=value.device, dtype=value.dtype)
     gate_out = torch.empty(gate.shape, device=gate.device, dtype=torch.float32)
@@ -124,9 +170,12 @@ def _norm_rope(
     ZERO_CENTERED : tl.constexpr,
     EPS           : tl.constexpr,
     BLOCK_SIZE    : tl.constexpr,
+    INPUT_SCALE   : tl.constexpr = 1.,
 ):
     columns = tl.arange(0, BLOCK_SIZE)
     values = tl.load(source + columns, columns < HEAD_DIM, other=0).to(tl.float32)
+    if INPUT_SCALE != 1.:
+        values = (values * INPUT_SCALE).to(source.dtype.element_ty).to(tl.float32)
     if NORMALIZE:
         scale = tl.rsqrt(tl.sum(values * values, 0) / HEAD_DIM + EPS)
         weights = tl.load(weight + columns, columns < HEAD_DIM, other=0).to(tl.float32)
@@ -172,6 +221,7 @@ def _qk_norm_rope_store_kernel(
     K_ZERO_CENTERED: tl.constexpr,
     Q_EPS          : tl.constexpr,
     K_EPS          : tl.constexpr,
+    K_SCALE        : tl.constexpr,
     BLOCK_SIZE     : tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -193,6 +243,7 @@ def _qk_norm_rope_store_kernel(
         result = _norm_rope(
             source, k_weight, cos_sin, position,
             HEAD_DIM, ROTARY_DIM, K_NORMALIZE, K_ZERO_CENTERED, K_EPS, BLOCK_SIZE,
+            K_SCALE,
         )
         location = tl.load(out_loc + token).to(tl.int64)
         page, offset = location // PAGE_SIZE, location % PAGE_SIZE
@@ -221,6 +272,7 @@ def qk_norm_rope_store(
     k_eps          : float = 1e-6,
     q_zero_centered: bool = False,
     k_zero_centered: bool = False,
+    k_scale        : float = 1.,
 ) -> torch.Tensor:
     assert query.ndim == key.ndim == value.ndim == 3
     tokens, q_heads, head_dim = query.shape
@@ -257,7 +309,7 @@ def qk_norm_rope_store(
         *k_cache.stride()[:3], *v_cache.stride()[:3],
         k_cache.shape[1], q_heads, key.shape[1], head_dim, rotary_dim,
         q_weight is not None, k_weight is not None,
-        q_zero_centered, k_zero_centered, q_eps, k_eps,
+        q_zero_centered, k_zero_centered, q_eps, k_eps, k_scale,
         triton.next_power_of_2(head_dim),
         num_warps=4,
         enable_fp_fusion=False,

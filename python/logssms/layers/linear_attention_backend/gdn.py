@@ -234,7 +234,7 @@ class GatedDeltaBackend(StandardLinearAttnBackend, BaseGatedDeltaBackend):
         from logssms.kernel.linear_attention.vendor.fla import (
             fused_recurrent_gated_delta_rule_to_slots,
         )
-        from logssms.kernel.linear_attention.gdn_conv_decode import conv_decode_qkv
+        from logssms.kernel.linear_attention.conv_decode import conv_decode
 
         ctx = get_global_ctx()
         pool = ctx.linear_state
@@ -242,8 +242,8 @@ class GatedDeltaBackend(StandardLinearAttnBackend, BaseGatedDeltaBackend):
         read_slots = metadata.read_slots
         write_slots = metadata.write_slots
         assert read_slots is not None and write_slots is not None
-        query, key, value = conv_decode_qkv(
-            mixed_qkv, conv_weight, config,
+        query, key, value = conv_decode(
+            mixed_qkv, conv_weight, config, split_qkv=True,
             read_slots=read_slots,
             write_slots=write_slots,
             standard_state=pool.conv_state,

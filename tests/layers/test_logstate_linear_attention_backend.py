@@ -142,8 +142,8 @@ def test_logstate_uses_physical_offsets_after_unaligned_prefix_hit() -> None:
         backend.prepare_metadata(batch)
         metadata = batch.linear_attn_metadata
         assert metadata.token_offsets.tolist() == list(range(16))
-        assert metadata.conv_snapshot_rows.tolist() == [15]
-        assert metadata.conv_write_granules.tolist() == [0]
+        assert metadata.conv_token_slots.tolist() == [-1] * 15 + [0]
+        assert metadata.conv_token_granules.tolist() == [0] * 16
 
         decode = Batch(reqs=[_make_request(17, 18)], phase="decode")
         decode.padded_reqs = decode.reqs
@@ -259,99 +259,6 @@ def test_direct_checkpoint_prefill_matches_log_prefill(reuse, granularity, chunk
         torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("granularity", [16, 32, 64])
-def test_memorized_prefill_reuses_gpu_tail_and_matches_full_state(granularity):
-    from collections import Counter
-    from tests.core.test_logstate_cache_manager import make_manager, new_req
-    from logssms.cache.logstate.prefix_cache import LogStateKind
-
-    torch.manual_seed(321)
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    config = GatedDeltaConfig(2, 2, 32, 32, 192, 3, 0)
-    x = torch.randn(321, 192, device=device, dtype=dtype) * .1
-    gate = torch.randn(321, 2, device=device, dtype=dtype) * .1
-    beta = torch.randn_like(gate)
-    weight = torch.randn(192, 1, 4, device=device, dtype=dtype) * .02
-    A, bias = torch.zeros(2, device=device), torch.zeros(2, device=device)
-
-    def forward(manager, req):
-        clear_global_ctx()
-        ctx = Context(page_size=64)
-        ctx.linear_state = manager.logstate_pool
-        ctx.page_table = manager.page_table
-        ctx.state_table = manager.state_table
-        ctx.work_state_table = manager.work_state_table
-        set_global_ctx(ctx)
-        backend = GatedDeltaLogStateBackend()
-        batch = Batch([req], "prefill")
-        manager.allocate([req], phase="prefill")
-        manager.prepare_batch(batch)
-        begin, end = req.cached_len, req.device_len
-        batch.positions = torch.arange(begin, end, device=device, dtype=torch.int32)
-        batch.out_loc = manager.page_table[req.table_idx, begin:end]
-        try:
-            backend.prepare_metadata(batch)
-            output = backend.forward(x[begin:end], gate[begin:end], beta[begin:end],
-                                     weight, A, bias, config, batch)
-            torch.cuda.synchronize()
-            return output
-        finally:
-            clear_global_ctx()
-
-    reference = make_manager(num_pages=32, num_states=32, device=device, granularity=granularity)
-    reference_req = new_req(reference, torch.arange(321, dtype=torch.int32))
-    expected_output = forward(reference, reference_req).clone()
-    expected_state = reference.logstate_pool.read_states(
-        torch.tensor([reference._request_states[0].work_slot], device=device), 0,
-    ).clone()
-
-    manager = make_manager(num_pages=32, num_states=32, device=device, granularity=granularity)
-    first = new_req(manager, torch.arange(256, dtype=torch.int32))
-    forward(manager, first)
-    pool = manager.logstate_pool
-    expected_checkpoint = pool.read_states(torch.tensor([manager._request_states[0].work_slot], device=device), 0).clone()
-    first.cached_len = 256
-    manager.cache_req(first, finished=True)
-    entries = manager.tree.iter_entries()
-    reuse = new_req(manager, torch.arange(129, dtype=torch.int32), table_idx=1)
-    manager.prepare_batch(Batch([reuse], "prefill"))
-    manager.cache_req(reuse, finished=True)
-    leaf = manager.tree.entry_owner(entries[-1])
-    manager.recycle_bin.remember(manager.tree, leaf)
-    counts = Counter(leaf._kv_page_counts)
-    eviction = manager.tree.evict_nodes((leaf,))
-    manager._release_cached_kv(counts)
-    pool.release_slots([entry.slot for entry in eviction.entries])
-    tail_slot = entries[2].slot
-
-    resumed = new_req(manager, torch.arange(321, dtype=torch.int32))
-    assert resumed.cached_len == 192
-    outputs = []
-    while resumed.cached_len < 321:
-        size = manager.plan_prefill_chunk(321 - resumed.cached_len, granularity)
-        resumed.device_len = resumed.cached_len + size
-        outputs.append(forward(manager, resumed))
-        resumed.cached_len = resumed.device_len
-    actual_output = torch.cat(outputs)
-    assert manager._recycled_restores[0].slots[256] == tail_slot
-    actual_checkpoint = pool.read_states(torch.tensor([tail_slot], device=device), 0)
-    actual_state = pool.read_states(torch.tensor([manager._request_states[0].work_slot], device=device), 0)
-    torch.testing.assert_close(actual_output, expected_output[192:], rtol=3e-2, atol=3e-3)
-    torch.testing.assert_close(actual_checkpoint, expected_checkpoint, rtol=3e-2, atol=3e-3)
-    torch.testing.assert_close(actual_state, expected_state, rtol=3e-2, atol=3e-3)
-    resumed.cached_len = 320
-    manager.cache_req(resumed, finished=True)
-    assert [(entry.begin, entry.end, entry.kind) for entry in manager.tree.iter_entries()] == [
-        (0, 128, LogStateKind.CHECKPOINT), (128, 256, LogStateKind.CHECKPOINT),
-        (256, 320, LogStateKind.LOG),
-    ]
-    manager.logstate_pool.poll_reclamation()
-    manager.check_integrity()
-    followup = new_req(manager, torch.arange(337, dtype=torch.int32), table_idx=1)
-    assert followup.cached_len == 320
-    manager.cache_req(followup, finished=True)
 
 
 def test_logstate_prefill_metadata_profile(monkeypatch: pytest.MonkeyPatch) -> None:

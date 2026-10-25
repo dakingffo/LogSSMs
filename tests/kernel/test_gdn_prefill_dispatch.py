@@ -21,7 +21,7 @@ class LaunchRecorder:
 
 def test_piecewise_warmup_request_counts():
     from logssms.engine.piecewise_graph import _warmup_cases
-    from logssms.kernel.linear_attention.vendor.fla.config import prefill_config
+    from logssms.kernel.linear_attention.tuning import prefill_config
 
     cases = _warmup_cases(32, 8192, 32)
     for count in range(1, 5):
@@ -37,7 +37,7 @@ def test_piecewise_warmup_request_counts():
 
 def test_piecewise_warmup_covers_dispatch_configs():
     from logssms.engine.piecewise_graph import _warmup_lengths
-    from logssms.kernel.linear_attention.vendor.fla.config import prefill_config
+    from logssms.kernel.linear_attention.tuning import prefill_config
 
     for budget in (64, 128, 256, 8192):
         lengths = _warmup_lengths(32, budget)
@@ -88,7 +88,7 @@ def test_prefill_chunk_dispatch(monkeypatch, stage, chunks, chunk_size, dim):
         module.solve_tril(matrix, **common)
     else:
         module.recompute_w_u_fwd(key, value, gate, matrix, g=gate, **common)
-    tuned = chunk_size == 32 and (stage == "solve" or dim == 128)
+    tuned = chunk_size == 32 and (stage in ("output", "solve") or dim == 128)
     assert len(fixed.calls) == int(tuned)
     assert len(fallback.calls) == int(not tuned)
     if not tuned:
@@ -98,7 +98,7 @@ def test_prefill_chunk_dispatch(monkeypatch, stage, chunks, chunk_size, dim):
         assert (config["BK"], config["BV"], config["num_warps"], config["num_stages"]) == (
             32, 32 if chunks < 4 else 64, 2 if chunks < 4 else 1, 3,
         )
-        assert grid == (128 // config["BV"], chunks, 6)
+        assert grid == ((dim + config["BV"] - 1) // config["BV"], chunks, 6)
     elif stage == "kkt":
         assert (config["BK"], config["num_warps"], config["num_stages"]) == (
             32, 4 if chunks < 12 else 1, 3,
@@ -132,7 +132,7 @@ def test_prefill_state_dispatch(monkeypatch, requests, chunk_size, dim):
         chunk_offsets=torch.arange(requests + 1, dtype=torch.int32),
     )
     grid, config = recorder.calls[0]
-    tuned = chunk_size == 32 and dim == 128
+    tuned = chunk_size == 32
     bv = 64 if tuned and requests >= 4 else 32
     assert grid == ((dim + bv - 1) // bv, requests * 6)
     assert (config["BV"], config["num_warps"], config["num_stages"]) == (

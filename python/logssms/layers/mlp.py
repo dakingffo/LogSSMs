@@ -20,6 +20,9 @@ class GatedMLP(BaseOP):
         hidden_size      : int,
         intermediate_size: int,
         hidden_act       : str,
+        *,
+        activation_scale : float = 1.,
+        output_scale     : float = 1.,
     ):
         self.gate_up_proj = LinearColParallelMerged(
             hidden_size,
@@ -32,6 +35,10 @@ class GatedMLP(BaseOP):
             self.act_fn = act_fn
         else:
             raise ValueError(f"Unsupported activation function: {hidden_act}")
+        self._activation_scale = activation_scale
+        self._output_scale = output_scale
+        if activation_scale != 1. and hidden_act != "silu":
+            raise ValueError("Scaled MLP activation requires SiLU")
 
         self.down_proj = LinearRowParallel(
             intermediate_size,
@@ -43,9 +50,15 @@ class GatedMLP(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj.forward(x)
         del x
-        y = self.act_fn(gate_up)
+        if self._activation_scale == 1.:
+            y = self.act_fn(gate_up)
+        else:
+            from logssms.kernel.fused import scaled_silu_and_mul
+
+            y = scaled_silu_and_mul(gate_up, self._activation_scale)
         del gate_up
-        return self.down_proj.forward(y)
+        output = self.down_proj.forward(y)
+        return output if self._output_scale == 1. else output * self._output_scale
 
 
 class MoEMLP(BaseOP):

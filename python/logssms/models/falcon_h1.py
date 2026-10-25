@@ -130,6 +130,7 @@ class FalconH1DecoderLayer(BaseOP):
             layer_id=layer_id, rotary_dim=rope.rotary_dim,
             max_position=rope.max_position, rope_base=rope.base,
             rope_scaling=tuple(rope.scaling.items()) if rope.scaling else None,
+            key_scale=config.key_multiplier,
         )
         self.mamba = Mamba2(
             hidden_size=config.hidden_size, num_heads=config.mamba_num_heads,
@@ -138,12 +139,15 @@ class FalconH1DecoderLayer(BaseOP):
             conv_bias=config.mamba_conv_bias, proj_bias=config.mamba_proj_bias,
             output_bias=config.projectors_bias, rms_norm=config.mamba_rms_norm,
             rms_norm_eps=config.rms_norm_eps, norm_before_gate=config.mamba_norm_before_gate,
-            in_multiplier=config.ssm_in_multiplier, multipliers=config.ssm_multipliers,
+            multipliers=config.ssm_multipliers,
             layer_idx=layer_id,
         )
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self.pre_ff_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
-        self.feed_forward = GatedMLP(config.hidden_size, config.intermediate_size, "silu")
+        self.feed_forward = GatedMLP(
+            config.hidden_size, config.intermediate_size, "silu",
+            activation_scale=config.mlp_multipliers[0], output_scale=config.mlp_multipliers[1],
+        )
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     @with_speculator(HiddenCapturePoint.DECODER_INPUT, layer_id_field="_layer_id")
@@ -161,23 +165,24 @@ class FalconH1DecoderLayer(BaseOP):
 
     @graph_piece
     def _prepare_attention(self, x, residual):
-        h, residual = self.input_layernorm.forward(x, residual)
-        query, key, value = self.self_attn._project(h * self._config.attention_in_multiplier)
-        xbc, gate, dt = self.mamba.proj(h)
-        return query, key * self._config.key_multiplier, value, xbc, gate, dt, residual
+        (attn_input, ssm_input), residual = self.input_layernorm.forward_branches(
+            x, residual, output_scales=(self._config.attention_in_multiplier,
+                                       self._config.ssm_in_multiplier),
+        )
+        query, key, value = self.self_attn._project(attn_input)
+        xbc, gate, dt = self.mamba.proj(ssm_input)
+        return query, key, value, xbc, gate, dt, residual
 
     @graph_piece
     def _finish_attention(self, attention, ssm, gate, residual):
         config = self._config
         attention = self.self_attn.o_proj.forward(attention.flatten(1))
         ssm = self.mamba.output(ssm, gate)
-        h = attention * config.attention_out_multiplier + ssm * config.ssm_out_multiplier
-        h, residual = self.pre_ff_layernorm.forward(h, residual)
-        gate_up = self.feed_forward.gate_up_proj.forward(h)
-        gate, up = gate_up.chunk(2, -1)
-        h = torch.nn.functional.silu(gate * config.mlp_multipliers[0]) * up
-        h = self.feed_forward.down_proj.forward(h) * config.mlp_multipliers[1]
-        return h, residual
+        (h,), residual = self.pre_ff_layernorm.forward_branches(
+            attention, residual, other=ssm,
+            input_scales=(config.attention_out_multiplier, config.ssm_out_multiplier),
+        )
+        return self.feed_forward.forward(h), residual
 
     def piecewise_graph_pieces(self):
         weight = self.mamba.in_proj.weight

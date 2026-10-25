@@ -5,127 +5,23 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from dataclasses import dataclass
-
 import torch
 import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp2
-from ...layout import log_pointer, state_pointer
+from ...state_io import ChunkStateIO, ChunkLogIO, _chunk_state_pointer, _store_chunk_state_tile, _store_chunk_log
+from ...tuning import prefill_state_config
 
 
-@dataclass(frozen=True)
-class ChunkStateIO:
-
-    storage           : torch.Tensor
-    read_slots        : torch.Tensor
-    chunk_write_slots : torch.Tensor
-    final_write_slots : torch.Tensor | None = None
-    payload_frames    : torch.Tensor | None = None
-    frame_bytes       : int = 0
-    head_payload_bytes: int = 0
-    layer             : int = 0
-    num_layers        : int = 1
-    granularity       : int = 64
-    page_size         : int = 64
-
-
-@dataclass(frozen=True)
-class ChunkLogIO:
-
-    slots             : torch.Tensor
-    token_offsets     : torch.Tensor
-    decay_frames      : torch.Tensor
-    gate              : torch.Tensor
-    page_size         : int
-    decay_record_bytes: int
-    num_key_heads     : int
-
-
-@triton.jit
-def _chunk_state_pointer(
-    storage, payload_frames, slot, head, offsets,
-    SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
-    HEAD_STRIDE: tl.constexpr, LAYER: tl.constexpr,
-    HV: tl.constexpr, LOGSTATE: tl.constexpr,
-    FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr,
-    HEAD_PAYLOAD_BYTES: tl.constexpr,
-    K: tl.constexpr, V: tl.constexpr, LAYERS: tl.constexpr,
-    GRANULARITY: tl.constexpr, PAGE_SIZE: tl.constexpr,
-):
-    if LOGSTATE:
-        return state_pointer(
-            storage, payload_frames, slot, LAYER, head, offsets,
-            HV, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
-        )
-    return storage + slot.to(tl.int64) * SLOT_STRIDE + LAYER * LAYER_STRIDE + head * HEAD_STRIDE + offsets
-
-
-@triton.jit
-def _store_chunk_state_tile(
-    storage, payload_frames, state, slot, head, key_offsets, value_offsets,
-    K: tl.constexpr, V: tl.constexpr,
-    SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr, HEAD_STRIDE: tl.constexpr,
-    LAYER: tl.constexpr, HV: tl.constexpr, LOGSTATE: tl.constexpr,
-    FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr, HEAD_PAYLOAD_BYTES: tl.constexpr,
-    LAYERS: tl.constexpr, GRANULARITY: tl.constexpr, PAGE_SIZE: tl.constexpr,
-):
-    offsets = key_offsets[:, None] * V + value_offsets[None, :]
-    destination = _chunk_state_pointer(
-        storage, payload_frames, slot, head, offsets,
-        SLOT_STRIDE, LAYER_STRIDE, HEAD_STRIDE, LAYER, HV, LOGSTATE,
-        FRAME_BYTES, FRAMES_PER_SLOT, HEAD_PAYLOAD_BYTES, K, V, LAYERS, GRANULARITY, PAGE_SIZE,
-    )
-    mask = (key_offsets[:, None] < K) & (value_offsets[None, :] < V)
-    tl.store(destination, state.to(destination.dtype.element_ty), mask=mask & (slot >= 0))
-
-
-@triton.jit
-def _store_chunk_log(
-    storage, payload_frames, decay_frames, slots, token_offsets, gate, key,
-    residual, rows, token_mask, head, value_offsets, value_tile,
-    K: tl.constexpr, V: tl.constexpr, H: tl.constexpr, HV: tl.constexpr,
-    LAYER: tl.constexpr, PAGE_SIZE: tl.constexpr, FRAME_BYTES: tl.constexpr,
-    FRAMES_PER_SLOT: tl.constexpr, HEAD_PAYLOAD_BYTES: tl.constexpr,
-    DECAY_RECORD_BYTES: tl.constexpr, BK: tl.constexpr,
-    LAYERS: tl.constexpr, GRANULARITY: tl.constexpr,
-    LOG_KEY_HEADS: tl.constexpr,
-):
-    slot = tl.load(slots + rows, token_mask, other=-1)
-    position = tl.load(token_offsets + rows, token_mask, other=0).to(tl.int64)
-    active = token_mask & (slot >= 0)
-    tl.store(
-        log_pointer(
-            storage, payload_frames, slot[:, None], LAYER, head,
-            position[:, None], value_offsets[None, :], LAYERS, HV, K, V, GRANULARITY,
-            PAGE_SIZE, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, True, LOG_KEY_HEADS,
-        ),
-        residual, active[:, None] & (value_offsets[None, :] < V),
-    )
-
-    if value_tile == 0:
-        if head % (HV // LOG_KEY_HEADS) == 0:
-            columns = tl.arange(0, BK)
-            keys = tl.load(
-                key + rows[:, None].to(tl.int64) * H * K + (head // (HV // H)) * K + columns[None, :],
-                token_mask[:, None] & (columns[None, :] < K), other=0,
-            )
-            tl.store(log_pointer(
-                storage, payload_frames, slot[:, None], LAYER, head,
-                position[:, None], columns[None, :], LAYERS, HV, K, V, GRANULARITY,
-                PAGE_SIZE, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT, False, LOG_KEY_HEADS,
-            ), keys, active[:, None] & (columns[None, :] < K))
-        frame = tl.load(decay_frames + slot * 2, active, other=0).to(tl.int64)
-        record = tl.load(decay_frames + slot * 2 + 1, active, other=0).to(tl.int64)
-        decay = storage.to(tl.pointer_type(tl.uint8)) + frame * FRAME_BYTES + record * DECAY_RECORD_BYTES
-        decay = decay.to(tl.pointer_type(tl.float32)) + (LAYER * PAGE_SIZE + position) * HV + head
-        values = tl.load(gate + rows.to(tl.int64) * HV + head, token_mask, other=0)
-        tl.store(decay, values, active)
-
-
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=[
+        'read_slots', 'chunk_write_slots', 'final_write_slots', 'payload_frames', 'log_slots',
+        'log_token_offsets', 'decay_frames', 'cu_seqlens', 'chunk_offsets',
+    ],
+)
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
     v,
@@ -429,9 +325,8 @@ def chunk_gated_delta_rule_fwd_h(
         assert log_io.num_key_heads > 0
         assert H % log_io.num_key_heads == HV % log_io.num_key_heads == 0
 
-    tuned = BT == 32 and K == V == 128
-    BV = 64 if tuned and N >= 4 else 32
-    num_warps = 4 if tuned else 2
+    config = prefill_state_config(N, BT)
+    BV = config.pop("BV")
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, BV), N * HV)](
         k=k, v=u, w=w, v_new=v_new, g=g, h=h,
         state_storage=state_io.storage,
@@ -459,6 +354,6 @@ def chunk_gated_delta_rule_fwd_h(
         PAGE_SIZE=state_io.page_size,
         LOG_KEY_HEADS=H if log_io is None else log_io.num_key_heads,
         DECAY_RECORD_BYTES=log_io.decay_record_bytes if log_io is not None else 0,
-        num_warps=num_warps, num_stages=2,
+        **config,
     )
     return h, v_new

@@ -1,7 +1,7 @@
 from .fused import prepare_gdn, qk_norm_rope_store, sigmoid_and_mul
 from .index import indexing
 from .moe import fused_moe_kernel_triton, moe_sum_reduce_triton
-from .norm import rms_norm_gated
+from .norm import grouped_rms_norm_gated, rms_norm_gated
 from .radix import fast_compare_key
 from .store import store_cache, store_state
 
@@ -13,6 +13,7 @@ __all__ = [
     "fused_moe_kernel_triton",
     "moe_sum_reduce_triton",
     "rms_norm_gated",
+    "grouped_rms_norm_gated",
     "sigmoid_and_mul",
     "qk_norm_rope_store",
     "prepare_gdn",

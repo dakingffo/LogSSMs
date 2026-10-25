@@ -33,7 +33,7 @@ def marconi_layout(config):
     return HybridBlockLayout.make(
         model.num_attention_layers, spec,
         max(1, model.num_kv_heads // config.tp_info.size), model.head_dim,
-        config.cache_config.page_size,
+        config.cache_config.block_size,
     )
 
 
@@ -56,8 +56,8 @@ def marconi_cost(config, layout):
     return MarconiCost(
         (mlp + attn_projection + linear) / tp,
         2 * q * model.num_attention_layers / tp,
-        layout.state_groups * block_bytes,
-        block_bytes // layout.page_size,
+        layout.state_blocks * block_bytes,
+        block_bytes // layout.block_size,
     )
 
 
@@ -72,13 +72,17 @@ class MarconiCachePlan(CachePlan):
 class MarconiRequest:
     handle: MarconiHandle
     prompt: tuple[int, ...]
-    work: int
+    states: tuple[int, int]
     pages: list[int]
+    branch_state: int | None = None
     branch: int = 0
     checkpoints: dict[int, int] = field(default_factory=dict)
     published: set[int] = field(default_factory=set)
     planned: bool = False
     computed_end: int = 0
+
+    def state_at(self, end: int, page_size: int) -> int:
+        return self.states[((end - 1) // page_size) % 2]
 
 
 class MarconiCacheManager(BaseCacheManager):
@@ -87,8 +91,8 @@ class MarconiCacheManager(BaseCacheManager):
         self.plan = plan
         self.config = config
         self.cost = marconi_cost(config, plan.layout)
-        tree = MarconiPrefixCache(self.pool.device, plan.layout.page_size, self.cost, pool=self.pool)
-        super().__init__(plan.layout.page_size, resources, prefix_cache=tree)
+        tree = MarconiPrefixCache(self.pool.device, plan.layout.block_size, self.cost, pool=self.pool)
+        super().__init__(plan.layout.block_size, resources, prefix_cache=tree)
         self.tree = tree
         self.requests: dict[int, MarconiRequest] = {}
         self.completed = 0
@@ -115,7 +119,7 @@ class MarconiCacheManager(BaseCacheManager):
             self.tune_executor = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
             self.tune_future = self.tune_executor.submit(
                 tune_marconi, self.tune_snapshot, self.tune_history, self.page_size,
-                self.cost, (self.plan.num_blocks - 1 - self.plan.layout.state_groups) * self.plan.layout.block_bytes(self.pool.dtype.itemsize),
+                self.cost, (self.plan.num_blocks - 1 - self.plan.layout.state_blocks) * self.plan.layout.block_bytes(self.pool.dtype.itemsize),
             )
             self.tune_history = []
             self.tune_snapshot = None
@@ -144,15 +148,31 @@ class MarconiCacheManager(BaseCacheManager):
         return len(self.pool.allocator.free) + self.tree.reclaimable_blocks()
 
     def reservation_size(self, token_len, *, handle=None, table_idx=None):
-        groups = self.plan.layout.state_groups
+        state_blocks = self.plan.layout.state_blocks
         entry = self.requests.get(table_idx)
         if entry is None:
             offset = 0 if handle is None else handle.cached_len % self.page_size
-            return (token_len + offset + self.page_size - 1) // self.page_size + 2 * groups
-        # One optional branch snapshot plus the remaining KV pages.
-        return (token_len + self.page_size - 1) // self.page_size + (
-            groups if not entry.planned or (entry.branch and entry.branch not in entry.checkpoints) else 0
+            return (token_len + offset + self.page_size - 1) // self.page_size + 3 * state_blocks
+        return (token_len + self.page_size - 1) // self.page_size
+
+    def _can_allocate(self, count, states=0):
+        layout = self.plan.layout
+        return len(self.pool.allocator.free) >= count and self.pool.allocator.can_allocate_groups(
+            states * layout.state_groups, layout.state_blocks_per_group,
         )
+
+    def prefill_acquire(self, total_len, handle, request_len=None):
+        if total_len > self.admission_capacity:
+            return False
+        self.lock(handle)
+        if total_len > self.admission_capacity:
+            self.unlock(handle)
+            return False
+        while not self._can_allocate(3 * self.plan.layout.state_blocks, states=3):
+            if not self.tree.evict_one():
+                self.unlock(handle)
+                return False
+        return True
 
     def match_req(self, req):
         match = self.tree.match_prefix(req.input_ids[:-1])
@@ -161,30 +181,29 @@ class MarconiCacheManager(BaseCacheManager):
     def plan_prefill_chunk(self, remain_len, token_budget):
         return remain_len if remain_len <= token_budget else token_budget // 64 * 64
 
-    def _ensure_free(self, count):
-        while len(self.pool.allocator.free) < count:
+    def _ensure_free(self, count, *, states=0):
+        while not self._can_allocate(count, states):
             if not self.tree.evict_one():
                 raise RuntimeError(f"Marconi reservation exhausted: need={count}, free={len(self.pool.allocator.free)}")
 
     def init_with_handle(self, table_idx, handle):
-        self._ensure_free(self.plan.layout.state_groups + int(handle.cached_len % self.page_size != 0))
-        work = self.pool.allocate_state()
+        assert handle.cached_len % self.page_size == 0
+        self._ensure_free(3 * self.plan.layout.state_blocks, states=3)
+        states = (self.pool.allocate_state(), self.pool.allocate_state())
+        branch_state = self.pool.allocate_state()
         pages = list(dict.fromkeys(x // self.page_size for x in handle.node.locations))
         self.pool.allocator.retain(pages)
+        entry = MarconiRequest(handle, handle.input_tokens, states, pages,
+                               branch_state=branch_state, branch=handle.branch_end,
+                               computed_end=handle.cached_len)
         if handle.cached_len:
-            self.pool.copy_state(handle.node.state, work)
+            self.pool.copy_state(handle.node.state, entry.state_at(handle.cached_len, self.page_size))
             self.tree.touch(handle.node)
-        if handle.cached_len % self.page_size:
-            old = pages[-1]
-            new, = self.pool.allocator.allocate(1)
-            for layer in range(self.pool.num_layers):
-                self.pool.k_cache(layer)[new].copy_(self.pool.k_cache(layer)[old])
-                self.pool.v_cache(layer)[new].copy_(self.pool.v_cache(layer)[old])
-            self.pool.allocator.release((old,))
-            pages[-1] = new
-        entry = MarconiRequest(handle, handle.input_tokens, work, pages, handle.branch_end)
         self.requests[table_idx] = entry
-        self.state_table[table_idx].fill_(work)
+        row = self.state_table[table_idx]
+        slots = torch.tensor(states, dtype=row.dtype, device=row.device)
+        page_parity = torch.arange(row.numel(), device=row.device) // self.page_size % 2
+        row.copy_(slots[page_parity])
         self._write_pages(table_idx, pages, 0)
 
     def _write_pages(self, table_idx, pages, start):
@@ -203,22 +222,27 @@ class MarconiCacheManager(BaseCacheManager):
                 entry = self.requests[req.table_idx]
                 if not entry.planned:
                     matched = max([entry.branch, *[common_prefix(entry.prompt, p) for p in previous]])
-                    branch = entry.handle.cached_len + (max(0, matched - entry.handle.cached_len) // 64) * 64
+                    branch = matched // self.page_size * self.page_size
                     entry.branch = branch if branch > entry.handle.cached_len else 0
                     entry.planned = True
+                    if not entry.branch:
+                        self.pool.release_state(entry.branch_state)
+                        entry.branch_state = None
                 previous.append(entry.prompt)
         for req in reqs:
             entry = self.requests[req.table_idx]
             n_pages = (req.device_len + self.page_size - 1) // self.page_size
             needed = max(0, n_pages - len(entry.pages))
             write_branch = req.cached_len < entry.branch <= req.device_len and entry.branch not in entry.checkpoints
-            self._ensure_free(needed + int(write_branch) * self.plan.layout.state_groups)
+            self._ensure_free(needed)
             if needed:
                 pages = self.pool.allocator.allocate(needed)
                 self._write_pages(req.table_idx, pages, len(entry.pages))
                 entry.pages.extend(pages)
             if write_branch:
-                entry.checkpoints[entry.branch] = self.pool.allocate_state()
+                assert entry.branch_state is not None
+                entry.checkpoints[entry.branch] = entry.branch_state
+                entry.branch_state = None
             entry.computed_end = req.device_len
 
     def prepare_batch(self, batch):
@@ -230,9 +254,18 @@ class MarconiCacheManager(BaseCacheManager):
             entry = self.requests[req.table_idx]
             targets = [(end - req.cached_len, slot) for end, slot in entry.checkpoints.items()
                        if req.cached_len < end < req.device_len]
-            targets.append((req.extend_len, entry.work))
+            boundary = req.device_len // self.page_size * self.page_size
+            if req.cached_len < boundary < req.device_len:
+                targets.append((boundary - req.cached_len, entry.state_at(boundary, self.page_size)))
+            output_slot = entry.state_at(req.device_len, self.page_size)
+            targets.append((req.extend_len, output_slot))
             if req.device_len in entry.checkpoints:
-                batch.cache_metadata.checkpoint_copies.append((entry.work, entry.checkpoints[req.device_len]))
+                batch.cache_metadata.checkpoint_copies.append((output_slot, entry.checkpoints[req.device_len]))
+            if boundary in entry.checkpoints and req.cached_len < boundary < req.device_len:
+                targets.remove((boundary - req.cached_len, entry.checkpoints[boundary]))
+                batch.cache_metadata.checkpoint_copies.append(
+                    (entry.state_at(boundary, self.page_size), entry.checkpoints[boundary])
+                )
             writes.append(sorted(targets))
         batch.cache_metadata.checkpoint_writes = writes
 
@@ -262,15 +295,21 @@ class MarconiCacheManager(BaseCacheManager):
             entry.published.add(position)
         if not finished:
             return
+        boundary = entry.computed_end // self.page_size * self.page_size
+        if 0 < boundary <= end:
+            self.tree.insert(tokens[:boundary], self._locations(entry, boundary),
+                             entry.state_at(boundary, self.page_size))
+            self.record_cached_session(req, boundary)
         if end == entry.computed_end and end > 0:
-            self.tree.insert(tokens, self._locations(entry, end), entry.work)
-            self.record_cached_session(req, end)
             self._record_history(entry.prompt, tokens)
         self.unlock(entry.handle)
         del self.requests[req.table_idx]
         def release():
             self.pool.allocator.release(entry.pages)
-            self.pool.release_state(entry.work)
+            for slot in entry.states:
+                self.pool.release_state(slot)
+            if entry.branch_state is not None:
+                self.pool.release_state(entry.branch_state)
             for slot in entry.checkpoints.values():
                 self.pool.release_state(slot)
         if self._deferred is not None:
@@ -302,6 +341,7 @@ class MarconiCacheManager(BaseCacheManager):
         assert len(set(allocator.free)) == len(allocator.free)
         assert all(allocator.refs[b] == 0 for b in allocator.free)
         assert sum(ref == 0 for ref in allocator.refs) == len(allocator.free)
+        assert {b for begin, end in allocator.intervals for b in range(begin, end)} == allocator.free
 
     def profile_result(self):
         result = super().profile_result()
@@ -323,9 +363,9 @@ class MarconiCacheFactory(BaseCacheFactory):
         blocks = (available_memory - table_bytes) // (block_bytes + 8 * layout.state_groups)
         if config.num_page_override is not None:
             blocks = min(blocks, config.num_page_override)
-        if blocks < 3 * layout.state_groups + 2:
+        if blocks < 4 * layout.state_blocks + 2:
             raise ValueError("Insufficient cache budget for Marconi shared blocks")
-        return MarconiCachePlan(blocks, blocks * layout.page_size, config.max_seq_len, max_len,
+        return MarconiCachePlan(blocks, blocks * layout.block_size, config.max_seq_len, max_len,
                                 layout, blocks, table_bytes + blocks * 8 * layout.state_groups)
 
     def allocate(self, config, plan, device, dtype):
@@ -335,11 +375,8 @@ class MarconiCacheFactory(BaseCacheFactory):
         pool.zero_state(dummy_state)
         shape = (config.max_running_req + 1, plan.aligned_max_seq_len)
         pages = torch.zeros(shape, device=device, dtype=torch.int32)
-        pages[-1] = dummy_page * plan.layout.page_size + torch.arange(shape[1], device=device) % plan.layout.page_size
+        pages[-1] = dummy_page * plan.layout.block_size + torch.arange(shape[1], device=device) % plan.layout.block_size
         states = torch.full(shape, dummy_state, device=device, dtype=torch.int32)
-        logger.info(f"Marconi shared cache: {plan.num_blocks} blocks, "
-                    f"{plan.layout.block_bytes(dtype.itemsize)} bytes/block, "
-                    f"KV page={plan.layout.page_size}, state groups={plan.layout.state_groups}")
         return CacheResources(pool, pages, pool, states, None)
 
     def make_manager(self, config, plan, resources):

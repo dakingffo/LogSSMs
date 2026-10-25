@@ -103,8 +103,7 @@ class MarconiPrefixCache(BasePrefixCache):
     def match_prefix(self, input_ids):
         tokens = tuple(input_ids.tolist()) if isinstance(input_ids, torch.Tensor) else tuple(input_ids)
         matched, best = self._walk(tokens)
-        # Snapshot positions use the prefill kernel's chunk boundaries.
-        branch = best.end + ((matched - best.end) // 64) * 64
+        branch = matched // self.page_size * self.page_size
         if branch == best.end:
             branch = 0
         handle = MarconiHandle(best.end, best, self.device, branch, tokens)
@@ -149,6 +148,7 @@ class MarconiPrefixCache(BasePrefixCache):
     def insert(self, tokens, locations, state):
         tokens, locations = tuple(tokens), tuple(locations)
         assert len(tokens) == len(locations) and tokens
+        assert len(tokens) % self.page_size == 0
         parent = self.root
         while parent.end < len(tokens):
             child = parent.children.get(tokens[parent.end])
@@ -267,7 +267,9 @@ def tune_marconi(snapshot, history, page_size, cost, capacity_bytes):
             saved += cost.saved_flops(0, h.cached_len)
             if h.branch_end:
                 tree.insert(sequence[:h.branch_end], range(h.branch_end), 0)
-            tree.insert(sequence, range(len(sequence)), 0)
+            end = len(sequence) // page_size * page_size
+            if end:
+                tree.insert(sequence[:end], range(end), 0)
             while usage() > capacity_bytes and tree.evict_one():
                 pass
         results.append((saved, hits, -step, step / 10))

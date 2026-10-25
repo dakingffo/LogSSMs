@@ -36,7 +36,10 @@ else:
     key=['H', 'HV', 'K', 'BC'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     k,
     g,

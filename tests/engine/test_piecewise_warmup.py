@@ -82,6 +82,37 @@ def test_warmup_skips_inactive_piecewise_runner(enabled, graphs):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_warmup_storage_accepts_int32_state_indices():
+    device = torch.device("cuda")
+    pool = SimpleNamespace(
+        conv_state=torch.ones((4, 2, 3), device=device),
+        recurrent_state=torch.ones((4, 2, 4, 4), device=device),
+    )
+    pages = torch.full((1, 128), -1, dtype=torch.int32, device=device)
+    states = pages.clone()
+    free_states = torch.tensor([1, 3], dtype=torch.int32, device=device)
+    engine = SimpleNamespace(
+        device=device, config=SimpleNamespace(page_size=64),
+        kv_cache=SimpleNamespace(kv_page_size=64),
+        ctx=SimpleNamespace(page_table=pages, state_table=states,
+                            work_state_table=None, linear_state=pool),
+        cache_manager=SimpleNamespace(
+            free_pages=torch.tensor([0, 64], dtype=torch.int32, device=device),
+            free_states=free_states,
+        ),
+    )
+    with piecewise_graph._warmup_storage(engine, (65,)):
+        assert engine.ctx.state_table[0, :64].eq(1).all()
+        assert engine.ctx.state_table[0, 64].item() == 3
+        for tensor in (pool.conv_state, pool.recurrent_state):
+            assert tensor[[1, 3]].eq(0).all()
+            assert tensor[[0, 2]].eq(1).all()
+    assert engine.ctx.page_table is pages
+    assert engine.ctx.state_table is states
+    assert free_states.dtype == torch.int32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fail", [False, True])
 def test_warmup_storage_releases_frames_and_restores_tables(fail):
     from logssms.cache.logstate.frame_pool import MHALogStatePool

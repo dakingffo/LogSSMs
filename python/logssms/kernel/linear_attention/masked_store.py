@@ -7,7 +7,9 @@ import triton.language as tl
 from .layout import state_pointer
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=['frames', 'slots'],
+)
 def _state_store(storage, frames, slots, values,
                  HEADS: tl.constexpr, WIDTH: tl.constexpr, LAYER: tl.constexpr,
                  HEAD_BYTES: tl.constexpr, FRAME_BYTES: tl.constexpr,
@@ -25,7 +27,9 @@ def _state_store(storage, frames, slots, values,
     tl.store(destination, value, offsets < WIDTH)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=['frames', 'slots', 'granules'],
+)
 def _conv_store(storage, frames, slots, granules, values,
                 WIDTH: tl.constexpr, LAYER: tl.constexpr, GRANULES: tl.constexpr,
                 FRAME_ELEMS: tl.constexpr, BLOCK: tl.constexpr):

@@ -10,12 +10,15 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
-from .config import prefill_config
+from ...tuning import prefill_config
 from .op import exp2
 from .runtime import autotune_cache_kwargs
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def _chunk_scaled_dot_kkt_fwd_kernel(
     k,
     g,

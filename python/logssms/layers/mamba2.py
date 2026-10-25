@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from logssms.core import get_global_ctx
 from logssms.distributed import DistributedCommunicator, get_tp_info
 from logssms.utils import div_even, nvtx_annotate
+from logssms.kernel.norm import grouped_rms_norm_gated
+from logssms.kernel.fused import silu_and_mul
 
 from .base import BaseOP
 from .linear import LinearTPImpl, LinearRowParallel
@@ -21,6 +22,8 @@ class Mamba2Config:
     state_dim : int
     state_len : int
     layer_idx : int
+    conv_scales: tuple[float, float, float] = (1., 1., 1.)
+    dt_scale   : float = 1.
 
     @property
     def value_dim(self) -> int:
@@ -30,6 +33,10 @@ class Mamba2Config:
     def conv_dim(self) -> int:
         return self.value_dim + 2 * self.num_groups * self.state_dim
 
+    @property
+    def conv_boundaries(self) -> tuple[int, int]:
+        return self.value_dim, self.value_dim + self.num_groups * self.state_dim
+
 
 class Mamba2Conv(BaseOP):
     def __init__(self, channels: int, kernel_size: int, has_bias: bool):
@@ -37,35 +44,27 @@ class Mamba2Conv(BaseOP):
         self.bias = torch.empty(channels) if has_bias else None
 
 
-class Mamba2GatedNorm(BaseOP):
+class GroupedNormGated(BaseOP):
 
-    def __init__(self, size: int, groups: int, eps: float, before_gate: bool):
+    def __init__(self, size: int, groups: int, eps: float, before_gate: bool, gate_scale: float = 1.):
         tp = get_tp_info().size
         self._groups = div_even(groups, tp, allow_replicate=True)
         self._group_ranks = max(1, tp // groups)
         self._comm = DistributedCommunicator()
         self._eps = eps
         self._before_gate = before_gate
+        self._gate_scale = gate_scale
         self.weight = torch.empty(div_even(size, tp))
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        shape = x.shape
-        dtype = x.dtype
-        x = x.float()
-        gate = F.silu(gate.float())
-        if not self._before_gate:
-            x = x * gate
-        grouped = x.reshape(shape[0], self._groups, -1)
-        variance = grouped.square().mean(-1, keepdim=True)
-        if self._group_ranks > 1:
+        return grouped_rms_norm_gated(
+            x, gate, self.weight, self._eps, self._groups, self._before_gate,
+            reduce_mean=self._reduce_mean if self._group_ranks > 1 else None,
+            gate_scale=self._gate_scale,
+        )
 
-
-            variance = self._comm.all_reduce(variance) / self._group_ranks
-        x = (grouped * torch.rsqrt(variance + self._eps)).reshape(shape)
-        x = x * self.weight
-        if self._before_gate:
-            x = x * gate
-        return x.to(dtype)
+    def _reduce_mean(self, variance):
+        return self._comm.all_reduce(variance) / self._group_ranks
 
 
 class Mamba2(BaseOP):
@@ -84,7 +83,6 @@ class Mamba2(BaseOP):
         rms_norm        : bool,
         rms_norm_eps    : float,
         norm_before_gate: bool,
-        in_multiplier   : float,
         multipliers     : tuple[float, ...],
         layer_idx       : int,
     ):
@@ -96,10 +94,10 @@ class Mamba2(BaseOP):
             num_groups=div_even(num_groups, tp, allow_replicate=True),
             head_dim=head_dim, state_dim=state_dim,
             state_len=conv_kernel_size - 1, layer_idx=layer_idx,
+            conv_scales=tuple(multipliers[1:4]), dt_scale=multipliers[4],
         )
         config = self._config
-        self._in_multiplier = in_multiplier
-        self._multipliers = multipliers
+        self._gate_scale = multipliers[0]
         self.in_proj = LinearTPImpl(
             hidden_size, config.value_dim + config.conv_dim + config.num_heads,
             has_bias=proj_bias,
@@ -109,7 +107,8 @@ class Mamba2(BaseOP):
         self.dt_bias = torch.empty(config.num_heads)
         self.D = torch.empty(config.num_heads)
         self.norm = (
-            Mamba2GatedNorm(num_heads * head_dim, num_groups, rms_norm_eps, norm_before_gate)
+            GroupedNormGated(num_heads * head_dim, num_groups, rms_norm_eps, norm_before_gate,
+                             gate_scale=self._gate_scale)
             if rms_norm else None
         )
         self.out_proj = LinearRowParallel(
@@ -118,14 +117,11 @@ class Mamba2(BaseOP):
 
     def proj(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         config = self._config
-        widths = (config.value_dim, config.value_dim,
-                  config.num_groups * config.state_dim,
-                  config.num_groups * config.state_dim, config.num_heads)
-        parts = self.in_proj.forward(x * self._in_multiplier).split(widths, -1)
-        z, value, key, query, dt = (
-            part * scale for part, scale in zip(parts, self._multipliers)
+        projected = self.in_proj.forward(x)
+        z, xbc, dt = projected.split(
+            (config.value_dim, config.conv_dim, config.num_heads), -1,
         )
-        return torch.cat((value, key, query), -1), z, dt
+        return xbc, z, dt
 
     @nvtx_annotate("Mamba2", layer_id_field="_layer_idx")
     def attend(self, xbc: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
@@ -149,5 +145,5 @@ class Mamba2(BaseOP):
 
     def output(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x = x.flatten(1)
-        x = self.norm.forward(x, gate) if self.norm is not None else x * F.silu(gate)
+        x = self.norm.forward(x, gate) if self.norm is not None else silu_and_mul(x, gate, self._gate_scale)
         return self.out_proj.forward(x)

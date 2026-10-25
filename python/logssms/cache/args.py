@@ -63,13 +63,13 @@ class RadixCacheArgumentParser(CacheArgumentParserBase):
 class MarconiCacheArgumentParser(CacheArgumentParserBase):
     @staticmethod
     def add_arguments(parser):
-        parser.add_argument("--page-size", type=int, default=0,
-                            help="Marconi KV page size; zero selects the smallest shared block layout.")
+        parser.add_argument("--block-size", type=int, default=128,
+                            help="Marconi block size in tokens, a multiple of 64; zero selects auto sizing.")
         parser.add_argument("--marconi-bootstrap-multiplier", type=int, default=5)
 
     @staticmethod
     def make_config(kwargs):
-        return MarconiCacheConfig(kwargs.pop("page_size"), kwargs.pop("marconi_bootstrap_multiplier"))
+        return MarconiCacheConfig(kwargs.pop("block_size"), kwargs.pop("marconi_bootstrap_multiplier"))
 
 
 class LogStateCacheArgumentParser(CacheArgumentParserBase):

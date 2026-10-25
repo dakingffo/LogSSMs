@@ -170,7 +170,7 @@ def test_decode_recurrent_direct_store_matches_gather_scatter(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_packed_causal_conv_matches_individual_requests() -> None:
     from logssms.kernel.linear_attention.packed_conv import (
-        packed_causal_conv1d, packed_conv_snapshots,
+        packed_causal_conv1d,
     )
 
     torch.manual_seed(31)
@@ -187,9 +187,6 @@ def test_packed_causal_conv_matches_individual_requests() -> None:
         device="cuda", dtype=torch.int64,
     )
     output = packed_causal_conv1d(x, weight, history, cu_seqlens, chunks)
-    rows = torch.tensor([0, 9, 17, 50, 96], device="cuda", dtype=torch.int64)
-    reqs = torch.tensor([0, 1, 1, 2, 2], device="cuda", dtype=torch.int64)
-    snapshots = packed_conv_snapshots(x, history, cu_seqlens, rows, reqs)
 
     expected = torch.cat([
         torch.nn.functional.silu(torch.nn.functional.conv1d(
@@ -199,13 +196,6 @@ def test_packed_causal_conv_matches_individual_requests() -> None:
         for i in range(len(lengths))
     ])
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
-    expected_snapshots = torch.stack([
-        torch.cat([history[req], x[offsets[req]:offsets[req+1]].T], dim=-1)[
-            :, row - offsets[req] + 1:row - offsets[req] + state_len + 1
-        ]
-        for row, req in zip(rows.tolist(), reqs.tolist())
-    ])
-    torch.testing.assert_close(snapshots, expected_snapshots, rtol=0, atol=0)
 
 
 

@@ -28,7 +28,10 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
     key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def chunk_local_cumsum_scalar_kernel(
     s,
     o,
@@ -85,7 +88,10 @@ def chunk_local_cumsum_scalar_kernel(
     key=['B', 'H', 'S', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def chunk_local_cumsum_vector_kernel(
     s,
     o,

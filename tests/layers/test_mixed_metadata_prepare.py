@@ -9,6 +9,41 @@ from tests.utils import clear_global_ctx
 from logssms.layers.linear_attention_backend.mixed import MixedLinearCopyPlan
 
 
+def expected_writes(ctx, batch):
+    granularity = ctx.linear_state.layout.granularity
+    out_loc = batch.out_loc.tolist()
+    state_table = ctx.state_table.tolist()
+    checkpoints = dict(batch.cache_metadata.checkpoint_writes)
+    chunk_writes, conv_slots, conv_granules, log_slots = [], [], [], []
+    token_begin = 0
+    for req_index, req in enumerate(batch.reqs):
+        length = req.extend_len
+        first = out_loc[token_begin] % 64
+        writes = [-1] * ((length + granularity - 1) // granularity)
+        for row in range(length):
+            position = req.cached_len + row
+            global_row = token_begin + row
+            log = state_table[req.table_idx][position]
+            excluded = any(i == req_index and begin <= position < end
+                           for i, begin, end in batch.cache_metadata.checkpoint_ranges)
+            log_slots.append(-1 if excluded else log)
+            slot, granule = -1, 0
+            if (first + row + 1) % granularity == 0 or row + 1 == length:
+                if not excluded:
+                    slot, granule = log, (out_loc[global_row] % 64) // granularity
+                if global_row in checkpoints:
+                    slot = checkpoints[global_row]
+                    granule = (0 if ctx.linear_state.allocator.slot(slot).kind == "work"
+                               else ctx.linear_state.layout.num_granules - 1)
+                    writes[row // granularity] = slot
+            conv_slots.append(slot)
+            conv_granules.append(granule)
+        chunk_writes.extend(writes)
+        token_begin += length
+    return dict(chunk_write_slots=chunk_writes, conv_token_slots=conv_slots,
+                conv_token_granules=conv_granules, log_write_slots=log_slots)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_mixed_copy_plan_preserves_strided_guards(device):
     if device == "cuda" and not torch.cuda.is_available():
@@ -41,7 +76,7 @@ def test_mixed_copy_plan_validates_before_writing(invalid):
 @pytest.mark.parametrize("granularity", [16, 32, 64])
 @pytest.mark.parametrize("begin,length", [(0, 1), (16, 31), (32, 65), (0, 128)])
 @pytest.mark.parametrize("checkpoint", [False, True])
-def test_direct_mixed_prefill_maps_match_general_path(granularity, begin, length, checkpoint):
+def test_direct_mixed_prefill_maps_match_boundaries(granularity, begin, length, checkpoint):
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device, granularity)
@@ -55,24 +90,16 @@ def test_direct_mixed_prefill_maps_match_general_path(granularity, begin, length
         batch.cache_metadata.checkpoint_writes = [(length - 1, 3)]
     backend = GatedDeltaLogStateBackend()
     try:
-        backend.direct_prefill_metadata = False
-        backend.prepare_metadata(batch)
-        expected = batch.linear_attn_metadata
-        backend.direct_prefill_metadata = True
+        expected = expected_writes(ctx, batch)
         backend.prepare_metadata(batch)
         actual = batch.linear_attn_metadata
-        for field in ("chunk_write_slots", "conv_token_slots", "conv_token_granules", "log_write_slots",
-                      "work_slots", "conv_read_slots", "conv_read_granules"):
-            torch.testing.assert_close(getattr(actual, field), getattr(expected, field), rtol=0, atol=0)
-        assert actual.conv_snapshot_rows is None
+        for field, values in expected.items():
+            assert getattr(actual, field).tolist() == values
         batch.prefill_token_capacity = 128
         backend.prepare_metadata(batch)
         for field in ("chunk_write_slots", "conv_token_slots", "conv_token_granules", "log_write_slots"):
             torch.testing.assert_close(getattr(actual, field), getattr(batch.linear_attn_metadata, field),
                                        rtol=0, atol=0)
-        for field in ("cu_seqlens", "chunk_indices", "chunk_offsets", "endings", "conv_chunks"):
-            torch.testing.assert_close(getattr(actual.prefill_indices, field),
-                                       getattr(expected.prefill_indices, field), rtol=0, atol=0)
     finally:
         clear_global_ctx()
 
@@ -103,13 +130,14 @@ def test_direct_prefill_variable_requests_and_checkpoint_ranges(device, granular
     set_global_ctx(ctx)
     backend = GatedDeltaLogStateBackend()
     try:
-        backend.direct_prefill_metadata = False
-        backend.prepare_metadata(batch)
-        expected = batch.linear_attn_metadata
-        backend.direct_prefill_metadata = True
+        expected = expected_writes(ctx, batch)
         backend.prepare_metadata(batch)
         actual = batch.linear_attn_metadata
-        for field in ("chunk_write_slots", "conv_token_slots", "conv_token_granules", "log_write_slots"):
-            torch.testing.assert_close(getattr(actual, field), getattr(expected, field), rtol=0, atol=0)
+        for field, values in expected.items():
+            assert getattr(actual, field).tolist() == values
+        batch.cache_metadata.first_offsets = None
+        backend.prepare_metadata(batch)
+        for field, values in expected.items():
+            assert getattr(batch.linear_attn_metadata, field).tolist() == values
     finally:
         clear_global_ctx()

@@ -12,6 +12,7 @@ import triton.language as tl
 
 from logssms.cache.logstate.layout import LOG_STATE_REPLAY_WINDOW
 from ...layout import log_pointer, state_pointer
+from ...tuning import decode_config
 
 from .op import exp
 
@@ -27,7 +28,10 @@ def _frame_byte_offset(frame, frame_bytes: tl.constexpr):
     return frame.to(tl.int64) * frame_bytes
 
 
-@triton.jit(do_not_specialize=["SEQ_LEN"])
+@triton.jit(
+    do_not_specialize=['SEQ_LEN'],
+    do_not_specialize_on_alignment=['log_slots', 'token_offsets', 'work_slots', 'read_slots', 'write_slots', 'replay_counts'],
+)
 def _fused_recurrent_gated_delta_kernel(
     query,
     key,
@@ -318,19 +322,7 @@ def fused_recurrent_gated_delta_rule_to_logstate(
     full_k = triton.next_power_of_2(head_k_dim)
     tiled = not enable_eager_state and head_k_dim == head_v_dim == 128
     if tiled:
-        block_v = 64
-        if batch_size < 8:
-            block_k, num_warps, num_stages = 32, 4, 4
-        elif batch_size < 16:
-            block_k, num_warps, num_stages = 64, 1, 1
-        elif batch_size < 24:
-            block_k, num_warps, num_stages = 64, 1, 4
-        elif batch_size < 32:
-            block_k, num_warps, num_stages = 64, 1, 1
-        elif batch_size < 48:
-            block_k, num_warps, num_stages = 64, 1, 4
-        else:
-            block_k, num_warps, num_stages = 64, 1, 4
+        block_k, block_v, num_warps, num_stages = decode_config(batch_size)
     else:
         block_k = None
         block_v = 8 if head_v_dim < 128 else (16 if batch_size == 1 else 32)

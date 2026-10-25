@@ -1,10 +1,12 @@
 import pytest
 import torch
+from dataclasses import replace
+from itertools import product
 
 from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.logstate import store_log_states
 from logssms.kernel.linear_attention.packed_conv import (
-    PackedConvStateIO, packed_causal_conv1d, packed_conv_snapshots,
+    PackedConvStateIO, packed_causal_conv1d,
 )
 from logssms.kernel.linear_attention.vendor.fla import (
     ChunkLogIO, ChunkStateIO, chunk_gated_delta_rule_to_cache,
@@ -23,6 +25,97 @@ def _pool(granularity, dim, dtype, head_ratio=1):
         head_k_dim=dim, head_v_dim=dim, conv_dim=(4 + 2 * head_ratio) * dim, state_len=3,
         device=torch.device("cuda"), dtype=dtype,
     )
+
+
+@pytest.mark.parametrize("algorithm", ["gdn", "mamba2"])
+def test_prefill_metadata_alignment_reuses_kernel(algorithm):
+    from logssms.kernel.linear_attention.mamba2 import mamba2_prefill, _mamba2_prefill_state_kernel
+    from logssms.kernel.linear_attention.vendor.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
+    )
+
+    torch.manual_seed(73)
+    pool = _pool(32, 128, torch.bfloat16, head_ratio=3)
+    allocation = pool.reserve(logs=5, works=8)
+    assert allocation is not None
+    logs, works = allocation[1:]
+    lengths = [1, 17, 65, 13]
+    indices = PackedLinearIndices.from_lengths(lengths, pool.device, 32)
+    total = sum(lengths)
+    slots = torch.tensor([logs[0]] + [logs[1]] * 17 + [logs[2]] * 64
+                         + [logs[3]] + [logs[4]] * 13, device=pool.device, dtype=torch.int32)
+    positions = torch.cat([torch.arange(n, device=pool.device) % 64 for n in lengths]).int()
+    reads = torch.tensor(works[:4], device=pool.device, dtype=torch.int32)
+    writes = torch.full((len(indices.chunk_indices),), -1, device=pool.device, dtype=torch.int32)
+    writes[indices.endings] = torch.tensor(works[4:], device=pool.device, dtype=torch.int32)
+    io = ChunkStateIO(
+        pool.storage.view(pool.dtype), reads, writes, reads,
+        pool.payload_frame_table, pool.frame_bytes, pool.head_payload_bytes,
+        layer=1, num_layers=2, granularity=32, page_size=64,
+    )
+    query = torch.nn.functional.normalize(
+        torch.randn(1, total, 2, 128, device=pool.device), dim=-1,
+    ).to(pool.dtype)
+    key = torch.nn.functional.normalize(torch.randn_like(query).float(), dim=-1).to(pool.dtype)
+    value = torch.randn(1, total, 6, 128, device=pool.device, dtype=pool.dtype) * .1
+    gate = -torch.rand(1, total, 6, device=pool.device) * .1
+    beta = torch.rand_like(gate)
+    log_io = ChunkLogIO(slots, positions, pool.decay_frame_table, gate, 64,
+                        pool.layout.log_decay_bytes, 2)
+    xbc = torch.randn(total, 6 * 128, device=pool.device, dtype=pool.dtype)
+    skip = torch.randn(6, device=pool.device)
+    pool.storage.zero_()
+    pool.write_states(reads, 1, torch.randn(4, 6, 128, 128, device=pool.device, dtype=pool.dtype) * .01)
+    initial = pool.storage.clone()
+
+    def shifted(tensor, offset):
+        if not offset:
+            return tensor
+        backing = tensor.new_empty(tensor.numel() + offset)
+        result = backing[offset:].view(tensor.shape)
+        result.copy_(tensor)
+        assert result.data_ptr() % 16 != 0
+        return result
+
+    kernel = (chunk_gated_delta_rule_fwd_kernel_h_blockdim64 if algorithm == "gdn"
+              else _mamba2_prefill_state_kernel)
+    expected = expected_storage = compiled = None
+    for write_offset, index_offset in product((0, 1), repeat=2):
+        current = replace(
+            io, read_slots=shifted(reads, index_offset),
+            chunk_write_slots=shifted(writes, write_offset),
+            final_write_slots=shifted(reads, write_offset),
+            payload_frames=shifted(io.payload_frames, index_offset),
+        )
+        packed = replace(
+            indices, cu_seqlens=shifted(indices.cu_seqlens, write_offset),
+            chunk_indices=shifted(indices.chunk_indices, index_offset),
+            chunk_offsets=shifted(indices.chunk_offsets, index_offset),
+        )
+        current_log = replace(
+            log_io, slots=shifted(slots, write_offset),
+            token_offsets=shifted(positions, index_offset),
+            decay_frames=shifted(log_io.decay_frames, write_offset),
+        )
+        pool.storage.copy_(initial)
+        if algorithm == "gdn":
+            output, _ = chunk_gated_delta_rule_to_cache(
+                query, key, value, gate, beta, current, packed.cu_seqlens,
+                chunk_size=32, **packed.fla_kwargs(), log_io=current_log,
+            )
+        else:
+            output = mamba2_prefill(
+                xbc, key[0], query[0], value[0], gate[0], skip,
+                current, packed, 32, log_io=current_log,
+            )
+        torch.cuda.synchronize()
+        count = len(kernel.device_caches[torch.cuda.current_device()][0])
+        if expected is None:
+            expected, expected_storage, compiled = output.clone(), pool.storage.clone(), count
+        else:
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            torch.testing.assert_close(pool.storage, expected_storage, rtol=0, atol=0)
+            assert count == compiled
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
@@ -105,18 +198,18 @@ def test_conv_prefill_direct_snapshots_and_mutable_graph_destinations(granularit
     history = torch.randn(3, channels, state_len, device=pool.device, dtype=pool.dtype)
     weight = torch.randn(channels, 1, state_len + 1, device=pool.device, dtype=pool.dtype) * .02
     bias = torch.randn(channels, device=pool.device, dtype=pool.dtype) * .01
-    rows, requests = [], []
+    rows, snapshots = [], []
     begin = 0
     for req, length in enumerate(lengths):
         selected = list(range(granularity - 1, length, granularity))
         if not selected or selected[-1] != length - 1:
             selected.append(length - 1)
         rows.extend(begin + row for row in selected)
-        requests.extend([req] * len(selected))
+        snapshots.extend(torch.cat((history[req], x[begin:begin + row + 1].T), -1)[:, -state_len:]
+                         for row in selected)
         begin += length
     rows = torch.tensor(rows, device=pool.device, dtype=torch.int64)
-    requests = torch.tensor(requests, device=pool.device, dtype=torch.int64)
-    snapshots = packed_conv_snapshots(x, history, indices.cu_seqlens, rows, requests)
+    snapshots = torch.stack(snapshots)
     expected = packed_causal_conv1d(x, weight, history, indices.cu_seqlens, indices.conv_chunks, bias)
     slots = torch.full((total,), -1, device=pool.device, dtype=torch.int32)
     granules = torch.zeros_like(slots)

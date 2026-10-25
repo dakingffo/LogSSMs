@@ -20,6 +20,23 @@ class PackedConvStateIO:
 
 
 @triton.jit
+def _scale_conv_input(value, channel, END0: tl.constexpr, END1: tl.constexpr,
+                      SCALE0: tl.constexpr, SCALE1: tl.constexpr, SCALE2: tl.constexpr):
+    if (SCALE0 != 1.) | (SCALE1 != 1.) | (SCALE2 != 1.):
+        scale = tl.where(channel < END0, SCALE0, tl.where(channel < END1, SCALE1, SCALE2))
+        value = (value.to(tl.float32) * scale).to(value.dtype)
+    return value
+
+
+def _conv_input_scale_args(channels, boundaries, scales):
+    if boundaries is None:
+        assert tuple(scales) == (1., 1., 1.)
+        boundaries = (channels, channels)
+    assert len(scales) == 3 and 0 <= boundaries[0] <= boundaries[1] <= channels
+    return (*boundaries, *scales)
+
+
+@triton.jit
 def _conv_destination(
     storage, frames, slot, granule,
     C: tl.constexpr, S: tl.constexpr, LAYER: tl.constexpr,
@@ -32,7 +49,9 @@ def _conv_destination(
     return storage + slot.to(tl.int64) * SLOT_STRIDE + LAYER * LAYER_STRIDE
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=['offsets', 'chunks', 'write_slots', 'write_granules', 'final_slots', 'conv_frames'],
+)
 def _packed_conv_kernel(
     x, weight, bias, history, offsets, chunks, output,
     state_storage, write_slots, write_granules, final_slots, conv_frames,
@@ -43,6 +62,8 @@ def _packed_conv_kernel(
     STORE_STATE: tl.constexpr, LOGSTATE: tl.constexpr, STORE_FINAL: tl.constexpr,
     LAYER: tl.constexpr, SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
     NUM_GRANULES: tl.constexpr, FRAME_ELEMS: tl.constexpr,
+    END0: tl.constexpr, END1: tl.constexpr,
+    SCALE0: tl.constexpr, SCALE1: tl.constexpr, SCALE2: tl.constexpr,
 ):
     chunk = tl.program_id(0)
     request = tl.load(chunks + chunk * 2).to(tl.int32)
@@ -80,6 +101,7 @@ def _packed_conv_kernel(
             x + (begin + source[:, None]) * X_ROW_STRIDE + c[None, :] * X_COL_STRIDE,
             mask=active & ~old[:, None], other=0,
         )
+        current = _scale_conv_input(current, c[None, :], END0, END1, SCALE0, SCALE1, SCALE2)
         w = tl.load(weight + c * K + tap, mask=c < C, other=0)
         values = tl.where(old[:, None], previous, current)
         result += values.to(tl.float32) * w[None, :].to(tl.float32)
@@ -101,35 +123,6 @@ def _packed_conv_kernel(
     tl.store(output + (begin + t[:, None]) * C + c[None, :], result, mask=active)
 
 
-@triton.jit
-def _packed_snapshots_kernel(
-    x, history, offsets, rows, requests, output,
-    C: tl.constexpr, S: tl.constexpr, BS: tl.constexpr, BC: tl.constexpr,
-    X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
-):
-    snapshot = tl.program_id(0)
-    request = tl.load(requests + snapshot).to(tl.int32)
-    begin = tl.load(offsets + request).to(tl.int32)
-    row = tl.load(rows + snapshot).to(tl.int32) - begin
-    c = tl.program_id(1) * BC + tl.arange(0, BC)
-    s = tl.arange(0, BS)
-    source = row - S + 1 + s
-    old = source < 0
-    previous = tl.load(
-        history + request * C * S + c[:, None] * S + source[None, :] + S,
-        mask=(c[:, None] < C) & (s[None, :] < S) & old[None, :], other=0,
-    )
-    current = tl.load(
-        x + (begin + source[None, :]) * X_ROW_STRIDE + c[:, None] * X_COL_STRIDE,
-        mask=(c[:, None] < C) & (s[None, :] < S) & ~old[None, :], other=0,
-    )
-    tl.store(
-        output + (snapshot * C + c[:, None]) * S + s[None, :],
-        tl.where(old[None, :], previous, current),
-        mask=(c[:, None] < C) & (s[None, :] < S),
-    )
-
-
 def packed_causal_conv1d(
     x            : torch.Tensor,
     weight       : torch.Tensor,
@@ -139,6 +132,8 @@ def packed_causal_conv1d(
     bias         : torch.Tensor | None = None,
     *,
     state_io     : PackedConvStateIO | None = None,
+    input_boundaries: tuple[int, int] | None = None,
+    input_scales : tuple[float, float, float] = (1., 1., 1.),
 ) -> torch.Tensor:
     total_tokens, channels = x.shape
     kernel_size = weight.shape[-1]
@@ -174,30 +169,10 @@ def packed_causal_conv1d(
         state_io.storage.stride(1) if direct and not logstate else 0,
         state_io.frame_table.shape[1] if logstate else 0,
         state_io.frame_bytes // x.element_size() if logstate else 0,
+        *_conv_input_scale_args(channels, input_boundaries, input_scales),
         num_warps=4,
     )
     return output
 
 
-def packed_conv_snapshots(
-    x         : torch.Tensor,
-    history   : torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    rows      : torch.Tensor,
-    requests  : torch.Tensor,
-) -> torch.Tensor:
-    _, channels = x.shape
-    state_len = history.shape[-1]
-    output = torch.empty(
-        len(rows), channels, state_len, device=x.device, dtype=x.dtype
-    )
-    _packed_snapshots_kernel[(len(rows), triton.cdiv(channels, 32))](
-        x, history, cu_seqlens, rows, requests, output,
-        channels, state_len, triton.next_power_of_2(state_len), 32,
-        x.stride(0), x.stride(1),
-        num_warps=4,
-    )
-    return output
-
-
-__all__ = ["PackedConvStateIO", "packed_causal_conv1d", "packed_conv_snapshots"]
+__all__ = ["PackedConvStateIO", "packed_causal_conv1d"]

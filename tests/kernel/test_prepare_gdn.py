@@ -9,12 +9,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 def _reference(query, key, value, gate, beta, A_log, dt_bias):
-    repeats = value.shape[2] // query.shape[2]
     def norm(x):
         values = x.float()
         return (values * torch.rsqrt(values.square().sum(-1, keepdim=True) + 1e-6)).to(x.dtype)
-    query = norm(query.repeat_interleave(repeats, 2))
-    key = norm(key.repeat_interleave(repeats, 2))
+    query = norm(query)
+    key = norm(key)
     return (query, key, value.contiguous(),
             -A_log.float().exp() * F.softplus(gate.float() + dt_bias),
             beta.float().sigmoid())

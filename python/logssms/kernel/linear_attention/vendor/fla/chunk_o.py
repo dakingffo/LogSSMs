@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
-from .config import prefill_config
+from ...tuning import prefill_config
 from .runtime import fla_cache_autotune
 from .op import exp2
 from .runtime import (
@@ -23,7 +23,10 @@ BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('a
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(
+    do_not_specialize=['T'],
+    do_not_specialize_on_alignment=['cu_seqlens', 'chunk_indices'],
+)
 def _chunk_fwd_kernel_o(
     q,
     k,
@@ -34,6 +37,10 @@ def _chunk_fwd_kernel_o(
     o,
     cu_seqlens,
     chunk_indices,
+    skip,
+    skip_weight,
+    SKIP_TOKEN_STRIDE: tl.constexpr,
+    HAS_SKIP: tl.constexpr,
     scale,
     T,
     H: tl.constexpr,
@@ -121,6 +128,11 @@ def _chunk_fwd_kernel_o(
 
 
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
+    if HAS_SKIP:
+        b_x = tl.load(skip + (bos + o_t[:, None]) * SKIP_TOKEN_STRIDE
+                      + i_h * V + o_v[None, :],
+                      mask=m_t[:, None] & (o_v < V)[None, :], other=0).to(tl.float32)
+        b_o += b_x * tl.load(skip_weight + i_h).to(tl.float32)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
@@ -157,6 +169,8 @@ def chunk_fwd_o(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     out: torch.Tensor | None = None,
+    skip: torch.Tensor | None = None,
+    skip_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, H, K, V, HV = *q.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
@@ -170,7 +184,7 @@ def chunk_fwd_o(
     assert o.shape == v.shape and o.dtype == v.dtype and o.is_contiguous()
     kernel = chunk_fwd_kernel_o
     config = {}
-    if BT == 32 and K == V == 128:
+    if BT == 32:
         kernel = chunk_fwd_kernel_o_configured
         config = prefill_config("output", B * NT)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * HV)
@@ -184,6 +198,10 @@ def chunk_fwd_o(
         o=o,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        skip=skip,
+        skip_weight=skip_weight,
+        SKIP_TOKEN_STRIDE=0 if skip is None else skip.stride(-3),
+        HAS_SKIP=skip is not None,
         scale=scale,
         T=T,
         H=H,

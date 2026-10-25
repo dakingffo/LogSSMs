@@ -347,7 +347,7 @@ class Engine:
                 for part in (prefill, decode):
                     self.linear_attn_backend.prepare_metadata(part)
                 prepare_mixed_linear_metadata(
-                    self.linear_attn_backend, prefill, decode, batch.prefill_token_capacity,
+                    prefill, decode, batch.prefill_token_capacity,
                 )
         with stage("sampler_prepare"):
             params = [req.sampling_params for req in batch.reqs if not isinstance(req, ChunkedRequest)]
@@ -526,7 +526,7 @@ class Engine:
             if config.enable_specualtive_decoding:
                 raise ValueError("Marconi currently supports autoregressive decoding only")
             layout = marconi_layout(config)
-            override("cache_config", replace(config.cache_config, page_size=layout.page_size))
+            override("cache_config", replace(config.cache_config, block_size=layout.block_size))
             if config.attention_backend not in ("auto", "fi"):
                 raise ValueError("Marconi shared blocks require FlashInfer attention")
             override("attention_backend", "fi")

@@ -1,0 +1,558 @@
+{
+  "measurement_note": "Runtime Triton compilation coincides with a global 51.757173-second output pause; original benchmark metrics retain this pause.",
+  "pause_local_time": [
+    "2026-10-25 01:09:55.151 Asia/Shanghai",
+    "2026-10-25 01:10:46.908 Asia/Shanghai"
+  ],
+  "pause_relative_s": [
+    36.182083,
+    87.939256
+  ],
+  "long_ttft_requests": 17,
+  "decode_requests_spanning_pause": 102,
+  "kernel": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+  "compiled_variants": 48,
+  "compilation_artifact_span_s": 50.7248892784,
+  "warmup_variant_difference": {
+    "chunk_write_slots": {
+      "runtime_alignment16": false,
+      "prior_cached_variant_alignment16": true
+    },
+    "chunk_offsets": {
+      "runtime_alignment16": true,
+      "prior_cached_variant_alignment16": false
+    }
+  },
+  "amplifier": "LAYER is constexpr; the new pointer-alignment combination compiles separately across 48 GDN layers.",
+  "mean_ttft_pause_contribution_ms": 771.1394959143473,
+  "kernel_cache_metadata": [
+    {
+      "mtime": 1792861796.2774482,
+      "path": "/root/.triton/cache/PJZVOUC5364B6DDQ7KO2JV24YLM7XLWUVPRF4RE7RSUW572SXP5Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "7a7357505ddfb81f0c70fa9da4d75cc2d9fbaed4abe25e449f8ca96eff52bbfb",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861797.3494666,
+      "path": "/root/.triton/cache/3WEYKFGQVT5ZHT3RHM6MX5ZFPO3W2R3SOR455WG3KPD74PFJHMCA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "dd898514d0acfb93cf713b3ccbf7257bb76d47727479ded8db53c7fe3ca93b04",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861798.4054847,
+      "path": "/root/.triton/cache/ITADC23DMKC3U7YUZTIYTAR64LDYOWEJDB5TVYWYY4S366EP6CRA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "44c0316b636285ba7f14ccd189823ee2c7875889187b3ae2d8c725bf788ff0a2",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861799.4415023,
+      "path": "/root/.triton/cache/6QOLJH4NAFSCLGCJWE7733TNKP6JJQQIDNPWYF65WR3SDTMS6MBQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "f41cb49f8d0164259849b13ffdee6d53fc94c2081b5f6c17ddb47721cd92f303",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861800.5455213,
+      "path": "/root/.triton/cache/WCMYAUI4VMZL2ZCZQ4JPJHWXL5Y4SEKPRM6QTQMYRWKHCO4XIQ3Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "b09980511cab32bd64598712f49ed75f71c9114f8b3d09c1988d94713b974437",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861801.6055396,
+      "path": "/root/.triton/cache/2UNQJDGVD5CYGAB3DPBATKVHPO3DXV5CGZOAPY7YUU2X6KEARZYQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "d51b048cd51f4583003b1bc209aaa77bb63bd7a2365c07e3f8a5357f28808e71",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861802.6495574,
+      "path": "/root/.triton/cache/XUTKFJCZ46Y6ISRCCTSLG64EWPTPDAQRW6J3QEUA3DUMZ5LIFWHA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "bd26a2a459e7b1e44a2214e4b37b84b3e6f18211b793b81280d8e8ccf5682d8e",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861803.7535763,
+      "path": "/root/.triton/cache/MQEODPAP2GC4L5U2ZVLO7SW5ZKTVELMXC5PNSO6KJB3KRBBQPQTQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "6408e1bc0fd185c5f69acd56efcaddcaa7522d97175ed93bca4876a884307c27",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861804.8655956,
+      "path": "/root/.triton/cache/USTENOEEOSU4T73AJRAY2UJ2E3CW3ZQ5KZQG4W6ZEGARWQ2H5IJA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "a4a646b88474a9c9ff604c418d513a26c56de61d56606e5bd921811b4347ea12",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861805.9856148,
+      "path": "/root/.triton/cache/I3B3O4SNDWIRAMQWG3PQ6KVXQVETTC53J2PDIYTBVMIZ7AXMC73A/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "46c3b7724d1d9110321636df0f2ab78549398bbb4e9e346261ab119f82ec17f6",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861807.1576352,
+      "path": "/root/.triton/cache/MJEBCIGI63YGLBQVIPXE3QMQEFE25IBHIB6X3N5ANJXCSAKJD3JQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "62481120c8f6f065861543ee4dc1902149aea027407d7db7a06a6e2901491ed3",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861808.2096534,
+      "path": "/root/.triton/cache/ECAGAB4IMTPTLUUDN7VNVBW4THRZN4UC2KO5UBZNUDQ56TB34UHQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "208060078864df35d2836feada86dc99e396f282d29dda072da0e1df4c3be50f",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861809.2616715,
+      "path": "/root/.triton/cache/DU2WSLNVHLLCIKD5XEVPBSHF75FBUS4IYRLHTUV3KLVMREOBO3WA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "1d35692db53ad624287db92af0c8e5ff4a1a4b88c45679d2bb52eac891c176ec",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861810.32969,
+      "path": "/root/.triton/cache/2ATS3NHYWWFPQRX4MMMPFOCKTVXJQOTSLBVBQPL47XMCBSZO623Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "d0272db4f8b58af846fc6318f2b84a9d6e983a72586a183d7cfdd820cb2ef6b7",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861811.4177089,
+      "path": "/root/.triton/cache/2GSBY6ZN32RAS4IWOJDMGGZ47CTMR4IS5BQUKTLUBBNTCJHWOXPA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "d1a41c7b2ddea20971167246c31b3cf8a6c8f112e861454d74085b3124f675de",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861812.4937274,
+      "path": "/root/.triton/cache/K3AOXZR3MH6SMNKQACLNTXISPDGDOFVFEXUDZ3QTYSWXFTNDOFHQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "56c0ebe63b61fd2635500096d9dd1278cc3716a525e83cee13c4ad72cda3714f",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861813.5937467,
+      "path": "/root/.triton/cache/ZXRHRYJFGGNBZLZT6JUPVFTDLAIU3IRRVNN3D7PFCSUKD35JAKOQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "cde278e125319a1caf33f268fa966358114da231ab5bb1fde514a8a1efa9029d",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861814.6737654,
+      "path": "/root/.triton/cache/IB45CTH5DQXIF5SJ2UJOZMQ4HJNBNO6Z5NET364HXYPFW66WQE6Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "4079d14cfd1c2e82f649d512ecb21c3a5a16bbd9eb493dfb87be1e5b7bd6813d",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861815.7177837,
+      "path": "/root/.triton/cache/U5Y5LD43SULYAXQ2CG3H6ZTLC6XOL4OVPFUEFZALZHWULKER35YQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "a771d58f9b9517805e1a11b67f666b17aee5f1d5796842e40bc9ed45a891df71",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861816.817803,
+      "path": "/root/.triton/cache/ZXFEL72NBCKNJMVIBJF46VVXWBECSEPAZN46ZHVM3OMEM4EK5LJQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "cdca45ff4d0894d4b2a80a4bcf56b7b0482911e0cb79ec9eacdb9846708aead3",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861817.921822,
+      "path": "/root/.triton/cache/W3F3WUGNSBW3WLGBXASPZMJMMHONB5G56WBEAQMSMLSTV2IRSTKA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "b6cbbb50cd906dbb2cc1b824fcb12c61dcd0f4ddf58240419262e53ae91194d4",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861819.001841,
+      "path": "/root/.triton/cache/V7JFPAUTQLYRYK3BT5FHKKBMVUMGIU2HG5QVUPQXYJ6FWQW526NA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "afd257829382f11c2b619f4a75282cad1864534737615a3e17c27c5b42ddd79a",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861820.1178606,
+      "path": "/root/.triton/cache/ATWLCH2NFLP5WUL3SQWBYOKKUE5ZXZHD6NSSSUAJYIF3PIW6XM5Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "04ecb11f4d2adfdb517b942c1c394aa13b9be4e3f365295009c20bb7a2debb3b",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861821.4698842,
+      "path": "/root/.triton/cache/ZK7Y5OQMYDUBS7GNKN73SZID2NUOTMZBO3MTULDIGKFEN7IPZPEQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "cabf8eba0cc0e8197ccd537fb96503d368e9b32176d93a2c68328a46fd0fcbc9",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861822.5579033,
+      "path": "/root/.triton/cache/R5FA4CJOBCDXU3VVS7DFR22ZURHFHMV4SRVIBOYHZMJJXAUJKTLQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "8f4a0e092e08877a6eb597c658eb59a44e53b2bc946a80bb07cb129b828954d7",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861823.6459224,
+      "path": "/root/.triton/cache/BI2YU5A7O2QRKC56OJSCJA5WCNG3FPGQSRVI2IH3WU6EKQURQ63Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "0a358a741f76a1150bbe72642483b6134db2bcd0946a8d20fbb53c45429187b7",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861824.7099411,
+      "path": "/root/.triton/cache/SFN2I2YSTAOUL6NATW24WDQ3LLXHGJCJ3EY7WPSXRXIPJGTJDCXA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "915ba46b12981d45f9a09db5cb0e1b5aee732449d931fb3e578dd0f49a6918ae",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861825.7699597,
+      "path": "/root/.triton/cache/5RPINQYNRKARZGLMAHEXFP2FKK4J64KS3IFFHFQI7B2SDE4DGGAQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "ec5e86c30d8a811c996c01c972bf4552b89f7152da0a539608f8752193833181",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861826.8459787,
+      "path": "/root/.triton/cache/LJO54LRJ5SXEEWYMBCJ5KC4H4TKL2FIWB2PU54L5BK5W2CMB2C2A/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "5a5dde2e29ecae425b0c0893d50b87e4d4bd15160e9f4ef17d0abb6d0981d0b4",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861827.889997,
+      "path": "/root/.triton/cache/6TSWWOKWR6D4XUUCXVEHQBN4A5ETOARWMY43XVFAICTGH5ZZVHZA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "f4e56b39568f87cbd282bd487805bc07493702366639bbd4a040a663f739a9f2",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861828.9940166,
+      "path": "/root/.triton/cache/YHGEO5EFAIJWQ5IKQGDKASPETOJDQFWTGJZSBHLMXH3JKZEZAT6A/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "c1cc477485021368750a8186a049e49b923816d33273209d6cb9f695649904fc",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861830.1620371,
+      "path": "/root/.triton/cache/GKK266JINJGKCTJMUC7TTKUMA5CZZ35V5T6GYTYZHZSEM4CIGJ3Q/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "3295af79286a4ca14d2ca0bf39aa8c07459cefb5ecfc6c4f193e644670483277",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861831.2100558,
+      "path": "/root/.triton/cache/AAZNL22DOGCCGCUJUXVBASRHPU52VQBYLEKRCGZCNLP4GYFDTDUA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "0032d5eb437184230a89a5ea104a277d3baac0385915111b226adfc360a398e8",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861832.2500741,
+      "path": "/root/.triton/cache/WBGA4WTD2AAYR3MEBQ4O52HJGZ7VJTMSJO5LAIG33XUK2YQB6MFA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "b04c0e5a63d00188ed840c38eee8e9367f54cd924bbab020dbdde8ad6201f30a",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861833.262092,
+      "path": "/root/.triton/cache/PQIJ3KOTOMHJUUKXXANVKWS3QBCFI2SKQ4JI6XP2QJSAV5KOL3WQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "7c109da9d3730e9a5157b81b555a5b8044546a4a87128f5dfa82640af54e5eed",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861834.3501115,
+      "path": "/root/.triton/cache/JCHOEXNRQUAKUT4T3CU4AGEZPI57Q63VW72LGBLPZWQ26DL2Q2BA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "488ee25db18500aa4f93d8a9c018997a3bf87b75b7f4b3056fcda1af0d7a8682",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861835.4061303,
+      "path": "/root/.triton/cache/BXOSNPINLHAM7JAGM6ZDJNUMHUC2SJNCT4WD4S2B2A3C2D2PMAKQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "0ddd26bd0d59c0cfa40667b234b68c3d05a925a29f2c3e4b41d0362d0f4f6015",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861836.4301484,
+      "path": "/root/.triton/cache/S5TLFICACJLGV2O53YVAMAU57FE53OQWW5UPICU2FETKD7P3SVXA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "9766b2a04012566ae9ddde2a06029df949ddba16b768f40a9a2926a1fdfb956e",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861837.4821672,
+      "path": "/root/.triton/cache/U4BIKAJQ2YXMOYUSEIIUSBAX5W6NUWUWPQW6JQNKG67EJHNTUFUQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "a702850130d62ec762922211490417edbcda5a967c2de4c1aa37be449db3a169",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861838.4981852,
+      "path": "/root/.triton/cache/CJKIMBW4KF4DNGFCXJTV5HWGBYDHPX7ONNZKYO3QT4ZUEEYRL4TQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "12548606dc51783698a2ba675e9ec60e0677dfee6b72ac3b709f334213115f27",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861839.5342038,
+      "path": "/root/.triton/cache/OI62RDWZUSRTAOCMB3MA7UTJRXK7JLBJEGEFAANNURNMEGAWQKNA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "723da88ed9a4a330384c0ed80fd2698dd5f4ac2921885001ada45ac21816829a",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861840.5782223,
+      "path": "/root/.triton/cache/7GZ5MBR4HTAULIMF4ZZANOPISLTSB6R4NQGL3CYQHAKZOVEG37TA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "f9b3d6063c3cc145a185e67206b9e892e720fa3c6c0cbd8b103815975486dfe6",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861841.5862403,
+      "path": "/root/.triton/cache/THUFAYMVBLWBNGXZSJMBZRFOEDKN5AHGUDSTKGQISKTM4EKBMROQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "99e85061950aec169af992581cc4ae20d4de80e6a0e5351a0892a6ce1141645d",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861842.630259,
+      "path": "/root/.triton/cache/AQ2YSH76SZBCPKXONKJ45XE726HFSOPDBPJLEXZENX2E454TZGPQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "0435891ffe964227aaee6a93cedc9fd78e5939e30bd2b25f246df44e7793c99f",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861843.690278,
+      "path": "/root/.triton/cache/7QJQDFF5J6KEICKYKEEMLMI25C52IKEXQP7YVHAS5O2NQQQYBXKQ/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "fc130194bd4f944409585108c5b11ae8bba4289783ff8a9c12ebb4d842180dd5",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861844.8022978,
+      "path": "/root/.triton/cache/UHNASH6MVIP57LKCIFUZWRYOXXTJ3OY7ZFQ4ZKI4B722O74YRMGA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "a1da091fccaa1fdfad4241699b470ebde69dbb1fc961cca91c0ff5a77f988b0c",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861845.866317,
+      "path": "/root/.triton/cache/KKWA7O6DX5BTL4GSU56QGF6A5DOG6C4ORZFK3GYA7J722ERZPE2A/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "52ac0fbbc3bf4335f0d2a77d0317c0e8dc6f0b8e8e4aad9b00fa7fad12397934",
+        "shared": 46208
+      }
+    },
+    {
+      "mtime": 1792861847.0023375,
+      "path": "/root/.triton/cache/KIXKNDLVW5AYUJWKWGIJXDDYFMYZP6CBAFK5N5VGBNKHFPVQ2XJA/chunk_gated_delta_rule_fwd_kernel_h_blockdim64.json",
+      "metadata": {
+        "name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "num_warps": 4,
+        "num_stages": 2,
+        "hash": "522ea68d75b7418a26cab1909b8c782b3197f8410155d6f6a60b5472beb0d5d2",
+        "shared": 46208
+      }
+    }
+  ]
+}

@@ -68,6 +68,7 @@ class RMSNormFused(BaseOP):
         )
 
         self.eps = eps
+        self._zero_centered = zero_centered
         self.weight = torch.zeros(size) if zero_centered else torch.empty(size)
         self.rmsnorm = gemma_rmsnorm if zero_centered else rmsnorm
         self.fused_add_rmsnorm = (
@@ -85,3 +86,12 @@ class RMSNormFused(BaseOP):
         else:
             self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
             return x, residual
+
+    def forward_branches(self, x, residual=None, *, other=None,
+                         input_scales=(1., 1.), output_scales=(1.,)):
+        from logssms.kernel.norm import rms_norm_branches
+
+        return rms_norm_branches(
+            x, self.weight, self.eps, residual, other=other,
+            input_scales=input_scales, output_scales=output_scales, zero_centered=self._zero_centered,
+        )

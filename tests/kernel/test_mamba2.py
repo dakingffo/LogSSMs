@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from logssms.cache.radix.state_pool import LinearStatePool
 from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.kernel.linear_attention.mamba2 import (
-    prepare_mamba2, mamba2_prefill, mamba2_decode, mamba2_conv_decode,
+    prepare_mamba2, mamba2_prefill, mamba2_decode,
 )
+from logssms.kernel.linear_attention.conv_decode import conv_decode
 from logssms.layers.mamba2 import Mamba2Config
+from logssms.kernel.linear_attention.vendor.fla import ChunkStateIO
 from logssms.layers.linear_attention_backend.standard import PackedLinearIndices
 from tests.utils import clear_global_ctx
 
@@ -36,7 +38,7 @@ def reference(xbc, dt, A, bias, D, config, initial):
     return torch.stack(outputs), torch.stack(states)
 
 
-@pytest.mark.parametrize("state_dim,groups,chunk", [(32, 1, 16), (128, 2, 32), (256, 1, 64)])
+@pytest.mark.parametrize("state_dim,groups,chunk", [(32, 1, 16), (128, 2, 32), (256, 1, 32), (256, 1, 64)])
 def test_packed_mamba2_prefill_matches_recurrence(state_dim, groups, chunk):
     torch.manual_seed(14)
     config = Mamba2Config(4, groups, 64, state_dim, 3, 0)
@@ -47,28 +49,37 @@ def test_packed_mamba2_prefill_matches_recurrence(state_dim, groups, chunk):
     initial = torch.randn(2, 4, state_dim, 64, device="cuda", dtype=xbc.dtype) * 0.1
     indices = PackedLinearIndices.from_lengths(lengths, xbc.device, chunk)
     keys, queries, values, decay = prepare_mamba2(xbc, dt, A, bias, config)
-    actual, final, states = mamba2_prefill(xbc, keys, queries, values, decay, D, initial, indices, chunk)
+    assert keys.shape == queries.shape == (sum(lengths), groups, state_dim)
+    count = len(indices.chunk_indices)
+    storage = torch.zeros(count + 2, 1, 4, state_dim, 64, device="cuda", dtype=xbc.dtype)
+    storage[:2, 0] = initial
+    reads = torch.arange(2, device="cuda", dtype=torch.int32)
+    writes = torch.arange(2, count + 2, device="cuda", dtype=torch.int32)
+    actual = mamba2_prefill(xbc, keys, queries, values, decay, D,
+                          ChunkStateIO(storage, reads, writes), indices, chunk)
+    states = storage[2:, 0]
+    final = states.index_select(0, indices.endings)
     begin, ch = 0, 0
     for i, length in enumerate(lengths):
         expected, snapshots = reference(xbc[begin:begin+length], dt[begin:begin+length], A, bias, D, config, initial[i])
         torch.testing.assert_close(actual[begin:begin+length].float(), expected, atol=2e-3, rtol=2e-2)
-        torch.testing.assert_close(final[i], snapshots[-1], atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(final[i].float(), snapshots[-1], atol=2e-3, rtol=2e-2)
         for end in list(range(chunk, length, chunk)) + [length]:
-            torch.testing.assert_close(states[ch], snapshots[end-1], atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(states[ch].float(), snapshots[end-1], atol=2e-3, rtol=2e-2)
             ch += 1
         begin += length
 
 
-def make_logstate(config):
+def make_logstate(config, batch_size=2, granularity=32):
     pool = MHALogStatePool(
-        num_frames=256, page_size=64, granularity=32,
+        num_frames=max(256, 32 * batch_size), page_size=64, granularity=granularity,
         num_attention_layers=1, num_kv_heads=2, head_dim=128,
         num_linear_layers=1, num_key_heads=config.num_groups,
         num_value_heads=config.num_heads, head_k_dim=config.state_dim,
         head_v_dim=config.head_dim, conv_dim=config.conv_dim, state_len=3,
         device=torch.device("cuda"), dtype=torch.bfloat16, recurrent_type="mamba2",
     )
-    reservation = pool.reserve(logs=2, works=4)
+    reservation = pool.reserve(logs=batch_size, works=2 * batch_size)
     assert reservation is not None
     return pool, reservation
 
@@ -93,9 +104,12 @@ def test_memorized_checkpoint_prefill_matches_log_state(reuse, chunk_size):
         ctx.page_table = torch.arange(128, device="cuda", dtype=torch.int32)[None]
         ctx.state_table = torch.tensor(logs, device="cuda", dtype=torch.int32).repeat_interleave(64)[None]
         ctx.work_state_table = torch.tensor([[works[0]]], device="cuda", dtype=torch.int32)
-        target = logs[0] if reuse else works[1]
+        target = logs[-1] if reuse else works[1]
         if direct:
             ctx.state_table.fill_(-1)
+            if reuse:
+                pool.zero_state(works[2])
+                pool.coalesce_groups([tuple(logs)], [works[2]])
         pool.zero_state(works[0])
         pool.zero_work_conv(works[0])
         backend = Mamba2LogStateBackend()
@@ -118,6 +132,10 @@ def test_memorized_checkpoint_prefill_matches_log_state(reuse, chunk_size):
                 outputs.append(backend.forward(x[begin:end], dt[begin:end], weight,
                                                None, A, bias, D, config, batch))
             state = pool.read_states(torch.tensor([target if direct else works[0]], device="cuda"), 0).clone()
+            if not direct:
+                pool.kernels.restore(pool, [(None, [(slot, 0, 64) for slot in logs], works[3])])
+                restored = pool.read_states(torch.tensor([works[3]], device="cuda"), 0)
+                torch.testing.assert_close(restored, state, atol=2e-3, rtol=2e-2)
             conv = pool.read_conv(
                 torch.tensor([target if direct else logs[1]], device="cuda"),
                 torch.tensor([pool.layout.num_granules - 1 if reuse or not direct else 0], device="cuda"), 0,
@@ -135,23 +153,28 @@ def test_memorized_checkpoint_prefill_matches_log_state(reuse, chunk_size):
 
 
 @pytest.mark.parametrize("eager", [False, True])
-def test_mamba2_logstate_replay_and_graph_match_standard(eager):
+@pytest.mark.parametrize("batch_size,state_dim,groups,granularity", [
+    (2, 128, 1, 32), (8, 128, 1, 32), (16, 128, 1, 32),
+    (24, 128, 1, 32), (32, 128, 1, 32), (64, 128, 1, 32),
+    (2, 256, 1, 16), (32, 256, 1, 32), (2, 256, 1, 64), (2, 128, 2, 32),
+])
+def test_mamba2_logstate_replay_and_graph_match_standard(eager, batch_size, state_dim, groups, granularity):
     torch.manual_seed(31)
-    config = Mamba2Config(4, 1, 64, 128, 3, 0)
-    pool, reservation = make_logstate(config)
+    config = Mamba2Config(4, groups, 64, state_dim, 3, 0)
+    pool, reservation = make_logstate(config, batch_size, granularity)
     log_slots = torch.tensor(reservation[1], device="cuda", dtype=torch.int32)
-    work = torch.tensor(reservation[2][:2], device="cuda", dtype=torch.int32)
-    bases = torch.tensor(reservation[2][2:], device="cuda", dtype=torch.int32)
-    zeros = torch.zeros(2, device="cuda", dtype=torch.int32)
+    work = torch.tensor(reservation[2][:batch_size], device="cuda", dtype=torch.int32)
+    bases = torch.tensor(reservation[2][batch_size:], device="cuda", dtype=torch.int32)
+    zeros = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
     pos, counts = zeros.clone(), zeros.clone()
     metadata = SimpleNamespace(
         work_slots=work, log_slots=log_slots, token_offsets=pos, replay_counts=counts,
     )
-    initial = torch.randn(2, 4, 128, 64, device="cuda", dtype=pool.dtype) * 0.05
+    initial = torch.randn(batch_size, 4, state_dim, 64, device="cuda", dtype=pool.dtype) * 0.05
     pool.write_states(work, 0, initial)
     pool.write_states(bases, 0, initial)
-    xbc = torch.randn(2, config.conv_dim, device="cuda", dtype=pool.dtype) * 0.1
-    dt = torch.randn(2, 4, device="cuda", dtype=pool.dtype) - 2
+    xbc = torch.randn(batch_size, config.conv_dim, device="cuda", dtype=pool.dtype) * 0.1
+    dt = torch.randn(batch_size, 4, device="cuda", dtype=pool.dtype) - 2
     A, bias, D = (torch.randn(4, device="cuda") * 0.1 for _ in range(3))
     def forward():
         return mamba2_decode(xbc, dt, A, bias, D, config, metadata, pool, logstate=True, eager=eager)
@@ -161,24 +184,30 @@ def test_mamba2_logstate_replay_and_graph_match_standard(eager):
         actual = forward()
     pool.write_states(work, 0, initial)
     expected_state = initial.float()
+    log_state = initial.float().clone()
+    last_work = pool.read_states(work, 0).clone()
     for step in range(32):
         xbc.normal_(std=0.1)
         pos.fill_(step)
         counts.fill_(step % 16)
         graph.replay()
-        for req in range(2):
+        for req in range(batch_size):
             expected, states = reference(xbc[req:req+1], dt[req:req+1], A, bias, D, config, expected_state[req])
             expected_state[req] = states[-1]
+            _, logged = reference(xbc[req:req+1], dt[req:req+1], A, bias, D, config, log_state[req])
+            log_state[req] = logged[-1]
             torch.testing.assert_close(actual[req].float(), expected[0], atol=4e-3, rtol=4e-2)
         if eager or (step + 1) % 16 == 0:
             saved = pool.read_states(work, 0)
             torch.testing.assert_close(saved.float(), expected_state, atol=2e-3, rtol=4e-2)
             expected_state = saved.float()
+            last_work = saved.clone()
+        else:
+            torch.testing.assert_close(pool.read_states(work, 0), last_work, atol=0, rtol=0)
     # Generic affine reconstruction must also work for Mamba2 logs, not just GDN.
-    saved = pool.read_states(work, 0).clone()
     pool.kernels.restore(pool, [(base, [(slot, 0, 32)], out)
-                               for base, slot, out in zip(reservation[2][2:], reservation[1], reservation[2][:2])])
-    torch.testing.assert_close(pool.read_states(work, 0), saved, atol=4e-3, rtol=5e-2)
+                               for base, slot, out in zip(reservation[2][batch_size:], reservation[1], reservation[2][:batch_size])])
+    torch.testing.assert_close(pool.read_states(work, 0).float(), log_state, atol=2e-3, rtol=2e-2)
 
 
 def test_mamba2_decode_uses_different_read_and_write_slots():
@@ -213,7 +242,8 @@ def test_mamba2_conv_decode_bias_and_snapshot():
     bias = torch.randn(config.conv_dim, device="cuda", dtype=pool.dtype) * 0.1
     conv_input = torch.cat((pool.conv_state[:2, 0], x.unsqueeze(-1)), -1)
     expected = F.silu(F.conv1d(conv_input, weight, bias, groups=config.conv_dim)).squeeze(-1)
-    actual = mamba2_conv_decode(x, weight, bias, config, metadata, pool, logstate=False)
+    actual = conv_decode(x, weight, config, bias=bias, round_conv=True,
+                         read_slots=read, write_slots=write, standard_state=pool.conv_state)
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(pool.conv_state[2:, 0], conv_input[:, :, -3:])
 

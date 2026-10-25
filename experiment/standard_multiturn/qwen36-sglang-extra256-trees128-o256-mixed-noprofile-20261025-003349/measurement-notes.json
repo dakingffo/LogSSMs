@@ -1,0 +1,3 @@
+{
+  "measurement_note": "Custom all-reduce initialization failed during CUDA JIT compilation; service continued with fallback. See server.log."
+}

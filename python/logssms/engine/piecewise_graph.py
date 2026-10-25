@@ -33,7 +33,7 @@ def piecewise_token_buckets(max_tokens: int) -> list[int]:
 
 
 def _warmup_lengths(granularity, token_budget):
-    from logssms.kernel.linear_attention.vendor.fla.config import PREFILL_CHUNK_BOUNDS
+    from logssms.kernel.linear_attention.tuning import PREFILL_CHUNK_BOUNDS
 
     chunks = {1, *(n - 1 for n in PREFILL_CHUNK_BOUNDS), *PREFILL_CHUNK_BOUNDS}
     return sorted({min(token_budget, max(1, n * granularity - offset))
@@ -100,8 +100,9 @@ def _warmup_storage(engine, lengths):
                 states = engine.cache_manager.free_states[:sum(state_counts)]
                 if len(states) != sum(state_counts):
                     raise RuntimeError("Insufficient state capacity for piecewise graph warmup")
-                pool.conv_state.index_fill_(0, states, 0)
-                pool.recurrent_state.index_fill_(0, states, 0)
+                state_indices = states.to(torch.int64)
+                pool.conv_state.index_fill_(0, state_indices, 0)
+                pool.recurrent_state.index_fill_(0, state_indices, 0)
         kv_offset = state_offset = 0
         for row, length in enumerate(lengths):
             pages = kv[kv_offset:kv_offset + kv_counts[row]]

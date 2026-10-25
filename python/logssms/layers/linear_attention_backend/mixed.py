@@ -12,13 +12,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .base import BaseMamba2Backend
 from .logstate import LogStateLinearAttnMetadata
 from .standard import LinearAttnMetadata, PackedLinearIndices
 
 if TYPE_CHECKING:
     from logssms.core import Batch
-    from .base import BaseLinearAttnBackend
 
 
 class _MetadataPadding:
@@ -59,7 +57,6 @@ def _packed_pad(
 
 
 def prepare_mixed_linear_metadata(
-    backend: BaseLinearAttnBackend,
     prefill: Batch,
     decode: Batch,
     prefill_capacity: int,
@@ -122,43 +119,6 @@ def prepare_mixed_linear_metadata(
             log_write_slots=pad(pm.log_write_slots, prefill_capacity, -1),
             conv_token_granules=pad(pm.conv_token_granules, prefill_capacity),
         )
-        # GDN consumes the direct-write arrays above. Remove unused eager gather
-        # descriptors so optional checkpoints cannot change graph structure.
-        for name in (
-            "conv_snapshot_rows", "conv_snapshot_reqs", "conv_final_rows",
-            "conv_write_slots", "conv_write_granules", "log_row_indices",
-            "checkpoint_slots", "checkpoint_conv_granules",
-            "checkpoint_state_indices", "checkpoint_snapshot_indices",
-            "conv_write_snapshot_indices",
-        ):
-            updates[name] = None
-        if isinstance(backend, BaseMamba2Backend):
-            # Keep all gathers fixed-size, including the optional checkpoint
-            # branch. Padding gathers row/state zero but never stores it.
-            for name in (
-                "conv_snapshot_rows", "conv_snapshot_reqs", "conv_write_slots",
-                "conv_write_granules", "checkpoint_slots",
-                "checkpoint_conv_granules", "checkpoint_state_indices",
-                "checkpoint_snapshot_indices",
-            ):
-                tensor = getattr(pm, name)
-                if tensor is None:
-                    dtype = torch.int64 if name.endswith("indices") else pm.work_slots.dtype
-                    tensor = torch.empty(0, dtype=dtype, device=pm.work_slots.device)
-                updates[name] = pad(
-                    tensor, prefill_capacity,
-                    -1 if name in ("conv_write_slots", "checkpoint_slots") else 0,
-                )
-            selection = pm.conv_write_snapshot_indices
-            if selection is None:
-                selection = torch.arange(
-                    len(pm.conv_write_slots), device=pm.work_slots.device, dtype=torch.int64,
-                )
-            updates["conv_write_snapshot_indices"] = pad(selection, prefill_capacity)
-            updates["conv_final_rows"] = pm.conv_final_rows
-            # The dense direct-log map already excludes checkpoint-only rows.
-            # Using it avoids a variable-size log_row_indices gather entirely.
-            updates["log_slots"] = updates["log_write_slots"]
     decode_updates = {}
     if isinstance(dm, LinearAttnMetadata):
         for name in ("slots", "read_slots", "write_slots"):

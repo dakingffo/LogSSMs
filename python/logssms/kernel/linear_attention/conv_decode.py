@@ -9,22 +9,29 @@ import torch
 import triton
 import triton.language as tl
 
+from .packed_conv import _scale_conv_input, _conv_input_scale_args
+
 
 @triton.jit
 def _frame_element_offset(frame, frame_elems: tl.constexpr):
     return frame.to(tl.int64) * frame_elems
 
 
-@triton.jit
-def _gdn_conv_decode(
-    X, W, Q, K, V, StandardState, Storage, FrameTable,
+@triton.jit(
+    do_not_specialize_on_alignment=['FrameTable', 'ReadSlots', 'ReadGranules', 'WriteSlots', 'WriteGranules', 'WorkSlots'],
+)
+def _conv_decode_kernel(
+    X, W, Bias, Q, K, V, StandardState, Storage, FrameTable,
     ReadSlots, ReadGranules, WriteSlots, WriteGranules, WorkSlots,
     C: tl.constexpr, KEY_DIM: tl.constexpr, STATE_LEN: tl.constexpr,
     X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
     STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr, LAYER: tl.constexpr,
     READ_STRIDE: tl.constexpr, WRITE_STRIDE: tl.constexpr,
     FRAME_ELEMS: tl.constexpr, NUM_GRANULES: tl.constexpr,
+    HAS_BIAS: tl.constexpr, SPLIT_QKV: tl.constexpr, ROUND_CONV: tl.constexpr,
     LOGSTATE: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+    END0: tl.constexpr, END1: tl.constexpr,
+    SCALE0: tl.constexpr, SCALE1: tl.constexpr, SCALE2: tl.constexpr,
 ):
     b = tl.program_id(0)
     ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -97,6 +104,7 @@ def _gdn_conv_decode(
         & (ch < C)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+    loaded_x = _scale_conv_input(loaded_x, ch[None, :], END0, END1, SCALE0, SCALE1, SCALE2)
     tl.debug_barrier()
 
     new_conv_state = tl.where(mask, conv_state, loaded_x)
@@ -138,6 +146,8 @@ def _gdn_conv_decode(
 
     x_base_1d = x_base  # starting of chunk [BLOCK_C]
     mask_x_1d = ch < C
+    current_x = tl.load(x_base_1d, mask_x_1d, other=0.)
+    current_x = _scale_conv_input(current_x, ch, END0, END1, SCALE0, SCALE1, SCALE2)
 
     # STEP 5: compute each token
 
@@ -150,16 +160,14 @@ def _gdn_conv_decode(
             if KERNEL_WIDTH == 2:
                 if j == 1:  # KERNEL_WIDTH-1:
                     matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d  # [BLOCK_C]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = current_x
             elif KERNEL_WIDTH == 3:
                 if j == 1:
                     matrix_w = w_col1
                     matrix_x = col1
                 elif j == 2:
                     matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d  # [BLOCK_C]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = current_x
             elif KERNEL_WIDTH == 4:
                 if j == 1:
                     matrix_w = w_col1
@@ -169,8 +177,7 @@ def _gdn_conv_decode(
                     matrix_x = col2
                 elif j == 3:
                     matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d  # [BLOCK_C]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = current_x
             elif KERNEL_WIDTH == 5:
                 if j == 1:
                     matrix_w = w_col1
@@ -183,8 +190,7 @@ def _gdn_conv_decode(
                     matrix_x = col3
                 elif j == 4:
                     matrix_w = w_col4
-                    x_ptrs_1d = x_base_1d  # [BLOCK_C]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = current_x
             elif KERNEL_WIDTH == 6:
                 if j == 1:
                     matrix_w = w_col1
@@ -200,8 +206,7 @@ def _gdn_conv_decode(
                     matrix_x = col4
                 elif j == 5:
                     matrix_w = w_col5
-                    x_ptrs_1d = x_base_1d  # [BLOCK_C]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = current_x
 
             acc += matrix_x * matrix_w  # [BLOCK_C]
 
@@ -226,22 +231,33 @@ def _gdn_conv_decode(
             col3 = col4
             col4 = matrix_x
 
+        if HAS_BIAS:
+            acc += tl.load(Bias + ch, ch < C, other=0).to(tl.float32)
+        if ROUND_CONV:
+            acc = acc.to(X.dtype.element_ty).to(tl.float32)
         acc = acc / (1 + tl.exp(-acc))
         mask_1d = (idx_token < 1) & (
             ch < C
         )  # token-index  # feature-index
-        tl.store(Q + b * KEY_DIM + ch, acc, mask_1d & (ch < KEY_DIM))
-        tl.store(K + b * KEY_DIM + ch - KEY_DIM, acc,
-                 mask_1d & (ch >= KEY_DIM) & (ch < 2 * KEY_DIM))
-        tl.store(V + b * (C - 2 * KEY_DIM) + ch - 2 * KEY_DIM, acc,
-                 mask_1d & (ch >= 2 * KEY_DIM))
+        if SPLIT_QKV:
+            tl.store(Q + b * KEY_DIM + ch, acc, mask_1d & (ch < KEY_DIM))
+            tl.store(K + b * KEY_DIM + ch - KEY_DIM, acc,
+                     mask_1d & (ch >= KEY_DIM) & (ch < 2 * KEY_DIM))
+            tl.store(V + b * (C - 2 * KEY_DIM) + ch - 2 * KEY_DIM, acc,
+                     mask_1d & (ch >= 2 * KEY_DIM))
+        else:
+            tl.store(Q + b * C + ch, acc, mask_1d)
 
 
-def conv_decode_qkv(
+
+def conv_decode(
     mixed_qkv: torch.Tensor,
     weight: torch.Tensor,
     config,
     *,
+    bias: torch.Tensor | None = None,
+    split_qkv: bool = False,
+    round_conv: bool = False,
     read_slots: torch.Tensor,
     write_slots: torch.Tensor,
     standard_state: torch.Tensor | None = None,
@@ -249,16 +265,22 @@ def conv_decode_qkv(
     read_granules: torch.Tensor | None = None,
     write_granules: torch.Tensor | None = None,
     work_slots: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_boundaries: tuple[int, int] | None = None,
+    input_scales: tuple[float, float, float] = (1., 1., 1.),
+):
     assert mixed_qkv.is_cuda and mixed_qkv.ndim == 2
     assert 1 <= config.state_len <= 5
     bs, channels = mixed_qkv.shape
     assert channels == config.conv_dim
-    q = torch.empty((bs, 1, config.num_k_heads, config.head_k_dim),
-                    dtype=mixed_qkv.dtype, device=mixed_qkv.device)
-    k = torch.empty_like(q)
-    v = torch.empty((bs, 1, config.num_v_heads, config.head_v_dim),
-                    dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    if split_qkv:
+        q = torch.empty((bs, 1, config.num_k_heads, config.head_k_dim),
+                        dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+        k = torch.empty_like(q)
+        v = torch.empty((bs, 1, config.num_v_heads, config.head_v_dim),
+                        dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    else:
+        q = torch.empty((bs, channels), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+        k = v = q
     logstate = pool is not None
     if logstate:
         assert read_granules is not None and write_granules is not None
@@ -275,14 +297,15 @@ def conv_decode_qkv(
         read_granules = write_granules = work_slots = read_slots
         frame_elems = num_granules = 1
         slot_stride, layer_stride = standard_state.stride()[:2]
-    _gdn_conv_decode[(bs, triton.cdiv(channels, 256))](
-        mixed_qkv, weight, q, k, v, state, state, table,
+    _conv_decode_kernel[(bs, triton.cdiv(channels, 256))](
+        mixed_qkv, weight, bias, q, k, v, state, state, table,
         read_slots, read_granules, write_slots, write_granules, work_slots,
-        channels, config.key_dim, config.state_len,
+        channels, config.key_dim if split_qkv else 0, config.state_len,
         mixed_qkv.stride(0), mixed_qkv.stride(1),
         slot_stride, layer_stride, config.layer_idx,
         read_slots.stride(0), write_slots.stride(0), frame_elems, num_granules,
-        logstate, 256, triton.next_power_of_2(config.state_len),
+        bias is not None, split_qkv, round_conv, logstate, 256, triton.next_power_of_2(config.state_len),
+        *_conv_input_scale_args(channels, input_boundaries, input_scales),
         num_warps=4,
     )
-    return q, k, v
+    return (q, k, v) if split_qkv else q
