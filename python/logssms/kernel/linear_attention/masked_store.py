@@ -8,10 +8,11 @@ from .layout import state_pointer
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=['frames', 'slots'],
 )
 def _state_store(storage, frames, slots, values,
-                 HEADS: tl.constexpr, WIDTH: tl.constexpr, LAYER: tl.constexpr,
+                 HEADS: tl.constexpr, WIDTH: tl.constexpr, LAYER,
                  HEAD_BYTES: tl.constexpr, FRAME_BYTES: tl.constexpr,
                  FRAMES_PER_SLOT: tl.constexpr, BLOCK: tl.constexpr):
     row, head = tl.program_id(0), tl.program_id(1)
@@ -28,10 +29,11 @@ def _state_store(storage, frames, slots, values,
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=['frames', 'slots', 'granules'],
 )
 def _conv_store(storage, frames, slots, granules, values,
-                WIDTH: tl.constexpr, LAYER: tl.constexpr, GRANULES: tl.constexpr,
+                WIDTH: tl.constexpr, LAYER, GRANULES: tl.constexpr,
                 FRAME_ELEMS: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     slot = tl.load(slots + row)

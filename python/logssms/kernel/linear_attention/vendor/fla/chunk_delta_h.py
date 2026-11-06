@@ -16,7 +16,7 @@ from ...tuning import prefill_state_config
 
 
 @triton.jit(
-    do_not_specialize=['T'],
+    do_not_specialize=['T', 'LAYER'],
     do_not_specialize_on_alignment=[
         'read_slots', 'chunk_write_slots', 'final_write_slots', 'payload_frames', 'log_slots',
         'log_token_offsets', 'decay_frames', 'cu_seqlens', 'chunk_offsets',
@@ -51,7 +51,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STATE_SLOT_STRIDE: tl.constexpr,
     STATE_LAYER_STRIDE: tl.constexpr,
     STATE_HEAD_STRIDE: tl.constexpr,
-    LAYER: tl.constexpr,
+    LAYER,
     FRAME_BYTES: tl.constexpr,
     FRAMES_PER_SLOT: tl.constexpr,
     HEAD_PAYLOAD_BYTES: tl.constexpr,

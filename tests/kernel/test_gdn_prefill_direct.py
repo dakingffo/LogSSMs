@@ -17,25 +17,25 @@ from logssms.layers.linear_attention_backend.standard import PackedLinearIndices
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _pool(granularity, dim, dtype, head_ratio=1):
+def _pool(granularity, dim, dtype, head_ratio=1, num_layers=2):
     return MHALogStatePool(
-        num_frames=128, page_size=64, granularity=granularity,
+        num_frames=64 * num_layers, page_size=64, granularity=granularity,
         num_attention_layers=1, num_kv_heads=2, head_dim=256,
-        num_linear_layers=2, num_key_heads=2, num_value_heads=2 * head_ratio,
+        num_linear_layers=num_layers, num_key_heads=2, num_value_heads=2 * head_ratio,
         head_k_dim=dim, head_v_dim=dim, conv_dim=(4 + 2 * head_ratio) * dim, state_len=3,
         device=torch.device("cuda"), dtype=dtype,
     )
 
 
 @pytest.mark.parametrize("algorithm", ["gdn", "mamba2"])
-def test_prefill_metadata_alignment_reuses_kernel(algorithm):
+def test_prefill_layer_and_metadata_alignment_reuse_kernel(algorithm):
     from logssms.kernel.linear_attention.mamba2 import mamba2_prefill, _mamba2_prefill_state_kernel
     from logssms.kernel.linear_attention.vendor.fla.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
     )
 
     torch.manual_seed(73)
-    pool = _pool(32, 128, torch.bfloat16, head_ratio=3)
+    pool = _pool(32, 128, torch.bfloat16, head_ratio=3, num_layers=17)
     allocation = pool.reserve(logs=5, works=8)
     assert allocation is not None
     logs, works = allocation[1:]
@@ -51,7 +51,7 @@ def test_prefill_metadata_alignment_reuses_kernel(algorithm):
     io = ChunkStateIO(
         pool.storage.view(pool.dtype), reads, writes, reads,
         pool.payload_frame_table, pool.frame_bytes, pool.head_payload_bytes,
-        layer=1, num_layers=2, granularity=32, page_size=64,
+        num_layers=17, granularity=32, page_size=64,
     )
     query = torch.nn.functional.normalize(
         torch.randn(1, total, 2, 128, device=pool.device), dim=-1,
@@ -65,7 +65,10 @@ def test_prefill_metadata_alignment_reuses_kernel(algorithm):
     xbc = torch.randn(total, 6 * 128, device=pool.device, dtype=pool.dtype)
     skip = torch.randn(6, device=pool.device)
     pool.storage.zero_()
-    pool.write_states(reads, 1, torch.randn(4, 6, 128, 128, device=pool.device, dtype=pool.dtype) * .01)
+    initial_states = {}
+    for layer in (0, 1, 16):
+        initial_states[layer] = torch.randn(4, 6, 128, 128, device=pool.device, dtype=pool.dtype) * .01
+        pool.write_states(reads, layer, initial_states[layer])
     initial = pool.storage.clone()
 
     def shifted(tensor, offset):
@@ -79,10 +82,28 @@ def test_prefill_metadata_alignment_reuses_kernel(algorithm):
 
     kernel = (chunk_gated_delta_rule_fwd_kernel_h_blockdim64 if algorithm == "gdn"
               else _mamba2_prefill_state_kernel)
+
+    def forward(current, packed, current_log):
+        if algorithm == "gdn":
+            return chunk_gated_delta_rule_to_cache(
+                query, key, value, gate, beta, current, packed.cu_seqlens,
+                chunk_size=32, **packed.fla_kwargs(), log_io=current_log,
+            )[0]
+        return mamba2_prefill(
+            xbc, key[0], query[0], value[0], gate[0], skip,
+            current, packed, 32, log_io=current_log,
+        )
+
     expected = expected_storage = compiled = None
-    for write_offset, index_offset in product((0, 1), repeat=2):
+    for layer, write_offset, index_offset in product((0, 1, 16), (0, 1), (0, 1)):
+        if write_offset == index_offset == 0:
+            expected = expected_storage = None
+            reference = torch.zeros(max(works) + 1, 1, 6, 128, 128,
+                                    device=pool.device, dtype=pool.dtype)
+            reference[reads.long(), 0] = initial_states[layer]
+            reference_output = forward(ChunkStateIO(reference, reads, writes, reads), indices, None)
         current = replace(
-            io, read_slots=shifted(reads, index_offset),
+            io, layer=layer, read_slots=shifted(reads, index_offset),
             chunk_write_slots=shifted(writes, write_offset),
             final_write_slots=shifted(reads, write_offset),
             payload_frames=shifted(io.payload_frames, index_offset),
@@ -98,24 +119,25 @@ def test_prefill_metadata_alignment_reuses_kernel(algorithm):
             decay_frames=shifted(log_io.decay_frames, write_offset),
         )
         pool.storage.copy_(initial)
-        if algorithm == "gdn":
-            output, _ = chunk_gated_delta_rule_to_cache(
-                query, key, value, gate, beta, current, packed.cu_seqlens,
-                chunk_size=32, **packed.fla_kwargs(), log_io=current_log,
-            )
-        else:
-            output = mamba2_prefill(
-                xbc, key[0], query[0], value[0], gate[0], skip,
-                current, packed, 32, log_io=current_log,
-            )
+        output = forward(current, packed, current_log)
         torch.cuda.synchronize()
         count = len(kernel.device_caches[torch.cuda.current_device()][0])
+        if compiled is None:
+            compiled = count
+        assert count == compiled
         if expected is None:
-            expected, expected_storage, compiled = output.clone(), pool.storage.clone(), count
+            expected, expected_storage = output.clone(), pool.storage.clone()
         else:
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
             torch.testing.assert_close(pool.storage, expected_storage, rtol=0, atol=0)
-            assert count == compiled
+        torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+        targets = torch.tensor(works, device=pool.device, dtype=torch.int32)
+        torch.testing.assert_close(pool.read_states(targets, layer), reference[targets.long(), 0],
+                                   rtol=0, atol=0)
+        for other in (0, 1, 16):
+            if other != layer:
+                torch.testing.assert_close(pool.read_states(reads, other), initial_states[other],
+                                           rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])

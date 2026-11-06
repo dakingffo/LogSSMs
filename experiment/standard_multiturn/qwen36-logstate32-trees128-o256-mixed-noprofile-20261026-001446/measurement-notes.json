@@ -1,0 +1,30 @@
+{
+  "commit": "620e03f9a86161d6de264b99782dac7e10f21030",
+  "triton_cache_audit": {
+    "scope": "New unique compiled variants created between run start and report completion; shared cache does not count per-rank compiler invocations.",
+    "startup": 489,
+    "client_warmup": 1,
+    "measurement": 0,
+    "startup_by_kernel": {
+      "_state_store": 48,
+      "_conv_store": 48,
+      "_conv_decode_kernel": 48,
+      "_gdn_replay_kernel": 144,
+      "_packed_conv_kernel": 96,
+      "chunk_local_cumsum_scalar_kernel": 1,
+      "_chunk_scaled_dot_kkt_fwd_kernel": 2,
+      "merge_16x16_to_32x32_inverse_kernel": 2,
+      "_recompute_w_u_fwd_kernel": 2,
+      "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": 96,
+      "_chunk_fwd_kernel_o": 2
+    },
+    "client_warmup_kernel": "_copy_conv_snapshots",
+    "prefill_state_variants": "48 layers * BV in {32,64}; each (layer,BV) occurs once; all integer metadata pointers have no alignment specialization.",
+    "prefill_conv_variants": "48 layers * X_ROW_STRIDE in {5120,8192}; each (layer,stride) occurs once.",
+    "evidence_on_server": "/tmp/logssms-retest-compiles.json"
+  },
+  "prefix_continuity": {
+    "continuations": 740,
+    "broken": 0
+  }
+}

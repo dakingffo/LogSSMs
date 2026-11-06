@@ -66,6 +66,7 @@ def prepare_mamba2(xbc, dt, A_log, dt_bias, config):
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=[
         'Offsets', 'ChunkOffsets', 'Read', 'Writes', 'Final', 'Payload', 'LogSlots', 'Positions',
         'DecayFrames',
@@ -76,7 +77,7 @@ def _mamba2_prefill_state_kernel(
     Hidden, Read, Writes, Final, Payload, LogSlots, Positions, DecayFrames, LogGate,
     H: tl.constexpr, G: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr, BT: tl.constexpr,
-    SS: tl.constexpr, LS: tl.constexpr, HS: tl.constexpr, LAYER: tl.constexpr,
+    SS: tl.constexpr, LS: tl.constexpr, HS: tl.constexpr, LAYER,
     LOGSTATE: tl.constexpr, FRAME_BYTES: tl.constexpr, FRAMES: tl.constexpr,
     HEAD_BYTES: tl.constexpr, LAYERS: tl.constexpr, GRANULARITY: tl.constexpr,
     PAGE: tl.constexpr, STORE_FINAL: tl.constexpr, STORE_LOG: tl.constexpr,
@@ -194,6 +195,7 @@ def mamba2_prefill(xbc, keys, queries, values, decay, D, state_io: ChunkStateIO,
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=['Payload', 'DecayFrames', 'Read', 'Write', 'LogSlots', 'Positions', 'Counts'],
 )
 def _mamba2_decode_kernel(
@@ -201,7 +203,7 @@ def _mamba2_decode_kernel(
     Read, Write, LogSlots, Positions, Counts, Output,
     H: tl.constexpr, G: tl.constexpr, K: tl.constexpr, V: tl.constexpr, C: tl.constexpr,
     DS0: tl.constexpr, DS1: tl.constexpr, RS: tl.constexpr, WS: tl.constexpr,
-    LAYERS: tl.constexpr, LAYER: tl.constexpr, LOGSTATE: tl.constexpr, EAGER: tl.constexpr,
+    LAYERS: tl.constexpr, LAYER, LOGSTATE: tl.constexpr, EAGER: tl.constexpr,
     FRAME_BYTES: tl.constexpr, PAYLOAD_FRAMES: tl.constexpr, HEAD_BYTES: tl.constexpr,
     DECAY_BYTES: tl.constexpr, PAGE: tl.constexpr, WINDOW: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr,

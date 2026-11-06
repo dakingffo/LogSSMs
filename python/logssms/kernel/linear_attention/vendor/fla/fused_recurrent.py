@@ -29,7 +29,7 @@ def _frame_byte_offset(frame, frame_bytes: tl.constexpr):
 
 
 @triton.jit(
-    do_not_specialize=['SEQ_LEN'],
+    do_not_specialize=['SEQ_LEN', 'LAYER'],
     do_not_specialize_on_alignment=['log_slots', 'token_offsets', 'work_slots', 'read_slots', 'write_slots', 'replay_counts'],
 )
 def _fused_recurrent_gated_delta_kernel(
@@ -61,7 +61,7 @@ def _fused_recurrent_gated_delta_kernel(
     BLOCK_V    : tl.constexpr,
     DIRECT_STORE: tl.constexpr,
     SLOTTED_STORE: tl.constexpr,
-    LAYER      : tl.constexpr,
+    LAYER,
     STATE_SLOT_STRIDE: tl.constexpr,
     STATE_LAYER_STRIDE: tl.constexpr,
     STATE_HEAD_STRIDE: tl.constexpr,

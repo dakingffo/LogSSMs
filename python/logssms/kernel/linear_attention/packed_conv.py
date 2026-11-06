@@ -39,7 +39,7 @@ def _conv_input_scale_args(channels, boundaries, scales):
 @triton.jit
 def _conv_destination(
     storage, frames, slot, granule,
-    C: tl.constexpr, S: tl.constexpr, LAYER: tl.constexpr,
+    C: tl.constexpr, S: tl.constexpr, LAYER,
     SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
     LOGSTATE: tl.constexpr, NUM_GRANULES: tl.constexpr, FRAME_ELEMS: tl.constexpr,
 ):
@@ -50,6 +50,7 @@ def _conv_destination(
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=['offsets', 'chunks', 'write_slots', 'write_granules', 'final_slots', 'conv_frames'],
 )
 def _packed_conv_kernel(
@@ -60,7 +61,7 @@ def _packed_conv_kernel(
     BT: tl.constexpr, BC: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     STORE_STATE: tl.constexpr, LOGSTATE: tl.constexpr, STORE_FINAL: tl.constexpr,
-    LAYER: tl.constexpr, SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
+    LAYER, SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
     NUM_GRANULES: tl.constexpr, FRAME_ELEMS: tl.constexpr,
     END0: tl.constexpr, END1: tl.constexpr,
     SCALE0: tl.constexpr, SCALE1: tl.constexpr, SCALE2: tl.constexpr,

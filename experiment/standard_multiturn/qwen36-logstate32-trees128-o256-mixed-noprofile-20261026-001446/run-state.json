@@ -1,5 +1,5 @@
 {
-  "name": "qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349",
+  "name": "qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446",
   "experiment": "standard_multiturn",
   "state": "complete",
   "server": [
@@ -58,7 +58,7 @@
     "--request-timeout",
     "1800",
     "--name",
-    "qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349",
+    "qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446",
     "--dataset",
     "oasst2",
     "--language",
@@ -68,20 +68,20 @@
     "--output-len",
     "256"
   ],
-  "run_dir": "/root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349",
-  "started": 1792861564.1865637,
-  "server_log": "/tmp/qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349-server.log",
-  "client_log": "/tmp/qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349-client.log",
-  "server_pid": 27396,
-  "ready": 1792861720.2298305,
-  "client_pid": 28635,
+  "run_dir": "/root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446",
+  "started": 1792944886.7212744,
+  "server_log": "/tmp/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446-server.log",
+  "client_log": "/tmp/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446-client.log",
+  "server_pid": 1399,
+  "ready": 1792945330.8460858,
+  "client_pid": 16715,
   "client_exit": 0,
   "result": {
     "api": "logssms",
     "base_url": "http://127.0.0.1:28300",
     "model": "/root/autodl-tmp/models/Qwen3.6-27B",
     "ignore_eos": false,
-    "manifest": "/root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349/manifest.json",
+    "manifest": "/root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446/manifest.json",
     "manifest_sha256": "78fad08e6ef8713e2c7b9b528992d02beff0304d25d8dff9a96c6f62d90df455",
     "status": "complete",
     "warmup": {
@@ -89,34 +89,34 @@
       "ignore_eos": false,
       "in_tokens": 5020,
       "requested_out": 2496,
-      "early_stops": 8,
-      "out_tokens": 2282,
-      "duration_s": 30.264317128108814,
-      "output_tok_per_s": 75.40232909734249,
-      "decode_tok_per_s": 75.40232909734249,
-      "req_per_s": 1.28864629044538,
+      "early_stops": 9,
+      "out_tokens": 2271,
+      "duration_s": 16.667199423070997,
+      "output_tok_per_s": 136.25564453596485,
+      "decode_tok_per_s": 136.25564453596485,
+      "req_per_s": 2.339925203391734,
       "ttft_ms": [
-        1544.835879559963,
-        89.87894398160279,
-        14131.328130955808,
-        14140.866739093326,
-        14140.866739093326
+        144.7711986883615,
+        82.4701958335936,
+        474.13809411227703,
+        485.38570082746446,
+        485.38570082746446
       ],
       "tpot_ms": [
-        22.029292079468956,
-        21.984456031258027,
-        23.166699776618138,
-        23.27790739761281,
-        23.27790739761281
+        22.08888228317695,
+        22.025325041993156,
+        23.357432960024614,
+        23.599494049059494,
+        23.599494049059494
       ],
       "ttft_requests": 39,
       "tpot_requests": 39,
       "e2e_s": [
-        2.809246317922281,
-        1.478018642985262,
-        14.633430341025814,
-        15.493175893090665,
-        15.493175893090665
+        1.4077223563471284,
+        1.4749604559037834,
+        1.6728006599005312,
+        1.84313328191638,
+        1.84313328191638
       ],
       "rounds": 0,
       "avg_accept": 0.0,
@@ -137,42 +137,42 @@
       "exact_continuations": 27,
       "single_token_responses": 0,
       "empty_responses": 0,
-      "input_trace_sha256": "2a914dcc59b9bc4f40f1e4113da66e385c7df9ee699ace28e4add7c9a12fa7da",
-      "output_trace_sha256": "90267f9d362f97a99214106f241a57961cf617120655d3bf98992df53ed39157"
+      "input_trace_sha256": "7366d17059c129b6ce5d06875c2588890ea0d6159fdf8b3f548a07af25dcd8e4",
+      "output_trace_sha256": "4c9c9093d24b054e054dbe14d6c79b489639413012556327b23598f753addce5"
     },
     "stats": {
       "n": 1141,
       "ignore_eos": false,
-      "in_tokens": 275565,
+      "in_tokens": 275297,
       "requested_out": 292096,
-      "early_stops": 249,
-      "out_tokens": 255158,
-      "duration_s": 172.1321930369595,
-      "output_tok_per_s": 1482.3374727190837,
-      "decode_tok_per_s": 1482.3374727190837,
-      "req_per_s": 6.628626405491791,
+      "early_stops": 243,
+      "out_tokens": 255648,
+      "duration_s": 120.58543665497564,
+      "output_tok_per_s": 2120.0570076424015,
+      "decode_tok_per_s": 2120.0570076424015,
+      "req_per_s": 9.462170819720788,
       "ttft_ms": [
-        1179.2645483358544,
-        196.1785750463605,
-        1277.796303969808,
-        52090.47921106685,
-        52249.41365700215
+        401.17466065597597,
+        192.98961199820042,
+        1119.58840303123,
+        1577.5433641392738,
+        1611.9135268963873
       ],
       "tpot_ms": [
-        63.32021942981972,
-        42.921505721432034,
-        61.71721114577459,
-        279.85447580335006,
-        1183.2137525653588
+        42.57996317126049,
+        43.03667634889922,
+        44.45879552969892,
+        64.41276936352045,
+        82.07480306737125
       ],
       "ttft_requests": 1141,
       "tpot_requests": 1141,
       "e2e_s": [
-        15.149372429472063,
-        11.118668096954934,
-        57.396553852944635,
-        64.28402524301782,
-        64.3966964710271
+        9.77298012805395,
+        11.17608620901592,
+        12.152066909940913,
+        12.506306336959824,
+        12.685464918147773
       ],
       "rounds": 0,
       "avg_accept": 0.0,
@@ -184,18 +184,18 @@
       "cache": {
         "source": "response.meta_info.cached_tokens",
         "continuations": 740,
-        "expected_reusable_tokens": 230486,
-        "admitted_cached_tokens": 205126,
-        "admitted_hit_fraction": 0.889971625174631,
-        "total_cached_tokens": 215744,
-        "overall_hit_fraction": 0.7829151017001433
+        "expected_reusable_tokens": 230219,
+        "admitted_cached_tokens": 205013,
+        "admitted_hit_fraction": 0.8905129463684579,
+        "total_cached_tokens": 215680,
+        "overall_hit_fraction": 0.7834447887190925
       },
       "exact_continuations": 740,
       "single_token_responses": 0,
       "empty_responses": 0,
-      "input_trace_sha256": "ead71e65f21d1d108452dd6fe273eb11c55cdb1c7ce8a7143d1a110c8652d99e",
-      "output_trace_sha256": "23c96ed104b6eb41762497713e3391cec75745e0e417bdfb6987cc3aba9c7281"
+      "input_trace_sha256": "ed798e5f3dee99f6400d33628d48a2511c57a4b69984bde64e38078df56290a2",
+      "output_trace_sha256": "4fb3db4e917212b24efd669a2b01773d02542f6b22fc5ed30813f4d95159c22d"
     }
   },
-  "ended": 1792861932.2534134
+  "ended": 1792945478.1870255
 }

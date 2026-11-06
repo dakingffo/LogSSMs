@@ -1,0 +1,12 @@
+{
+  "commit": "620e03f9a86161d6de264b99782dac7e10f21030",
+  "prefix_continuity": {
+    "continuations": 480,
+    "broken": 0
+  },
+  "triton_cache_audit": {
+    "scope": "New unique compiled cache variants during this run",
+    "startup": 68,
+    "post_ready": 0
+  }
+}

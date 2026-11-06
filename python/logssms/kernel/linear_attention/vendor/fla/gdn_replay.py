@@ -8,6 +8,7 @@ from ...replay import reconstruct_tile
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=[
         'work_slots', 'log_slots', 'token_offsets', 'replay_counts', 'payload_frames',
         'decay_frames',
@@ -23,7 +24,7 @@ def _gdn_replay_kernel(
     FULL_K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_V: tl.constexpr,
     FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr,
     HEAD_PAYLOAD_BYTES: tl.constexpr, DECAY_RECORD_BYTES: tl.constexpr,
-    LAYER: tl.constexpr, PAGE_SIZE: tl.constexpr, REPLAY_WINDOW: tl.constexpr,
+    LAYER, PAGE_SIZE: tl.constexpr, REPLAY_WINDOW: tl.constexpr,
     LAYERS: tl.constexpr, GRANULARITY: tl.constexpr,
 ):
     value_block = tl.program_id(0)

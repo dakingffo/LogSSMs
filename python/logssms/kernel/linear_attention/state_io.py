@@ -44,7 +44,7 @@ class ChunkLogIO:
 def _chunk_state_pointer(
     storage, payload_frames, slot, head, offsets,
     SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr,
-    HEAD_STRIDE: tl.constexpr, LAYER: tl.constexpr,
+    HEAD_STRIDE: tl.constexpr, LAYER,
     HV: tl.constexpr, LOGSTATE: tl.constexpr,
     FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr,
     HEAD_PAYLOAD_BYTES: tl.constexpr,
@@ -64,7 +64,7 @@ def _store_chunk_state_tile(
     storage, payload_frames, state, slot, head, key_offsets, value_offsets,
     K: tl.constexpr, V: tl.constexpr,
     SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr, HEAD_STRIDE: tl.constexpr,
-    LAYER: tl.constexpr, HV: tl.constexpr, LOGSTATE: tl.constexpr,
+    LAYER, HV: tl.constexpr, LOGSTATE: tl.constexpr,
     FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr, HEAD_PAYLOAD_BYTES: tl.constexpr,
     LAYERS: tl.constexpr, GRANULARITY: tl.constexpr, PAGE_SIZE: tl.constexpr,
 ):
@@ -83,7 +83,7 @@ def _store_chunk_log(
     storage, payload_frames, decay_frames, slots, token_offsets, gate, key,
     residual, rows, token_mask, head, value_offsets, value_tile,
     K: tl.constexpr, V: tl.constexpr, H: tl.constexpr, HV: tl.constexpr,
-    LAYER: tl.constexpr, PAGE_SIZE: tl.constexpr, FRAME_BYTES: tl.constexpr,
+    LAYER, PAGE_SIZE: tl.constexpr, FRAME_BYTES: tl.constexpr,
     FRAMES_PER_SLOT: tl.constexpr, HEAD_PAYLOAD_BYTES: tl.constexpr,
     DECAY_RECORD_BYTES: tl.constexpr, BK: tl.constexpr,
     LAYERS: tl.constexpr, GRANULARITY: tl.constexpr,

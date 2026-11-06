@@ -1,4 +1,4 @@
-Prepared 128 trees, 1141 requests: /root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349
+Prepared 128 trees, 1141 requests: /root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446
 requests done: 16/39
 requests done: 32/39
 requests done: 39/39
@@ -74,8 +74,8 @@ requests done: 1104/1141
 requests done: 1120/1141
 requests done: 1136/1141
 requests done: 1141/1141
-TTFT avg/p50: 1179.26/196.18 ms
-TPOT avg/p50: 63.32/42.92 ms
-Output: 1482.34 tok/s; requests: 6.63/s
-Cache: 78.29%; reusable history: 89.00%
-Results: /root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261025-003349
+TTFT avg/p50: 401.17/192.99 ms
+TPOT avg/p50: 42.58/43.04 ms
+Output: 2120.06 tok/s; requests: 9.46/s
+Cache: 78.34%; reusable history: 89.05%
+Results: /root/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446

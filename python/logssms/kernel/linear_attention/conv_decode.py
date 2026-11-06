@@ -18,6 +18,7 @@ def _frame_element_offset(frame, frame_elems: tl.constexpr):
 
 
 @triton.jit(
+    do_not_specialize=['LAYER'],
     do_not_specialize_on_alignment=['FrameTable', 'ReadSlots', 'ReadGranules', 'WriteSlots', 'WriteGranules', 'WorkSlots'],
 )
 def _conv_decode_kernel(
@@ -25,7 +26,7 @@ def _conv_decode_kernel(
     ReadSlots, ReadGranules, WriteSlots, WriteGranules, WorkSlots,
     C: tl.constexpr, KEY_DIM: tl.constexpr, STATE_LEN: tl.constexpr,
     X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
-    STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr, LAYER: tl.constexpr,
+    STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr, LAYER,
     READ_STRIDE: tl.constexpr, WRITE_STRIDE: tl.constexpr,
     FRAME_ELEMS: tl.constexpr, NUM_GRANULES: tl.constexpr,
     HAS_BIAS: tl.constexpr, SPLIT_QKV: tl.constexpr, ROUND_CONV: tl.constexpr,
