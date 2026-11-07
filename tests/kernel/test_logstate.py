@@ -47,7 +47,7 @@ def test_logstate_decode_selects_launch_config(monkeypatch, batch_size, eager, d
         frame_bytes=32768, head_payload_bytes=32768,
         allocator=SimpleNamespace(payload_frames=6), page_size=64,
         storage=torch.empty(0, dtype=torch.uint8),
-        payload_frame_table=slots, decay_frame_table=slots,
+        payload_frame_table=torch.zeros(1, 6, dtype=torch.int32), decay_frame_table=slots,
     )
     fused_recurrent_gated_delta_rule_to_logstate(
         q, q, v, a, a, torch.empty(6), torch.empty(6), pool,

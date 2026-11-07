@@ -276,6 +276,7 @@ def test_linear_descriptors_change_when_log_becomes_checkpoint():
     assert torch.all(pool.conv_frame_table[work, 1:] == -1)
     payload = pool.payload_frame_table[log].clone()
     pool.materialize(log)
+    payload[pool.allocator.payload_frames:] = -1
     torch.testing.assert_close(pool.payload_frame_table[log], payload)
     assert torch.all(pool.conv_frame_table[log, :-1] == -1)
     assert torch.all(pool.conv_frame_table[log, -1] >= 0)
@@ -301,6 +302,7 @@ def test_batch_materialization_and_partial_release(device):
     pool.release_slots(logs[:1])
     assert not pool._retired_materializations
     assert all(pool.allocator.slot(slot).kind == "checkpoint" for slot in logs[1:])
+    payload[:, pool.allocator.payload_frames:] = -1
     torch.testing.assert_close(pool.payload_frame_table[logs[1:]], payload[1:])
     assert torch.all(pool.conv_frame_table[logs[1:], :-1] == -1)
     assert torch.all(pool.decay_frame_table[logs] == -1)
@@ -351,6 +353,7 @@ def test_merged_slots_retire_without_reusing_inflight_frames(monkeypatch):
     assert any(event.waits for event in events)
     assert not pool.retiring_slots
     assert pool.allocator.slot(logs[2]).kind == "checkpoint"
+    payload[2, pool.allocator.payload_frames:] = -1
     torch.testing.assert_close(pool.payload_frame_table[logs[2]], payload[2])
     pool.allocator.check_integrity()
     pool.release_kv(kv)

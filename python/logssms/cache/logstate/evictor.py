@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from time import perf_counter_ns
 
 from .frame_pool import MHALogStatePool
-from .prefix_cache import LogRadixTree, LogRadixTreeNode, LogStateKind
+from .prefix_cache import LogRadixTree, LogRadixEvictionSegment, LogStateKind
 from .recycler import LogStateRecycleBin
 
 
@@ -87,22 +87,22 @@ class LogStateEvictor:
             evicted_entry_spans = (
                 [
                     {
-                        "node_uuid": node.uuid,
+                        "node_uuid": segment.node.uuid,
                         "kind": entry.kind.value,
                         "begin": entry.begin,
                         "end": entry.end,
                         "slot": entry.slot,
                     }
-                    for node in selected for entry in node.entries
+                    for segment in selected for entry in segment.entries
                 ]
                 if self._profile_enabled else None
             )
             evicted_nodes = [] if self._profile_enabled else None
             free_frames_before = self._allocator.free_frames if self._profile_enabled else 0
             if recycle_bin is not None:
-                for node in selected:
-                    recycle_bin.remember(self.tree, node)
-            eviction = self.tree.evict_nodes(selected, evicted_nodes)
+                for segment in selected:
+                    recycle_bin.remember(self.tree, segment)
+            eviction = self.tree.evict(selected, evicted_nodes)
             if profile is not None:
                 now = perf_counter_ns()
                 profile["timing_ms"]["tree_evict_ms"] = (now - stage) / 1e6
@@ -114,7 +114,6 @@ class LogStateEvictor:
                 stage = now
             for slot in released_slots:
                 assert not self.tree.has_slot(slot)
-
 
             self.pool.retire_slots(sorted(released_slots))
             if profile is not None:
@@ -183,7 +182,7 @@ class LogStateEvictor:
 
     def plan(
         self, needed_pages: int, needed_states: int, needed_works: int,
-    ) -> tuple[list[LogRadixTreeNode], dict[int, int], set[int], list[tuple[int, int]]]:
+    ) -> tuple[list[LogRadixEvictionSegment], dict[int, int], set[int], list[tuple[int, int]]]:
         from logssms.kernel import logstate as planning
 
         allocator = self._allocator
@@ -194,25 +193,24 @@ class LogStateEvictor:
                 self._profile_stats["eviction_candidate_windows"] += int(log_only)
                 self._profile_stats["eviction_full_snapshots"] += int(not log_only)
                 self._profile_stats["eviction_serialized_nodes"] += len(nodes)
-            node_slots = [node.eviction_slots for node in nodes]
+            node_slots = [segment.eviction_slots for segment in nodes]
             slot_ids = {slot for row in node_slots for slot in row}
             slots = []
             decay_frames = set()
             for slot in slot_ids:
                 record = allocator.slot(slot)
                 slots.append((
-                    slot, self.tree.slot_entry_count(slot),
+                    slot,
                     len(record.payload) + sum(map(len, record.conv)),
                     -1 if record.decay is None else record.decay.frame,
-                    -1 if record.decay is None else record.decay.index,
                 ))
                 if record.decay is not None:
                     decay_frames.add(record.decay.frame)
             rows = planning.plan_eviction(
                 topology,
-                [[value for frame, count in node._kv_page_counts.items() for value in (
+                [[value for frame, count in segment._kv_frame_counts.items() for value in (
                     frame, count, self.cached_page_tokens[frame * self.page_size],
-                )] for node in nodes],
+                )] for segment in nodes],
                 node_slots,
                 slots,
                 [(frame, allocator._decay_masks[frame].bit_count()) for frame in decay_frames],

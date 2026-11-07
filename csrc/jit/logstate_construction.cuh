@@ -41,13 +41,13 @@ LOGSSMS_DEVICE T *payload_pointer(
   const LogStateKernelParams& params, std::int32_t slot,
   std::int64_t layer, std::int64_t head, std::int64_t element
 ) {
-  const auto bytes = (layer * params.num_heads + head) * params.head_payload_bytes;
+  const auto bytes = (layer * params.num_heads + head) * params.head_payload_bytes + element * sizeof(T);
   const auto frame = params.payload_frames[
     slot * params.payload_frames_per_slot + bytes / params.frame_bytes
   ];
   return reinterpret_cast<T *>(
     params.frame_storage + frame * params.frame_bytes + bytes % params.frame_bytes
-  ) + element;
+  );
 }
 
 struct LogStateRestoreParams : LogStateKernelParams {
@@ -94,9 +94,7 @@ LOGSSMS_DEVICE const T *key_pointer(
   std::int64_t column = 0
 ) {
   const auto group = head / (params.num_heads / params.num_key_heads);
-  const auto layer_size = params.num_key_heads == params.num_heads
-    ? params.num_heads * params.head_payload_bytes / sizeof(T) / (params.page_size / params.granularity)
-    : params.granularity * (params.num_key_heads * kHeadKDim + params.num_heads * kHeadVDim);
+  const auto layer_size = params.granularity * (params.num_key_heads * kHeadKDim + params.num_heads * kHeadVDim);
   const auto offset = (token / params.granularity * params.num_layers + layer) * layer_size
     + (group * params.granularity + token % params.granularity) * kHeadKDim + column;
   const auto bytes = offset * sizeof(T);
@@ -116,9 +114,7 @@ LOGSSMS_DEVICE const T *value_pointer(
   std::int64_t column = 0
 ) {
   const auto key_size = params.granularity * params.num_key_heads * kHeadKDim;
-  const auto layer_size = params.num_key_heads == params.num_heads
-    ? params.num_heads * params.head_payload_bytes / sizeof(T) / (params.page_size / params.granularity)
-    : key_size + params.granularity * params.num_heads * kHeadVDim;
+  const auto layer_size = key_size + params.granularity * params.num_heads * kHeadVDim;
   const auto offset = (token / params.granularity * params.num_layers + layer) * layer_size
     + key_size + (head * params.granularity + token % params.granularity) * kHeadVDim + column;
   const auto bytes = offset * sizeof(T);
@@ -142,9 +138,7 @@ LOGSSMS_DEVICE LogChunk<T> resolve_log_chunk(
 ) {
   const auto group = head / (params.num_heads / params.num_key_heads);
   const auto key_size = params.granularity * params.num_key_heads * kHeadKDim;
-  const auto layer_size = params.num_key_heads == params.num_heads
-    ? params.num_heads * params.head_payload_bytes / sizeof(T) / (params.page_size / params.granularity)
-    : key_size + params.granularity * params.num_heads * kHeadVDim;
+  const auto layer_size = key_size + params.granularity * params.num_heads * kHeadVDim;
   const auto base = (begin / params.granularity * params.num_layers + layer) * layer_size;
   const auto key_bytes = (base + (group * params.granularity + begin % params.granularity) * kHeadKDim) * sizeof(T);
   const auto value_bytes = (base + key_size + (head * params.granularity + begin % params.granularity) * kHeadVDim) * sizeof(T);
@@ -256,7 +250,12 @@ __device__ void write_state_tiles(
     for (int index = lane; index < 256; index += 32) {
       const int k = tile_k + index / 16, v = tile_v + index % 16;
       if (k < kHeadKDim && v < kHeadVDim) {
-        destination[k * kHeadVDim + v] = from_float<T>(tiles[warp * 256 + index]);
+        const auto value = from_float<T>(tiles[warp * 256 + index]);
+        if (params.head_payload_bytes <= params.frame_bytes) {
+          destination[k * kHeadVDim + v] = value;
+        } else {
+          *state_pointer<T, kHeadKDim, kHeadVDim>(params, slot, layer, head, k * kHeadVDim + v) = value;
+        }
       }
     }
     __syncwarp();
@@ -317,7 +316,8 @@ void log_state_kernel(const __grid_constant__ LogStateRestoreParams params) {
         const int k = k_begin + tile / tiles_v * 16 + index / 16;
         const int v = v_begin + tile % tiles_v * 16 + index % 16;
         scratch.tiles[warp * 256 + index] = k < kHeadKDim && v < kHeadVDim
-          ? to_float(base[k * kHeadVDim + v]) : 0.f;
+          ? to_float(params.head_payload_bytes <= params.frame_bytes ? base[k * kHeadVDim + v]
+                     : *state_pointer<T, kHeadKDim, kHeadVDim>(params, base_slot, layer, head, k * kHeadVDim + v)) : 0.f;
       }
       __syncwarp();
       wmma::load_matrix_sync(state[step], scratch.tiles + warp * 256,
@@ -404,7 +404,12 @@ __global__ void copy_log_state_kernel(const __grid_constant__ LogStateRestorePar
   auto *source = state_pointer<T, kHeadKDim, kHeadVDim>(params, params.base_slots[task], layer, head);
   auto *target = state_pointer<T, kHeadKDim, kHeadVDim>(params, params.output_slots[task], layer, head);
   for (auto index = threadIdx.x; index < kHeadKDim * kHeadVDim; index += blockDim.x) {
-    target[index] = source[index];
+    if (params.head_payload_bytes <= params.frame_bytes) {
+      target[index] = source[index];
+    } else {
+      *state_pointer<T, kHeadKDim, kHeadVDim>(params, params.output_slots[task], layer, head, index)
+        = *state_pointer<T, kHeadKDim, kHeadVDim>(params, params.base_slots[task], layer, head, index);
+    }
   }
 }
 

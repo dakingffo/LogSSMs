@@ -28,7 +28,6 @@ from logssms.cache.logstate.prefix_cache import (
     LogStateRecovery,
     LogRadixTrace,
     LogRadixTree,
-    LogRadixTreeNode,
     LogStateEntry,
     LogStateKind,
     LogStateMergeStats,
@@ -59,7 +58,6 @@ if TYPE_CHECKING:
     from logssms.models.config import AffineLogCacheSpec
     from logssms.scheduler.prefill import PendingRequest
     from logssms.speculator import SpeculatorReserve
-
 
 logger = init_logger(__name__)
 
@@ -126,8 +124,7 @@ class LogStateConstruction:
             (
                 task.base_slot,
                 [
-                    (entry.slot, entry.begin - entry.physical_begin,
-                     entry.end - entry.physical_begin)
+                    (entry.slot, 0, entry.end - entry.begin)
                     for entry in task.logs
                 ],
                 task.output_slot,
@@ -199,11 +196,11 @@ class LogStateCachePlan(CachePlan):
 
 
 @dataclass(frozen=True)
-class _LivePage:
-    begin     : int
-    end       : int
-    kv_page   : int
-    state_slot: int | None
+class _LiveGranule:
+    begin           : int
+    end             : int
+    kv_offset       : int
+    state_slot      : int | None
     checkpoint_begin: int | None = None
 
 
@@ -212,29 +209,29 @@ class _RequestCacheState:
     work_slot         : int
     work_committed_pos: int
     request_end       : int
-    live_pages        : list[_LivePage]     = field(default_factory=list)
+    live_granules      : list[_LiveGranule] = field(default_factory=list)
     recycle_match     : RecycledMatch | None = None
-    live_page_cursor  : int                 = 0
+    live_granule_cursor: int = 0
 
-    def live_page_at(self, position: int) -> _LivePage | None:
-        pages = self.live_pages
-        if not pages:
+    def live_granule_at(self, position: int) -> _LiveGranule | None:
+        granules = self.live_granules
+        if not granules:
             return None
-        cursor = min(self.live_page_cursor, len(pages) - 1)
-        page = pages[cursor]
-        if page.begin <= position < page.end:
-            return page
+        cursor = min(self.live_granule_cursor, len(granules) - 1)
+        granule = granules[cursor]
+        if granule.begin <= position < granule.end:
+            return granule
         # Decode normally uses the tail, including immediately after prefill.
-        if pages[-1].begin <= position < pages[-1].end:
-            self.live_page_cursor = len(pages) - 1
-            return pages[-1]
-        if position < page.begin:
+        if granules[-1].begin <= position < granules[-1].end:
+            self.live_granule_cursor = len(granules) - 1
+            return granules[-1]
+        if position < granule.begin:
             cursor = 0
-        while cursor < len(pages) and pages[cursor].end <= position:
+        while cursor < len(granules) and granules[cursor].end <= position:
             cursor += 1
-        if cursor < len(pages) and pages[cursor].begin <= position:
-            self.live_page_cursor = cursor
-            return pages[cursor]
+        if cursor < len(granules) and granules[cursor].begin <= position:
+            self.live_granule_cursor = cursor
+            return granules[cursor]
         return None
 
 
@@ -260,17 +257,17 @@ class LogStateCacheManager(BaseCacheManager):
         assert isinstance(pool, MHALogStatePool)
         assert state_table is not None
         assert work_state_table is not None
-        assert pool.page_size == page_size
+        assert pool.page_size == page_size == granularity
         assert pool.layout.granularity == granularity
         assert num_pages > 0 and num_states > 0
         assert num_work_states == work_state_table.numel()
         assert pool.allocator.num_frames >= num_pages + 1
 
         tree = LogRadixTree(
-            page_size=page_size,
-            device=resources.page_table.device,
             granularity=granularity,
+            device=resources.page_table.device,
             on_slot_reclaimable=pool.allocator.set_reclaimable,
+            checkpoint_log_count=pool.allocator.checkpoint_log_count,
         )
         super().__init__(
             page_size=page_size,
@@ -281,8 +278,8 @@ class LogStateCacheManager(BaseCacheManager):
             "LOGSSMS_PROFILE_SCHEDULER", "0"
         ).lower() in ("1", "true", "yes")
         self.analyzer = OnlineAnalysisScheduler(
-            page_size=page_size,
             granularity=granularity,
+            checkpoint_log_count=pool.allocator.checkpoint_log_count,
             enable_merge_adjustment=enable_merge_adjustment,
             min_sampling_len=min_sampling_len,
             max_merge_intensity=max_merge_intensity,
@@ -387,20 +384,7 @@ class LogStateCacheManager(BaseCacheManager):
         assert isinstance(pool, MHALogStatePool)
         return pool
 
-    @property
-    def free_pages(self) -> torch.Tensor:
-        return torch.tensor(
-            self._allocator._free, dtype=torch.int32, device=self.device
-        ) * self.page_size
-
-    @property
-    def free_states(self) -> torch.Tensor:
-        return torch.tensor(
-            self._allocator._free_slot_ids, dtype=torch.int32, device=self.device
-        )
-
     def match_req(self, req: PendingRequest) -> MatchResult:
-
 
         version = None if req.input_ids.is_inference() else req.input_ids._version
         epoch = (
@@ -428,7 +412,6 @@ class LogStateCacheManager(BaseCacheManager):
                         )
                 return result
         result = self._match_req(req, version)
-
 
         epoch = (
             self.tree.revision, self.tree.lock_revision,
@@ -511,7 +494,6 @@ class LogStateCacheManager(BaseCacheManager):
             assert trace is not None and handle.trace_revision == self.tree.revision
             source_node = trace.node
 
-
             if trace.matched_len > 0:
                 while source_node.merge_stats is None and len(source_node.children) == 1:
                     source_node = next(iter(source_node.children.values()))
@@ -532,7 +514,6 @@ class LogStateCacheManager(BaseCacheManager):
             if recycle_match is not None and recycle_match.branch.merge_stats:
                 origin, tail, intensity, next_update, *hits = recycle_match.branch.merge_stats
                 if recycle_match.matched_len == tail == len(recycle_match.branch.tokens):
-
 
                     stats = LogStateMergeStats(
                         origin, tail, intensity, deque(hits),
@@ -563,7 +544,7 @@ class LogStateCacheManager(BaseCacheManager):
         pending = self.analyzer._find_protections(
             self.tree, [req.input_ids for req in reqs], traces=self._prefill_traces(reqs),
         )
-        self._apply_protections(self.analyzer._plan_protections(self.tree, pending))
+        self._apply_protections(self.analyzer._plan_protections(pending))
         self._prefill_protection_key = key
         self._prefill_protections = pending
         points: dict[int, list[int]] = {}
@@ -576,34 +557,42 @@ class LogStateCacheManager(BaseCacheManager):
             (req, self._recycled_restores[req.table_idx]) for req in reqs
             if req.table_idx in self._recycled_restores
             and not self._recycled_restores[req.table_idx].prepared
-            and not self._request_states[req.table_idx].live_pages
+            and not self._request_states[req.table_idx].live_granules
         ]
-        if not restores or not pending:
+        if not restores:
             return
+        current_pins = Counter(slot for req in reqs for slot in self._recovery_pins.get(
+            id(self._pending_matches.get(req.table_idx)), (None, ()))[1])
+        blocked = {slot for slot, refs in self.tree._recovery_slot_refs.items()
+                   if refs > current_pins[slot]}
         for req, restore in restores:
             branches = points.get(req.uid, ())
             handle = self._pending_matches[req.table_idx]
             plan = self._plan_recycled_restore(
                 handle, handle.recycle_match, branches,
                 intensity=restore.plan.intensity, previous=restore.plan,
+                blocked_slots=frozenset(blocked),
             )
             assert plan is not None
             restore.plan = plan
+            blocked.update(entry.slot for checkpoint in plan.checkpoints for entry in checkpoint.gpu_entries)
+            blocked.update(slot for item in plan.gpu_materialize for slot in item.slots)
+            blocked.update(slot for item in plan.gpu_coalesce for slot in item.slots)
             restore.slots = {
-                checkpoint.end: checkpoint.gpu_entries[-1].slot
-                for checkpoint in plan.checkpoints
-                if checkpoint.gpu_entries and not (
-                    self.logstate_pool.shared_keys
-                    and self._allocator.slot(checkpoint.gpu_entries[-1].slot).kind == "log"
-                )
+                checkpoint.end: slot for checkpoint in plan.checkpoints
+                if (slot := self._checkpoint_output_slot(checkpoint)) is not None
             }
+
+    def _checkpoint_output_slot(self, checkpoint: RecycledCheckpoint) -> int | None:
+        for entry in reversed(checkpoint.gpu_entries):
+            if (self.tree.has_entry(entry)
+                and len(self._allocator.slot(entry.slot).payload) >= self._allocator.payload_frames):
+                return entry.slot
+        return None
 
     def _apply_protections(self, protections: Sequence[BranchProtection]) -> None:
         for protection in protections:
-            if protection.node is not None:
-                self.tree.protect(protection.node)
-            if protection.log_slot is not None and self.tree.has_slot(protection.log_slot):
-                self.tree.protect_entry(protection.log_slot)
+            self.tree.protect_at(protection.node, protection.position)
 
     def _plan_recycled_restore(
         self,
@@ -613,126 +602,91 @@ class LogStateCacheManager(BaseCacheManager):
         *,
         intensity    : int = 2,
         previous     : RecycledRestorePlan | None = None,
+        blocked_slots: frozenset[int] = frozenset(),
     ) -> RecycledRestorePlan | None:
         if match is None:
             return None
         from logssms.kernel import logstate as planning
 
         cached_len = handle.cached_len
-        gpu = tuple(
-            entry for entry in handle.match_entries
-            if entry.end <= cached_len
-        )
+        gpu = tuple(entry for entry in handle.match_entries if entry.end <= cached_len)
         path = handle.match_path
-        protected = frozenset(
-            (*match.branch.protected_endpoints, *batch_branches,
-             *((match.matched_len,) if match.matched_len < len(match.branch.tokens) else ()),
-             *(node.depth for node in path if node.is_protected))
-        )
-        context = _MergePathContext.build(self.tree, path, gpu, ())
-        protected_slots = {entry.slot for entry in context.protected_entries}
+        protected = frozenset((
+            *match.branch.protected_endpoints, *batch_branches,
+            *((match.matched_len,) if match.matched_len < len(match.branch.tokens) else ()),
+            *(node.depth for node in path if node.is_protected),
+        ))
+        context = _MergePathContext.build(path, ())
+        boundaries = tuple(sorted({*protected, *(node.depth for node in path
+                                                if node.is_protected or not node.is_leaf())}))
         eligible_slots = None if previous is None else {
             *(entry.slot for checkpoint in previous.checkpoints for entry in checkpoint.gpu_entries),
-            *(item.log_slot for item in previous.gpu_materialize),
+            *(slot for item in previous.gpu_materialize for slot in item.slots),
             *(slot for item in previous.gpu_coalesce for slot in item.slots),
         }
         lock_boundaries = context.lock_boundaries if previous is None else previous.lock_boundaries
-
-
-        protected_pages = {
-            position // self.page_size for position in protected
-            if position % self.page_size
-        }
-        pieces: list[tuple[int, int, LogStateEntry | None, bool]] = []
-        for entry in gpu:
-            eligible = (
-                (not self.tree.entry_owner(entry).is_locked if eligible_slots is None
-                 else entry.slot in eligible_slots)
-                and entry.slot not in protected_slots
-                and not self.tree.slot_is_fragmented(entry.slot)
-                and entry.begin % self.page_size == 0
-                and entry.end % self.page_size == 0
-                and not any(entry.begin < position < entry.end for position in protected)
-                and not (entry.kind is LogStateKind.LOG and entry.end in protected)
-            )
-            pieces.append((entry.begin, entry.end, entry, eligible))
+        pieces = [(entry.begin, entry.end, entry,
+                   (not self.tree.entry_owner(entry).is_locked if eligible_slots is None
+                    else entry.slot in eligible_slots)
+                   and entry.slot not in blocked_slots
+                   and not any(entry.begin < position < entry.end for position in boundaries))
+                  for entry in gpu]
         for entry in match.branch.logs:
-            begin = max(cached_len, entry.begin)
-            end = min(match.matched_len, entry.end)
-            begin = align_ceil(begin, self.page_size)
-            end = align_down(end, self.page_size)
-            if begin >= end:
-                continue
-            cuts = {begin, end}
-            cuts.update(pos for pos in protected if begin < pos < end and pos % self.page_size == 0)
-            for page in protected_pages:
-                cuts.update(pos for pos in (page * self.page_size, (page + 1) * self.page_size)
-                            if begin < pos < end)
-
-
-            cuts.update(range(begin, end, self.page_size))
-            boundaries = sorted(cuts)
-            for left, right in zip(boundaries, boundaries[1:]):
-                if left // self.page_size in protected_pages:
-                    continue
-                pieces.append((left, right, None, True))
+            begin = align_ceil(max(cached_len, entry.begin), self.granularity)
+            end = align_down(min(match.matched_len, entry.end), self.granularity)
+            pieces.extend((left, left + self.granularity, None, True)
+                          for left in range(begin, end, self.granularity))
         pieces.sort(key=lambda item: (item[0], item[1]))
-        rows = []
-        for index, (begin, end, entry, eligible) in enumerate(pieces):
-            rows.extend((
-                index, begin, end, (end - begin) // self.page_size,
-                begin, int(eligible), int(not eligible), 0,
-            ))
+        rows = [value for index, (begin, end, entry, eligible) in enumerate(pieces)
+                for value in (index, begin, end,
+                              entry.span_granules if entry is not None and entry.kind is LogStateKind.CHECKPOINT else -1,
+                              int(eligible))]
+        candidates = [(0, index, int(entry is not None)) for index, (_, _, entry, eligible) in enumerate(pieces)
+                      if eligible and (entry is None or entry.kind is LogStateKind.LOG)]
+        materialize = planning.plan_materialize(
+            [rows], [boundaries], candidates, self.granularity, self._allocator.checkpoint_log_count,
+        )
+        virtual = [(pieces[index][0], pieces[index][1], (index,), False)
+                   for index, (_, _, entry, _) in enumerate(pieces)
+                   if entry is not None and entry.kind is LogStateKind.CHECKPOINT]
+        virtual.extend((pieces[candidates[group[0]][1]][0], pieces[candidates[group[-1]][1]][1],
+                        tuple(candidates[index][1] for index in group), True)
+                       for group in materialize)
+        virtual.sort(key=lambda item: (item[0], item[1]))
+        projected = [value for index, (begin, end, indices, _) in enumerate(virtual)
+                     for value in (index, begin, end, (end - begin) // self.granularity,
+                                   int(all(pieces[i][3] for i in indices)))]
         groups, _ = planning.plan_coalesce(
-            [rows], [sorted(protected)], [lock_boundaries],
+            [projected], [boundaries], [lock_boundaries],
             [(0, match.matched_len, intensity, int(self.enable_merge_adjustment))],
-            (), self.page_size, False,
+            self.granularity, False,
         )
         consumed = set()
-        checkpoints = []
-        gpu_coalesce = []
+        checkpoints, gpu_materialize, gpu_coalesce = [], [], []
         for group in groups:
-            indices = group[3::2]
-            if all(pieces[index][2] is not None for index in indices):
+            virtual_indices = group[3::2]
+            consumed.update(virtual_indices)
+            indices = tuple(index for i in virtual_indices for index in virtual[i][2])
+            entries = tuple(pieces[index][2] for index in indices if pieces[index][2] is not None)
+            if len(entries) == len(indices):
                 gpu_coalesce.append(CheckpointCoalesce(
-                    tuple(pieces[index][2].slot for index in indices),
-                    tuple(group[4::2]), group[0], group[1], group[2],
+                    tuple(entry.slot for entry in entries),
+                    tuple(entry.span_granules if entry.kind is LogStateKind.CHECKPOINT else 1 for entry in entries),
+                    group[0], group[1], group[2],
                 ))
+            else:
+                checkpoints.append(RecycledCheckpoint(group[0], group[1], entries))
+        for index, (begin, end, indices, is_materialize) in enumerate(virtual):
+            if index in consumed or not is_materialize:
                 continue
-            consumed.update(indices)
-            checkpoints.append(RecycledCheckpoint(
-                group[0], group[1], tuple(
-                    pieces[index][2] for index in indices if pieces[index][2] is not None
-                ),
-            ))
-        checkpoints.extend(
-            RecycledCheckpoint(begin, end)
-            for index, (begin, end, entry, eligible) in enumerate(pieces)
-            if index not in consumed and entry is None and eligible
-        )
-        gpu_candidates = []
-        for index, (begin, end, entry, eligible) in enumerate(pieces):
-            if index in consumed or entry is None or not eligible or entry.kind is not LogStateKind.LOG:
-                continue
-            gpu_candidates.append(entry)
-        if gpu_candidates:
-            indices = {entry: i for i, entry in enumerate(gpu)}
-            rows = [value for entry in gpu for value in (
-                entry.slot, entry.begin, entry.end,
-                -1 if entry.span_pages is None else entry.span_pages,
-                entry.physical_begin, 1, 0, 0,
-            )]
-            reachable = planning.plan_materialize(
-                [rows], [()], [(0, indices[entry]) for entry in gpu_candidates], self.page_size,
-            )
-            assert len(reachable) == len(gpu_candidates)
-        gpu_materialize = tuple(MaterializeCandidate(entry.slot, entry.begin, entry.end)
-                                for entry in gpu_candidates)
+            entries = tuple(pieces[i][2] for i in indices if pieces[i][2] is not None)
+            if len(entries) == len(indices):
+                gpu_materialize.append(MaterializeCandidate(tuple(entry.slot for entry in entries), begin, end))
+            else:
+                checkpoints.append(RecycledCheckpoint(begin, end, entries))
         return RecycledRestorePlan(
-            cached_len, match.matched_len,
-            tuple(sorted(checkpoints, key=lambda entry: entry.end)), protected,
-            tuple(gpu_materialize), tuple(gpu_coalesce),
-            intensity, lock_boundaries,
+            cached_len, match.matched_len, tuple(sorted(checkpoints, key=lambda item: item.end)),
+            protected, tuple(gpu_materialize), tuple(gpu_coalesce), intensity, lock_boundaries,
         )
 
     @property
@@ -764,8 +718,8 @@ class LogStateCacheManager(BaseCacheManager):
         else:
             state = self._request_states[table_idx]
             end = state.request_end
-            pages = state.live_pages
-            begin = pages[-1].end if pages else max(0, end - token_len)
+            granules = state.live_granules
+            begin = granules[-1].end if granules else max(0, end - token_len)
             restore = self._recycled_restores.get(table_idx)
             plan = None if restore is None else restore.plan
             slots = {} if restore is None else restore.slots
@@ -788,13 +742,10 @@ class LogStateCacheManager(BaseCacheManager):
             ) + covered * max(0, checkpoint_frames - log_frames)
         states = int(new_request) + sum(
             checkpoint.end > begin and checkpoint.begin < end
-            and (not checkpoint.gpu_entries or (
-                self.logstate_pool.shared_keys
-                and self._allocator.slot(checkpoint.gpu_entries[-1].slot).kind == "log"
-            )) and checkpoint.end not in slots
+            and checkpoint.end not in slots
+            and self._checkpoint_output_slot(checkpoint) is None
             for checkpoint in checkpoints
         )
-
 
         return self._allocator.required_frames(
             kv, kv - covered, states, free_decay_records=0,
@@ -815,7 +766,7 @@ class LogStateCacheManager(BaseCacheManager):
             return False
         if handle.restore_plan is not None and any(
             not self.tree.has_slot(entry.slot)
-            or self.tree.entries_for_slot(entry.slot) != (entry,)
+            or not self.tree.has_entry(entry)
             or self.tree.entry_owner(entry).is_locked
             for checkpoint in handle.restore_plan.checkpoints
             for entry in checkpoint.gpu_entries
@@ -829,7 +780,6 @@ class LogStateCacheManager(BaseCacheManager):
                 or not handle.node.is_leaf() or handle.node.is_locked
                 or handle.node.depth != stats.tail
             ):
-
 
                 if self._profile_enabled:
                     self._profile_stats["admission_rejections"] += 1
@@ -877,7 +827,7 @@ class LogStateCacheManager(BaseCacheManager):
         if handle.restore_plan is not None:
             slots.update(entry.slot for checkpoint in handle.restore_plan.checkpoints
                          for entry in checkpoint.gpu_entries)
-            slots.update(item.log_slot for item in handle.restore_plan.gpu_materialize)
+            slots.update(slot for item in handle.restore_plan.gpu_materialize for slot in item.slots)
             slots.update(slot for item in handle.restore_plan.gpu_coalesce for slot in item.slots)
         return tuple(sorted(slots))
 
@@ -1085,7 +1035,6 @@ class LogStateCacheManager(BaseCacheManager):
                     free_capacity=free_capacity,
                 ) * self.page_size
 
-
         self.logstate_pool.poll_reclamation()
         return self._allocator.admissible_pages(
             evictable_kv_frames=self.tree.evictable_kv_frames(),
@@ -1125,12 +1074,8 @@ class LogStateCacheManager(BaseCacheManager):
         if handle.restore_plan is not None:
             restore = _RecycledRestore(handle.restore_plan)
             restore.slots.update({
-                checkpoint.end: checkpoint.gpu_entries[-1].slot
-                for checkpoint in restore.plan.checkpoints
-                if checkpoint.gpu_entries and not (
-                    self.logstate_pool.shared_keys
-                    and self._allocator.slot(checkpoint.gpu_entries[-1].slot).kind == "log"
-                )
+                checkpoint.end: slot for checkpoint in restore.plan.checkpoints
+                if (slot := self._checkpoint_output_slot(checkpoint)) is not None
             })
             self._recycled_restores[table_idx] = restore
 
@@ -1159,8 +1104,8 @@ class LogStateCacheManager(BaseCacheManager):
         for req in reqs:
             state = self._request_states[req.table_idx]
             state.request_end = req.max_device_len
-            pages = state.live_pages
-            begin = pages[-1].end if pages else req.cached_len
+            granules = state.live_granules
+            begin = granules[-1].end if granules else req.cached_len
             if req.device_len > begin:
                 first_span = self.page_size - begin % self.page_size
                 count = 1 + div_ceil(
@@ -1222,7 +1167,7 @@ class LogStateCacheManager(BaseCacheManager):
                 self._profile_allocation_samples.append(profile)
             return
 
-        kv_pages, state_slots, direct_slots = self._allocate(
+        kv_offsets, state_slots, direct_slots = self._allocate(
             needed, needed_logs, needed_checkpoints, profile=profile
         )
         if profile is not None:
@@ -1234,12 +1179,12 @@ class LogStateCacheManager(BaseCacheManager):
         checkpoint_offset = 0
         regions = []
         for req, begin, count, direct in allocation_info:
-            live_pages = self._request_states[req.table_idx].live_pages
+            live_granules = self._request_states[req.table_idx].live_granules
             restore = self._recycled_restores.get(req.table_idx)
             logical_begin = begin
             for index in range(count):
                 logical_end = align_ceil(logical_begin + 1, self.page_size)
-                kv_page = int(kv_pages[offset])
+                kv_offset = int(kv_offsets[offset])
                 offset += 1
                 checkpoint_begin = direct.get(logical_end)
                 inside_checkpoint = any(
@@ -1258,11 +1203,11 @@ class LogStateCacheManager(BaseCacheManager):
                 else:
                     state_slot = int(state_slots[log_offset])
                     log_offset += 1
-                live_pages.append(
-                    _LivePage(
+                live_granules.append(
+                    _LiveGranule(
                         begin=logical_begin,
                         end=logical_end,
-                        kv_page=kv_page,
+                        kv_offset=kv_offset,
                         state_slot=state_slot,
                         checkpoint_begin=checkpoint_begin,
                     )
@@ -1270,7 +1215,7 @@ class LogStateCacheManager(BaseCacheManager):
                 regions.append((
                     req.table_idx, logical_begin,
                     min(logical_end, req.max_device_len, self.page_table.shape[1]),
-                    kv_page, state_slot if checkpoint_begin is None and not inside_checkpoint else -1,
+                    kv_offset, state_slot if checkpoint_begin is None and not inside_checkpoint else -1,
                 ))
                 logical_begin = logical_end
             mapped_end = min(
@@ -1278,7 +1223,7 @@ class LogStateCacheManager(BaseCacheManager):
                 req.max_device_len,
                 self.page_table.shape[1],
             )
-            assert live_pages[-1].begin < mapped_end <= live_pages[-1].end
+            assert live_granules[-1].begin < mapped_end <= live_granules[-1].end
         from logssms.kernel.metadata import write_cache_mapping
 
         write_cache_mapping(regions, self.page_table, state_table, self.page_size)
@@ -1295,7 +1240,7 @@ class LogStateCacheManager(BaseCacheManager):
     def _profile_resource_snapshot(self) -> dict:
         entries = self.tree.iter_entries()
         checkpoint_spans = Counter(
-            entry.span_pages for entry in entries
+            entry.span_granules for entry in entries
             if entry.kind is LogStateKind.CHECKPOINT
         )
         log_slots = {
@@ -1311,8 +1256,8 @@ class LogStateCacheManager(BaseCacheManager):
             "frame_usage": self._allocator.profile_usage(),
             "free_frames": self._allocator.free_frames,
             "pending_merge_reclamation_slots": len(self.logstate_pool.retiring_slots),
-            "free_kv_pages": len(self.free_pages),
-            "free_state_slots": len(self.free_states),
+            "free_kv_pages": self._allocator.free_frames,
+            "free_state_slots": len(self._allocator._free_slot_ids),
             "evictable_kv_tokens": self.tree.size_info.evictable_size,
             "cached_kv_tokens": self.tree.size_info.total_size,
             "evictable_kv_pages": (
@@ -1329,11 +1274,11 @@ class LogStateCacheManager(BaseCacheManager):
             ),
             "tree_log_slots": len(log_slots),
             "tree_checkpoint_slots": len(checkpoint_slots),
-            "checkpoint_span_pages": dict(sorted(checkpoint_spans.items())),
+            "checkpoint_span_granules": dict(sorted(checkpoint_spans.items())),
             "checkpoint_covered_pages": sum(
                 span * count for span, count in checkpoint_spans.items()
             ),
-            "live_log_pages": sum(len(state.live_pages) for state in self._request_states.values()),
+            "live_log_granules": sum(len(state.live_granules) for state in self._request_states.values()),
         }
 
     def _profile_request_paths(
@@ -1344,7 +1289,7 @@ class LogStateCacheManager(BaseCacheManager):
         for req in reqs:
             recovery = self.pending_recoveries.get(req.table_idx)
             state = self._request_states.get(req.table_idx)
-            live = () if state is None else state.live_pages
+            live = () if state is None else state.live_granules
             restore = self._recycled_restores.get(req.table_idx)
             handle = req.cache_handle
             cached_entries = ()
@@ -1397,11 +1342,11 @@ class LogStateCacheManager(BaseCacheManager):
                     entry.slot for entry in cached_entries
                     if entry.kind is LogStateKind.CHECKPOINT
                 }),
-                "cached_checkpoint_span_pages": dict(sorted(Counter(
-                    entry.span_pages for entry in cached_entries
+                "cached_checkpoint_span_granules": dict(sorted(Counter(
+                    entry.span_granules for entry in cached_entries
                     if entry.kind is LogStateKind.CHECKPOINT
                 ).items())),
-                "live_log_pages": len(live),
+                "live_log_granules": len(live),
             })
         return result
 
@@ -1413,9 +1358,9 @@ class LogStateCacheManager(BaseCacheManager):
                 replay_counts = []
                 for req in batch.reqs:
                     state = self._request_states[req.table_idx]
-                    page = state.live_page_at(req.cached_len)
-                    assert page is not None, "Decode token has no LogState page"
-                    offset = req.cached_len - page.begin
+                    granule = state.live_granule_at(req.cached_len)
+                    assert granule is not None, "Decode token has no LogState page"
+                    offset = req.cached_len - granule.begin
                     count = req.cached_len - state.work_committed_pos
                     assert 0 <= count < LOG_STATE_REPLAY_WINDOW
                     assert count <= offset % LOG_STATE_REPLAY_WINDOW
@@ -1434,19 +1379,17 @@ class LogStateCacheManager(BaseCacheManager):
         self._prefill_protections = None
         profile_start = perf_counter_ns() if self._profile_enabled else 0
 
-
         first_offsets = []
         for req in batch.reqs:
-            page = next(
-                (page for page in self._request_states[req.table_idx].live_pages
-                 if page.begin <= req.cached_len < page.end),
+            granule = next(
+                (granule for granule in self._request_states[req.table_idx].live_granules
+                 if granule.begin <= req.cached_len < granule.end),
                 None,
             )
-            if page is None:
-
+            if granule is None:
 
                 break
-            first_offsets.append(req.cached_len - page.begin)
+            first_offsets.append(req.cached_len - granule.begin)
         batch.cache_metadata.first_offsets = (
             first_offsets if len(first_offsets) == len(batch.reqs) else None
         )
@@ -1461,15 +1404,15 @@ class LogStateCacheManager(BaseCacheManager):
                     for checkpoint in restore.plan.checkpoints
                     if checkpoint.begin < req.device_len and req.cached_len < checkpoint.end
                 )
-            for page in self._request_states[req.table_idx].live_pages:
+            for granule in self._request_states[req.table_idx].live_granules:
                 if (
-                    page.checkpoint_begin is not None
-                    and req.cached_len < page.end <= req.device_len
+                    granule.checkpoint_begin is not None
+                    and req.cached_len < granule.end <= req.device_len
                 ):
-                    assert page.state_slot is not None
+                    assert granule.state_slot is not None
                     batch.cache_metadata.checkpoint_writes.append((
-                        row_offset + page.end - req.cached_len - 1,
-                        page.state_slot,
+                        row_offset + granule.end - req.cached_len - 1,
+                        granule.state_slot,
                     ))
             row_offset += req.extend_len
         for req in batch.reqs:
@@ -1498,7 +1441,7 @@ class LogStateCacheManager(BaseCacheManager):
         blocked = frozenset(
             [entry.slot for restore in recycled
              for checkpoint in restore.plan.checkpoints for entry in checkpoint.gpu_entries]
-            + [item.log_slot for restore in recycled for item in restore.plan.gpu_materialize]
+            + [slot for restore in recycled for item in restore.plan.gpu_materialize for slot in item.slots]
             + [slot for restore in recycled for item in restore.plan.gpu_coalesce for slot in item.slots]
         )
         current_pins = Counter(
@@ -1627,7 +1570,8 @@ class LogStateCacheManager(BaseCacheManager):
             sample["materialized_slots"] = construction.get("materialized_slots", len(plan.materialize))
             sample["released_state_slots"] = released
             sample["scheduled_payload_conv_frames"] = released_frames
-            outcome = self._merge_batch_outcome(plan, released)
+            outcome = self._merge_batch_outcome(plan, construction["merged_checkpoint_groups"],
+                                               construction["materialized_slots"])
             sample["merge_outcome"] = outcome
             outcomes = self._profile_stats["merge_batch_outcomes"]
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
@@ -1669,7 +1613,7 @@ class LogStateCacheManager(BaseCacheManager):
                 for entry in checkpoint.gpu_entries:
                     if entry.slot in restore.detached:
                         continue
-                    assert self.tree.entries_for_slot(entry.slot) == (entry,)
+                    assert self.tree.has_entry(entry)
                     assert not self.tree.entry_is_protected(entry.slot), (
                         "Cannot detach a protected LogState branch anchor"
                     )
@@ -1694,6 +1638,7 @@ class LogStateCacheManager(BaseCacheManager):
                 and (
                     handle.match_trace.matched_len < handle.trace_input_len
                     or usable_len == handle.trace_input_len
+                    or (handle.match_trace.is_exact and not handle.match_trace.node.children)
                 )
             ):
                 traces.append(handle.match_trace)
@@ -1706,35 +1651,34 @@ class LogStateCacheManager(BaseCacheManager):
         old_handle = req.cache_handle
         assert isinstance(old_handle, LogStateCacheHandle)
         request_state = self._request_states[req.table_idx]
-        pages = request_state.live_pages
+        granules = request_state.live_granules
         restore = self._recycled_restores.get(req.table_idx)
         protected_endpoints = set(old_handle.protected_endpoints)
         protected_endpoints.update(self._protected_prefixes.get(req.uid, ()))
         if restore is not None:
             protected_endpoints.update(restore.plan.protected_endpoints)
-        full_pages = [page for page in pages if page.end <= req.cached_len]
-        committed_ends = {page: page.end for page in full_pages}
+        full_pages = [granule for granule in granules if granule.end <= req.cached_len]
+        committed_ends = {granule: granule.end for granule in full_pages}
         if finished:
-            for page in pages:
-                if page.end <= req.cached_len or page.checkpoint_begin is not None:
+            for granule in granules:
+                if granule.end <= req.cached_len or granule.checkpoint_begin is not None:
                     continue
                 position = max((value for value in protected_endpoints
-                                if page.begin < value <= req.cached_len < page.end), default=0)
+                                if granule.begin < value <= req.cached_len < granule.end), default=0)
                 if position:
-                    full_pages.append(page)
-                    committed_ends[page] = position
+                    full_pages.append(granule)
+                    committed_ends[granule] = position
         insert_len = old_handle.cached_len
-        for page in full_pages:
-            if page.begin != insert_len:
+        for granule in full_pages:
+            if granule.begin != insert_len:
                 break
-            insert_len = committed_ends[page]
+            insert_len = committed_ends[granule]
         if restore is not None:
             for checkpoint in restore.plan.checkpoints:
                 if checkpoint.begin < insert_len < checkpoint.end and (
                     insert_len > old_handle.cached_len
                     or any(entry.slot in restore.detached for entry in checkpoint.gpu_entries)
                 ):
-
 
                     insert_len = checkpoint.begin
                     break
@@ -1745,18 +1689,18 @@ class LogStateCacheManager(BaseCacheManager):
             req.input_ids[: req.cached_len],
             self.page_table[req.table_idx, : req.cached_len],
             cache_len=insert_len,
-            kv_page_spans=((page.begin, committed_ends[page], page.kv_page // self.page_size)
-                           for page in full_pages),
+            kv_frame_spans=((granule.begin, committed_ends[granule], granule.kv_offset // self.page_size)
+                           for granule in full_pages),
         )
         tree_insert_ms = (
             (perf_counter_ns() - stage_start) / 1e6
             if self._profile_enabled else 0.0
         )
         adopted = [
-            page
-            for page in full_pages
-            if old_handle.cached_len <= page.begin
-            and committed_ends[page] <= insert.inserted_len
+            granule
+            for granule in full_pages
+            if old_handle.cached_len <= granule.begin
+            and committed_ends[granule] <= insert.inserted_len
         ]
         adopted_set = set(adopted)
         stage_start = perf_counter_ns() if self._profile_enabled else 0
@@ -1766,79 +1710,76 @@ class LogStateCacheManager(BaseCacheManager):
             if self._profile_enabled else 0.0
         )
         covered_len = existing.position
-        released_kv_pages = []
+        released_kv_offsets = []
         released_state_slots = []
         retain_kv_ms = 0.0
-        for page in adopted:
-            page_end = committed_ends[page]
-            logical_begin = max(page.begin, covered_len)
-            if page.checkpoint_begin is not None and logical_begin < page_end:
-                assert page.state_slot is not None
-                checkpoint_begin = max(
-                    page.checkpoint_begin, align_down(covered_len, self.page_size),
-                )
-                kind = self._allocator.slot(page.state_slot).kind
+        for granule in adopted:
+            page_end = committed_ends[granule]
+            logical_begin = max(granule.begin, covered_len)
+            if granule.checkpoint_begin is not None and logical_begin < page_end:
+                assert granule.state_slot is not None
+                checkpoint_begin = granule.checkpoint_begin
+                kind = self._allocator.slot(granule.state_slot).kind
                 if kind == "work":
-                    self.logstate_pool.commit_checkpoint(page.state_slot)
+                    self.logstate_pool.commit_checkpoint(granule.state_slot)
                 elif kind == "log":
-                    self.logstate_pool.materialize(page.state_slot)
+                    self.logstate_pool.materialize(granule.state_slot)
                 self.tree.attach_entry(
                     insert.node,
                     LogStateEntry(
-                        slot=page.state_slot,
+                        slot=granule.state_slot,
                         kind=LogStateKind.CHECKPOINT,
                         begin=checkpoint_begin,
-                        end=page.end,
-                        span_pages=(page.end - checkpoint_begin) // self.page_size,
+                        end=granule.end,
+                        span_granules=(granule.end - checkpoint_begin) // self.page_size,
                     ),
                 )
-                covered_len = page.end
+                covered_len = granule.end
                 if restore is not None:
-                    restore.committed.add(page.end)
+                    restore.committed.add(granule.end)
                     if self._profile_enabled:
                         self._profile_stats["recycle_committed_checkpoints"] += 1
                         self._profile_stats["recycle_reused_gpu_slots"] += int(kind != "work")
                         self._profile_stats["recycle_committed_tokens"] += (
-                            page.end - max(checkpoint_begin, restore.plan.cached_len)
+                            granule.end - max(checkpoint_begin, restore.plan.cached_len)
                         )
-            elif page.state_slot is not None and logical_begin < page_end:
+            elif granule.state_slot is not None and logical_begin < page_end:
                 self.tree.attach_entry(
                     insert.node,
                     LogStateEntry(
-                        slot=page.state_slot,
+                        slot=granule.state_slot,
                         kind=LogStateKind.LOG,
                         begin=logical_begin,
                         end=page_end,
-                        storage_begin=page.begin,
                     ),
                 )
                 covered_len = page_end
-            elif page.state_slot is not None:
-                released_state_slots.append(page.state_slot)
-                if restore is not None and page.checkpoint_begin is not None:
-                    restore.slots.pop(page.end, None)
+            elif granule.state_slot is not None:
+                released_state_slots.append(granule.state_slot)
+                if restore is not None and granule.checkpoint_begin is not None:
+                    restore.slots.pop(granule.end, None)
 
-            kv_begin = max(page.begin, insert.previous_len)
+            kv_begin = max(granule.begin, insert.previous_len)
             if kv_begin < page_end:
                 stage_start = perf_counter_ns() if self._profile_enabled else 0
-                self.evictor.cached_page_tokens[page.kv_page] = (
-                    self.evictor.cached_page_tokens.get(page.kv_page, 0)
+                self.evictor.cached_page_tokens[granule.kv_offset] = (
+                    self.evictor.cached_page_tokens.get(granule.kv_offset, 0)
                     + page_end - kv_begin
                 )
                 if self._profile_enabled:
                     retain_kv_ms += (perf_counter_ns() - stage_start) / 1e6
             else:
-                released_kv_pages.append(page.kv_page)
+                released_kv_offsets.append(granule.kv_offset)
 
         duplicates = [
-            page
-            for page in full_pages
-            if page not in adopted_set and committed_ends[page] <= insert.previous_len
+            granule
+            for granule in full_pages
+            if granule not in adopted_set and committed_ends[granule] <= insert.previous_len
         ]
-        self._release_live_pages(req.table_idx, duplicates)
-        if released_kv_pages or released_state_slots:
+        self._release_live_granules(req.table_idx, duplicates)
+        if released_kv_offsets or released_state_slots:
             self._return_slots(
-                released_kv_pages,
+                released_kv_offsets,
                 released_state_slots,
             )
 
@@ -1847,13 +1788,7 @@ class LogStateCacheManager(BaseCacheManager):
                 if 0 < position <= insert.inserted_len:
                     trace = self.tree.trace(req.input_ids[:position])
                     node = trace.node
-                    if not trace.is_exact:
-                        node = self.tree.split_at(node, trace.matched_in_node)
-                    self.tree.protect(node)
-                    for entry in self.tree.matched_entries(insert.node):
-                        if (entry.kind is LogStateKind.LOG
-                            and entry.physical_begin < position < entry.physical_begin + self.page_size):
-                            self.tree.protect_entry(entry.slot)
+                    self.tree.protect_at(node, position)
 
         merge_stats_start = perf_counter_ns() if self._profile_enabled else 0
         stats = old_handle.merge_stats
@@ -1892,7 +1827,7 @@ class LogStateCacheManager(BaseCacheManager):
         )
 
         removed_pages = adopted_set.union(duplicates)
-        remaining = [page for page in pages if page not in removed_pages]
+        remaining = [granule for granule in granules if granule not in removed_pages]
         conv_copy_ms = 0.0
         work_slot_lookup_ms = 0.0
         if (
@@ -1926,12 +1861,11 @@ class LogStateCacheManager(BaseCacheManager):
                 and self.recycle_bin is not None
             ):
 
-
                 self.recycle_bin.discard(recycled.branch)
-            self._release_live_pages(req.table_idx, remaining)
+            self._release_live_granules(req.table_idx, remaining)
             restore = self._recycled_restores.pop(req.table_idx, None)
             if restore is not None:
-                page_slots = {page.state_slot for page in remaining}
+                page_slots = {granule.state_slot for granule in remaining}
                 uncommitted = [
                     slot for end, slot in restore.slots.items()
                     if end not in restore.committed and slot not in page_slots
@@ -1959,8 +1893,8 @@ class LogStateCacheManager(BaseCacheManager):
         else:
             req.cache_handle = new_handle
             self.lock(new_handle)
-            request_state.live_pages = remaining
-            request_state.live_page_cursor = 0
+            request_state.live_granules = remaining
+            request_state.live_granule_cursor = 0
         if self._profile_enabled:
             self._cache_req_samples.append({
                 "tag": req.profile_tag,
@@ -1978,12 +1912,12 @@ class LogStateCacheManager(BaseCacheManager):
 
     def free_to_cached(self, req: Request) -> None:
         state = self._request_states[req.table_idx]
-        pages = state.live_pages
-        keep = [page for page in pages if page.begin < req.cached_len]
-        release = [page for page in pages if page.begin >= req.cached_len]
-        self._release_live_pages(req.table_idx, release)
-        state.live_pages = keep
-        state.live_page_cursor = 0
+        granules = state.live_granules
+        keep = [granule for granule in granules if granule.begin < req.cached_len]
+        release = [granule for granule in granules if granule.begin >= req.cached_len]
+        self._release_live_granules(req.table_idx, release)
+        state.live_granules = keep
+        state.live_granule_cursor = 0
         req.device_len = min(req.cached_len + 1, req.max_device_len)
 
     def commit_speculative(self, req: Request, C: int, num_sampled: int) -> None:
@@ -1993,10 +1927,10 @@ class LogStateCacheManager(BaseCacheManager):
 
     def check_integrity(self) -> None:
         self.tree.check_integrity()
-        live_pages = sum(len(state.live_pages) for state in self._request_states.values())
-        if live_pages != 0:
+        live_granules = sum(len(state.live_granules) for state in self._request_states.values())
+        if live_granules != 0:
             raise RuntimeError(
-                f"LogState cache has {live_pages} request-owned pages while idle."
+                f"LogState cache has {live_granules} request-owned pages while idle."
             )
 
         if sum(self.evictor.cached_page_tokens.values()) != self.tree.size_info.total_size:
@@ -2011,18 +1945,17 @@ class LogStateCacheManager(BaseCacheManager):
         for row, state in self._request_states.items():
             if int(work_state_table[row, 0]) != state.work_slot:
                 raise RuntimeError("LogState work-state table disagrees with allocations.")
-        kv_pages = {page // self.page_size for page in self.evictor.cached_page_tokens}
+        kv_pages = {granule // self.page_size for granule in self.evictor.cached_page_tokens}
         kv_pages.update(
-            page.kv_page // self.page_size
-            for state in self._request_states.values() for page in state.live_pages
+            granule.kv_offset // self.page_size
+            for state in self._request_states.values() for granule in state.live_granules
         )
         expected_kv = kv_pages | {self._dummy_kv_frame}
         expected_state = tree_slots | {self._dummy_log_slot} | {
-            page.state_slot for state in self._request_states.values() for page in state.live_pages
-            if page.state_slot is not None
+            granule.state_slot for state in self._request_states.values() for granule in state.live_granules
+            if granule.state_slot is not None
         } | work_slots
         self.logstate_pool.poll_reclamation()
-
 
         expected_state.update(self.logstate_pool.retiring_slots)
         self._allocator.check_integrity()
@@ -2067,7 +2000,6 @@ class LogStateCacheManager(BaseCacheManager):
             recycle_bin=self.recycle_bin,
         )
 
-
     def _allocate_work(self) -> int:
         _pages, _logs, works = self._allocate(0, 0, 1)
         return int(works[0])
@@ -2091,26 +2023,31 @@ class LogStateCacheManager(BaseCacheManager):
         self, batch: Batch, works: Sequence[int], plan: LogStatePlan,
     ) -> tuple[dict, tuple[int, int, dict[str, int]]]:
         pool = self.logstate_pool
-        released = released_frames = merged = segments = materialized = 0
+        released = released_frames = merged = segments = materialized = materialized_logs = 0
         skips: Counter[str] = Counter()
         events = None
-        if self._profile_enabled and (works or plan.coalesce):
+        if self._profile_enabled and (works or plan.coalesce or plan.materialize):
             events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             events[0].record()
 
-
         for req in batch.reqs:
             self._release_recovery(id(self._pending_matches.get(req.table_idx)))
-        groups = iter(plan.coalesce)
+        merge_groups = {group.slots for group in plan.coalesce}
+        consumed = {slot for group in plan.coalesce for slot in group.slots}
+        materialize = [CheckpointCoalesce(
+            item.slots, (1,) * len(item.slots), item.begin, item.end,
+            (item.end - item.begin) // self.granularity,
+        ) for item in plan.materialize if not any(slot in consumed for slot in item.slots)]
+        groups = iter(sorted((*plan.coalesce, *materialize), key=lambda item: (item.end, item.begin)))
         wave_count = 0
         while True:
-            wave, chains, frame_counts = [], [], []
+            wave, chains, frame_counts, log_counts = [], [], [], []
             for group in groups:
-                if any(not self.tree.has_slot(slot) or self.tree.slot_is_fragmented(slot)
+                if any(not self.tree.has_slot(slot)
                        or slot in self.tree._recovery_slot_refs for slot in group.slots):
-                    skips["pending_or_fragmented_source"] += 1
+                    skips["pending_or_missing_source"] += 1
                     continue
-                right = self.tree.entries_for_slot(group.right_slot)[0]
+                right = self.tree.entry_for_slot(group.right_slot)
                 if right.kind is LogStateKind.CHECKPOINT:
                     count, frames, reasons = self._commit_coalesce((group,), allow_logs=True)
                     released += count
@@ -2124,15 +2061,17 @@ class LogStateCacheManager(BaseCacheManager):
                 if self._allocator.checkpoint_frame_capacity(group.slots) < self._allocator.payload_frames:
                     skips["insufficient_group_frames"] += 1
                     continue
-                if self._allocator.checkpoint_frame_savings(group.slots) <= 0:
+                if self._allocator.checkpoint_frame_savings(group.slots) < 0:
                     skips["no_memory_gain"] += 1
                     continue
                 recovery = self.tree.recovery_at(self.tree.entry_owner(right), right.end)
                 assert recovery.position == right.end
-                logs = [(entry.slot, entry.begin - entry.physical_begin, entry.end - entry.physical_begin)
+                logs = [(entry.slot, 0, entry.end - entry.begin)
                         for entry in recovery.logs]
                 wave.append(group)
                 chains.append((recovery.base_checkpoint_slot, logs, works[len(wave) - 1]))
+                log_counts.append(sum(self.tree.entry_for_slot(slot).kind is LogStateKind.LOG
+                                      for slot in group.slots))
                 frame_counts.append(sum(len(self._allocator.slot(slot).payload)
                                         + sum(map(len, self._allocator.slot(slot).conv)) for slot in group.slots))
                 segments += len(logs)
@@ -2141,7 +2080,6 @@ class LogStateCacheManager(BaseCacheManager):
             if not wave:
                 break
 
-
             pool.kernels.restore(pool, chains)
             committed, committed_works = [], []
             count, _frames, reasons = self._commit_coalesce(tuple(wave), allow_logs=True,
@@ -2149,19 +2087,19 @@ class LogStateCacheManager(BaseCacheManager):
             released += count
             skips.update(reasons)
             for index, group in enumerate(wave):
-                right_entries = self.tree.entries_for_slot(group.right_slot)
-                if (len(right_entries) == 1 and right_entries[0].kind is LogStateKind.CHECKPOINT
-                    and right_entries[0].begin == group.begin and right_entries[0].end == group.end):
+                right = self.tree.entry_for_slot(group.right_slot)
+                if (right.kind is LogStateKind.CHECKPOINT
+                    and right.begin == group.begin and right.end == group.end):
                     committed.append(group.slots)
                     committed_works.append(works[index])
+                    materialized_logs += log_counts[index]
                     released_frames += frame_counts[index] - self._allocator.payload_frames - self._allocator.conv_frames
             if committed:
                 pool.coalesce_groups(committed, committed_works)
                 pool.retire_slots([slot for group in committed for slot in group[:-1]])
-            merged += len(committed)
+            merged += sum(group in merge_groups for group in committed)
             materialized += len(committed)
             wave_count += 1
-
 
         refreshed = []
         for req in batch.reqs:
@@ -2184,7 +2122,7 @@ class LogStateCacheManager(BaseCacheManager):
         construction["outputs"] += materialized
         construction["waves"] += wave_count
         construction["merged_checkpoint_groups"] = merged
-        construction["materialized_slots"] = materialized
+        construction["materialized_slots"] = materialized_logs
         if events is not None:
             events[1].record()
             construction["cuda_ms"] = None
@@ -2192,9 +2130,11 @@ class LogStateCacheManager(BaseCacheManager):
         return construction, (released, released_frames, dict(skips))
 
     @staticmethod
-    def _merge_batch_outcome(plan: LogStatePlan, released: int) -> str:
-        if released:
+    def _merge_batch_outcome(plan: LogStatePlan, merged: int, materialized: int = 0) -> str:
+        if merged:
             return "merged"
+        if materialized:
+            return "materialized"
         if plan.coalesce:
             return "commit_skipped"
         diagnostics = dict(plan.merge_diagnostics)
@@ -2220,15 +2160,15 @@ class LogStateCacheManager(BaseCacheManager):
                 continue
             if any(
                 not self.tree.has_slot(slot)
-                or self.tree.slot_is_fragmented(slot)
+
                 for slot in plan.slots
             ):
-                skips["missing_or_fragmented_slot"] = (
-                    skips.get("missing_or_fragmented_slot", 0) + 1
+                skips["missing_slot"] = (
+                    skips.get("missing_slot", 0) + 1
                 )
                 continue
             entries = [
-                self.tree.entries_for_slot(slot)[0]
+                self.tree.entry_for_slot(slot)
                 for slot in plan.slots
             ]
             if any(
@@ -2236,7 +2176,7 @@ class LogStateCacheManager(BaseCacheManager):
                     allow_logs and entry.kind is LogStateKind.LOG and level == 1
                 ))
                 or entry.slot != slot
-                or (entry.span_pages if entry.kind is LogStateKind.CHECKPOINT else 1) != level
+                or (entry.span_granules if entry.kind is LogStateKind.CHECKPOINT else 1) != level
                 for entry, slot, level in zip(
                     entries,
                     plan.slots,
@@ -2266,7 +2206,6 @@ class LogStateCacheManager(BaseCacheManager):
                 for slot in plan.slots[:-1]:
                     record = self._allocator.slot(slot)
 
-
                     released_frames += len(record.payload) + (
                         sum(map(len, record.conv)) if allow_logs else len(record.conv[-1])
                     )
@@ -2279,60 +2218,59 @@ class LogStateCacheManager(BaseCacheManager):
                     kind=LogStateKind.CHECKPOINT,
                     begin=plan.begin,
                     end=plan.end,
-                    span_pages=plan.next_span,
+                    span_granules=plan.next_span,
                 ),
                 checkpoint_timestamp=checkpoint_timestamp,
             )
             released.extend(plan.slots[:-1])
         if released and retire_sources:
 
-
             self.logstate_pool.retire_slots(released)
         return len(released), released_frames, skips
 
-    def _release_live_pages(
+    def _release_live_granules(
         self,
         table_idx: int,
-        pages    : Sequence[_LivePage],
+        granules    : Sequence[_LiveGranule],
     ) -> None:
-        if not pages:
+        if not granules:
             return
         state_table = self.state_table
         assert state_table is not None
         restore = self._recycled_restores.get(table_idx)
         released_states = []
-        for page in pages:
-            state_table[table_idx, page.begin:page.end].fill_(-1)
-            if page.state_slot is None:
+        for granule in granules:
+            state_table[table_idx, granule.begin:granule.end].fill_(-1)
+            if granule.state_slot is None:
                 continue
-            if restore is not None and page.checkpoint_begin is not None:
-                checkpoint = next(value for value in restore.plan.checkpoints if value.end == page.end)
+            if restore is not None and granule.checkpoint_begin is not None:
+                checkpoint = next(value for value in restore.plan.checkpoints if value.end == granule.end)
                 if (
-                    page.state_slot not in restore.detached
-                    and any(entry.slot == page.state_slot for entry in checkpoint.gpu_entries)
+                    granule.state_slot not in restore.detached
+                    and any(entry.slot == granule.state_slot for entry in checkpoint.gpu_entries)
                 ):
                     continue
-                restore.slots.pop(page.end, None)
-            released_states.append(page.state_slot)
+                restore.slots.pop(granule.end, None)
+            released_states.append(granule.state_slot)
         self._return_slots(
-            [page.kv_page for page in pages],
+            [granule.kv_offset for granule in granules],
             released_states,
         )
 
     def _return_slots(
         self,
-        pages : Sequence[int],
+        granules : Sequence[int],
         states: Sequence[int],
     ) -> None:
         if self._lazy_free_pages is None:
-            page_frames = [page // self.page_size for page in pages]
+            page_frames = [granule // self.page_size for granule in granules]
             self.logstate_pool.release_kv(page_frames)
             self.logstate_pool.release_slots(states)
         else:
             assert self._lazy_free_states is not None
             # Snapshot the IDs, but leave reclamation and event waits to the
             # pool after the region exits, including exceptional exits.
-            self._lazy_free_pages.extend(pages)
+            self._lazy_free_pages.extend(granules)
             self._lazy_free_states.extend(states)
 
 
@@ -2351,9 +2289,6 @@ class LogStateCacheFactory(BaseCacheFactory):
         assert isinstance(config.cache_config, LogStateCacheConfig)
         assert config.model_config.is_hybrid, (
             "LogState cache is only defined for hybrid models."
-        )
-        assert config.page_size == 64, (
-            "LogState currently uses a fixed 64-token physical page."
         )
         assert speculator_reserve is None, (
             "LogState speculative verify is not implemented yet."
@@ -2403,8 +2338,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             layout.conv_state_bytes // layout.num_granules, cache_per_page
         )
         assert layout.log_decay_bytes <= cache_per_page
-        log_payload_frames = (payload_frames if layout.num_key_heads == layout.num_value_heads
-                              else div_ceil(layout.log_payload_bytes, cache_per_page))
+        log_payload_frames = div_ceil(layout.log_payload_bytes, cache_per_page)
         state_units = log_payload_frames + layout.num_granules * conv_frames + 1
         work_units = payload_frames + conv_frames
 
@@ -2541,9 +2475,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             ),
         )
 
-
 SUPPORTED_CACHE_FACTORIES.register("logstate")(LogStateCacheFactory())
-
 
 __all__ = [
     "LogStateCacheManager",

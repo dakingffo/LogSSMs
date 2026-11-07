@@ -9,10 +9,16 @@ def state_pointer(
     FRAME_BYTES: tl.constexpr, FRAMES_PER_SLOT: tl.constexpr,
 ):
     byte_offset = (layer * HEADS + head) * HEAD_BYTES
+    if HEAD_BYTES <= FRAME_BYTES:
+        frame = tl.load(frames + slot * FRAMES_PER_SLOT + byte_offset // FRAME_BYTES,
+                        mask=slot >= 0, other=0)
+        return (storage.to(tl.pointer_type(tl.uint8)) + frame.to(tl.int64) * FRAME_BYTES
+                + byte_offset % FRAME_BYTES).to(storage.dtype) + elements
+    byte_offset += elements * storage.dtype.element_ty.primitive_bitwidth // 8
     frame = tl.load(frames + slot * FRAMES_PER_SLOT + byte_offset // FRAME_BYTES,
                     mask=slot >= 0, other=0)
     return (storage.to(tl.pointer_type(tl.uint8)) + frame.to(tl.int64) * FRAME_BYTES
-            + byte_offset % FRAME_BYTES).to(storage.dtype) + elements
+            + byte_offset % FRAME_BYTES).to(storage.dtype)
 
 
 @triton.jit
@@ -27,10 +33,7 @@ def _log_pointer(
 ):
     key_heads: tl.constexpr = KEY_HEADS if KEY_HEADS != 0 else HEADS
     key_size: tl.constexpr = GRANULARITY * key_heads * K
-    if key_heads == HEADS:
-        layer_size: tl.constexpr = HEADS * HEAD_BYTES // 2 // (PAGE_SIZE // GRANULARITY)
-    else:
-        layer_size: tl.constexpr = key_size + GRANULARITY * HEADS * V
+    layer_size: tl.constexpr = key_size + GRANULARITY * HEADS * V
     dim: tl.constexpr = V if VALUE else K
     index = head if VALUE else head // (HEADS // key_heads)
     offset = (positions // GRANULARITY * LAYERS + layer) * layer_size
@@ -62,10 +65,7 @@ def log_pointer(
     key_heads: tl.constexpr = KEY_HEADS if KEY_HEADS != 0 else HEADS
     dim: tl.constexpr = V if VALUE else K
     key_size: tl.constexpr = GRANULARITY * key_heads * K
-    if key_heads == HEADS:
-        layer_size: tl.constexpr = HEADS * HEAD_BYTES // 2 // (PAGE_SIZE // GRANULARITY)
-    else:
-        layer_size: tl.constexpr = key_size + GRANULARITY * HEADS * V
+    layer_size: tl.constexpr = key_size + GRANULARITY * HEADS * V
     aligned: tl.constexpr = ((FRAME_BYTES % (GRANULARITY * dim * 2) == 0)
                             & (layer_size % (GRANULARITY * dim) == 0)
                             & ((not VALUE) | (key_size % (GRANULARITY * dim) == 0)))
@@ -93,3 +93,15 @@ def log_pointer(
         LAYERS, HEADS, K, V, GRANULARITY, PAGE_SIZE, HEAD_BYTES,
         FRAME_BYTES, FRAMES_PER_SLOT, VALUE, KEY_HEADS,
     )
+
+
+@triton.jit
+def conv_pointer(storage, frames, slot, granule, elements,
+                 GRANULES: tl.constexpr, FRAMES: tl.constexpr,
+                 FRAME_ELEMS: tl.constexpr, valid=True):
+    if FRAMES == 1:
+        frame = tl.load(frames + slot * GRANULES + granule, slot >= 0, other=0)
+        return storage + frame.to(tl.int64) * FRAME_ELEMS + elements
+    frame = tl.load(frames + (slot * GRANULES + granule) * FRAMES + elements // FRAME_ELEMS,
+                    (slot >= 0) & valid, other=0)
+    return storage + frame.to(tl.int64) * FRAME_ELEMS + elements % FRAME_ELEMS

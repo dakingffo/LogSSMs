@@ -53,7 +53,7 @@ def test_compact_group_rejects_insufficient_storage_without_mutating_ownership()
     allocator.check_integrity()
 
 
-def test_compact_group_requires_positive_net_frame_savings():
+def test_compact_group_allows_zero_net_frame_growth():
     allocator = LogStateAllocator(
         num_frames=40, frame_bytes=100, payload_bytes=500, log_payload_bytes=100,
         conv_snapshot_bytes=80, decay_bytes=20, num_granules=2,
@@ -61,17 +61,11 @@ def test_compact_group_requires_positive_net_frame_savings():
     _kv, logs, _states = allocator.reserve(logs=3)
     group = tuple(logs[:2])
     assert allocator.checkpoint_frame_capacity(group) == allocator.payload_frames
-    # The third Log owns another record in the same decay frame, so freeing
-    # this group yields bitmap holes only. It does not release physical memory.
     assert allocator.checkpoint_frame_savings(group) == 0
-    before = allocator.profile_usage()
-    with pytest.raises(AssertionError, match="release more than its expansion"):
-        allocator.coalesce_to_checkpoint(group)
-    assert allocator.profile_usage() == before
-    allocator.release_slot(logs[2])
-    assert allocator.checkpoint_frame_savings(group) == 1
+    before = allocator.free_frames
     retirement = allocator.coalesce_to_checkpoint(group)
     allocator.release_retirement(retirement)
+    assert allocator.free_frames == before
     allocator.release_slot(logs[0])
     allocator.check_integrity()
 

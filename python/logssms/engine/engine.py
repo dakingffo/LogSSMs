@@ -548,7 +548,7 @@ class Engine:
             override("moe_backend", "fused")
             logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 
-        if config.model_config.is_hybrid:
+        if config.model_config.is_hybrid and config.cache_type != "logstate":
             if config.page_size % 64 != 0:
                 original_page_size = config.page_size
                 override_page_size(64)

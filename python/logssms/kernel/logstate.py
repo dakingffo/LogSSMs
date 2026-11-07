@@ -12,7 +12,6 @@ from logssms.tvm import load_aot
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
-
 Rows: TypeAlias = Sequence[Sequence[int]]
 
 
@@ -43,12 +42,6 @@ def _unpack(tensor) -> list[list[int]]:
     return rows
 
 
-def batch_branch_points(inputs: Sequence[torch.Tensor], granularity: int) -> list[list[int]]:
-    if len(inputs) < 2:
-        return []
-    return _unpack(_load_logstate_module().batch_branch_points(inputs, granularity))
-
-
 def branch_protections(inputs: Sequence[torch.Tensor], forced: Rows,
                        granularity: int) -> list[list[int]]:
     return _unpack(_load_logstate_module().branch_protections(inputs, _pack(forced), granularity))
@@ -67,17 +60,16 @@ def make_recycle_bin(capacity_bytes: int):
 
 
 def plan_materialize(paths: Rows, boundaries: Rows, candidates: Rows,
-                     page_size: int) -> list[list[int]]:
+                     granularity: int, log_count: int) -> list[list[int]]:
     return _unpack(_load_logstate_module().plan_materialize(
-        _pack(paths), _pack(boundaries), _pack(candidates), page_size,
+        _pack(paths), _pack(boundaries), _pack(candidates), granularity, log_count,
     ))
 
 
 def plan_coalesce(paths: Rows, boundaries: Rows, locks: Rows, anchors: Rows,
-                  materialized: Sequence[int], page_size: int,
-                  diagnostics: bool) -> tuple[list[list[int]], dict[str, int]]:
+                  granularity: int, diagnostics: bool) -> tuple[list[list[int]], dict[str, int]]:
     result = _load_logstate_module().plan_coalesce(
         _pack(paths), _pack(boundaries), _pack(locks), _pack(anchors),
-        materialized, page_size, diagnostics,
+        granularity, diagnostics,
     )
     return _unpack(result["groups"]), dict(result["diagnostics"].items())

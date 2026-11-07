@@ -12,7 +12,6 @@ from logssms.cache.args import (
 from logssms.cache.config import (
     BaseCacheConfig,
     LOG_STATE_GRANULARITIES,
-    LOG_STATE_PAGE_SIZE,
     LogStateCacheConfig,
     NaiveCacheConfig,
     RadixCacheConfig,
@@ -71,7 +70,6 @@ __all__ = [
     "MarconiCachePlan",
     "LogStateCacheConfig",
     "LOG_STATE_GRANULARITIES",
-    "LOG_STATE_PAGE_SIZE",
     "make_cache_argument_parser",
     "LogStateCacheManager",
     "LogStateCacheFactory",

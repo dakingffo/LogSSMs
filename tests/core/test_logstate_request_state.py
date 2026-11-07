@@ -4,25 +4,26 @@ import pytest
 import torch
 
 from logssms.cache.logstate.manager import (
-    _LivePage,
+    _LiveGranule,
     _RequestCacheState,
 )
 from logssms.core import Batch, SamplingParams
 from logssms.scheduler.prefill import PendingRequest
+from tests.core.test_logstate_cache_manager import cpu_cache_copy as cpu_cache_copy
 from tests.core.test_logstate_cache_manager import (
-    cpu_cache_copy, make_manager, new_req,
+    make_manager, new_req,
 )
 
 
-def test_live_page_cursor_matches_scan_across_partial_pages_and_backtracking():
-    pages = [_LivePage(16, 64, 0, 1), _LivePage(64, 128, 64, 2),
-             _LivePage(192, 256, 192, 3)]
-    state = _RequestCacheState(10, 16, 300, live_pages=pages)
+def test_live_granule_cursor_matches_scan_and_backtracking():
+    pages = [_LiveGranule(16, 64, 0, 1), _LiveGranule(64, 128, 64, 2),
+             _LiveGranule(192, 256, 192, 3)]
+    state = _RequestCacheState(10, 16, 300, live_granules=pages)
     for position in (16, 63, 64, 127, 128, 191, 192, 255, 256, 15, 80, 16):
         expected = next((p for p in pages if p.begin <= position < p.end), None)
-        assert state.live_page_at(position) is expected
-    state.live_pages = []
-    assert state.live_page_at(16) is None
+        assert state.live_granule_at(position) is expected
+    state.live_granules = []
+    assert state.live_granule_at(16) is None
 
 
 def test_decode_tail_lookup_does_not_iterate_history():
@@ -36,13 +37,13 @@ def test_decode_tail_lookup_does_not_iterate_history():
             self.reads += 1
             return super().__getitem__(index)
 
-    pages = IndexedPages(_LivePage(i * 64, (i + 1) * 64, i * 64, i)
+    pages = IndexedPages(_LiveGranule(i * 64, (i + 1) * 64, i * 64, i)
                          for i in range(1024))
-    state = _RequestCacheState(2000, 0, 65536, live_pages=pages)
-    assert state.live_page_at(65535).begin == 65472
+    state = _RequestCacheState(2000, 0, 65536, live_granules=pages)
+    assert state.live_granule_at(65535).begin == 65472
     pages.reads = 0
     for _ in range(20):
-        assert state.live_page_at(65535).begin == 65472
+        assert state.live_granule_at(65535).begin == 65472
     assert pages.reads == 20
 
 
@@ -65,7 +66,7 @@ def test_pending_match_precedes_table_state_and_table_reuse_starts_fresh():
     req = new_req(manager, history, table_idx=2)
     old_state = manager._request_states[2]
     assert old_state.work_committed_pos == 128
-    assert old_state.live_pages == [] and old_state.live_page_cursor == 0
+    assert old_state.live_granules == [] and old_state.live_granule_cursor == 0
     manager.allocate([req], phase="prefill")
     manager.prepare_batch(Batch([req], "prefill"))
     req.cached_len = len(history)
@@ -74,8 +75,8 @@ def test_pending_match_precedes_table_state_and_table_reuse_starts_fresh():
     req = new_req(manager, torch.arange(2000, 2010, dtype=torch.int32), table_idx=2)
     state = manager._request_states[2]
     assert state is not old_state
-    assert state.work_committed_pos == 0 and state.live_pages == []
-    assert state.live_page_cursor == 0 and state.recycle_match is None
+    assert state.work_committed_pos == 0 and state.live_granules == []
+    assert state.live_granule_cursor == 0 and state.recycle_match is None
     manager.cache_req(req, finished=True)
     manager.check_integrity()
 
@@ -86,16 +87,16 @@ def test_page_replacement_resets_cursor_and_releases_state_on_finish(finish):
     req = new_req(manager, torch.arange(193, dtype=torch.int32))
     manager.allocate([req])
     state = manager._request_states[req.table_idx]
-    assert state.live_page_at(192).begin == 192
-    assert state.live_page_cursor == 3
+    assert state.live_granule_at(192).begin == 192
+    assert state.live_granule_cursor == 3
     req.cached_len = 70
     manager.free_to_cached(req)
-    assert state.live_page_cursor == 0 and len(state.live_pages) == 2
-    assert state.live_page_at(69).begin == 64
+    assert state.live_granule_cursor == 0 and len(state.live_granules) == 2
+    assert state.live_granule_at(69).begin == 64
     manager.cache_req(req, finished=finish)
     if not finish:
-        assert state.live_page_cursor == 0
-        assert state.live_page_at(69).begin == 64
+        assert state.live_granule_cursor == 0
+        assert state.live_granule_at(69).begin == 64
         manager.cache_req(req, finished=True)
     assert req.table_idx not in manager._request_states
     manager.check_integrity()

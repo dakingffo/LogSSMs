@@ -177,7 +177,7 @@ def summarize_checkpoint_spans(cache: dict) -> dict[str, dict]:
         row["merged_slots"] += batch["released_state_slots"]
         resources = batch["resources_after"]
         row["last_tree_checkpoint_spans"] = resources[
-            "checkpoint_span_pages"
+            "checkpoint_span_granules"
         ]
         row["last_tree_log_slots"] = resources["tree_log_slots"]
         row["last_tree_checkpoint_slots"] = resources[
@@ -188,11 +188,11 @@ def summarize_checkpoint_spans(cache: dict) -> dict[str, dict]:
             request_turn = uid_turn.get(request["uid"])
             if request_turn is not None:
                 per_turn[request_turn]["matched_path_checkpoint_spans"].update(
-                    request.get("cached_checkpoint_span_pages", {})
+                    request.get("cached_checkpoint_span_granules", {})
                 )
                 if request["uid"] not in seen_uids:
                     seen_uids.add(request["uid"])
-                    spans = request.get("cached_checkpoint_span_pages", {})
+                    spans = request.get("cached_checkpoint_span_granules", {})
                     first_paths[request_turn].append({
                         "cached_len": request["cached_len"],
                         "checkpoint_slots": request["cached_checkpoint_slots"],
@@ -201,9 +201,9 @@ def summarize_checkpoint_spans(cache: dict) -> dict[str, dict]:
                             request["cached_checkpoint_slots"]
                             + request["cached_log_slots"]
                         ),
-                        "max_span_pages": (
+                        "max_span_granules": (
                             max(map(int, spans), default=0)
-                            if "cached_checkpoint_span_pages" in request else None
+                            if "cached_checkpoint_span_granules" in request else None
                         ),
                     })
     return {
@@ -227,15 +227,15 @@ def summarize_checkpoint_spans(cache: dict) -> dict[str, dict]:
                 "state_slots_median": median(
                     item["state_slots"] for item in first_paths[turn]
                 ),
-                "max_span_pages_hist": dict(sorted(Counter(
-                    item["max_span_pages"] for item in first_paths[turn]
-                    if item["max_span_pages"] is not None
+                "max_span_granules_hist": dict(sorted(Counter(
+                    item["max_span_granules"] for item in first_paths[turn]
+                    if item["max_span_granules"] is not None
                 ).items())),
-                "max_span_pages_median": median(
-                    item["max_span_pages"] for item in first_paths[turn]
-                    if item["max_span_pages"] is not None
+                "max_span_granules_median": median(
+                    item["max_span_granules"] for item in first_paths[turn]
+                    if item["max_span_granules"] is not None
                 ) if any(
-                    item["max_span_pages"] is not None
+                    item["max_span_granules"] is not None
                     for item in first_paths[turn]
                 ) else None,
             },

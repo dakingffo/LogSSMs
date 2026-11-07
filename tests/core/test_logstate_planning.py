@@ -45,22 +45,18 @@ def test_native_branches_preserve_token_prefixes_and_ignore_partial_granules(gra
         for value in (101, 102, 103)
     ]
     inputs[1] = inputs[1].to(torch.int32)
-    assert planning.batch_branch_points(inputs, granularity) == [[granularity, 0, 1, 2]]
-    assert planning.batch_branch_points([], granularity) == []
-    assert planning.batch_branch_points(inputs[:1], granularity) == []
+    assert planning.branch_protections(inputs, [], granularity) == [[granularity, 0, 1, 2]]
+    assert planning.branch_protections([], [], granularity) == []
+    assert planning.branch_protections(inputs[:1], [], granularity) == []
 
 
-def test_native_materialize_respects_fragmented_and_protected_slots():
-    path = [
-        0, 0, 64, 1, 0, 1, 0, 0,
-        1, 64, 128, -1, 64, 1, 0, 0,
-        2, 128, 192, -1, 128, 1, 0, 1,
-    ]
-    assert planning.plan_materialize([path], [()], [(0, 1), (0, 2)], 64) == [[0]]
-    # A pending branch inside the physical page protects the entire Log.
-    assert planning.plan_materialize([path], [(96,)], [(0, 1)], 64) == []
-    path[8 + 6] = 1
-    assert planning.plan_materialize([path], [()], [(0, 1)], 64) == []
+def test_materialize_respects_granule_groups_and_node_boundaries():
+    path = [value for slot in range(5) for value in (
+        slot, slot * 32, (slot + 1) * 32, -1, int(slot != 4),
+    )]
+    candidates = [(0, slot, 1) for slot in range(5)]
+    assert planning.plan_materialize([path], [()], candidates, 32, 2) == [[0, 1], [2, 3]]
+    assert planning.plan_materialize([path], [(32,)], candidates, 32, 2) == [[1, 2]]
 
 
 def test_materialize_eligibility_matches_serial_recovery_oracle():
@@ -70,19 +66,15 @@ def test_materialize_eligibility_matches_serial_recovery_oracle():
         position = 0
         for slot in range(rng.randint(1, 80)):
             position += rng.choice((0, 0, 32, 64))
-            size = rng.choice((32, 64, 128))
+            checkpoint = rng.random() < .25
+            size = rng.choice((32, 64, 128)) if checkpoint else 32
             values.append((slot, position, position + size,
-                           size // 64 if rng.random() < .25 else -1,
-                           position, int(rng.random() > .1),
-                           int(rng.random() < .1), int(rng.random() < .1)))
+                           size // 32 if checkpoint else -1, int(rng.random() > .1)))
             position += size
-        boundaries = sorted({rng.randrange(position + 1) for _ in range(4)})
+        boundaries = sorted({rng.randrange(position // 32 + 1) * 32 for _ in range(4)})
         expected = []
-        for i, entry in enumerate(values):
-            _, begin, end, span, _, eligible, protected, fragmented = entry
-            if (not eligible or span >= 0 or fragmented or (end - begin) % 64
-                or any(begin < p < end for p in boundaries)
-                or any(v[6] and begin <= v[1] and v[2] <= end for v in values)):
+        for i, (_, begin, end, span, eligible) in enumerate(values):
+            if not eligible or span >= 0:
                 continue
             cursor = max((v[2] for v in values if v[3] >= 0 and v[2] <= begin), default=0)
             for value in values:
@@ -94,14 +86,16 @@ def test_materialize_eligibility_matches_serial_recovery_oracle():
             if cursor == end:
                 expected.append([i])
         path = [v for entry in values for v in entry]
-        actual = planning.plan_materialize([path], [boundaries], [(0, i) for i in range(len(values))], 64)
+        actual = planning.plan_materialize(
+            [path], [boundaries], [(0, i, 1) for i in range(len(values))], 32, 1,
+        )
         assert actual == expected
 
 
 def test_materialize_returns_bounded_metadata_for_long_log_chain():
-    path = [v for i in range(128) for v in (i, i * 64, (i + 1) * 64, -1, i * 64, 1, 0, 0)]
-    result = planning.plan_materialize([path], [()], [(0, i) for i in range(128)], 64)
-    assert result == [[i] for i in range(128)]
+    path = [v for i in range(128) for v in (i, i * 32, (i + 1) * 32, -1, 1)]
+    result = planning.plan_materialize([path], [()], [(0, i, 1) for i in range(128)], 32, 2)
+    assert result == [[i, i + 1] for i in range(0, 128, 2)]
 
 
 def test_native_coalesce_matches_nondecreasing_group_oracle():
@@ -112,8 +106,8 @@ def test_native_coalesce_matches_nondecreasing_group_oracle():
         path = []
         tail = 0
         for slot, span in enumerate(spans):
-            end = tail + span * 64
-            path.extend((slot, tail, end, span, tail, 1, 0, 0))
+            end = tail + span * 32
+            path.extend((slot, tail, end, span, 1))
             tail = end
         expected = []
         begin = 0
@@ -126,19 +120,19 @@ def test_native_coalesce_matches_nondecreasing_group_oracle():
                 expected.append(tuple(range(begin, end)))
             begin = end
         groups, _ = planning.plan_coalesce(
-            [path], [()], [()], [(0, tail, intensity, 1)], (), 64, False,
+            [path], [()], [()], [(0, tail, intensity, 1)], 32, False,
         )
         assert [tuple(group[3::2]) for group in groups] == expected
         assert all(group[2] == sum(group[4::2]) for group in groups)
 
 
-def test_native_coalesce_obeys_protections_locks_and_unique_slot_ownership():
+def test_native_coalesce_obeys_boundaries_locks_and_unique_slot_ownership():
     path = [value for slot in range(6) for value in (
-        slot, slot * 64, (slot + 1) * 64, 1, slot * 64, 1, int(slot == 4), 0,
+        slot, slot * 32, (slot + 1) * 32, 1, 1,
     )]
     groups, diagnostics = planning.plan_coalesce(
-        [path], [(128,)], [(256,)], [(0, 384, 8, 1), (0, 384, 8, 1)],
-        (), 64, True,
+        [path], [(64, 160)], [(128,)], [(0, 192, 8, 1), (0, 192, 8, 1)],
+        32, True,
     )
     assert [tuple(group[3::2]) for group in groups] == [(0, 1), (2, 3)]
     assert diagnostics["planned_slot_releases"] == 2
@@ -149,9 +143,9 @@ def test_native_metadata_validation_precedes_pointer_access():
     bad = torch.tensor([10, 1], dtype=torch.int64)
     empty = torch.empty(0, dtype=torch.int64)
     with pytest.raises(RuntimeError, match="Invalid packed planning row"):
-        module.plan_materialize(bad, empty, empty, 64)
+        module.plan_materialize(bad, empty, empty, 64, 1)
     with pytest.raises(RuntimeError, match="CPU int64"):
-        module.plan_materialize(bad.to(torch.int32), empty, empty, 64)
+        module.plan_materialize(bad.to(torch.int32), empty, empty, 64, 1)
 
 
 def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
@@ -170,18 +164,22 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
 
         page_refs = [[rng.randrange(10) for _ in range(rng.randrange(4))]
                      for _ in nodes]
-        slot_refs = [[rng.randrange(12) for _ in range(rng.randrange(4))]
-                     for _ in nodes]
+        slot_refs = []
+        next_slot = 0
+        for _ in nodes:
+            count = rng.randrange(4)
+            slot_refs.append(list(range(next_slot, next_slot + count)))
+            next_slot += count
         page_totals = Counter(frame for refs in page_refs for frame in refs)
         slot_totals = Counter(slot for refs in slot_refs for slot in refs)
         kv = [[value for frame, refs in Counter(row).items()
                for value in (frame, refs, page_totals[frame])] for row in page_refs]
         # Three partially occupied decay frames, including records owned by
         # live requests outside this tree. Checkpoints do not own decay.
-        slots = [(slot, refs, rng.randrange(1, 8), slot // 4 if rng.random() > .25 else -1, slot % 4)
-                 for slot, refs in slot_totals.items()]
-        own_decay = Counter(row[3] for row in slots if row[3] >= 0)
-        occupied = [(frame, rng.randrange(max(1, own_decay[frame]), 5)) for frame in range(3)]
+        slots = [(slot, rng.randrange(1, 8), slot // 4 if rng.random() > .25 else -1)
+                 for slot in slot_totals]
+        own_decay = Counter(row[2] for row in slots if row[2] >= 0)
+        occupied = [(frame, rng.randrange(count, 5)) for frame, count in own_decay.items()]
         config = [rng.randrange(3), sum(4 - n for _, n in occupied), 2, 1, 2, 4,
                   rng.randrange(1, 12), rng.randrange(1, 12), rng.randrange(3), 2, 0]
         selected, pages, refs, released = [], Counter(), Counter(), set()
@@ -193,7 +191,7 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
             released = {slot for slot in refs if refs[slot] == slot_totals[slot]}
             free, decay = config[:2]
             decay_counts = Counter()
-            for slot, _, frames, frame, _ in slots:
+            for slot, frames, frame in slots:
                 if slot in released:
                     free += frames
                     if frame >= 0:
@@ -221,7 +219,7 @@ def test_native_eviction_matches_shared_frame_and_decay_capacity_oracle():
 def assert_log_capacity_order(nodes, expected):
     """Each Log owns one frame; pressure must reclaim exactly the coldest safe prefix."""
     refs = [[uuid] if parent >= 0 else [] for uuid, parent, *_ in nodes]
-    slots = [(slot, 1, 1, -1, -1) for row in refs for slot in row]
+    slots = [(slot, 1, -1) for row in refs for slot in row]
     for needed in range(1, len(expected) + 2):
         result = planning.plan_eviction(
             nodes, [[] for _ in nodes], refs, slots, [],
@@ -266,7 +264,7 @@ def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_lock
 def test_small_capacity_requests_select_the_globally_coldest_leaf():
     nodes = eviction_chains(4, 2)
     refs = [[]] + [[i] for i in range(1, len(nodes))]
-    slots = [(i, 1, 1, -1, -1) for i in range(1, len(nodes))]
+    slots = [(i, 1, -1) for i in range(1, len(nodes))]
     result = planning.plan_eviction(
         nodes, [[] for _ in nodes], refs, slots, [], [0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0], (),
     )
@@ -276,7 +274,7 @@ def test_small_capacity_requests_select_the_globally_coldest_leaf():
 def test_checkpoint_pressure_thins_one_fixed_heat_snapshot():
     nodes = eviction_chains(10, 1, checkpoint=True)
     refs = [[]] + [[i] for i in range(1, len(nodes))]
-    slots = [(i, 1, 1, -1, -1) for i in range(1, len(nodes))]
+    slots = [(i, 1, -1) for i in range(1, len(nodes))]
     actions = [(i, -1, nodes[i][4], i) for i in range(1, len(nodes))]
     order = [2, 4, 6, 8, 3, 7, 5, 1, 9, 10]
     for needed in (4, 8, 9, 10):
@@ -291,7 +289,7 @@ def test_eviction_prunes_logs_before_dropping_private_checkpoints():
     nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 1, 100),
              (2, 1, 0, 1, 1), (3, 0, 0, 0, 999)]
     refs = [[], [10], [11], [12]]
-    slots = [(10, 1, 3, -1, -1), (11, 1, 3, -1, -1), (12, 1, 8, -1, -1)]
+    slots = [(10, 3, -1), (11, 3, -1), (12, 8, -1)]
     actions = [(10, 11, 100, 1), (11, -1, 1, 2, 1)]
     config = [0, 0, 3, 0, 1, 1, 8, 0, 0, 3, 1]
     assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [
@@ -311,7 +309,7 @@ def test_eviction_keeps_coldest_candidate_until_later_thinning_pass():
     nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 1, 999),
              (2, 1, 0, 1, 1), (3, 2, 0, 1, 0)]
     refs = [[], [10], [11], [12]]
-    slots = [(slot, 1, 3, -1, -1) for slot in (10, 11, 12)]
+    slots = [(slot, 3, -1) for slot in (10, 11, 12)]
     actions = [(11, 12, 1, 2, 1), (10, 11, 999, 1), (12, -1, 0, 3, 2, 1)]
     config = [0, 0, 3, 0, 1, 1, 3, 0, 0, 3, 1]
     assert planning.plan_eviction(nodes, [[], [], [], []], refs, slots, [], config, actions) == [

@@ -26,17 +26,15 @@ def test_restore_submits_independent_tasks_without_planner(mode, profile):
     pool = make_pool()
     construction = LogStateConstruction(pool)
     direct = RestoreTask(20, 10, (), 10, 2, 0)
-    # Sliced entries must retain their physical storage offsets. Shared sources
-    # still produce independent work outputs, including batches larger than four.
     logs = (
-        LogStateEntry(1, LogStateKind.LOG, 80, 128, storage_begin=64),
-        LogStateEntry(2, LogStateKind.LOG, 128, 144),
+        LogStateEntry(1, LogStateKind.LOG, 64, 96),
+        LogStateEntry(2, LogStateKind.LOG, 96, 128),
     )
     replay = [RestoreTask(21 + i, None if i == 0 else 10, logs, 2, 1, 0)
               for i in range(5)]
     tasks = {"empty": [], "direct": [direct], "replay": replay,
              "mixed": [replay[0], direct, *replay[1:]]}[mode]
-    expected = [(task.base_slot, [(1, 16, 64), (2, 0, 16)], task.output_slot)
+    expected = [(task.base_slot, [(1, 0, 32), (2, 0, 32)], task.output_slot)
                 for task in tasks if task.logs]
     with (
         patch("logssms.kernel.logstate._load_logstate_module",

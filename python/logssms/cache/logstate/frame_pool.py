@@ -52,7 +52,7 @@ class MHALogStatePool:
         head_payload_bytes = layout.head_payload_bytes(frame_bytes)
         payload_bytes = num_linear_layers * num_value_heads * head_payload_bytes
         self.shared_keys = num_key_heads < num_value_heads
-        log_payload_bytes = layout.log_payload_bytes if self.shared_keys else payload_bytes
+        log_payload_bytes = layout.log_payload_bytes
         conv_snapshot_bytes = layout.conv_state_bytes // layout.num_granules
         allocator = LogStateAllocator(
             num_frames=num_frames,
@@ -79,7 +79,7 @@ class MHALogStatePool:
         )
         self._device = self.storage.device
         self.payload_frame_table = torch.full(
-            (num_frames, allocator.payload_frames), -1,
+            (num_frames, allocator.descriptor_frames), -1,
             dtype=torch.int32, device=device,
         )
         self.conv_frame_table = torch.full(
@@ -176,26 +176,25 @@ class MHALogStatePool:
             self.layout.state_len,
         )
 
-
     def _state_indices(self, slots: torch.Tensor, layer: int) -> torch.Tensor:
-        assert self.frame_bytes % self.head_payload_bytes == 0
         slots = slots.to(torch.int64)
-        heads = torch.arange(
-            self.layout.num_value_heads, dtype=torch.int64, device=self.device
-        )
-        offsets = torch.arange(
-            self.layout.head_k_dim * self.layout.head_v_dim,
-            dtype=torch.int64, device=self.device,
-        )
-        logical = (layer * self.layout.num_value_heads + heads) * self.head_payload_bytes
-        frames = self.payload_frame_table[
-            slots[:, None], (logical // self.frame_bytes)[None, :]
-        ].to(torch.int64)
-        base = (
-            frames * (self.frame_bytes // self.dtype.itemsize)
-            + (logical % self.frame_bytes)[None, :] // self.dtype.itemsize
-        )
-        return base[:, :, None] + offsets
+        heads = torch.arange(self.layout.num_value_heads, dtype=torch.int64, device=self.device)
+        offsets = torch.arange(self.layout.head_k_dim * self.layout.head_v_dim,
+                               dtype=torch.int64, device=self.device)
+        if self.head_payload_bytes <= self.frame_bytes:
+            logical = (layer * self.layout.num_value_heads + heads) * self.head_payload_bytes
+            frames = self.payload_frame_table[
+                slots[:, None], (logical // self.frame_bytes)[None, :]
+            ].to(torch.int64)
+            base = (
+                frames * (self.frame_bytes // self.dtype.itemsize)
+                + (logical % self.frame_bytes)[None, :] // self.dtype.itemsize
+            )
+            return base[:, :, None] + offsets
+        logical = ((layer * self.layout.num_value_heads + heads[:, None]) * self.head_payload_bytes
+                   + offsets[None, :] * self.dtype.itemsize)
+        frames = self.payload_frame_table[slots[:, None, None], logical[None, :, :] // self.frame_bytes].long()
+        return frames * (self.frame_bytes // self.dtype.itemsize) + logical[None, :, :] % self.frame_bytes // self.dtype.itemsize
 
     def read_states(self, slots: torch.Tensor, layer: int) -> torch.Tensor:
         return self.storage.view(self.dtype).flatten()[self._state_indices(slots, layer)].view(
@@ -234,19 +233,22 @@ class MHALogStatePool:
     def _conv_indices(
         self, slots: torch.Tensor, granules: torch.Tensor, layer: int
     ) -> torch.Tensor:
-        assert self.allocator.conv_frames == 1
-        frames = self.conv_frame_table[
-            slots.to(torch.int64), granules.to(torch.int64), 0
-        ].to(torch.int64)
-        base = (
-            frames * (self.frame_bytes // self.dtype.itemsize)
-            + layer * self.layout.conv_dim * self.layout.state_len
-        )
-        offsets = torch.arange(
-            self.layout.conv_dim * self.layout.state_len,
-            dtype=torch.int64, device=self.device,
-        )
-        return base[:, None] + offsets[None, :]
+        offsets = torch.arange(self.layout.conv_dim * self.layout.state_len,
+                               dtype=torch.int64, device=self.device)
+        if self.allocator.conv_frames == 1:
+            frames = self.conv_frame_table[
+                slots.to(torch.int64), granules.to(torch.int64), 0
+            ].to(torch.int64)
+            base = (
+                frames * (self.frame_bytes // self.dtype.itemsize)
+                + layer * self.layout.conv_dim * self.layout.state_len
+            )
+            return base[:, None] + offsets[None, :]
+        logical = layer * self.layout.conv_dim * self.layout.state_len + offsets
+        frame_elems = self.frame_bytes // self.dtype.itemsize
+        frames = self.conv_frame_table[slots.long()[:, None], granules.long()[:, None],
+                                       logical[None, :] // frame_elems].long()
+        return frames * frame_elems + logical[None, :] % frame_elems
 
     def read_conv(
         self, slots: torch.Tensor, granules: torch.Tensor, layer: int
@@ -283,9 +285,20 @@ class MHALogStatePool:
         output_slot    : int,
         output_granule : int = 0,
     ) -> None:
-        self.conv_view(output_slot, output_granule).copy_(
-            self.conv_view(source_slot, source_granule)
-        )
+        if self.allocator.conv_frames == 1:
+            self.conv_view(output_slot, output_granule).copy_(
+                self.conv_view(source_slot, source_granule)
+            )
+            return
+        from logssms.kernel.linear_attention.conv_copy import copy_conv_snapshots
+        if self.device.type == "cuda":
+            src, sg, dst, dg = make_device_vectors([[source_slot], [source_granule],
+                                                   [output_slot], [output_granule]], self.device)
+            copy_conv_snapshots(self, src, sg, dst, dg)
+            return
+        for layer in range(self.layout.num_linear_layers):
+            source = self.read_conv(torch.tensor([source_slot]), torch.tensor([source_granule]), layer)
+            self.write_conv(torch.tensor([output_slot]), torch.tensor([output_granule]), layer, source)
 
     def zero_work_conv(self, slot: int) -> None:
         slots = torch.tensor([slot], dtype=torch.int64, device=self.device)
@@ -317,7 +330,7 @@ class MHALogStatePool:
         for slot in slots:
             record = self.allocator.slot(slot)
             payload.extend(record.payload)
-            payload.extend([-1] * (self.allocator.payload_frames - len(record.payload)))
+            payload.extend([-1] * (self.allocator.descriptor_frames - len(record.payload)))
             row = [-1] * conv_width
             if record.kind == "log":
                 granules = range(self.layout.num_granules)
@@ -498,7 +511,6 @@ class MHALogStatePool:
                 materialized = 0
                 for slot in slots:
                     if slot in self._retiring_slots:
-
 
                         continue
                     self.allocator.materialize(slot)

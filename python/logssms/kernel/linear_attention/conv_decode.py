@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from .packed_conv import _scale_conv_input, _conv_input_scale_args
+from .layout import conv_pointer
 
 
 @triton.jit
@@ -28,7 +29,7 @@ def _conv_decode_kernel(
     X_ROW_STRIDE: tl.constexpr, X_COL_STRIDE: tl.constexpr,
     STATE_SLOT_STRIDE: tl.constexpr, STATE_LAYER_STRIDE: tl.constexpr, LAYER,
     READ_STRIDE: tl.constexpr, WRITE_STRIDE: tl.constexpr,
-    FRAME_ELEMS: tl.constexpr, NUM_GRANULES: tl.constexpr,
+    FRAME_ELEMS: tl.constexpr, NUM_GRANULES: tl.constexpr, CONV_FRAMES: tl.constexpr,
     HAS_BIAS: tl.constexpr, SPLIT_QKV: tl.constexpr, ROUND_CONV: tl.constexpr,
     LOGSTATE: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
     END0: tl.constexpr, END1: tl.constexpr,
@@ -43,17 +44,18 @@ def _conv_decode_kernel(
         read_granule = tl.load(ReadGranules + b)
         write_granule = tl.load(WriteGranules + b)
         work_slot = tl.load(WorkSlots + b)
-        read_frame = tl.load(
-            FrameTable + read_slot * NUM_GRANULES + read_granule
-        )
-        write_frame = tl.load(
-            FrameTable + write_slot * NUM_GRANULES + write_granule
-        )
-        work_frame = tl.load(FrameTable + work_slot * NUM_GRANULES)
         state_ptr = tl.cast(Storage, tl.pointer_type(X.dtype.element_ty))
-        old_base = _frame_element_offset(read_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
-        new_base = _frame_element_offset(write_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
-        work_base = _frame_element_offset(work_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
+        if CONV_FRAMES == 1:
+            read_frame = tl.load(FrameTable + read_slot * NUM_GRANULES + read_granule)
+            write_frame = tl.load(FrameTable + write_slot * NUM_GRANULES + write_granule)
+            work_frame = tl.load(FrameTable + work_slot * NUM_GRANULES)
+            old_base = _frame_element_offset(read_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
+            new_base = _frame_element_offset(write_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
+            work_base = _frame_element_offset(work_frame, FRAME_ELEMS) + LAYER * C * STATE_LEN
+        else:
+            old_base = 0
+            new_base = 0
+            work_base = 0
     else:
         state_ptr = StandardState
         old_base = read_slot * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
@@ -67,19 +69,44 @@ def _conv_decode_kernel(
 
     prior_tokens = conv_states_base
     if KERNEL_WIDTH >= 2:
-        conv_states_ptrs = prior_tokens  # [BLOCK_C]
+        if LOGSTATE and CONV_FRAMES > 1:
+            conv_states_ptrs = conv_pointer(state_ptr, FrameTable, read_slot, read_granule,
+                                           LAYER * C * STATE_LEN + ch * STATE_LEN + 0,
+                                           NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, ch < C)
+        else:
+            conv_states_ptrs = prior_tokens  # [BLOCK_C]
         col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 3:
-        conv_states_ptrs = prior_tokens + 1  # [BLOCK_C]
+        if LOGSTATE and CONV_FRAMES > 1:
+            conv_states_ptrs = conv_pointer(state_ptr, FrameTable, read_slot, read_granule,
+                                           LAYER * C * STATE_LEN + ch * STATE_LEN + 1,
+                                           NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, ch < C)
+        else:
+            conv_states_ptrs = prior_tokens + 1  # [BLOCK_C]
         col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 4:
-        conv_states_ptrs = prior_tokens + 2  # [BLOCK_C]
+        if LOGSTATE and CONV_FRAMES > 1:
+            conv_states_ptrs = conv_pointer(state_ptr, FrameTable, read_slot, read_granule,
+                                           LAYER * C * STATE_LEN + ch * STATE_LEN + 2,
+                                           NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, ch < C)
+        else:
+            conv_states_ptrs = prior_tokens + 2  # [BLOCK_C]
         col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 5:
-        conv_states_ptrs = prior_tokens + 3  # [BLOCK_C]
+        if LOGSTATE and CONV_FRAMES > 1:
+            conv_states_ptrs = conv_pointer(state_ptr, FrameTable, read_slot, read_granule,
+                                           LAYER * C * STATE_LEN + ch * STATE_LEN + 3,
+                                           NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, ch < C)
+        else:
+            conv_states_ptrs = prior_tokens + 3  # [BLOCK_C]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 6:
-        conv_states_ptrs = prior_tokens + 4  # [BLOCK_C]
+        if LOGSTATE and CONV_FRAMES > 1:
+            conv_states_ptrs = conv_pointer(state_ptr, FrameTable, read_slot, read_granule,
+                                           LAYER * C * STATE_LEN + ch * STATE_LEN + 4,
+                                           NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, ch < C)
+        else:
+            conv_states_ptrs = prior_tokens + 4  # [BLOCK_C]
         col4 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
     # Shift the convolution history by one token.
@@ -90,6 +117,10 @@ def _conv_decode_kernel(
         ((idx_tokens + 1) < STATE_LEN)[:, None]
         & (ch < C)[None, :]
     )
+    if LOGSTATE and CONV_FRAMES > 1:
+        conv_state_ptrs_source = conv_pointer(state_ptr, FrameTable, read_slot, read_granule,
+                                             LAYER * C * STATE_LEN + ch[None, :] * STATE_LEN + (idx_tokens + 1)[:, None],
+                                             NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, mask)
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
     VAL = STATE_LEN - 1
@@ -114,9 +145,17 @@ def _conv_decode_kernel(
         state_ptr + new_base + ch[None, :] * STATE_LEN + idx_tokens[:, None]
     )
     mask = (idx_tokens < STATE_LEN)[:, None] & (ch < C)[None, :]
+    if LOGSTATE and CONV_FRAMES > 1:
+        conv_state_ptrs_target = conv_pointer(state_ptr, FrameTable, write_slot, write_granule,
+                                             LAYER * C * STATE_LEN + ch[None, :] * STATE_LEN + idx_tokens[:, None],
+                                             NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, mask)
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
     if LOGSTATE:
         work_ptrs = state_ptr + work_base + ch[None, :] * STATE_LEN + idx_tokens[:, None]
+        if CONV_FRAMES > 1:
+            work_ptrs = conv_pointer(state_ptr, FrameTable, work_slot, 0,
+                                     LAYER * C * STATE_LEN + ch[None, :] * STATE_LEN + idx_tokens[:, None],
+                                     NUM_GRANULES, CONV_FRAMES, FRAME_ELEMS, mask)
         tl.store(work_ptrs, new_conv_state, mask)
 
     # STEP 3: init accumulator
@@ -285,7 +324,7 @@ def conv_decode(
     logstate = pool is not None
     if logstate:
         assert read_granules is not None and write_granules is not None
-        assert work_slots is not None and pool.allocator.conv_frames == 1
+        assert work_slots is not None
         state = pool.storage
         table = pool.conv_frame_table
         frame_elems = pool.frame_bytes // mixed_qkv.element_size()
@@ -305,6 +344,7 @@ def conv_decode(
         mixed_qkv.stride(0), mixed_qkv.stride(1),
         slot_stride, layer_stride, config.layer_idx,
         read_slots.stride(0), write_slots.stride(0), frame_elems, num_granules,
+        pool.allocator.conv_frames if logstate else 1,
         bias is not None, split_qkv, round_conv, logstate, 256, triton.next_power_of_2(config.state_len),
         *_conv_input_scale_args(channels, input_boundaries, input_scales),
         num_warps=4,

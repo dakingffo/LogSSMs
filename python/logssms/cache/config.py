@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from logssms.cache.logstate.layout import LOG_STATE_GRANULARITY
 
-LOG_STATE_PAGE_SIZE = 64
 LOG_STATE_GRANULARITIES = (16, 32, 64)
 
 
@@ -81,13 +80,12 @@ class LogStateCacheConfig(BaseCacheConfig):
 
     @property
     def page_size(self) -> int:
-        return LOG_STATE_PAGE_SIZE
+        return self.granularity
 
 
 __all__ = [
     "BaseCacheConfig",
     "LOG_STATE_GRANULARITIES",
-    "LOG_STATE_PAGE_SIZE",
     "LogStateCacheConfig",
     "NaiveCacheConfig",
     "RadixCacheConfig",

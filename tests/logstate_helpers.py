@@ -28,18 +28,28 @@ def is_lock_boundary(tree, leaf, position: int) -> bool:
 def log_offsets(layout, positions, columns, layer, heads, *, value, head_bytes):
     key_size = layout.granularity * layout.num_key_heads * layout.head_k_dim
     layer_size = key_size + layout.granularity * layout.num_value_heads * layout.head_v_dim
-    if layout.num_key_heads == layout.num_value_heads:
-        layer_size = layout.num_value_heads * head_bytes // layout.dtype.itemsize // layout.num_granules
     offset = (positions // layout.granularity * layout.num_linear_layers + layer) * layer_size
     if value:
         return offset + key_size + (heads * layout.granularity + positions % layout.granularity) * layout.head_v_dim + columns
     return offset + (heads * layout.granularity + positions % layout.granularity) * layout.head_k_dim + columns
 
 
+def eviction_range(tree, node):
+    from logssms.cache.logstate.prefix_cache import LogRadixEvictionSegment
+    return LogRadixEvictionSegment(
+        node, node.begin, node.depth, node.uuid, node.parent.uuid,
+        node.eviction_slots, tree,
+    )
+
+
 def remember_log_tail(recycle, tree, node) -> None:
-    """Remember a pruned path in production's leaf-to-root order."""
     for part in reversed(tree.path(node)):
-        recycle.remember(tree, part)
+        recycle.remember(tree, eviction_range(tree, part))
+
+
+def recycled_bytes(branch):
+    return (256 + 8 * len(branch.tokens) + 16 * len(branch.logs)
+            + 8 * len(branch.protected_endpoints) + 8 * len(branch.merge_stats))
 
 
 def _head_indices(

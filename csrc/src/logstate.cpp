@@ -45,36 +45,24 @@ const Int* cpu_ints(tvm::ffi::TensorView tensor) {
 }
 
 struct Entry {
-
-
-  Int slot, begin, end, span, physical;
-  bool eligible = true, protected_entry = false, fragmented = false;
+  Int slot, begin, end, span;
+  bool eligible;
 };
 
 std::vector<Entry> entries(const List& row) {
-  check(row.size() % 8 == 0, "Invalid LogState entry metadata");
+  check(row.size() % 5 == 0, "Invalid LogState entry metadata");
   std::vector<Entry> result;
-  result.reserve(row.size() / 8);
-  for (size_t i = 0; i < row.size(); i += 8) {
-    result.push_back({row[i], row[i + 1], row[i + 2], row[i + 3], row[i + 4],
-                      bool(row[i + 5]), bool(row[i + 6]), bool(row[i + 7])});
+  result.reserve(row.size() / 5);
+  for (size_t i = 0; i < row.size(); i += 5) {
+    result.push_back({row[i], row[i + 1], row[i + 2], row[i + 3], bool(row[i + 4])});
   }
   return result;
 }
 
-bool protected_interval(const std::vector<Entry>& path, const List& boundaries,
-                        Int begin, Int end) {
-  for (const auto position : boundaries) {
-    if (begin < position && position < end) {
-      return true;
-    }
-  }
-  for (const auto& entry : path) {
-    if (entry.protected_entry && begin <= entry.begin && entry.end <= end) {
-      return true;
-    }
-  }
-  return false;
+bool crosses_boundary(const List& boundaries, Int begin, Int end) {
+  return std::any_of(boundaries.begin(), boundaries.end(), [&](Int position) {
+    return begin < position && position < end;
+  });
 }
 
 Rows batch_branch_points(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int granularity) {
@@ -136,11 +124,11 @@ Rows batch_branch_points(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int gr
 }
 
 Rows plan_materialize(const Rows& paths, const Rows& boundaries,
-                      const Rows& candidates, Int page_size) {
-  check(paths.size() == boundaries.size() && page_size > 0, "Invalid materialize metadata");
+                      const Rows& candidates, Int granularity, Int log_count) {
+  check(paths.size() == boundaries.size() && granularity > 0 && log_count > 0, "Invalid materialize metadata");
   struct PathIndex {
     std::vector<Entry> values;
-    Vector checkpoints, boundaries, protected_begins, protected_ends;
+    Vector checkpoints, boundaries;
     std::vector<std::pair<Int, Int>> logs;
   };
   std::vector<PathIndex> unpacked(paths.size());
@@ -149,15 +137,12 @@ Rows plan_materialize(const Rows& paths, const Rows& boundaries,
     index.values = entries(paths[p]);
     index.boundaries.assign(boundaries[p].begin(), boundaries[p].end());
     std::sort(index.boundaries.begin(), index.boundaries.end());
-    std::vector<std::pair<Int, Int>> logs, protected_intervals;
+    std::vector<std::pair<Int, Int>> logs;
     for (const auto& value : index.values) {
       if (value.span >= 0) {
         index.checkpoints.push_back(value.end);
       } else {
         logs.emplace_back(value.begin, value.end);
-      }
-      if (value.protected_entry) {
-        protected_intervals.emplace_back(value.begin, value.end);
       }
     }
     std::sort(index.checkpoints.begin(), index.checkpoints.end());
@@ -169,34 +154,26 @@ Rows plan_materialize(const Rows& paths, const Rows& boundaries,
         index.logs.push_back(interval);
       }
     }
-    std::sort(protected_intervals.begin(), protected_intervals.end());
-    for (const auto& interval : protected_intervals) {
-      index.protected_begins.push_back(interval.first);
-      index.protected_ends.push_back(interval.second);
-    }
-    for (size_t i = index.protected_ends.size(); i > 1; --i) {
-      index.protected_ends[i - 2] = std::min(index.protected_ends[i - 2], index.protected_ends[i - 1]);
-    }
+
   }
   Rows result;
   for (Int candidate = 0; candidate < static_cast<Int>(candidates.size()); ++candidate) {
     const auto& row = candidates[candidate];
-    check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(paths.size()),
+    check(row.size() == 3 && row[0] >= 0 && row[0] < static_cast<Int>(paths.size()),
           "Invalid materialize candidate path");
     const auto& index = unpacked[row[0]];
     check(row[1] >= 0 && row[1] < static_cast<Int>(index.values.size()), "Invalid candidate entry");
     const auto& entry = index.values[row[1]];
-    if (!entry.eligible || entry.span >= 0 || entry.fragmented
-        || (entry.end - entry.begin) % page_size) {
+    if (!entry.eligible || entry.span >= 0
+        || entry.end - entry.begin != granularity) {
       continue;
     }
     const auto boundary = std::upper_bound(index.boundaries.begin(), index.boundaries.end(), entry.begin);
-    const auto protected_index = std::lower_bound(
-        index.protected_begins.begin(), index.protected_begins.end(), entry.begin)
-        - index.protected_begins.begin();
-    if ((boundary != index.boundaries.end() && *boundary < entry.end)
-        || (protected_index < static_cast<Int>(index.protected_ends.size())
-            && index.protected_ends[protected_index] <= entry.end)) {
+    if (boundary != index.boundaries.end() && *boundary < entry.end) {
+      continue;
+    }
+    if (!row[2]) {
+      result.push_back(List({candidate}));
       continue;
     }
     auto checkpoint = std::upper_bound(index.checkpoints.begin(), index.checkpoints.end(), entry.begin);
@@ -208,15 +185,38 @@ Rows plan_materialize(const Rows& paths, const Rows& boundaries,
       result.push_back(List({candidate}));
     }
   }
-  return result;
+  if (log_count == 1) {
+    return result;
+  }
+  Rows grouped;
+  Vector group;
+  Int path = -1, previous_end = -1;
+  for (const auto& accepted : result) {
+    const auto candidate = accepted[0];
+    const auto& source = candidates[candidate];
+    const auto& entry = unpacked[source[0]].values[source[1]];
+    const auto& index = unpacked[source[0]];
+    if (source[0] != path || entry.begin != previous_end
+        || std::binary_search(index.boundaries.begin(), index.boundaries.end(), entry.begin)) {
+      group.clear();
+    }
+    path = source[0];
+    previous_end = entry.end;
+    group.push_back(candidate);
+    if (static_cast<Int>(group.size()) == log_count) {
+      grouped.push_back(List(group.begin(), group.end()));
+      group.clear();
+    }
+  }
+  return grouped;
 }
 
 Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& locks,
-                     const Rows& anchors, const List& materialized,
-                     Int page_size, bool diagnostics) {
+                     const Rows& anchors,
+                     Int granularity, bool diagnostics) {
   check(paths.size() == boundaries.size() && paths.size() == locks.size()
-        && page_size > 0, "Invalid coalesce metadata");
-  std::unordered_set<Int> projected(materialized.begin(), materialized.end()), used;
+        && granularity > 0, "Invalid coalesce metadata");
+  std::unordered_set<Int> used;
   std::map<std::string, Int> counts;
   Rows groups;
   auto add = [&](const std::string& key, Int value = 1) {
@@ -244,9 +244,6 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
       if (used.contains(entry.slot)) {
         continue;
       }
-      if (projected.contains(entry.slot)) {
-        entry.span = 1;
-      }
       if (entry.span < 0) {
         add("logs_not_materialized");
       }
@@ -262,7 +259,7 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
     add(anchor[3] ? "anchors_with_stats" : "anchors_without_stats");
     add("anchors_intensity_" + std::to_string(anchor[2]));
     auto blocked = [&](Int begin, Int end) {
-      return protected_interval(path, boundaries[index], begin, end);
+      return crosses_boundary(boundaries[index], begin, end);
     };
     auto locked = [&](Int position) {
       return std::find(locks[index].begin(), locks[index].end(), position) != locks[index].end();
@@ -301,7 +298,7 @@ Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& lock
         }
       }
       std::string reason;
-      if (std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.end - e.begin != page_size * e.span; })) {
+      if (std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.end - e.begin != granularity * e.span; })) {
         reason = "span_mismatch";
       }
       else {
@@ -490,10 +487,10 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
         "Invalid eviction capacity metadata");
   std::unordered_map<Int, Vector> slot_info;
   for (const auto& row : slots) {
-    check(row.size() == 5 && row[1] > 0, "Invalid eviction slot");
+    check(row.size() == 3 && row[1] >= 0, "Invalid eviction slot");
     slot_info.emplace(row[0], Vector(row.begin(), row.end()));
   }
-  std::unordered_map<Int, Int> decay_occupied, decay_released, references, pages;
+  std::unordered_map<Int, Int> decay_occupied, decay_released, pages;
   for (const auto& row : occupied) {
     check(row.size() == 2 && row[1] > 0 && row[1] <= config[5], "Invalid decay occupancy");
     decay_occupied.emplace(row[0], row[1]);
@@ -513,10 +510,10 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
     check(released_set.insert(slot).second, "Duplicate eviction slot release");
     const auto& record = slot_info.at(slot);
     released.push_back(slot);
-    free += record[2];
-    if (record[3] >= 0) {
-      check(decay_occupied.contains(record[3]), "Missing decay frame occupancy");
-      if (++decay_released[record[3]] == decay_occupied.at(record[3])) {
+    free += record[1];
+    if (record[2] >= 0) {
+      check(decay_occupied.contains(record[2]), "Missing decay frame occupancy");
+      if (++decay_released[record[2]] == decay_occupied.at(record[2])) {
         ++free;
         decay -= config[5] - 1;
       }
@@ -544,12 +541,6 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
         continue;
       }
       check(slot_info.contains(slot), "Missing eviction slot");
-      const auto& record = slot_info.at(slot);
-      const auto refs = ++references[slot];
-      check(refs <= record[1], "Eviction exceeds cached slot references");
-      if (refs != record[1]) {
-        continue;
-      }
       release(slot);
     }
   };
@@ -666,8 +657,6 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
           right = successors.at(right);
         }
         if (right >= 0 && !released_set.contains(right)) {
-          check(slot_info.at(action[0])[1] == 1 && slot_info.at(right)[1] == 1,
-                "Cannot compress shared checkpoint slots");
           compressed.insert(compressed.end(), {action[0], right});
           successors.emplace(action[0], right);
           release(action[0]);
@@ -947,10 +936,6 @@ Result make_recycle_bin(Int capacity) {
 }
 
 struct Planner {
-  static tvm::ffi::Tensor branches(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int granularity) {
-    return write_rows(batch_branch_points(inputs, granularity));
-  }
-
   static tvm::ffi::Tensor protections(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs,
                                      tvm::ffi::TensorView forced, Int granularity) {
     return write_rows(branch_protections(inputs, read_rows(forced), granularity));
@@ -980,15 +965,15 @@ struct Planner {
   }
 
   static tvm::ffi::Tensor materialize(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
-                                    tvm::ffi::TensorView candidates, Int page_size) {
-    return write_rows(plan_materialize(read_rows(paths), read_rows(boundaries), read_rows(candidates), page_size));
+                                    tvm::ffi::TensorView candidates, Int granularity, Int log_count) {
+    return write_rows(plan_materialize(read_rows(paths), read_rows(boundaries), read_rows(candidates), granularity, log_count));
   }
 
   static Result coalesce(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
                          tvm::ffi::TensorView locks, tvm::ffi::TensorView anchors,
-                         const List& materialized, Int page_size, bool diagnostics) {
+                         Int granularity, bool diagnostics) {
     auto result = plan_coalesce(read_rows(paths), read_rows(boundaries), read_rows(locks),
-                                read_rows(anchors), materialized, page_size, diagnostics);
+                                read_rows(anchors), granularity, diagnostics);
     result.Set("groups", write_rows(result.at("groups").cast<Rows>()));
     return result;
   }
@@ -998,7 +983,6 @@ struct Planner {
 }
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_branch_points, logssms::Planner::branches);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_coalesce, logssms::Planner::coalesce);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);

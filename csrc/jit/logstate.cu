@@ -52,11 +52,8 @@ __global__ void log_store_kernel(
     return;
   }
   const auto position = params.token_offsets[token];
-  const auto head_granule = params.head_payload_bytes / (kPageSize / kGranularity);
   const auto key_head = head / (params.num_heads / params.num_key_heads);
-  const auto layer_bytes = params.num_key_heads == params.num_heads
-    ? params.num_heads * head_granule
-    : kGranularity * (params.num_key_heads * params.key_bytes + params.num_heads * params.value_bytes);
+  const auto layer_bytes = kGranularity * (params.num_key_heads * params.key_bytes + params.num_heads * params.value_bytes);
   const auto layer_offset = (position / kGranularity * params.num_layers + params.layer) * layer_bytes;
   const auto key_offset = layer_offset
     + (key_head * kGranularity + position % kGranularity) * params.key_bytes;
@@ -190,9 +187,7 @@ struct LogStateKernel {
     runtime_assert(input_key_heads.unwrap() == num_key_heads || input_key_heads.unwrap() == num_heads.unwrap());
     runtime_assert(num_layers * num_heads.unwrap() * head_payload_bytes
       <= num_payload_frames.unwrap() * frame_bytes.unwrap());
-    runtime_assert(head_payload_bytes >= page_size * (key_bytes + value_bytes));
-    runtime_assert(head_payload_bytes <= frame_bytes.unwrap());
-    runtime_assert(frame_bytes.unwrap() % head_payload_bytes == 0);
+    runtime_assert(frame_bytes.unwrap() % head_payload_bytes == 0 || head_payload_bytes % frame_bytes.unwrap() == 0);
     runtime_assert(decay_record_bytes > 0 && decay_record_bytes <= frame_bytes.unwrap());
     runtime_assert(frame_bytes.unwrap() % itemsize == 0);
     if (num_tokens.unwrap() == 0) {

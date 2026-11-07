@@ -47,7 +47,11 @@ class LogStateAllocator:
         self.log_payload_frames = self.payload_frames if log_payload_bytes is None else (
             log_payload_bytes + frame_bytes - 1
         ) // frame_bytes
-        assert 0 < self.log_payload_frames <= self.payload_frames
+        assert self.log_payload_frames > 0
+        self.descriptor_frames = max(self.payload_frames, self.log_payload_frames)
+        self.checkpoint_log_count = (
+            self.payload_frames + self.log_payload_frames - 1
+        ) // self.log_payload_frames
         self.conv_frames = (conv_snapshot_bytes + frame_bytes - 1) // frame_bytes
         self.decay_records_per_frame = frame_bytes // decay_bytes
         self.num_granules = num_granules
@@ -302,14 +306,14 @@ class LogStateAllocator:
     def materialize(self, slot: int) -> tuple[int, ...]:
         record = self._slots[slot]
         assert record.kind == "log" and record.decay is not None
-        assert len(record.payload) == self.payload_frames, "Compact Log needs merged checkpoint storage"
+        assert len(record.payload) >= self.payload_frames, "Compact Log needs merged checkpoint storage"
         reclaimable = slot in self._reclaimable_slots
         self.set_reclaimable(slot, False)
-        released = tuple(frame for snapshot in record.conv[:-1] for frame in snapshot)
+        released = record.payload[self.payload_frames:] + tuple(frame for snapshot in record.conv[:-1] for frame in snapshot)
         self._free.extend(released)
         self._release_decay(record.decay)
         self._slots[slot] = LinearCacheSlot(
-            record.payload, (record.conv[-1],), None, "checkpoint"
+            record.payload[:self.payload_frames], (record.conv[-1],), None, "checkpoint"
         )
         if reclaimable:
             self.set_reclaimable(slot, True)
@@ -330,9 +334,9 @@ class LogStateAllocator:
         return savings + sum(mask == self._decay_masks[frame] for frame, mask in decay_masks.items())
 
     def coalesce_to_checkpoint(self, slots: tuple[int, ...]) -> RetiredResources:
-        assert len(slots) == len(set(slots)) and len(slots) > 1
+        assert len(slots) == len(set(slots)) and len(slots) >= 1
         assert self.checkpoint_frame_capacity(slots) >= self.payload_frames
-        assert self.checkpoint_frame_savings(slots) > 0, "Materialization must release more than its expansion"
+        assert self.checkpoint_frame_savings(slots) >= 0, "Materialization must cover its expansion"
         records = [self._slots[slot] for slot in slots]
         reclaimable = [slot for slot in slots if slot in self._reclaimable_slots]
         for slot in reclaimable:

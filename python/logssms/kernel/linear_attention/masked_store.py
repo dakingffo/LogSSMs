@@ -4,7 +4,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from .layout import state_pointer
+from .layout import state_pointer, conv_pointer
 
 
 @triton.jit(
@@ -34,16 +34,17 @@ def _state_store(storage, frames, slots, values,
 )
 def _conv_store(storage, frames, slots, granules, values,
                 WIDTH: tl.constexpr, LAYER, GRANULES: tl.constexpr,
-                FRAME_ELEMS: tl.constexpr, BLOCK: tl.constexpr):
+                FRAME_ELEMS: tl.constexpr, FRAMES: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     slot = tl.load(slots + row)
     if slot < 0:
         return
     granule = tl.load(granules + row)
-    frame = tl.load(frames + slot * GRANULES + granule).to(tl.int64)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(values + row * WIDTH + offsets, offsets < WIDTH, other=0)
-    tl.store(storage + frame * FRAME_ELEMS + LAYER * WIDTH + offsets, value, offsets < WIDTH)
+    destination = conv_pointer(storage, frames, slot, granule, LAYER * WIDTH + offsets,
+                               GRANULES, FRAMES, FRAME_ELEMS, offsets < WIDTH)
+    tl.store(destination, value, offsets < WIDTH)
 
 
 def store_states(pool, slots, layer, values):
@@ -61,12 +62,11 @@ def store_states(pool, slots, layer, values):
 def store_conv(pool, slots, granules, layer, values):
     assert slots.is_cuda and granules.is_cuda and values.is_cuda
     assert granules.shape == slots.shape
-    assert pool.conv_frame_table.shape[2] == 1
     if not len(slots):
         return
     width = pool.layout.conv_dim * pool.layout.state_len
     _conv_store[(len(slots), triton.cdiv(width, 256))](
         pool.storage.view(pool.dtype), pool.conv_frame_table, slots.contiguous(),
         granules.contiguous(), values.contiguous(), width, layer,
-        pool.conv_frame_table.shape[1], pool.frame_bytes // pool.dtype.itemsize, 256,
+        pool.conv_frame_table.shape[1], pool.frame_bytes // pool.dtype.itemsize, pool.allocator.conv_frames, 256,
     )

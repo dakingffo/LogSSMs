@@ -320,7 +320,7 @@ def mamba2_decode(xbc, dt, A_log, dt_bias, D, config, metadata, pool, *, logstat
         read = write = metadata.work_slots
         log_slots, offsets, counts = metadata.log_slots, metadata.token_offsets, metadata.replay_counts
         state, storage, payload, decay = pool.storage, pool.storage, pool.payload_frame_table, pool.decay_frame_table
-        layers, frame_bytes, frames = pool.layout.num_linear_layers, pool.frame_bytes, pool.allocator.payload_frames
+        layers, frame_bytes, frames = pool.layout.num_linear_layers, pool.frame_bytes, pool.payload_frame_table.shape[1]
         head_bytes, decay_bytes, page = pool.head_payload_bytes, pool.layout.log_decay_bytes, pool.page_size
     else:
         read, write = metadata.read_slots, metadata.write_slots

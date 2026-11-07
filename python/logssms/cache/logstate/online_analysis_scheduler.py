@@ -25,43 +25,21 @@ class LogStateRound:
 
 @dataclass(frozen=True)
 class _MergePathContext:
-    protected_depths : tuple[int, ...]
-    protected_entries: tuple[LogStateEntry, ...]
-    pending_positions : tuple[int, ...]
-    lock_boundaries   : frozenset[int]
+    pending_positions: tuple[int, ...]
+    lock_boundaries  : frozenset[int]
 
     @classmethod
     def build(
-        cls,
-        tree   : LogRadixTree,
-        path   : Sequence[LogRadixTreeNode],
-        entries: Sequence[LogStateEntry],
-        pending: Sequence[_PendingProtection],
+        cls, path: Sequence[LogRadixTreeNode], pending: Sequence[_PendingProtection],
     ) -> _MergePathContext:
         path_ids = {node.uuid for node in path}
-        protected_slots: dict[int, bool] = {}
-        protected_entries = []
-        for entry in entries:
-            protected = protected_slots.get(entry.slot)
-            if protected is None:
-                protected = tree.entry_is_protected(entry.slot)
-                protected_slots[entry.slot] = protected
-            if protected:
-                protected_entries.append(entry)
         return cls(
-            protected_depths=tuple(sorted(
-                node.depth for node in path if node.is_protected
-            )),
-            protected_entries=tuple(protected_entries),
             pending_positions=tuple(sorted(
                 value.position for value in pending
                 if value.trace.node.uuid in path_ids
             )),
             lock_boundaries=frozenset(
-                node.depth for node in path
-                if node.ref_count > sum(
-                    child.ref_count for child in node.children.values()
-                )
+                position for node in path for position in node._endpoint_refs
             ),
         )
 
@@ -70,15 +48,18 @@ class _MergePathContext:
 class BranchProtection:
     request_indices: tuple[int, ...]
     position       : int
-    log_slot       : int | None
-    node           : LogRadixTreeNode | None
+    node           : LogRadixTreeNode
 
 
 @dataclass(frozen=True)
 class MaterializeCandidate:
-    log_slot: int
-    begin   : int
-    end     : int
+    slots: tuple[int, ...]
+    begin: int
+    end  : int
+
+    @property
+    def right_slot(self) -> int:
+        return self.slots[-1]
 
 
 @dataclass(frozen=True)
@@ -123,20 +104,19 @@ class OnlineAnalysisScheduler:
 
     def __init__(
         self,
-        page_size                : int,
-        granularity              : int  = LOG_STATE_GRANULARITY,
+        granularity              : int = LOG_STATE_GRANULARITY,
+        checkpoint_log_count     : int = 1,
         enable_merge_adjustment  : bool = True,
         min_sampling_len         : int  = 1024,
         max_merge_intensity      : int  = 16,
         default_merge_growth_rate: int = 2,
         profile_enabled          : bool = False,
     ) -> None:
-        assert page_size > 0
-        assert granularity > 0 and page_size % granularity == 0
+        assert granularity > 0 and checkpoint_log_count > 0
         assert min_sampling_len > 0
         assert max_merge_intensity >= 2
         assert default_merge_growth_rate >= 1
-        self.page_size = page_size
+        self.checkpoint_log_count = checkpoint_log_count
         self.granularity = granularity
         self.enable_merge_adjustment = enable_merge_adjustment
         self.min_sampling_len = min_sampling_len
@@ -224,7 +204,7 @@ class OnlineAnalysisScheduler:
                     remaining.append(position)
                 elif position >= window_begin:
                     distance = max(self.granularity, boundary - position)
-                    index = (distance - 1) // self.page_size
+                    index = (distance - 1) // self.granularity
                     bins[index] = bins.get(index, 0) + 1
             stats.hit_positions = remaining
             sample_ms = (perf_counter_ns() - sample_start) / 1e6 if profile is not None else 0.0
@@ -288,8 +268,8 @@ class OnlineAnalysisScheduler:
                 )
             return None
 
-        xs = [math.log((index + 0.5) * self.page_size) for index in bins]
-        ys = [math.log(count / self.page_size) for count in bins.values()]
+        xs = [math.log((index + 0.5) * self.granularity) for index in bins]
+        ys = [math.log(count / self.granularity) for count in bins.values()]
         x_mean = sum(xs) / len(xs)
         y_mean = sum(ys) / len(ys)
         denominator = sum((value - x_mean) ** 2 for value in xs)
@@ -325,8 +305,10 @@ class OnlineAnalysisScheduler:
         self, tree: LogRadixTree, traces: Sequence[LogRadixTrace],
     ) -> LogStateRound:
         nodes, endpoints = self._analysis_paths(tree, traces)
+        limits = self._analysis_limits(nodes, endpoints)
         return LogStateRound(
-            frozenset(entry.slot for node in nodes for entry in node.entries),
+            frozenset(entry.slot for node in nodes for entry in node.entries
+                      if entry.end <= limits[node.uuid]),
             nodes, endpoints,
         )
 
@@ -341,7 +323,6 @@ class OnlineAnalysisScheduler:
         traces: Sequence[LogRadixTrace] | None = None,
         pending: tuple[_PendingProtection, ...] | None = None,
     ) -> LogStatePlan:
-        assert tree.page_size == self.page_size
         assert tree.granularity == self.granularity
         step_start = perf_counter_ns() if step_timing_ms is not None else 0
         if traces is None:
@@ -377,15 +358,15 @@ class OnlineAnalysisScheduler:
                 perf_counter_ns() - step_start
             ) / 1e6
             step_start = perf_counter_ns()
-        protections = self._plan_protections(tree, pending)
+        protections = self._plan_protections(pending)
         if step_timing_ms is not None:
             step_timing_ms["protection_and_restore_plan_ms"] = (
                 perf_counter_ns() - step_start
             ) / 1e6
             step_start = perf_counter_ns()
-        path_cache = {}
+        path_cache = {"limits": self._analysis_limits(analysis_nodes, endpoints)}
         materialize = self._plan_materialize(
-            tree, round_info.eligible_slots, pending, analysis_nodes, path_cache,
+            tree, round_info.eligible_slots, pending, analysis_nodes, path_cache, endpoints,
         )
         if step_timing_ms is not None:
             step_timing_ms["materialize_plan_ms"] = (
@@ -443,6 +424,17 @@ class OnlineAnalysisScheduler:
             )),
         )
 
+    @staticmethod
+    def _analysis_limits(
+        nodes: Sequence[LogRadixTreeNode],
+        endpoints: Sequence[_AnalysisEndpoint],
+    ) -> dict[int, int]:
+        parents = {node.parent.uuid for node in nodes}
+        limits = {node.uuid: node.depth if node.uuid in parents else 0 for node in nodes}
+        for endpoint in endpoints:
+            limits[endpoint.node.uuid] = max(limits[endpoint.node.uuid], endpoint.matched_len)
+        return limits
+
     def _find_protections(
         self,
         tree     : LogRadixTree,
@@ -494,23 +486,19 @@ class OnlineAnalysisScheduler:
 
     def _plan_protections(
         self,
-        tree   : LogRadixTree,
         pending: Sequence[_PendingProtection],
     ) -> tuple[BranchProtection, ...]:
         protections = []
         for value in pending:
-            entry = self._covering_log(tree, value)
             node = (
                 value.trace.node
-                if value.trace.is_exact
-                and value.trace.matched_len == value.position
+                if value.trace.matched_len == value.position
                 and not value.trace.node.is_root() else None
             )
-            if entry is not None or node is not None:
+            if node is not None:
                 protections.append(BranchProtection(
                     request_indices=value.request_indices,
                     position=value.position,
-                    log_slot=None if entry is None else entry.slot,
                     node=node,
                 ))
         return tuple(protections)
@@ -525,7 +513,8 @@ class OnlineAnalysisScheduler:
         if node.uuid not in cache:
             path = tree.path(node)
             entries = sorted(
-                (entry for part in path for entry in part.entries),
+                (entry for part in path for entry in part.entries
+                 if entry.end <= cache.get("limits", {}).get(part.uuid, part.depth)),
                 key=lambda entry: (entry.begin, entry.end, entry.slot),
             )
             cache[node.uuid] = (path, entries)
@@ -543,21 +532,20 @@ class OnlineAnalysisScheduler:
         key = ("native", node.uuid)
         if key not in path_cache:
             path, entries = self._cached_path_entries(tree, node, path_cache)
-            context = _MergePathContext.build(tree, path, entries, pending)
-            protected_slots = {entry.slot for entry in context.protected_entries}
+            context = _MergePathContext.build(path, pending)
             rows = [
                 value
                 for entry in entries
                 for value in (
                     entry.slot, entry.begin, entry.end,
-                    -1 if entry.span_pages is None else entry.span_pages,
-                    entry.physical_begin, int(entry.slot in eligible_slots),
-                    int(entry.slot in protected_slots), int(tree.slot_is_fragmented(entry.slot)),
+                    -1 if entry.span_granules is None else entry.span_granules,
+                    int(entry.slot in eligible_slots),
                 )
             ]
             path_cache[key] = (
                 entries, rows,
-                context.protected_depths + context.pending_positions,
+                tuple(sorted({*(part.depth for part in path), *context.pending_positions,
+                              *context.lock_boundaries})),
                 tuple(context.lock_boundaries),
             )
         return path_cache[key]
@@ -569,6 +557,7 @@ class OnlineAnalysisScheduler:
         pending       : tuple[_PendingProtection, ...],
         analysis_nodes: tuple[LogRadixTreeNode, ...],
         path_cache    : dict,
+        endpoints     : tuple[_AnalysisEndpoint, ...],
     ) -> tuple[MaterializeCandidate, ...]:
         from logssms.kernel import logstate as planning
 
@@ -577,8 +566,9 @@ class OnlineAnalysisScheduler:
         path_indices = {}
         entry_indices = []
         source_entries = []
-        entries = {entry.slot: entry for node in analysis_nodes for entry in node.entries}
-
+        limits = self._analysis_limits(analysis_nodes, endpoints)
+        entries = {entry.slot: entry for node in analysis_nodes for entry in node.entries
+                   if entry.end <= limits.get(node.uuid, node.depth)}
 
         parent_ids = {node.parent.uuid for node in analysis_nodes}
         owner_paths = {}
@@ -596,19 +586,23 @@ class OnlineAnalysisScheduler:
                 paths.append(path)
                 entry_indices.append({value: i for i, value in enumerate(path[0])})
             path_index = path_indices[owner.uuid]
-            candidates.append((path_index, entry_indices[path_index][entry]))
+            candidates.append((path_index, entry_indices[path_index][entry], 1))
             source_entries.append(entry)
         if not candidates:
             return ()
+        ordered = sorted(zip(candidates, source_entries), key=lambda item: item[0])
+        candidates, source_entries = map(list, zip(*ordered))
         rows = planning.plan_materialize(
             [path[1] for path in paths], [path[2] for path in paths],
-            candidates, self.page_size,
+            candidates, self.granularity, self.checkpoint_log_count,
         )
         result = []
         for row in rows:
-            entry = source_entries[row[0]]
-            result.append(MaterializeCandidate(entry.slot, entry.begin, entry.end))
-        result.sort(key=lambda value: (value.begin, value.end, value.log_slot))
+            group = [source_entries[index] for index in row]
+            result.append(MaterializeCandidate(
+                tuple(entry.slot for entry in group), group[0].begin, group[-1].end,
+            ))
+        result.sort(key=lambda value: (value.begin, value.end, value.right_slot))
         return tuple(result)
 
     def _plan_coalesce(
@@ -680,10 +674,23 @@ class OnlineAnalysisScheduler:
                 stats.intensity if stats is not None else 2,
                 int(stats is not None),
             ))
+        projected = {slot: item for item in materialize for slot in item.slots}
+        projected_paths = []
+        for path in paths:
+            rows = []
+            for index, entry in enumerate(path[0]):
+                item = projected.get(entry.slot)
+                if item is None:
+                    rows.extend(path[1][index * 5:(index + 1) * 5])
+                elif entry.slot == item.right_slot:
+                    rows.extend((item.right_slot, item.begin, item.end,
+                                 (item.end - item.begin) // self.granularity,
+                                 1))
+            projected_paths.append(rows)
         groups, native_diagnostics = planning.plan_coalesce(
-            [path[1] for path in paths], [path[2] for path in paths],
+            projected_paths, [path[2] for path in paths],
             [path[3] for path in paths], anchors,
-            [plan.log_slot for plan in materialize], self.page_size,
+            self.granularity,
             diagnostics is not None,
         )
         if diagnostics is not None:
@@ -691,39 +698,14 @@ class OnlineAnalysisScheduler:
         result = []
         for row in groups:
             values = tuple(row)
+            slots, spans = [], []
+            for slot, span in zip(values[3::2], values[4::2]):
+                item = projected.get(slot)
+                slots.extend((slot,) if item is None else item.slots)
+                spans.extend((span,) if item is None else (1,) * len(item.slots))
             result.append(CheckpointCoalesce(
-                slots=values[3::2], source_spans=values[4::2],
+                slots=tuple(slots), source_spans=tuple(spans),
                 begin=values[0], end=values[1], next_span=values[2],
             ))
         result.sort(key=lambda value: (value.begin, value.end, value.left_slot))
         return tuple(result)
-
-    def _covering_log(
-        self,
-        tree   : LogRadixTree,
-        pending: _PendingProtection,
-    ) -> LogStateEntry | None:
-        entries = self._entries_for_node(tree, pending.trace.node)
-        candidates = [
-            entry
-            for entry in entries
-            if entry.kind is LogStateKind.LOG
-            and entry.physical_begin < pending.position
-            < entry.physical_begin + self.page_size
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda entry: entry.end - entry.begin)
-
-    def _entries_for_node(
-        self,
-        tree: LogRadixTree,
-        node: LogRadixTreeNode,
-    ) -> list[LogStateEntry]:
-        entries = [
-            entry
-            for path_node in tree.path(node)
-            for entry in path_node.entries
-        ]
-        entries.sort(key=lambda entry: (entry.begin, entry.end, entry.slot))
-        return entries

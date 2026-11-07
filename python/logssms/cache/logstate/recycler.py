@@ -6,7 +6,7 @@ from weakref import WeakValueDictionary
 
 import torch
 
-from .prefix_cache import LogRadixTree, LogRadixTreeNode, LogStateEntry, LogStateKind
+from .prefix_cache import LogRadixTree, LogRadixEvictionSegment, LogStateEntry, LogStateKind
 
 if TYPE_CHECKING:
     from .online_analysis_scheduler import MaterializeCandidate, CheckpointCoalesce
@@ -26,16 +26,6 @@ class RecycledBranch:
     _serial           : int = field(default=0, compare=False, repr=False)
     merge_stats       : tuple[int, ...] = ()
 
-    @property
-    def bytes(self) -> int:
-
-
-        return (
-            256 + 8 * len(self.tokens) + 16 * len(self.logs)
-            + 8 * len(self.protected_endpoints)
-            + 8 * len(self.merge_stats)
-        )
-
 
 @dataclass(frozen=True)
 class RecycledMatch:
@@ -43,7 +33,6 @@ class RecycledMatch:
     matched_len: int
 
     def matched_tokens(self, start: int) -> int:
-
 
         return sum(
             max(0, min(log.end, self.matched_len) - max(log.begin, start))
@@ -91,25 +80,26 @@ class LogStateRecycleBin:
         self._matches: WeakValueDictionary[int, RecycledBranch] = WeakValueDictionary()
         self.revision = 0
 
-
     def remember(
         self,
         tree: LogRadixTree,
-        node: LogRadixTreeNode,
+        segment: LogRadixEvictionSegment,
     ) -> None:
         from logssms.kernel import logstate as planning
 
         logs = [
-            (max(node.begin, entry.begin), min(node.depth, entry.end))
-            for entry in node.entries if entry.kind is LogStateKind.LOG
+            (entry.begin, entry.end)
+            for entry in segment.entries if entry.kind is LogStateKind.LOG
         ]
         if self.capacity_bytes == 0 or not logs:
             return
         self.revision += 1
-        path = tree.path(node)
-        stats = node.merge_stats
+        source = segment.node
+        path = tree.path(source)
+        keys = [part.key for part in path[:-1]] + [source.key[:segment.end - source.begin]]
+        stats = source.merge_stats
         self._native["remember"](
-            [part.key for part in path],
+            keys,
             planning._pack(logs),
             [part.depth for part in path if part.is_protected
              and any(begin <= part.depth <= end for begin, end in logs)],

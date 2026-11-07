@@ -46,8 +46,8 @@ private:
     runtime_assert(num_layers > 0 && num_heads > 0);
     runtime_assert(head_k_dim % 16 == 0 && head_v_dim % 16 == 0);
     runtime_assert(page_size <= 64);
-    runtime_assert(frame_bytes.unwrap() % head_payload_bytes == 0);
-    runtime_assert(head_payload_bytes >= page_size * (head_k_dim + head_v_dim) * 2);
+    runtime_assert(frame_bytes.unwrap() % head_payload_bytes == 0
+      || head_payload_bytes % frame_bytes.unwrap() == 0);
     runtime_assert(head_payload_bytes >= head_k_dim * head_v_dim * 2);
     runtime_assert(num_layers * num_heads * head_payload_bytes
       <= num_payload_frames.unwrap() * frame_bytes.unwrap());
