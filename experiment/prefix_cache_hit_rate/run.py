@@ -371,30 +371,13 @@ def _write_results(
         json.dump(summary, file, indent=2)
         file.write("\n")
 
-    dataset_title = {
-        "swe_agent"                  : "SWE-agent",
-        "agentic_coding_trajectories": "Thoughtworks agentic-coding",
-    }.get(configuration["dataset"], configuration["dataset"])
+    highlight_end = 768 if configuration["dataset"] == "swe_agent" else 512
 
     _plot(
         density,
-        output_dir / "hit_density.png",
-        dataset_title=dataset_title,
-        branch_only=False,
+        output_dir / "hit_density_ccdf.png",
         max_distance=plot_max_distance,
-    )
-    _plot(
-        density,
-        output_dir / "branch_hit_density.png",
-        dataset_title=dataset_title,
-        branch_only=True,
-        max_distance=plot_max_distance,
-    )
-    _plot_ccdf(
-        density,
-        output_dir / "branch_hit_ccdf.png",
-        dataset_title=dataset_title,
-        max_distance=plot_max_distance,
+        highlight_end=highlight_end,
     )
 
 
@@ -410,61 +393,28 @@ def _write_ccdf(density: HitDensity, path: Path) -> None:
 def _plot(
     density      : HitDensity,
     path         : Path,
-    dataset_title: str,
-    branch_only  : bool,
     max_distance : int | None = None,
+    highlight_end: int = 512,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    attribute = "branch_bins" if branch_only else "all_bins"
     max_bucket = max(
-        (
-            max(getattr(stats, attribute), default=0)
-            for stats in density.stats.values()
-        ),
+        (max(stats.all_bins, default=0) for stats in density.stats.values()),
         default=0,
     )
-    x = [(bucket + 0.5) * density.bin_width for bucket in range(max_bucket + 1)]
-
-    figure, axis = plt.subplots(figsize=(8, 4.8))
-    for page_size, stats in density.stats.items():
-        bins = getattr(stats, attribute)
-        y = [
-            bins.get(bucket, 0) / density.bin_width / density.num_queries
-            for bucket in range(max_bucket + 1)
-        ]
-        label = (
-            "exact match (page size = 1)"
-            if page_size == 1 else f"page size = {page_size}"
-        )
-        axis.plot(x, y, label=label)
-
-    axis.set_xlabel("Distance from hit endpoint to cached tail (tokens)")
-    axis.set_ylabel("Hit density (hits / token / query)")
-    axis.set_title(
-        f"{dataset_title} branch-hit density"
-        if branch_only else f"{dataset_title} hit density"
-    )
-    if max_distance is not None:
-        axis.set_xlim(0, max_distance)
-    axis.grid(alpha=0.25)
-    axis.legend()
-    figure.tight_layout()
-    figure.savefig(path, dpi=180)
-    plt.close(figure)
-
-
-def _plot_ccdf(
-    density      : HitDensity,
-    path         : Path,
-    dataset_title: str,
-    max_distance : int | None = None,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    figure, axis = plt.subplots(figsize=(8, 4.8))
+    density_x = [(bucket + 0.5) * density.bin_width for bucket in range(max_bucket + 1)]
+    figure, (density_axis, ccdf_axis) = plt.subplots(2, 1, figsize=(6, 7))
     reference: tuple[list[int], list[float]] | None = None
     for page_size, stats in density.stats.items():
+        if page_size in (1, 256):
+            continue
+        label = f"page size = {page_size}"
+        density_y = [
+            stats.all_bins.get(bucket, 0) / density.bin_width / density.num_queries
+            for bucket in range(max_bucket + 1)
+        ]
+        density_axis.plot(density_x, density_y, label=label)
+
         remaining = sum(stats.branch_bins.values())
         x: list[int] = []
         y: list[float] = []
@@ -474,28 +424,44 @@ def _plot_ccdf(
                 x.append(distance)
                 y.append(remaining / density.num_queries)
             remaining -= stats.branch_bins.get(bucket, 0)
-        label = (
-            "exact match (page size = 1)"
-            if page_size == 1 else f"page size = {page_size}"
-        )
-        axis.plot(x, y, marker=".", label=label)
+        ccdf_axis.plot(x, y, marker=".", label=label)
         if reference is None and x:
-            reference_x = [x[0], max_distance or x[-1]]
-            reference_y = [y[0], y[0] * x[0] / reference_x[1]]
+            reference_end = max_distance or x[-1]
+            reference_x = [x[0] + (reference_end - x[0]) * index / 128
+                           for index in range(129)]
+            reference_y = [y[0] * x[0] / distance for distance in reference_x]
             reference = reference_x, reference_y
 
     if reference is not None:
-        axis.plot(*reference, "--", color="black", label=r"$d^{-1}$ reference")
-    axis.set_xscale("log")
-    axis.set_yscale("log")
-    axis.set_xlabel("Distance from hit endpoint to cached tail (tokens)")
-    axis.set_ylabel(r"CCDF: $P(D \geq d)$")
-    axis.set_title(f"{dataset_title} branch-hit distance CCDF")
+        ccdf_axis.plot(*reference, "--", color="black", label=r"$d^{-1}$ reference")
+    density_axis.set_ylabel("Hit density", fontsize=14)
+    ccdf_axis.set_xscale("log")
+    ccdf_axis.set_yscale("log")
+    ccdf_axis.set_ylabel("CCDF", fontsize=14)
     if max_distance is not None:
-        axis.set_xlim(density.bin_width, max_distance)
-    axis.grid(alpha=0.25, which="both")
-    axis.legend()
-    figure.tight_layout()
+        density_axis.set_xlim(0, max_distance)
+        if 0 < highlight_end < max_distance:
+            fraction = highlight_end / max_distance
+            left = highlight_end * fraction ** (fraction / (1 - fraction))
+        else:
+            left = density.bin_width
+        ccdf_axis.set_xlim(left, max_distance)
+    ccdf_axis.set_ylim(bottom=1e-3)
+    for axis in (density_axis, ccdf_axis):
+        right = axis.get_xlim()[1]
+        axis.set_xticks([highlight_end, right], labels=[f"{highlight_end} token", f"{right:g} token"])
+        axis.get_xticklabels()[0].set_horizontalalignment("right")
+        axis.get_xticklabels()[-1].set_horizontalalignment("right")
+        axis.tick_params(axis="x", which="major", labelsize=14)
+        axis.tick_params(axis="x", which="minor", labelbottom=False)
+        axis.tick_params(axis="y", which="both", labelleft=False)
+        axis.yaxis.get_offset_text().set_visible(False)
+        axis.axvspan(0, highlight_end, color="#66BB6A", alpha=0.10, linewidth=0, zorder=0)
+        axis.axvline(highlight_end, color="#55705B", linestyle="--", linewidth=1.2, alpha=0.85)
+        axis.grid(alpha=0.25, which="both")
+
+    ccdf_axis.legend(loc="lower left", fontsize=14, framealpha=0.9)
+    figure.subplots_adjust(left=0.095, right=0.985, top=0.99, bottom=0.05, hspace=0.11)
     figure.savefig(path, dpi=180)
     plt.close(figure)
 
@@ -515,7 +481,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-max-distance",
         type=int,
-        default=2000,
+        default=1024,
         help="Maximum x-axis distance in tokens; CSV data is never truncated",
     )
     parser.add_argument(

@@ -432,12 +432,16 @@ Rows branch_protections(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs,
   return result;
 }
 
+constexpr Int kEvictionBlocked = 1;
+constexpr Int kEvictionExpand = 2;
+
 template <typename NodeRows>
 class EvictionQueue {
 public:
   explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes), children_(nodes.size()) {
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-      check(nodes[i].size() == 5, "Invalid eviction node");
+      check(nodes[i].size() == 5 && nodes[i][2] >= 0 && nodes[i][2] <= kEvictionExpand,
+            "Invalid eviction node");
       check(indices_.emplace(nodes[i][0], i).second, "Duplicate eviction node");
     }
     for (const auto& node : nodes) {
@@ -446,7 +450,7 @@ public:
       }
     }
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-      if (!children_[i] && !nodes[i][2]) {
+      if (!children_[i] && nodes[i][2] != kEvictionBlocked) {
         push(i);
       }
     }
@@ -455,7 +459,7 @@ public:
   Int take(Int index) {
     check(leaves_.erase(index) == 1, "Eviction node is not an unlocked leaf");
     const auto parent = indices_.find(nodes_[index][1]);
-    if (parent != indices_.end() && !--children_[parent->second] && !nodes_[parent->second][2]) {
+    if (parent != indices_.end() && !--children_[parent->second] && nodes_[parent->second][2] != kEvictionBlocked) {
       push(parent->second);
       return parent->second;
     }
@@ -640,6 +644,9 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
     if (!logs.empty()) {
       const auto index = std::get<2>(logs.top());
       logs.pop();
+      if (nodes[index][2] == kEvictionExpand) {
+        return Rows({List({-1})});
+      }
       prune_leaf(index);
     }
     else {

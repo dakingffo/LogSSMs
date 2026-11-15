@@ -64,6 +64,6 @@
       "kwai-klear-swe-smith-mini": 61,
       "swe-smith-claude-3-7-sonnet": 39
     },
-    "plot_max_distance": 2000
+    "plot_max_distance": 1024
   }
 }

@@ -48,11 +48,13 @@ def branch_protections(inputs: Sequence[torch.Tensor], forced: Rows,
 
 
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
-                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]]:
+                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]] | None:
+    """Return a plan, [] for insufficient capacity, or None to expand a cold path."""
     groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
-    return _unpack(_load_logstate_module().plan_eviction(
+    result = _unpack(_load_logstate_module().plan_eviction(
         _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
     ))
+    return None if result == [[-1]] else result
 
 
 def make_recycle_bin(capacity_bytes: int):

@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from time import perf_counter_ns
 
 from .frame_pool import MHALogStatePool
-from .prefix_cache import LogRadixTree, LogRadixEvictionSegment, LogStateKind
+from .prefix_cache import LogRadixTree, LogRadixEvictionSegment, LogStateKind, _EVICTION_EXPAND
 from .recycler import LogStateRecycleBin
 
 
@@ -186,9 +186,18 @@ class LogStateEvictor:
         from logssms.kernel import logstate as planning
 
         allocator = self._allocator
-        for nodes, topology, log_only in self.tree.eviction_candidates():
+        leaf_limit, tail_limit = 1, 16
+        log_only = True
+        while True:
+            nodes, topology = (
+                self.tree.log_eviction_snapshot(leaf_limit, tail_limit=tail_limit)
+                if log_only else self.tree.eviction_snapshot()
+            )
             if not nodes:
-                continue
+                if log_only:
+                    log_only = False
+                    continue
+                break
             if self._profile_enabled:
                 self._profile_stats["eviction_candidate_windows"] += int(log_only)
                 self._profile_stats["eviction_full_snapshots"] += int(not log_only)
@@ -210,7 +219,7 @@ class LogStateEvictor:
                 topology,
                 [[value for frame, count in segment._kv_frame_counts.items() for value in (
                     frame, count, self.cached_page_tokens[frame * self.page_size],
-                )] for segment in nodes],
+                )] if row[2] != _EVICTION_EXPAND else [] for segment, row in zip(nodes, topology, strict=True)],
                 node_slots,
                 slots,
                 [(frame, allocator._decay_masks[frame].bit_count()) for frame in decay_frames],
@@ -225,6 +234,16 @@ class LogStateEvictor:
                 return ([nodes[index] for index in selected],
                         dict(zip(pages[::2], pages[1::2], strict=True)), set(released),
                         list(zip(compressed[::2], compressed[1::2], strict=True)))
+            if not log_only:
+                break
+            if rows is None:
+                if self._profile_enabled:
+                    self._profile_stats["eviction_tail_expansions"] += 1
+                tail_limit *= 4
+            elif leaf_limit < len(self.tree._log_leaf_heap):
+                leaf_limit *= 4
+            else:
+                log_only = False
         raise LogStateCapacityError(
             "Insufficient evictable LogState cache capacity: "
             f"need_pages={needed_pages}, need_states={needed_states}, "

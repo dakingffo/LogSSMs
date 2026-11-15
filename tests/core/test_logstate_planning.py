@@ -332,3 +332,16 @@ def test_native_protections_deduplicate_forced_and_batch_branches():
     ]
     with pytest.raises(RuntimeError, match="Invalid forced branch"):
         planning.branch_protections(inputs, [(0, 33)], 32)
+
+
+def test_partial_cold_chain_must_expand_before_evicting_a_warmer_chain():
+    nodes = [(0, -1, 1, 0, 0), (1, 0, 2, 0, 0),
+             (2, 1, 0, 0, 0), (3, 0, 0, 0, 1)]
+    kv = [[], [], [10, 1, 1], [11, 1, 1]]
+    slots = [[], [], [], []]
+    config = [0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0]
+    assert planning.plan_eviction(nodes, kv, slots, [], [], config, []) == [
+        [2], [10, 1], [], [],
+    ]
+    config[6] = 2
+    assert planning.plan_eviction(nodes, kv, slots, [], [], config, []) is None

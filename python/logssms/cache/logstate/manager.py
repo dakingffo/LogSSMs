@@ -337,6 +337,7 @@ class LogStateCacheManager(BaseCacheManager):
             "max_admission_wait_ms": 0.0,
             "eviction_rounds": 0,
             "eviction_candidate_windows": 0,
+            "eviction_tail_expansions": 0,
             "eviction_full_snapshots": 0,
             "eviction_serialized_nodes": 0,
             "pressure_dropped_checkpoints": 0,

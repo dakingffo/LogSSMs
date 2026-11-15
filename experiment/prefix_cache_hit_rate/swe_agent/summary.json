@@ -74,6 +74,6 @@
       "mwaskom/seaborn": 4,
       "pylint-dev/pylint": 6
     },
-    "plot_max_distance": 2000
+    "plot_max_distance": 1024
   }
 }
