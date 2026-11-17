@@ -27,7 +27,7 @@ def test_compact_log_capacity_and_frame_transfer_do_not_require_free_memory():
     sources.update(frame for slot in logs for conv in allocator.slot(slot).conv for frame in conv)
     allocator.reserve(kv=allocator.free_frames)
     assert allocator.free_frames == 0
-    retirement = allocator.coalesce_to_checkpoint(tuple(logs))
+    retirement = allocator.materialize_group(tuple(logs))
     right = allocator.slot(logs[-1])
     assert len(right.payload) == 4 and set(right.payload) <= sources
     assert allocator.free_frames == 0
@@ -48,7 +48,7 @@ def test_compact_group_rejects_insufficient_storage_without_mutating_ownership()
     _kv, logs, _states = allocator.reserve(logs=2)
     before = allocator.profile_usage()
     with pytest.raises(AssertionError):
-        allocator.coalesce_to_checkpoint(tuple(logs))
+        allocator.materialize_group(tuple(logs))
     assert allocator.profile_usage() == before
     allocator.check_integrity()
 
@@ -63,7 +63,7 @@ def test_compact_group_allows_zero_net_frame_growth():
     assert allocator.checkpoint_frame_capacity(group) == allocator.payload_frames
     assert allocator.checkpoint_frame_savings(group) == 0
     before = allocator.free_frames
-    retirement = allocator.coalesce_to_checkpoint(group)
+    retirement = allocator.materialize_group(group)
     allocator.release_retirement(retirement)
     assert allocator.free_frames == before
     allocator.release_slot(logs[0])

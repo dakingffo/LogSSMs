@@ -48,8 +48,13 @@ def remember_log_tail(recycle, tree, node) -> None:
 
 
 def recycled_bytes(branch):
-    return (256 + 8 * len(branch.tokens) + 16 * len(branch.logs)
-            + 8 * len(branch.protected_endpoints) + 8 * len(branch.merge_stats))
+    return (
+        256
+        + 8 * len(branch.tokens)
+        + 16 * len(branch.logs)
+        + 8 * len(branch.protected_endpoints)
+        + 24 * sum(log.analysis_owner is not None for log in branch.logs)
+    )
 
 
 def _head_indices(

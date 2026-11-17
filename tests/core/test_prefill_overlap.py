@@ -1,3 +1,4 @@
+import pytest
 from types import SimpleNamespace
 
 import torch
@@ -72,6 +73,7 @@ def test_cold_prefill_initializes_cache_handle() -> None:
     assert calls == [(3, handle)]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pinned transfer requires CUDA")
 def test_cache_match_snapshot_is_taken_only_after_successful_admission():
     from logssms.cache.base import BaseCacheManager
 
@@ -153,6 +155,7 @@ def test_same_request_can_schedule_next_chunk_before_previous_commit():
     assert manager.need_tokens == 12
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pinned transfer requires CUDA")
 def test_prefill_adder_continues_from_inflight_device_frontier():
     params = SamplingParams(max_tokens=8)
     pending = PendingRequest(0, torch.arange(12, dtype=torch.int32), params)
@@ -188,6 +191,7 @@ def test_prefill_adder_continues_from_inflight_device_frontier():
     assert current.device_len == 8
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pinned transfer requires CUDA")
 def test_hybrid_chunked_prefill_is_state_checkpoint_aligned():
     params = SamplingParams(max_tokens=8)
     pending = PendingRequest(0, torch.arange(200, dtype=torch.int32), params)

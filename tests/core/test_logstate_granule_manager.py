@@ -51,9 +51,9 @@ def fill(manager, req):
 
 @pytest.mark.parametrize('count,expected', [(1, [(32,'log')]), (2,[(64,'checkpoint')]),
                                           (3,[(64,'checkpoint'),(32,'log')]),
-                                          (4,[(128,'checkpoint')]),
-                                          (8,[(128,'checkpoint'),(128,'checkpoint')])])
-def test_production_prepare_materializes_and_merges_once(count, expected):
+                                          (4,[(64,'checkpoint')]*2),
+                                          (8,[(64,'checkpoint')]*4)])
+def test_production_prepare_materializes_without_checkpoint_thinning(count, expected):
     manager = make_manager()
     assert manager.logstate_pool.allocator.checkpoint_log_count == 2
     tokens = torch.arange(count*32, dtype=torch.int32)
@@ -119,10 +119,21 @@ def test_pressure_evicts_one_tail_granule_then_restores_with_current_gpu_shape()
 
 def remember(manager, tokens, begin, end):
     from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry
+
     ghost=LogRadixTree(manager.granularity,torch.device('cpu'))
     g=manager.granularity
-    node=ghost.insert(tokens,tokens,tuple(LogStateEntry(1000+i,LogStateKind.LOG,left,left+g)
-                                         for i,left in enumerate(range(begin,end,g)))).node
+    node = ghost.insert(
+        tokens,
+        tokens,
+        tuple(
+            LogStateEntry(1000 + i, LogStateKind.LOG, left, left + g)
+            for i, left in enumerate(range(begin, end, g))
+        ),
+    ).node
+    trace = manager.tree.trace(tokens)
+    node.analysis_owner = trace.node.analysis_owner
+    if node.analysis_owner is not None:
+        node.analysis_owner.tail = max(node.analysis_owner.tail, end)
     manager.recycle_bin.remember(ghost,eviction_range(ghost,node))
 
 
@@ -146,7 +157,7 @@ def checkpoint_history(manager, spans):
 @pytest.mark.parametrize('g',[16,32,64])
 def test_complete_base_groups_and_tail_are_model_sized(g):
     manager=make_manager(g=g,frames=192)
-    n=manager._allocator.checkpoint_log_count
+    n=manager._allocator.materialize_log_count
     count=3*n+1
     tokens=torch.arange(count*g,dtype=torch.int32)
     fill(manager,new_req(manager,tokens))
@@ -187,8 +198,8 @@ def test_direct_checkpoint_survives_granule_sized_prefill_chunks():
         writes.extend(batch.cache_metadata.checkpoint_writes)
         req.cached_len=end
         manager.cache_req(req,finished=end==129)
-    assert len(writes)==1
-    assert [(e.begin,e.end,e.kind.value) for e in manager.tree.iter_entries()]==[(0,128,'checkpoint')]
+    assert len(writes)==2
+    assert [(e.begin,e.end,e.kind.value) for e in manager.tree.iter_entries()]==[(0,64,'checkpoint'),(64,128,'checkpoint')]
     manager.check_integrity()
 
 
@@ -228,33 +239,3 @@ def test_external_pending_recovery_prevents_recycled_source_rebinding():
     for req in (first,second):
         req.cached_len=req.device_len;manager.cache_req(req,finished=True)
     manager.check_integrity()
-
-
-@pytest.mark.parametrize('abort',[None,'first_chunk','before_commit'])
-def test_recycled_prefill_reuses_full_checkpoint_and_releases_on_abort(abort):
-    manager=make_manager(frames=192)
-    _,checkpoints=checkpoint_history(manager,[2])
-    history=torch.arange(128,dtype=torch.int32)
-    fill(manager,new_req(manager,history[:97]))
-    remember(manager,history,96,128)
-    req=new_req(manager,torch.cat((history,torch.tensor([999],dtype=torch.int32))))
-    assert req.cached_len==96
-    restore=manager._recycled_restores[req.table_idx]
-    assert restore.slots[128]==checkpoints[0].slot
-    req.device_len=112
-    manager.allocate([req],phase='prefill');manager.prepare_batch(Batch([req],'prefill'))
-    assert not manager.tree.has_slot(checkpoints[0].slot)
-    req.cached_len=112
-    if abort=='first_chunk':
-        manager.free_to_cached(req);manager.cache_req(req,finished=True)
-    else:
-        req.device_len=129
-        manager.allocate([req],phase='prefill');manager.prepare_batch(Batch([req],'prefill'))
-        req.cached_len=127 if abort else 129
-        if abort:manager.free_to_cached(req)
-        manager.cache_req(req,finished=True)
-    manager.check_integrity()
-    if abort is None:
-        entries=manager.tree.iter_entries()
-        assert [(e.begin,e.end) for e in entries]==[(0,128)]
-        assert entries[0].slot==checkpoints[0].slot

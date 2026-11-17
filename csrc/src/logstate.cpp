@@ -1,6 +1,8 @@
+#include <limits>
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cmath>
 #include <map>
 #include <list>
 #include <memory>
@@ -57,12 +59,6 @@ std::vector<Entry> entries(const List& row) {
     result.push_back({row[i], row[i + 1], row[i + 2], row[i + 3], bool(row[i + 4])});
   }
   return result;
-}
-
-bool crosses_boundary(const List& boundaries, Int begin, Int end) {
-  return std::any_of(boundaries.begin(), boundaries.end(), [&](Int position) {
-    return begin < position && position < end;
-  });
 }
 
 Rows batch_branch_points(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int granularity) {
@@ -211,158 +207,6 @@ Rows plan_materialize(const Rows& paths, const Rows& boundaries,
   return grouped;
 }
 
-Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& locks,
-                     const Rows& anchors,
-                     Int granularity, bool diagnostics) {
-  check(paths.size() == boundaries.size() && paths.size() == locks.size()
-        && granularity > 0, "Invalid coalesce metadata");
-  std::unordered_set<Int> used;
-  std::map<std::string, Int> counts;
-  Rows groups;
-  auto add = [&](const std::string& key, Int value = 1) {
-    if (diagnostics) {
-      counts[key] += value;
-    }
-  };
-  for (const auto& anchor : anchors) {
-
-    check(anchor.size() == 4 && anchor[0] >= 0 && anchor[0] < static_cast<Int>(paths.size())
-          && anchor[2] >= 2, "Invalid coalesce anchor");
-    const auto index = anchor[0];
-    const auto path = entries(paths[index]);
-    std::vector<Entry> selected;
-    add("merge_anchors");
-    for (auto entry : path) {
-      if (entry.end > anchor[1]) {
-        add("entries_beyond_match_endpoint");
-        continue;
-      }
-      if (!entry.eligible) {
-        add("entries_not_eligible_this_round");
-        continue;
-      }
-      if (used.contains(entry.slot)) {
-        continue;
-      }
-      if (entry.span < 0) {
-        add("logs_not_materialized");
-      }
-      else {
-        selected.push_back(entry);
-      }
-    }
-    add("checkpoint_candidates", selected.size());
-    if (selected.empty()) {
-      add("anchors_without_eligible_entries");
-      continue;
-    }
-    add(anchor[3] ? "anchors_with_stats" : "anchors_without_stats");
-    add("anchors_intensity_" + std::to_string(anchor[2]));
-    auto blocked = [&](Int begin, Int end) {
-      return crosses_boundary(boundaries[index], begin, end);
-    };
-    auto locked = [&](Int position) {
-      return std::find(locks[index].begin(), locks[index].end(), position) != locks[index].end();
-    };
-    std::vector<std::vector<Entry>> segments;
-    std::vector<Entry> segment;
-    for (const auto& entry : selected) {
-      const bool entry_blocked = blocked(entry.begin, entry.end);
-      const bool gap = !segment.empty() && segment.back().end != entry.begin;
-      const bool lock = !segment.empty() && locked(segment.back().end);
-      const bool protection = !segment.empty() && blocked(segment.back().begin, entry.end);
-      add("protected_entries", entry_blocked);
-      add("gaps", gap);
-      add("lock_boundaries", lock);
-      add("protected_boundaries", protection);
-      if (entry_blocked || gap || lock || protection) {
-        if (!segment.empty()) {
-          segments.push_back(std::move(segment));
-          segment.clear();
-        }
-      }
-      if (!entry_blocked) {
-        segment.push_back(entry);
-      }
-    }
-    if (!segment.empty()) {
-      segments.push_back(std::move(segment));
-    }
-    add("segments", segments.size());
-    auto merge = [&](const std::vector<Entry>& group) {
-      add("candidate_groups");
-      for (const auto& entry : group) {
-        if (used.contains(entry.slot)) {
-          add("groups_already_planned");
-          return;
-        }
-      }
-      std::string reason;
-      if (std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.end - e.begin != granularity * e.span; })) {
-        reason = "span_mismatch";
-      }
-      else {
-        for (size_t i = 1; i < group.size(); ++i) {
-          if (group[i - 1].span > group[i].span) {
-            reason = "decreasing_span";
-            break;
-          }
-          if (group[i - 1].end != group[i].begin) {
-            reason = "discontinuity";
-            break;
-          }
-          if (locked(group[i - 1].end)) {
-            reason = "lock_boundary";
-            break;
-          }
-        }
-        if (reason.empty() && blocked(group.front().begin, group.back().end)) {
-          reason = "protected_interval";
-        }
-      }
-      if (!reason.empty()) {
-        add("rejected_" + reason);
-        return;
-      }
-      Vector output{group.front().begin, group.back().end, 0};
-      for (const auto& entry : group) {
-        output[2] += entry.span;
-        output.push_back(entry.slot);
-        output.push_back(entry.span);
-        used.insert(entry.slot);
-      }
-      groups.push_back(List(output.begin(), output.end()));
-      add("planned_groups");
-      add("planned_slot_releases", group.size() - 1);
-      const bool equal = std::all_of(group.begin(), group.end(), [&](const auto& e) { return e.span == group[0].span; });
-      add(equal ? "same_span_groups" : "cross_span_groups");
-      add("planned_covered_tokens", group.back().end - group.front().begin);
-      add("planned_arity_" + std::to_string(group.size()));
-    };
-    for (const auto& values : segments) {
-      add("segments_without_merge_pair", values.size() < 2);
-      for (size_t begin = 0; begin < values.size();) {
-        size_t end = begin + 1;
-        while (end < values.size() && end - begin < static_cast<size_t>(anchor[2])
-               && values[end - 1].span <= values[end].span) {
-          ++end;
-        }
-        if (end - begin >= 2) {
-          merge(std::vector<Entry>(values.begin() + begin, values.begin() + end));
-        }
-        begin = end;
-      }
-    }
-  }
-  tvm::ffi::Map<tvm::ffi::String, Int> diag;
-  for (const auto& [key, value] : counts) {
-    diag.Set(key, value);
-  }
-  Result result;
-  result.Set("groups", groups);
-  result.Set("diagnostics", diag);
-  return result;
-}
 
 Rows read_rows(tvm::ffi::TensorView tensor) {
   const auto data = cpu_ints(tensor);
@@ -483,15 +327,15 @@ private:
 template <typename NodeRows>
 Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& node_slots,
                    const NodeRows& slots, const NodeRows& occupied, const List& config,
-                   const NodeRows& checkpoint_actions) {
+                   const NodeRows& checkpoint_actions, tvm::ffi::TensorView models) {
 
 
   check(nodes.size() == kv.size() && nodes.size() == node_slots.size()
-        && config.size() == 11 && config[5] > 0 && config[10] >= 0,
+        && config.size() == 10 && config[5] > 0,
         "Invalid eviction capacity metadata");
   std::unordered_map<Int, Vector> slot_info;
   for (const auto& row : slots) {
-    check(row.size() == 3 && row[1] >= 0, "Invalid eviction slot");
+    check(row.size() == 5 && row[1] >= 0, "Invalid eviction slot");
     slot_info.emplace(row[0], Vector(row.begin(), row.end()));
   }
   std::unordered_map<Int, Int> decay_occupied, decay_released, pages;
@@ -561,138 +405,242 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
   };
 
 
-  std::vector<Vector> actions;
-  std::unordered_set<Int> checkpoint_slots;
-  for (const auto& row : checkpoint_actions) {
-    check(row.size() >= 3 && row[0] != row[1], "Invalid checkpoint eviction action");
-    actions.emplace_back(row.begin(), row.end());
-    checkpoint_slots.insert(row[0]);
-  }
-  std::sort(actions.begin(), actions.end(), [](const Vector& left, const Vector& right) {
-    return std::tie(left[2], left[0]) < std::tie(right[2], right[0]);
-  });
-  const auto retained_count = std::min(static_cast<size_t>(config[10]), actions.size());
-  const auto cold_count = actions.size() - retained_count;
-  std::vector<size_t> cold, order;
-  for (size_t i = 0; i < cold_count; ++i) {
-    cold.push_back(i);
-  }
-  while (!cold.empty()) {
-    if (cold.size() == 1) {
-      order.push_back(cold.front());
-      break;
+  struct Density {
+    double tail = 0, atom = 0, g = 1;
+    bool default_order = false;
+    std::vector<double> probability{0.};
+    double prefix(double position) const {
+      auto i = static_cast<Int>(std::floor((tail - position) / g));
+      return probability[std::clamp<Int>(i, 0, probability.size() - 1)];
     }
-    std::vector<size_t> retained;
-    for (size_t i = 0; i < cold.size(); ++i) {
-      (i % 2 ? order : retained).push_back(cold[i]);
+    double mass(double begin, double end) const {
+      return std::max(0., prefix(begin) - prefix(end));
     }
-    cold = std::move(retained);
+  };
+  const bool online = models.size(0) != 0;
+  check(!online || (models.ndim() == 1 && models.is_contiguous() &&
+        models.device().device_type == kDLCPU && models.dtype().code == kDLFloat &&
+        models.dtype().bits == 64 && models.size(0) == static_cast<Int>(nodes.size() * 10)),
+        "Invalid eviction density models");
+  const auto *model_data = online ? static_cast<const double *>(models.data_ptr()) : nullptr;
+  std::unordered_map<Int, Density> densities;
+  std::vector<Int> model_ids(nodes.size());
+  for (size_t i = 0; online && i < nodes.size(); ++i) {
+    const auto *p = model_data + i * 10;
+    const auto id = static_cast<Int>(p[0]);
+    model_ids[i] = id;
+    if (densities.contains(id)) continue;
+    Density d;
+    d.default_order = p[9] != 0.;
+    d.tail = p[2]; d.atom = std::clamp(p[5], 0., 1.); d.g = p[6];
+    check(d.g > 0 && std::isfinite(p[3]) && std::isfinite(p[4]), "Invalid hit density");
+    const auto count = std::max<Int>(1, static_cast<Int>((d.tail - p[1]) / d.g));
+    for (Int j = 1; j <= count; ++j) {
+      const auto a = j * d.g;
+      const auto mass = std::exp(p[4] - p[3] * std::log(a)) * d.g;
+      d.probability.push_back(d.probability.back() + mass);
+    }
+    const auto scale = std::min(1., (1. - d.atom) / std::max(1e-300, d.probability.back()));
+    for (auto &v : d.probability) v *= scale;
+    densities.emplace(id, std::move(d));
   }
-  for (size_t i = cold_count; i < actions.size(); ++i) {
-    order.push_back(i);
+  std::unordered_map<Int, Vector> actions;
+  std::unordered_map<Int, Int> previous;
+  std::unordered_map<Int, Int> slot_node;
+  std::vector<Vector> ordered_slots(nodes.size());
+  for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
+    for (auto slot : node_slots[i]) {
+      slot_node.emplace(slot, i);
+      ordered_slots[i].push_back(slot);
+    }
+    std::sort(ordered_slots[i].begin(), ordered_slots[i].end(), [&](Int a, Int b) {
+      return slot_info.at(a)[4] < slot_info.at(b)[4];
+    });
+  }
+  for (const auto &row : checkpoint_actions) {
+    check(row.size() >= 4, "Invalid checkpoint eviction action");
+    check(slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
+          "Checkpoint action has an invalid owner");
+    check(row[1] < 0 || (slot_node.contains(row[1])
+          && slot_node.at(row[0]) == slot_node.at(row[1])),
+          "Checkpoint merging must stay inside one node");
+    actions.emplace(row[0], Vector(row.begin(), row.end()));
+    if (row[1] >= 0) previous[row[1]] = row[0];
   }
   std::unordered_map<Int, Int> successors;
-  auto has_checkpoint = [&](Int index) {
-    return std::any_of(node_slots[index].begin(), node_slots[index].end(),
-        [&](Int slot) { return checkpoint_slots.contains(slot) && !released_set.contains(slot); });
+  auto successor = [&](Int slot) {
+    while (slot >= 0 && successors.contains(slot)) slot = successors.at(slot);
+    return slot;
   };
-  using LogPriority = std::tuple<Int, Int, Int>;
-  std::priority_queue<LogPriority, std::vector<LogPriority>, std::greater<LogPriority>> logs;
-  std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> checkpoints;
-  std::unordered_map<Int, std::vector<size_t>> owners;
-  std::vector<bool> queued(order.size());
-  auto enqueue = [&](size_t rank) {
-    if (!queued[rank] && !released_set.contains(actions[order[rank]][0])) {
-      checkpoints.push(rank);
-      queued[rank] = true;
+  auto recovery_before = [&](Int index, Int slot) {
+    if (previous.contains(slot)) return static_cast<double>(slot_info.at(previous.at(slot))[4]);
+    const auto end = slot_info.at(slot)[4];
+    double restored = model_data[index * 10 + 7];
+    for (auto preceding : ordered_slots[index]) {
+      if (released_set.contains(preceding)) continue;
+      const auto &record = slot_info.at(preceding);
+      if (record[4] >= end) break;
+      if ((nodes[index][3] != 0 && record[2] < 0) || record[3] == restored)
+        restored = record[4];
+    }
+    return restored;
+  };
+  auto slot_credit = [&](Int slot) {
+    if (released_set.contains(slot)) return Int{0};
+    const auto &record = slot_info.at(slot);
+    Int credit = record[1];
+    if (record[2] >= 0 && decay_released[record[2]] + 1 == decay_occupied.at(record[2])) ++credit;
+    return credit;
+  };
+  auto prune_credit = [&](Int index) {
+    Int credit = 0;
+    std::unordered_map<Int, Int> decays;
+    for (auto slot : node_slots[index]) if (!released_set.contains(slot)) {
+      const auto &record = slot_info.at(slot);
+      credit += record[1];
+      if (record[2] >= 0) ++decays[record[2]];
+    }
+    for (const auto &[frame, count] : decays)
+      credit += decay_released[frame] + count == decay_occupied.at(frame);
+    for (size_t j = 0; j < kv[index].size(); j += 3) {
+      const auto found = pages.find(kv[index][j]);
+      const auto count = found == pages.end() ? 0 : found->second;
+      credit += count + kv[index][j + 1] == kv[index][j + 2];
+    }
+    return credit;
+  };
+  struct Candidate {
+    double phase, score;
+    Int timestamp, id, kind, version;
+    double cost_score = 0.;
+    bool operator>(const Candidate &o) const {
+      return std::tie(phase, score, timestamp, kind, id) >
+             std::tie(o.phase, o.score, o.timestamp, o.kind, o.id);
     }
   };
-  for (size_t rank = 0; rank < order.size(); ++rank) {
-    const auto& action = actions[order[rank]];
-    if (action.size() > 3) {
-      owners[action[3]].push_back(rank);
+  using CandidateQueue = std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>>;
+  CandidateQueue candidates, default_candidates;
+  std::vector<Int> node_version(nodes.size());
+  std::unordered_map<Int, Int> action_version;
+  auto push_node = [&](Int index) {
+    if (index < 0 || !queue.is_leaf(index)) return;
+    const auto version = ++node_version[index];
+    Int checkpoints = 0;
+    for (auto slot : node_slots[index]) {
+      checkpoints += !released_set.contains(slot) && actions.contains(slot);
+      if (checkpoints > 1) return;
     }
-    if (action[1] >= 0) {
-      enqueue(rank);
-    }
-  }
-  auto activate = [&](Int index) {
-    if (index < 0 || !queue.is_leaf(index)) {
-      return;
-    }
-    if (has_checkpoint(index)) {
-      for (const auto rank : owners[index]) {
-        enqueue(rank);
+    const bool log = nodes[index][3] == 0 && !node_slots[index].empty();
+    double phase = (log || nodes[index][2] == kEvictionExpand) ? 0. : 2., score = 0.;
+    const auto default_phase = phase;
+    if (online) {
+      phase = 0.;
+      const auto *p = model_data + index * 10;
+      const auto &density = densities.at(model_ids[index]);
+      double cost = 0., restored = p[7];
+      for (auto slot : ordered_slots[index]) {
+        if (released_set.contains(slot)) continue;
+        const auto &record = slot_info.at(slot);
+        if ((nodes[index][3] != 0 && record[2] < 0) || record[3] == restored) {
+          cost += std::max(0., record[4] - restored) * (density.atom + density.prefix(record[4]));
+          restored = record[4];
+        }
       }
+      const auto credit = prune_credit(index);
+      score = credit ? cost / credit : std::numeric_limits<double>::infinity();
     }
-    else {
-      logs.emplace(nodes[index][4], nodes[index][0], index);
-    }
+    if (online && densities.at(model_ids[index]).default_order)
+      default_candidates.push({default_phase, 0., nodes[index][4], index, 0, version, score});
+    else candidates.push({phase, score, nodes[index][4], index, 0, version, score});
   };
-  for (const auto index : queue.leaves()) {
-    activate(index);
+  auto push_action = [&](Int slot) {
+    const auto version = ++action_version[slot];
+    if (!actions.contains(slot) || released_set.contains(slot)) return;
+    const auto &action = actions.at(slot);
+    const auto right = successor(action[1]);
+    if (right < 0 || released_set.contains(right)) return;
+    const auto &left_record = slot_info.at(slot), &right_record = slot_info.at(right);
+    const auto left_span = left_record[4] - left_record[3];
+    const auto right_span = right_record[4] - right_record[3];
+    double phase = 1., score = std::max(left_span, right_span);
+    if (online) {
+      phase = 0.;
+      const auto distance = left_record[4] - recovery_before(action[3], slot);
+      const auto cost = std::max(0., distance)
+          * densities.at(model_ids[action[3]]).mass(left_record[4], right_record[4]);
+      const auto credit = slot_credit(slot);
+      score = credit ? cost / credit : std::numeric_limits<double>::infinity();
+    }
+    if (online && densities.at(model_ids[action[3]]).default_order)
+      default_candidates.push({1., static_cast<double>(std::max(left_span, right_span)),
+                               action[2], slot, 1, version, score});
+    else candidates.push({phase, score, action[2], slot, 1, version, score});
+  };
+  // Shared KV/decay credits change only for candidates referencing the changed frames.
+  std::unordered_map<Int, std::vector<Int>> kv_users, decay_users;
+  for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
+    for (size_t j = 0; j < kv[i].size(); j += 3) kv_users[kv[i][j]].push_back(i);
+    for (auto slot : node_slots[i]) if (slot_info.at(slot)[2] >= 0)
+      decay_users[slot_info.at(slot)[2]].push_back(i);
   }
-  auto prune_leaf = [&](Int index) {
-    const auto parent = queue.take(index);
-    prune(index);
-    activate(parent);
+  for (const auto index : queue.leaves()) push_node(index);
+  for (const auto &[slot, action] : actions) push_action(slot);
+  if (fits()) return result();
+  auto valid = [&](const Candidate &c) {
+    if (c.kind == 0) return c.version == node_version[c.id] && queue.is_leaf(c.id);
+    if (c.version != action_version[c.id] || released_set.contains(c.id)) return false;
+    const auto right = successor(actions.at(c.id)[1]);
+    return right >= 0 && !released_set.contains(right);
   };
   while (true) {
-    while (!logs.empty() && !queue.is_leaf(std::get<2>(logs.top()))) {
-      logs.pop();
+    while (!candidates.empty() && !valid(candidates.top())) candidates.pop();
+    while (!default_candidates.empty() && !valid(default_candidates.top())) default_candidates.pop();
+    if (candidates.empty() && default_candidates.empty()) break;
+    bool use_default = candidates.empty();
+    if (!default_candidates.empty() && !candidates.empty()) {
+      auto next = default_candidates.top();
+      next.phase = 0.; next.score = next.cost_score;
+      use_default = candidates.top() > next;
     }
-    if (!logs.empty()) {
-      const auto index = std::get<2>(logs.top());
-      logs.pop();
-      if (nodes[index][2] == kEvictionExpand) {
-        return Rows({List({-1})});
+    auto &selected_queue = use_default ? default_candidates : candidates;
+    const auto c = selected_queue.top(); selected_queue.pop();
+    if (c.kind == 0) {
+      if (c.version != node_version[c.id] || !queue.is_leaf(c.id)) continue;
+      if (nodes[c.id][2] == kEvictionExpand) return Rows({List({-1})});
+      const auto parent = queue.take(c.id);
+      prune(c.id);
+      push_node(parent);
+      for (size_t j = 0; j < kv[c.id].size(); j += 3)
+        for (const auto user : kv_users[kv[c.id][j]]) push_node(user);
+      for (const auto slot : node_slots[c.id]) {
+        if (actions.contains(slot)) {
+          const auto right = successor(actions.at(slot)[1]);
+          successors[slot] = -1;
+          if (previous.contains(slot)) push_action(previous.at(slot));
+          if (right >= 0) previous.erase(right);
+        }
+        const auto frame = slot_info.at(slot)[2];
+        if (frame >= 0) for (const auto user : decay_users[frame]) push_node(user);
       }
-      prune_leaf(index);
+    } else {
+      if (c.version != action_version[c.id] || released_set.contains(c.id)) continue;
+      const auto right = successor(actions.at(c.id)[1]);
+      if (right < 0 || released_set.contains(right)) continue;
+      compressed.insert(compressed.end(), {c.id, right});
+      slot_info.at(right)[3] = slot_info.at(c.id)[3];
+      successors[c.id] = right;
+      release(c.id);
+      if (previous.contains(c.id)) {
+        previous[right] = previous.at(c.id);
+        push_action(previous.at(c.id));
+      } else previous.erase(right);
+      push_action(right);
+      push_node(slot_node.at(c.id));
+      push_node(slot_node.at(right));
     }
-    else {
-      bool advanced = false;
-      while (!checkpoints.empty()) {
-        const auto rank = checkpoints.top();
-        checkpoints.pop();
-        queued[rank] = false;
-        const auto& action = actions[order[rank]];
-        if (released_set.contains(action[0])) {
-          continue;
-        }
-        auto right = action[1];
-        while (successors.contains(right)) {
-          right = successors.at(right);
-        }
-        if (right >= 0 && !released_set.contains(right)) {
-          compressed.insert(compressed.end(), {action[0], right});
-          successors.emplace(action[0], right);
-          release(action[0]);
-          if (action.size() > 3) {
-            activate(action[3]);
-          }
-          advanced = true;
-        }
-        else if (action.size() > 3 && queue.is_leaf(action[3])) {
-          for (size_t i = 3; i < action.size(); ++i) {
-            if (i > 3 && has_checkpoint(action[i])) {
-              break;
-            }
-            prune_leaf(action[i]);
-          }
-          advanced = true;
-        }
-        if (advanced) {
-          break;
-        }
-      }
-      if (!advanced) {
-        return {};
-      }
-    }
-    if (fits()) {
-      return result();
-    }
+    if (fits()) return result();
   }
+  return {};
 }
 
 class RecycleBin {
@@ -701,16 +649,18 @@ public:
     check(capacity >= 0, "Invalid recycle capacity");
   }
 
-  Int remember(const tvm::ffi::Array<tvm::ffi::Tensor>& parts,
-               tvm::ffi::TensorView entry_rows, const List& protected_ends, const List& stats) {
+  Int remember(const tvm::ffi::Array<tvm::ffi::Tensor> &parts,
+               tvm::ffi::TensorView entry_rows, const List &protected_ends,
+               const List &stats) {
     if (!capacity_) {
       return 0;
     }
     auto tokens = read_prefix(parts);
     std::vector<std::array<Int, 2>> logs;
-    for (const auto& row : read_rows(entry_rows)) {
-      check(row.size() == 2 && row[0] >= 0 && row[0] < row[1]
-            && row[1] <= static_cast<Int>(tokens.size()), "Invalid recycled Log range");
+    for (const auto &row : read_rows(entry_rows)) {
+      check(row.size() == 2 && row[0] >= 0 && row[0] < row[1] &&
+                row[1] <= static_cast<Int>(tokens.size()),
+            "Invalid recycled Log range");
       logs.push_back({row[0], row[1]});
     }
     if (logs.empty()) {
@@ -720,14 +670,13 @@ public:
     std::sort(protected_values.begin(), protected_values.end());
     logs = merge_logs({}, logs);
     auto it = records_.lower_bound(tokens);
-    while (it != records_.end() && it->first.size() >= tokens.size()
-           && std::equal(tokens.begin(), tokens.end(), it->first.begin())) {
+    while (it != records_.end() && it->first.size() >= tokens.size() &&
+           std::equal(tokens.begin(), tokens.end(), it->first.begin())) {
       if (it->first.size() == tokens.size()) {
         ++it;
         continue;
       }
-      auto& record = it->second;
-
+      auto &record = it->second;
 
       auto refreshed = merge_logs(record.logs, logs);
       Vector ends = record.protected_ends;
@@ -737,6 +686,8 @@ public:
       used_ -= bytes(it->first, record);
       ids_.erase(record.id);
       record.logs = std::move(refreshed);
+      set_stats(record,
+                merge_owners(record.stats, Vector(stats.begin(), stats.end())));
       record.protected_ends = std::move(ends);
       record.id = ++serial_;
       *record.lru = record.id;
@@ -744,52 +695,67 @@ public:
       used_ += bytes(it->first, record);
       ++it;
     }
-    Record record{++serial_, logs, protected_values, Vector(stats.begin(), stats.end()), {}};
+    Record record{++serial_,
+                  logs,
+                  protected_values,
+                  Vector(stats.begin(), stats.end()),
+                  {}};
     if (const auto old = records_.find(tokens); old != records_.end()) {
       record.logs = merge_logs(old->second.logs, logs);
       record.protected_ends.insert(record.protected_ends.end(),
-                                  old->second.protected_ends.begin(), old->second.protected_ends.end());
+                                   old->second.protected_ends.begin(),
+                                   old->second.protected_ends.end());
       std::sort(record.protected_ends.begin(), record.protected_ends.end());
-      record.protected_ends.erase(std::unique(record.protected_ends.begin(), record.protected_ends.end()),
+      record.protected_ends.erase(std::unique(record.protected_ends.begin(),
+                                              record.protected_ends.end()),
                                   record.protected_ends.end());
-      if (record.stats.empty()) {
-        record.stats = old->second.stats;
-      }
+      record.stats = merge_owners(old->second.stats, record.stats);
     }
     if (bytes(tokens, record) > capacity_) {
+      for (size_t i = 2; i < record.stats.size(); i += 3)
+        if (!owner_refs_.contains(record.stats[i]))
+          retired_.push_back(record.stats[i]);
       trim();
       return 0;
     }
     if (const auto old = records_.find(tokens); old != records_.end()) {
       erase(old);
     }
-    auto [inserted, fresh] = records_.emplace(std::move(tokens), std::move(record));
+    auto [inserted, fresh] =
+        records_.emplace(std::move(tokens), std::move(record));
     check(fresh, "Duplicate recycled prefix");
     lru_.push_back(inserted->second.id);
     inserted->second.lru = std::prev(lru_.end());
     ids_[inserted->second.id] = inserted;
+    retain(inserted->second.stats);
     used_ += bytes(inserted->first, inserted->second);
     trim();
     return inserted->second.id;
   }
 
   Vector match(tvm::ffi::TensorView query, Int start, Int granularity) {
-    check(query.ndim() == 1 && query.is_contiguous() && query.device().device_type == kDLCPU
-          && query.dtype().code == kDLInt && (query.dtype().bits == 32 || query.dtype().bits == 64)
-          && start >= 0 && granularity > 0, "Invalid recycle query");
+    check(query.ndim() == 1 && query.is_contiguous() &&
+              query.device().device_type == kDLCPU &&
+              query.dtype().code == kDLInt &&
+              (query.dtype().bits == 32 || query.dtype().bits == 64) &&
+              start >= 0 && granularity > 0,
+          "Invalid recycle query");
     Vector tokens(query.size(0));
     for (Int i = 0; i < query.size(0); ++i) {
-      tokens[i] = query.dtype().bits == 32 ? static_cast<const int32_t*>(query.data_ptr())[i]
-                                         : static_cast<const Int*>(query.data_ptr())[i];
+      tokens[i] = query.dtype().bits == 32
+                      ? static_cast<const int32_t *>(query.data_ptr())[i]
+                      : static_cast<const Int *>(query.data_ptr())[i];
     }
     auto right = records_.lower_bound(tokens);
     auto best = records_.end();
     Int matched = start;
     auto consider = [&](auto candidate) {
       const auto limit = std::min(tokens.size(), candidate->first.size());
-      const auto pair = std::mismatch(tokens.begin(), tokens.begin() + limit, candidate->first.begin());
-      const auto length = (pair.first - tokens.begin()) / granularity * granularity;
-      for (const auto& log : candidate->second.logs) {
+      const auto pair = std::mismatch(tokens.begin(), tokens.begin() + limit,
+                                      candidate->first.begin());
+      const auto length =
+          (pair.first - tokens.begin()) / granularity * granularity;
+      for (const auto &log : candidate->second.logs) {
         const auto end = std::min(length, log[1]) / granularity * granularity;
         if (end > matched && end > log[0]) {
           matched = end;
@@ -798,7 +764,6 @@ public:
       }
       return length;
     };
-
 
     auto left = right;
     while (left != records_.begin()) {
@@ -824,9 +789,10 @@ public:
     check(ids_.contains(id), "Expired recycled record");
     const auto it = ids_.at(id);
     Rows result({List(it->first.begin(), it->first.end()),
-                 List(it->second.protected_ends.begin(), it->second.protected_ends.end()),
+                 List(it->second.protected_ends.begin(),
+                      it->second.protected_ends.end()),
                  List(it->second.stats.begin(), it->second.stats.end())});
-    for (const auto& log : it->second.logs) {
+    for (const auto &log : it->second.logs) {
       result.push_back(List(log.begin(), log.end()));
     }
     return result;
@@ -846,32 +812,82 @@ public:
 
   Vector usage() const { return {used_, static_cast<Int>(records_.size())}; }
 
+  Vector retired_owners() {
+    Vector result;
+    for (auto id : retired_)
+      if (!owner_refs_.contains(id))
+        result.push_back(id);
+    retired_.clear();
+    return result;
+  }
+
 private:
-  static std::vector<std::array<Int, 2>> merge_logs(
-      std::vector<std::array<Int, 2>> logs, const std::vector<std::array<Int, 2>>& added) {
+  static Vector merge_owners(const Vector &old, const Vector &added) {
+    std::vector<std::array<Int, 3>> rows;
+    for (const auto *values : {&old, &added}) {
+      check(values->size() % 3 == 0, "Invalid recycled owner ranges");
+      for (size_t i = 0; i < values->size(); i += 3)
+        rows.push_back({(*values)[i], (*values)[i + 1], (*values)[i + 2]});
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const auto &a, const auto &b) { return a[0] < b[0]; });
+    Vector result;
+    for (auto row : rows) {
+      if (!result.empty())
+        row[0] = std::max(row[0], result[result.size() - 2]);
+      if (row[0] < row[1])
+        result.insert(result.end(), row.begin(), row.end());
+    }
+    return result;
+  }
+  void retain(const Vector &stats) {
+    for (size_t i = 2; i < stats.size(); i += 3)
+      ++owner_refs_[stats[i]];
+  }
+  void release(const Vector &stats) {
+    for (size_t i = 2; i < stats.size(); i += 3) {
+      auto it = owner_refs_.find(stats[i]);
+      check(it != owner_refs_.end(), "Missing recycled owner reference");
+      if (!--it->second) {
+        retired_.push_back(it->first);
+        owner_refs_.erase(it);
+      }
+    }
+  }
+  template <typename RecordType>
+  void set_stats(RecordType &record, Vector stats) {
+    release(record.stats);
+    retain(stats);
+    record.stats = std::move(stats);
+  }
+  static std::vector<std::array<Int, 2>>
+  merge_logs(std::vector<std::array<Int, 2>> logs,
+             const std::vector<std::array<Int, 2>> &added) {
     logs.insert(logs.end(), added.begin(), added.end());
     std::sort(logs.begin(), logs.end());
     std::vector<std::array<Int, 2>> result;
-    for (const auto& log : logs) {
+    for (const auto &log : logs) {
       if (!result.empty() && log[0] < result.back()[1]) {
         result.back()[1] = std::max(result.back()[1], log[1]);
-      }
-      else {
+      } else {
         result.push_back(log);
       }
     }
     return result;
   }
 
-  static Vector read_prefix(const tvm::ffi::Array<tvm::ffi::Tensor>& parts) {
+  static Vector read_prefix(const tvm::ffi::Array<tvm::ffi::Tensor> &parts) {
     Vector tokens;
-    for (const auto& part : parts) {
-      check(part.ndim() == 1 && part.is_contiguous() && part.device().device_type == kDLCPU
-            && part.dtype().code == kDLInt && (part.dtype().bits == 32 || part.dtype().bits == 64),
+    for (const auto &part : parts) {
+      check(part.ndim() == 1 && part.is_contiguous() &&
+                part.device().device_type == kDLCPU &&
+                part.dtype().code == kDLInt &&
+                (part.dtype().bits == 32 || part.dtype().bits == 64),
             "Recycle tokens must be contiguous CPU int32/int64");
       for (Int i = 0; i < part.size(0); ++i) {
-        tokens.push_back(part.dtype().bits == 32 ? static_cast<const int32_t*>(part.data_ptr())[i]
-                                               : static_cast<const Int*>(part.data_ptr())[i]);
+        tokens.push_back(part.dtype().bits == 32
+                             ? static_cast<const int32_t *>(part.data_ptr())[i]
+                             : static_cast<const Int *>(part.data_ptr())[i]);
       }
     }
     return tokens;
@@ -886,14 +902,15 @@ private:
   };
   using Records = std::map<Vector, Record>;
 
-  static Int bytes(const Vector& tokens, const Record& record) {
+  static Int bytes(const Vector &tokens, const Record &record) {
 
-    return 256 + 8 * tokens.size() + 16 * record.logs.size()
-           + 8 * (record.protected_ends.size() + record.stats.size());
+    return 256 + 8 * tokens.size() + 16 * record.logs.size() +
+           8 * (record.protected_ends.size() + record.stats.size());
   }
 
   void erase(Records::iterator it) {
     used_ -= bytes(it->first, it->second);
+    release(it->second.stats);
     ids_.erase(it->second.id);
     lru_.erase(it->second.lru);
     records_.erase(it);
@@ -906,6 +923,8 @@ private:
   }
 
   Int capacity_, used_ = 0, serial_ = 0;
+  std::unordered_map<Int, Int> owner_refs_;
+  Vector retired_;
   Records records_;
   std::list<Int> lru_;
   std::unordered_map<Int, Records::iterator> ids_;
@@ -934,6 +953,8 @@ Result make_recycle_bin(Int capacity) {
     [bin](Int id) { bin->discard(id); }));
   result.Set("touch", tvm::ffi::Function::FromTyped(
     [bin](Int id) { bin->touch(id); }));
+  result.Set("retired_owners", tvm::ffi::Function::FromTyped(
+    [bin]() { const auto ids=bin->retired_owners(); return List(ids.begin(),ids.end()); }));
   result.Set("usage", tvm::ffi::Function::FromTyped(
     [bin]() {
       const auto values = bin->usage();
@@ -949,7 +970,7 @@ struct Planner {
   }
 
   static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List& counts,
-                                 const List& config) {
+                                 const List& config, tvm::ffi::TensorView models) {
     check(counts.size() == 6, "Invalid eviction metadata groups");
     const auto begin = cpu_ints(packed);
     const auto end = begin + packed.shape()[0];
@@ -968,7 +989,7 @@ struct Planner {
     }
     check(cursor == end, "Unexpected eviction metadata");
     return write_rows(plan_eviction(groups[0], groups[1], groups[2], groups[3],
-                                    groups[4], config, groups[5]));
+                                    groups[4], config, groups[5], models));
   }
 
   static tvm::ffi::Tensor materialize(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
@@ -976,14 +997,6 @@ struct Planner {
     return write_rows(plan_materialize(read_rows(paths), read_rows(boundaries), read_rows(candidates), granularity, log_count));
   }
 
-  static Result coalesce(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
-                         tvm::ffi::TensorView locks, tvm::ffi::TensorView anchors,
-                         Int granularity, bool diagnostics) {
-    auto result = plan_coalesce(read_rows(paths), read_rows(boundaries), read_rows(locks),
-                                read_rows(anchors), granularity, diagnostics);
-    result.Set("groups", write_rows(result.at("groups").cast<Rows>()));
-    return result;
-  }
 
 };
 
@@ -991,7 +1004,6 @@ struct Planner {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_coalesce, logssms::Planner::coalesce);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_eviction, logssms::Planner::eviction);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_recycle_bin, logssms::make_recycle_bin);

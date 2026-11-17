@@ -8,7 +8,7 @@ from enum import Enum
 from functools import cached_property
 from heapq import heappop, heappush
 from itertools import count
-from typing import Any, Callable, Iterable, NamedTuple, TypeAlias, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, TypeAlias
 
 if TYPE_CHECKING:
     from logssms.cache.logstate.recycler import (
@@ -17,10 +17,8 @@ if TYPE_CHECKING:
     )
 
 import torch
-
-from logssms.utils import align_down
-
 from logssms.cache.prefix_cache import BaseCacheHandle, BasePrefixCache, MatchResult, SizeInfo
+from logssms.utils import align_down
 
 _EVICTION_EXPAND = 2
 
@@ -39,13 +37,22 @@ class LogStateKind(Enum):
     CHECKPOINT = "checkpoint"
 
 
-@dataclass
-class LogStateMergeStats:
-    origin          : int
-    tail            : int
-    intensity       : int = 2
-    hit_positions   : deque[int] = field(default_factory=deque)
-    next_update_tail: int | None = None
+@dataclass(eq=False)
+class LogStateHitStats:
+    origin        : int
+    tail          : int
+    hits          : deque[tuple[int, int, int]] = field(default_factory=lambda: deque(maxlen=8192))
+    exposures     : deque[tuple[int, int]] = field(default_factory=deque)
+    exponent      : float = 2.0
+    log_amplitude : float | None = None
+    tail_probability: float = 0.0
+    query_begin   : int = 0
+    fit_query     : int = -1
+    fitted_hit_query: int = -1
+    exponent_query: int = -1
+    uuid          : int = field(default_factory=lambda: next(LogStateHitStats.counter))
+
+    counter = count(1)
 
 
 @dataclass(frozen=True)
@@ -95,7 +102,7 @@ class LogRadixTreeNode:
         self._entries: list[LogStateEntry] = []
         self._checkpoint_entries: list[LogStateEntry] = []
         self._append_buffers: tuple[torch.Tensor, ...] = ()
-        self.merge_stats: LogStateMergeStats | None = None
+        self.analysis_owner: LogStateHitStats | None = None
 
     def initialize(
         self,
@@ -226,11 +233,12 @@ class LogStateRecovery:
 
 @dataclass(frozen=True)
 class LogStateCacheHandle(BaseCacheHandle):
-    node              : LogRadixTreeNode
+    node            : LogRadixTreeNode
     lock_node         : LogRadixTreeNode
     recovery          : LogStateRecovery
-    merge_stats       : LogStateMergeStats | None = None
-    source_merge_stats: LogStateMergeStats | None = None
+    analysis_owner: LogStateHitStats | None = None
+    source_analysis_owner: LogStateHitStats | None = None
+    query_uid: int | None = None
     match_position    : int = 0
     recycle_match     : RecycledMatch | None = None
     restore_plan      : RecycledRestorePlan | None = None
@@ -253,7 +261,7 @@ class LogStateCacheHandle(BaseCacheHandle):
 
 
 class LogRadixInsert(NamedTuple):
-    node        : LogRadixTreeNode
+    node            : LogRadixTreeNode
     previous_len: int
     inserted_len: int
 
@@ -265,13 +273,14 @@ class LogRadixEviction(NamedTuple):
 
 @dataclass(frozen=True)
 class LogRadixEvictionSegment:
-    node: LogRadixTreeNode
-    begin: int
-    end: int
+    node            : LogRadixTreeNode
+    begin        : int
+    end          : int
     uuid: int
     parent_uuid: int
     storage_slots: tuple[int, ...]
     tree: LogRadixTree = field(repr=False, compare=False)
+    recovery_begin: int | None = None
 
     @property
     def depth(self) -> int:
@@ -300,12 +309,11 @@ class LogRadixEvictionSegment:
         return self.node.timestamp
 
     @property
-    def merge_stats(self):
-        return self.node.merge_stats
+    def analysis_owner(self):
+        return self.node.analysis_owner
 
 
 class LogRadixTree(BasePrefixCache):
-
     def __init__(
         self,
         granularity         : int,
@@ -340,6 +348,7 @@ class LogRadixTree(BasePrefixCache):
         self._recovery_slot_refs: dict[int, int] = {}
         self._evictable_slots: dict[int, None] = {}
         self._on_slot_reclaimable = on_slot_reclaimable
+        self.analysis_factory: Callable[[int], LogStateHitStats | None] | None = None
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         usable_len = align_down(len(input_ids), self.granularity)
@@ -459,6 +468,7 @@ class LogRadixTree(BasePrefixCache):
         cache_len : int | None = None,
         *,
         kv_frame_spans: Iterable[tuple[int, int, int]] | None = None,
+        analysis_owner: LogStateHitStats | None = None,
     ) -> LogRadixInsert:
         assert len(input_ids) == len(kv_indices)
         usable_len = align_down(len(input_ids), self.granularity)
@@ -486,7 +496,19 @@ class LogRadixTree(BasePrefixCache):
                 assert covered == inserted_len
             suffix_ids = input_ids[previous_len:inserted_len]
             suffix_kv = kv_indices[previous_len:inserted_len]
-            if not node.is_root() and node.is_leaf() and not node.is_protected:
+            owner_boundary = (
+                analysis_owner is not None
+                and analysis_owner is not node.analysis_owner
+                and analysis_owner.origin == previous_len
+            )
+            if (
+                not node.is_root()
+                and node.is_leaf()
+                and not node.is_protected
+                and not owner_boundary
+            ):
+                if node.analysis_owner is None and self.analysis_factory is not None:
+                    node.analysis_owner = self.analysis_factory(node.begin)
                 frame_ids = (torch.div(suffix_kv.to(device="cpu", dtype=torch.int32),
                                       self.granularity, rounding_mode="floor")
                              if kv_frames is None else kv_frames)
@@ -505,6 +527,16 @@ class LogRadixTree(BasePrefixCache):
                 new_node = LogRadixTreeNode(self.key_fn, self.granularity)
                 new_node.initialize(suffix_ids, suffix_kv, kv_frames)
                 new_node.set_parent(node)
+                if analysis_owner is not None and analysis_owner.origin == previous_len:
+                    new_node.analysis_owner = analysis_owner
+                elif not node.is_root() and len(node.children) == 1:
+                    new_node.analysis_owner = node.analysis_owner
+                elif self.analysis_factory is not None:
+                    new_node.analysis_owner = (
+                        analysis_owner
+                        if analysis_owner is not None and analysis_owner.origin == previous_len
+                        else self.analysis_factory(previous_len)
+                    )
                 self._remove_leaf(node)
                 self._add_leaf(new_node)
                 if not node.is_root() and len(node.children) > 1:
@@ -535,13 +567,15 @@ class LogRadixTree(BasePrefixCache):
         else:
             assert entry.span_granules is not None
             assert entry.end - entry.begin == entry.span_granules * self.granularity
-            assert entry.span_granules % self.checkpoint_log_count == 0
         assert entry.slot not in self._entries_by_slot, (
             f"Linear cache slot {entry.slot} is already owned by node "
             f"{self.entry_owner(entry.slot).uuid}."
         )
         owner = self._find_owner(leaf, entry.end)
-        assert entry.kind is LogStateKind.CHECKPOINT or entry.begin >= owner.begin
+        if entry.kind is LogStateKind.CHECKPOINT and entry.begin < owner.begin:
+            entry = replace(entry, begin=owner.begin,
+                            span_granules=(entry.end - owner.begin) // self.granularity)
+        assert entry.begin >= owner.begin
         self._register_entry(owner, entry, checkpoint_timestamp)
         self.revision += 1
 
@@ -566,6 +600,7 @@ class LogRadixTree(BasePrefixCache):
         prefix = LogRadixTreeNode(
             self.key_fn, self.granularity, node.timestamp
         )
+        prefix.analysis_owner = node.analysis_owner
         prefix._key = node._key[:pos]
         prefix._kv = node._kv[:pos]
         prefix._kv_frames = node._kv_frames[:pos]
@@ -604,6 +639,9 @@ class LogRadixTree(BasePrefixCache):
             if entry.end <= split_depth:
                 self._register_entry(prefix, entry, checkpoint_timestamp)
             else:
+                if entry.kind is LogStateKind.CHECKPOINT and entry.begin < split_depth:
+                    entry = replace(entry, begin=split_depth,
+                                    span_granules=(entry.end - split_depth) // self.granularity)
                 self._register_entry(node, entry, checkpoint_timestamp)
 
         node._append_buffers = ()
@@ -700,10 +738,11 @@ class LogRadixTree(BasePrefixCache):
 
     def _eviction_segments(self, nodes, *, log_only=False, blocked=(), tail_limit=None):
         selected = {node.uuid for node in nodes}
-        terminal = {}
+        terminal, recoveries = {}, {}
         segments, rows = [], []
         for node in sorted(nodes, key=lambda value: (value.depth, value.uuid)):
             parent = -1 if node.is_root() else terminal[node.parent.uuid]
+            recovery = 0 if node.is_root() else recoveries[node.parent.uuid]
             source = node._entries
             begin = node.begin
             if tail_limit is not None and len(source) > tail_limit:
@@ -712,6 +751,7 @@ class LogRadixTree(BasePrefixCache):
                 if first < len(source):
                     begin = source[first - 1].end
                     source = source[first:]
+                    recovery = self.recovery_at(node, begin).position
                     boundary = LogRadixEvictionSegment(
                         node, node.begin, begin, len(segments), parent, (), self,
                     )
@@ -721,8 +761,15 @@ class LogRadixTree(BasePrefixCache):
                     segments.append(boundary)
                     parent = boundary.uuid
             by_end: dict[int, list[LogStateEntry]] = {}
+            checkpoint_end = max((entry.end for entry in source
+                                  if entry.kind is LogStateKind.CHECKPOINT), default=begin)
+            if source and source[-1].kind is LogStateKind.CHECKPOINT:
+                checkpoint_end = node.depth
             for entry in source:
-                by_end.setdefault(entry.end, []).append(entry)
+                end = max(checkpoint_end, entry.end)
+                if entry is source[-1]:
+                    end = node.depth
+                by_end.setdefault(end, []).append(entry)
             cuts = [begin, *by_end]
             if cuts[-1] != node.depth:
                 cuts.append(node.depth)
@@ -730,7 +777,8 @@ class LogRadixTree(BasePrefixCache):
             for begin, end in pairs:
                 entries = by_end.get(end, ())
                 segment = LogRadixEvictionSegment(node, begin, end, len(segments), parent,
-                                                 tuple(entry.slot for entry in entries), self)
+                                                 tuple(entry.slot for entry in entries), self,
+                                                 recovery)
                 checkpoint = any(entry.kind is LogStateKind.CHECKPOINT for entry in entries)
                 unavailable = (node.is_root() or node.is_locked or node.uuid in blocked
                                or any(entry.slot in self._recovery_slot_refs for entry in entries)
@@ -742,7 +790,11 @@ class LogRadixTree(BasePrefixCache):
                                   if entry.kind is LogStateKind.CHECKPOINT), default=node.timestamp)))
                 segments.append(segment)
                 parent = segment.uuid
+                for entry in entries:
+                    if entry.kind is LogStateKind.CHECKPOINT or entry.begin == recovery:
+                        recovery = entry.end
             terminal[node.uuid] = parent
+            recoveries[node.uuid] = recovery
         return segments, rows
 
     def eviction_snapshot(self):
@@ -785,12 +837,11 @@ class LogRadixTree(BasePrefixCache):
             for entry in segment.entries:
                 if entry.kind is not LogStateKind.CHECKPOINT:
                     continue
+                if entry.slot in self._recovery_slot_refs:
+                    continue
                 successor = self._checkpoint_successor(entry)
-                tail = () if entry.slot in self._recovery_slot_refs else (index,)
-                if not tail:
-                    successor = None
                 result.append((entry.slot, -1 if successor is None else successor.slot,
-                               self._checkpoint_timestamps[entry.slot], *tail))
+                               self._checkpoint_timestamps[entry.slot], index))
         return result
 
     def drop_checkpoint(self, left_slot: int, right_slot: int) -> LogStateEntry:
@@ -800,14 +851,10 @@ class LogRadixTree(BasePrefixCache):
         assert left.end == right.begin
         owner = self.entry_owner(right)
         left_owner = self.entry_owner(left)
+        assert owner is left_owner
         assert not (left_owner.is_protected and left.end == left_owner.depth)
         assert left_slot not in self._recovery_slot_refs
         assert right_slot not in self._recovery_slot_refs
-        current = owner
-        while current is not left_owner:
-            current = current.parent
-            assert not current.is_protected
-            assert len(current.children) == 1
         checkpoint_timestamp = self._checkpoint_timestamps[right_slot]
         self.detach_entry(left_slot)
         self.detach_entry(right_slot)
@@ -831,13 +878,16 @@ class LogRadixTree(BasePrefixCache):
             begin = target.begin
             assert node.is_leaf() and not node.is_locked and not node.is_root()
             assert target.depth == node.depth
+            entries = tuple(entry for entry in node.entries if entry.end > begin)
+            if any(entry.kind is LogStateKind.CHECKPOINT for entry in entries):
+                assert begin == node.begin
+                assert sum(entry.kind is LogStateKind.CHECKPOINT for entry in entries) == 1
             if evicted_nodes is not None:
                 evicted_nodes.append((node.uuid, begin, node.depth))
             offset = begin - node.begin
             evicted_kv.append(node.kv[offset:])
             self.evictable_size -= node.depth - begin
             self._update_kv_refs(node, -1)
-            entries = tuple(entry for entry in node.entries if entry.end > begin)
             evicted_entries.extend(entries)
             for entry in entries:
                 node._entries.remove(entry)
@@ -1028,7 +1078,7 @@ class LogRadixTree(BasePrefixCache):
                     unprunable_log_refs.update(entry.slot for entry in node._entries
                                                if entry.kind is LogStateKind.LOG)
                 for entry in node.entries:
-                    if not (0 <= entry.begin < entry.end):
+                    if not (node.begin <= entry.begin < entry.end):
                         raise RuntimeError(
                             f"Node {node.uuid} owns invalid entry {entry}."
                         )
@@ -1372,15 +1422,6 @@ class LogRadixTree(BasePrefixCache):
                 and candidate.begin == entry.end
                 and candidate.slot not in self._recovery_slot_refs
             ) else None
-        while not node.is_protected and len(node.children) == 1:
-            node = next(iter(node.children.values()))
-            if node.entries:
-                candidate = node.entries[0]
-                return candidate if (
-                    candidate.kind is LogStateKind.CHECKPOINT
-                    and candidate.begin == entry.end
-                        and candidate.slot not in self._recovery_slot_refs
-                ) else None
         return None
 
     def _refresh_entry_neighbors(self, node: LogRadixTreeNode, position: int) -> None:
@@ -1452,6 +1493,7 @@ class LogRadixTree(BasePrefixCache):
             self._locked_kv_refs.pop(frame, None)
         self._evictable_kv_count += int(refs > 0 and locked == 0)
 
+
 __all__ = [
     "LogRadixEviction",
     "LogRadixInsert",
@@ -1461,6 +1503,6 @@ __all__ = [
     "LogStateCacheHandle",
     "LogStateEntry",
     "LogStateKind",
-    "LogStateMergeStats",
+    "LogStateHitStats",
     "LogStateRecovery",
 ]

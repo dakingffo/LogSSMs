@@ -134,6 +134,7 @@ def test_radix_lifecycle_profile_tracks_arrival_admission_and_eviction():
 
 
 @pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pinned transfer requires CUDA")
 def test_prefix_match_snapshot_survives_chunked_prefill(profile):
     from types import SimpleNamespace
     from logssms.core import ChunkedRequest

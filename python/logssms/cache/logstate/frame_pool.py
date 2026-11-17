@@ -451,13 +451,13 @@ class MHALogStatePool:
 
         copy_states(self, sources, destinations)
 
-    def coalesce_groups(self, groups: Sequence[tuple[int, ...]], works: Sequence[int]) -> None:
+    def materialize_groups(self, groups: Sequence[tuple[int, ...]], works: Sequence[int]) -> None:
         from logssms.kernel.linear_attention.logstate import copy_states
 
         assert len(groups) == len(works)
         if not groups:
             return
-        retirements = [self.allocator.coalesce_to_checkpoint(slots) for slots in groups]
+        retirements = [self.allocator.materialize_group(slots) for slots in groups]
         destinations = [slots[-1] for slots in groups]
         self._write_descriptors(destinations)
         copy_states(self, works, destinations)

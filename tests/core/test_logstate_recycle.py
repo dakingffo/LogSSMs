@@ -13,7 +13,7 @@ from logssms.cache.logstate.prefix_cache import (
     LogRadixTree,
     LogStateEntry,
     LogStateKind,
-    LogStateMergeStats,
+    LogStateHitStats,
 )
 from tests.logstate_helpers import remember_log_tail, recycled_bytes
 
@@ -256,15 +256,28 @@ def test_checkpoint_or_kv_only_snapshot_does_not_erase_remembered_logs():
     assert recycle.match(tokens, start=0, granularity=1).branch is old.branch
 
 
-def test_recycled_owner_statistics_are_immutable_cpu_metadata():
+def test_recycled_owner_statistics_share_the_original_analysis_object():
     tree = make_tree()
     tokens = torch.arange(8, dtype=torch.int32)
     leaf = insert_logs(tree, tokens)
-    leaf.merge_stats = LogStateMergeStats(0, 8, 6, deque([2, 4]), 12)
+    owner = leaf.analysis_owner = LogStateHitStats(0, 8, exponent=6)
     recycle = LogStateRecycleBin(4096)
     recycle.remember(tree, eviction_range(tree, leaf))
-    leaf.merge_stats.hit_positions.clear()
-    leaf.merge_stats.intensity = 2
+    owner.exponent = 2
     hit = recycle.match(tokens, start=4, granularity=1)
-    assert hit.branch.merge_stats == (0, 8, 6, 12, 2, 4)
-    assert recycle._native["usage"]()[0] == recycled_bytes(hit.branch)
+    assert hit.branch.analysis_owner is owner
+    assert all(log.analysis_owner is owner for log in hit.branch.logs)
+    assert hit.branch.analysis_owner.exponent == 2
+    recycle.discard(hit.branch)
+    assert not recycle._owners
+
+
+def test_rejected_oversized_record_does_not_retain_its_analysis_owner():
+    tree = make_tree()
+    tokens = torch.arange(8, dtype=torch.int32)
+    leaf = insert_logs(tree, tokens)
+    leaf.analysis_owner = LogStateHitStats(0, 8)
+    recycle = LogStateRecycleBin(1)
+    recycle.remember(tree, eviction_range(tree, leaf))
+    assert len(recycle) == 0
+    assert not recycle._owners

@@ -1,0 +1,6 @@
+{"variant": "regularized", "trees": 128, "hit": 0.8098308372412341, "historical": 0.9189641167757657, "recompute": 18656}
+{"variant": "unregularized", "trees": 128, "hit": 0.8087846943482857, "historical": 0.9178260699594734, "recompute": 18918}
+{"variant": "unregularized", "trees": 32, "hit": 0.9208330042387384, "historical": 0.9654161257107042, "recompute": 6180}
+{"variant": "regularized", "trees": 32, "hit": 0.921001500671353, "historical": 0.9655952007879304, "recompute": 6148}
+{"variant": "unregularized", "trees": 64, "hit": 0.8850866433238922, "historical": 0.9586219967779424, "recompute": 8296}
+{"variant": "regularized", "trees": 64, "hit": 0.8852293762126721, "historical": 0.9588813574538761, "recompute": 8244}

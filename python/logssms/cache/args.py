@@ -81,8 +81,8 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             choices=LOG_STATE_GRANULARITIES,
             default=LogStateCacheConfig.granularity,
             help=(
-                "LogState prefix-match, recovery and intermediate prefill-chunk alignment in tokens. "
-                "The physical page size remains fixed at 64 tokens."
+                "LogState storage, prefix-match, recovery and intermediate prefill-chunk "
+                "alignment in tokens."
             ),
         )
         parser.add_argument(
@@ -91,7 +91,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             dest="enable_merge_adjustment",
             default=LogStateCacheConfig.enable_merge_adjustment,
             metavar="{true,false}",
-            help="Adapt LogState merge intensity from online branch-hit samples (default: true). Set false for binary merging.",
+            help="Use online hit density for unified LogState eviction (default: true). Set false for Log-first, binary Checkpoint thinning.",
         )
         parser.add_argument(
             "--eager-state",
@@ -113,19 +113,17 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             "--min-sampling-len",
             type=int,
             default=LogStateCacheConfig.min_sampling_len,
-            help="Minimum observed chain length before fitting hit density.",
+            help="Token window for hit-density samples.",
         )
         parser.add_argument(
-            "--max-merge-intensity",
-            type=int,
-            default=LogStateCacheConfig.max_merge_intensity,
-            help="Maximum fitted LogState merge intensity.",
+            "--max-density-exponent", type=float,
+            default=LogStateCacheConfig.max_density_exponent,
+            help="Upper bound of the fitted hit-density exponent.",
         )
         parser.add_argument(
-            "--default-merge-growth-rate",
-            type=int,
-            default=LogStateCacheConfig.default_merge_growth_rate,
-            help="Merge-intensity multiplier when hit density cannot be fitted.",
+            "--hit-half-life", type=int,
+            default=LogStateCacheConfig.hit_half_life,
+            help="Hit-statistics half-life in admitted requests.",
         )
 
     @staticmethod
@@ -136,8 +134,8 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             enable_memorized_evict=kwargs.pop("enable_memorized_evict"),
             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
             min_sampling_len=kwargs.pop("min_sampling_len"),
-            max_merge_intensity=kwargs.pop("max_merge_intensity"),
-            default_merge_growth_rate=kwargs.pop("default_merge_growth_rate"),
+            max_density_exponent=kwargs.pop("max_density_exponent"),
+            hit_half_life=kwargs.pop("hit_half_life"),
         )
 
 

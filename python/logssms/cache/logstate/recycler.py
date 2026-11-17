@@ -6,16 +6,23 @@ from weakref import WeakValueDictionary
 
 import torch
 
-from .prefix_cache import LogRadixTree, LogRadixEvictionSegment, LogStateEntry, LogStateKind
+from .prefix_cache import (
+    LogRadixEvictionSegment,
+    LogRadixTree,
+    LogStateEntry,
+    LogStateKind,
+    LogStateHitStats,
+)
 
 if TYPE_CHECKING:
-    from .online_analysis_scheduler import MaterializeCandidate, CheckpointCoalesce
+    from .online_analysis_scheduler import MaterializationPlan
 
 
 @dataclass(frozen=True)
 class RecycledLog:
     begin: int
     end  : int
+    analysis_owner: LogStateHitStats | None = None
 
 
 @dataclass(frozen=True)
@@ -24,13 +31,27 @@ class RecycledBranch:
     logs              : tuple[RecycledLog, ...]
     protected_endpoints: frozenset[int]
     _serial           : int = field(default=0, compare=False, repr=False)
-    merge_stats       : tuple[int, ...] = ()
+
+    @property
+    def analysis_owner(self):
+        return self.logs[-1].analysis_owner if self.logs else None
 
 
 @dataclass(frozen=True)
 class RecycledMatch:
     branch     : RecycledBranch
     matched_len: int
+
+    @property
+    def analysis_owner(self):
+        return next(
+            (
+                log.analysis_owner
+                for log in reversed(self.branch.logs)
+                if log.begin < self.matched_len <= log.end
+            ),
+            None,
+        )
 
     def matched_tokens(self, start: int) -> int:
 
@@ -42,22 +63,18 @@ class RecycledMatch:
 
 @dataclass(frozen=True)
 class RecycledCheckpoint:
-    begin      : int
-    end        : int
+    begin: int
+    end  : int
     gpu_entries: tuple[LogStateEntry, ...] = ()
 
 
 @dataclass(frozen=True)
 class RecycledRestorePlan:
-
     cached_len         : int
-    matched_len        : int
+    matched_len: int
     checkpoints        : tuple[RecycledCheckpoint, ...]
     protected_endpoints: frozenset[int]
-    gpu_materialize    : tuple[MaterializeCandidate, ...] = ()
-    gpu_coalesce       : tuple[CheckpointCoalesce, ...] = ()
-    intensity          : int = 2
-    lock_boundaries    : frozenset[int] = frozenset()
+    gpu_materialize    : tuple[MaterializationPlan, ...] = ()
 
 
 @dataclass
@@ -70,7 +87,6 @@ class _RecycledRestore:
 
 
 class LogStateRecycleBin:
-
     def __init__(self, capacity_bytes: int) -> None:
         from logssms.kernel import logstate as planning
 
@@ -79,6 +95,7 @@ class LogStateRecycleBin:
         self._native = planning.make_recycle_bin(capacity_bytes)
         self._matches: WeakValueDictionary[int, RecycledBranch] = WeakValueDictionary()
         self.revision = 0
+        self._owners: dict[int, LogStateHitStats] = {}
 
     def remember(
         self,
@@ -97,18 +114,24 @@ class LogStateRecycleBin:
         source = segment.node
         path = tree.path(source)
         keys = [part.key for part in path[:-1]] + [source.key[:segment.end - source.begin]]
-        stats = source.merge_stats
+        stats = source.analysis_owner
+        if stats is not None:
+            self._owners[stats.uuid] = stats
         self._native["remember"](
             keys,
             planning._pack(logs),
-            [part.depth for part in path if part.is_protected
-             and any(begin <= part.depth <= end for begin, end in logs)],
-            [] if stats is None else [
-                stats.origin, stats.tail, stats.intensity,
-                -1 if stats.next_update_tail is None else stats.next_update_tail,
-                *stats.hit_positions,
+            [
+                part.depth
+                for part in path
+                if part.is_protected and any(begin <= part.depth <= end for begin, end in logs)
             ],
+            [] if stats is None else [v for begin, end in logs for v in (begin, end, stats.uuid)],
         )
+        self._release_owners()
+
+    def _release_owners(self):
+        for owner_id in self._native["retired_owners"]():
+            self._owners.pop(owner_id, None)
 
     def match(self, tokens: torch.Tensor, *, start: int, granularity: int) -> RecycledMatch | None:
         from logssms.kernel import logstate as planning
@@ -121,11 +144,27 @@ class LogStateRecycleBin:
         branch = self._matches.get(serial)
         if branch is None:
             rows = planning._unpack(self._native["get"](serial, tokens))
-            branch = RecycledBranch(
-                tuple(rows[0]), tuple(RecycledLog(begin, end)
-                                      for begin, end in rows[3:]), frozenset(rows[1]), serial,
-                tuple(rows[2]),
-            )
+            owner_ranges = list(zip(rows[2][::3], rows[2][1::3], rows[2][2::3]))
+            logs = []
+            for begin, end in rows[3:]:
+                boundaries = sorted(
+                    {
+                        begin,
+                        end,
+                        *(
+                            p
+                            for left, right, _ in owner_ranges
+                            for p in (left, right)
+                            if begin < p < end
+                        ),
+                    }
+                )
+                for left, right in zip(boundaries, boundaries[1:]):
+                    owner_id = next(
+                        (owner for a, b, owner in owner_ranges if a <= left and right <= b), None
+                    )
+                    logs.append(RecycledLog(left, right, self._owners.get(owner_id)))
+            branch = RecycledBranch(tuple(rows[0]), tuple(logs), frozenset(rows[1]), serial)
             self._matches[serial] = branch
         return RecycledMatch(branch, matched_len)
 
@@ -134,6 +173,7 @@ class LogStateRecycleBin:
             self.revision += 1
             self._native["discard"](branch._serial)
             del self._matches[branch._serial]
+            self._release_owners()
 
     def touch(self, branch: RecycledBranch) -> None:
         self._native["touch"](branch._serial)

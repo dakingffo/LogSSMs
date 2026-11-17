@@ -17,8 +17,8 @@ class LogStateEvictor:
         self,
         tree: LogRadixTree,
         pool: MHALogStatePool,
-        recent_checkpoint_limit: int,
         *,
+        analyzer,
         profile_enabled: bool,
         profile_stats: dict,
         allocation_samples: list[dict],
@@ -27,7 +27,7 @@ class LogStateEvictor:
         self.tree = tree
         self.pool = pool
         self.page_size = pool.page_size
-        self.recent_checkpoint_limit = recent_checkpoint_limit
+        self.analyzer = analyzer
         self.cached_page_tokens: dict[int, int] = {}
         self._allocator = pool.allocator
         self._profile_enabled = profile_enabled
@@ -135,7 +135,13 @@ class LogStateEvictor:
                     profile, "retry", retry_pool_timings
                 )
                 stage = now
-            assert reserved is not None, "Eviction plan did not free the projected frames"
+            assert reserved is not None, (
+                "Eviction plan did not free the projected frames: "
+                f"free={self._allocator.free_frames}, "
+                f"required={self._allocator.required_frames(needed_pages, needed_states, needed_works)}, "
+                f"kv={needed_pages}, logs={needed_states}, works={needed_works}, "
+                f"slots={len(released_slots)}, checkpoint_drops={len(checkpoint_pairs)}"
+            )
             if self._profile_enabled:
                 self._record_lifecycle_event({
                     "event": "eviction",
@@ -187,7 +193,8 @@ class LogStateEvictor:
 
         allocator = self._allocator
         leaf_limit, tail_limit = 1, 16
-        log_only = True
+        use_models = self.analyzer.enable_merge_adjustment and self.analyzer.has_internal_observations
+        log_only = not use_models
         while True:
             nodes, topology = (
                 self.tree.log_eviction_snapshot(leaf_limit, tail_limit=tail_limit)
@@ -212,6 +219,8 @@ class LogStateEvictor:
                     slot,
                     len(record.payload) + sum(map(len, record.conv)),
                     -1 if record.decay is None else record.decay.frame,
+                    self.tree.entry_for_slot(slot).begin,
+                    self.tree.entry_for_slot(slot).end,
                 ))
                 if record.decay is not None:
                     decay_frames.add(record.decay.frame)
@@ -226,8 +235,10 @@ class LogStateEvictor:
                 (allocator.free_frames, allocator._free_decay_records,
                  allocator.payload_frames, allocator.conv_frames, allocator.num_granules,
                  allocator.decay_records_per_frame, needed_pages, needed_states, needed_works,
-                 allocator.log_payload_frames, self.recent_checkpoint_limit),
+                 allocator.log_payload_frames),
                 () if log_only else self.tree.checkpoint_eviction_actions(nodes),
+                models=(self.analyzer.eviction_models(nodes)
+                        if use_models else None),
             )
             if rows:
                 selected, pages, released, compressed = rows

@@ -57,9 +57,9 @@ class LogStateCacheConfig(BaseCacheConfig):
     enable_eager_state       : bool = False
     enable_memorized_evict   : bool = True
     enable_merge_adjustment  : bool = True
-    min_sampling_len         : int  = 1024
-    max_merge_intensity      : int  = 16
-    default_merge_growth_rate: int = 2
+    min_sampling_len         : int  = 8192
+    max_density_exponent     : float = 16.0
+    hit_half_life            : int = 1024
 
     def __post_init__(self) -> None:
         if self.granularity not in LOG_STATE_GRANULARITIES:
@@ -69,10 +69,8 @@ class LogStateCacheConfig(BaseCacheConfig):
             )
         if self.min_sampling_len <= 0:
             raise ValueError("Minimum sampling length must be positive.")
-        if self.max_merge_intensity < 2:
-            raise ValueError("Maximum merge intensity must be at least 2.")
-        if self.default_merge_growth_rate < 1:
-            raise ValueError("Default merge growth rate must be at least one.")
+        if self.max_density_exponent <= 0 or self.hit_half_life <= 0:
+            raise ValueError("Density exponent limit and hit half-life must be positive.")
 
     @property
     def prefill_alignment(self) -> int:

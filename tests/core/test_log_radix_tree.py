@@ -38,8 +38,8 @@ def plan_kv_eviction(tree):
             [[value for frame, count in node._kv_frame_counts.items()
               for value in (frame, count, totals[frame])] for node in nodes],
             [node.eviction_slots for node in nodes],
-            [(slot, 0, -1) for slot in slots],
-            [], (0, 0, 0, 0, 1, 1, 1, 0, 0, 0, len(slots)),
+            [(slot, 0, -1, tree.entry_for_slot(slot).begin, tree.entry_for_slot(slot).end) for slot in slots],
+            [], (0, 0, 0, 0, 1, 1, 1, 0, 0, 0),
             [] if log_only else tree.checkpoint_eviction_actions(nodes),
         )
         if result:
@@ -192,8 +192,41 @@ def test_split_uses_entry_end_as_ownership_boundary():
     assert tree.entry_owner(2).depth == 12
     assert tree.entry_owner(0).entries == entries[:1]
     assert tree.entry_owner(1).entries == entries[1:2]
-    assert leaf.entries == entries[2:]
-    assert tree.matched_entries(leaf) == entries
+    assert leaf.entries == (LogStateEntry(2, LogStateKind.CHECKPOINT, 8, 12, span_granules=1),)
+    assert tree.matched_entries(leaf) == (*entries[:2], *leaf.entries)
+    tree.check_integrity()
+
+
+def test_checkpoint_interval_is_clipped_at_a_granule_aligned_node_split():
+    tree = LogRadixTree(32, torch.device("cpu"), checkpoint_log_count=2)
+    leaf = tree.insert(ids(128), ids(128, 1000), (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 128, span_granules=4),
+    )).node
+    prefix = tree.split_at(leaf, 32)
+    assert prefix.entries == ()
+    assert leaf.entries == (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 32, 128, span_granules=3),
+    )
+    assert tree.make_handle(leaf).recovery.base_checkpoint_slot == 0
+    segments, _ = tree.eviction_snapshot()
+    assert segments[-1].begin == 32 and segments[-1].recovery_begin == 0
+    assert checkpoint_drop_actions(tree) == []
+    tree.check_integrity()
+
+
+def test_checkpoint_core_and_its_unrecoverable_kv_tail_are_one_eviction_unit():
+    tree = make_tree()
+    leaf = tree.insert(ids(12), ids(12, 1000), (
+        LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_granules=1),
+        LogStateEntry(1, LogStateKind.CHECKPOINT, 4, 8, span_granules=1),
+    )).node
+    segments, _ = tree.eviction_snapshot()
+    assert len(segments) == 2
+    assert (segments[1].begin, segments[1].end, segments[1].storage_slots) == (0, 12, (0, 1))
+    tree.drop_checkpoint(0, 1)
+    eviction = tree.evict([segments[1]])
+    assert len(eviction.kv_indices) == 12
+    assert leaf.uuid not in tree._leaves
     tree.check_integrity()
 
 
@@ -284,7 +317,7 @@ def test_matching_refreshes_kv_path_but_only_the_selected_checkpoint():
     assert earlier.recovery.base_checkpoint_slot == 1
     assert tree._checkpoint_timestamps == {0: 10, 1: 200, 2: 100}
     assert tree.entry_owner(2).timestamp == 100
-    assert checkpoint_drop_actions(tree) == [(0, 1, 10), (1, 2, 200)]
+    assert checkpoint_drop_actions(tree) == [(0, 1, 10)]
     tree.check_integrity()
 
 
@@ -414,13 +447,13 @@ def test_checkpoint_drop_actions_stop_at_logs_protections_and_branches_not_kv_lo
     assert checkpoint_drop_actions(tree) == []
     tree.protect(first, False)
     tree.lock(tree.entry_owner(1))
-    assert checkpoint_drop_actions(tree) == pairs
-    assert 0 in tree.evictable_slots() and 1 not in tree.evictable_slots()
+    assert checkpoint_drop_actions(tree) == []
+    assert 0 not in tree.evictable_slots() and 1 not in tree.evictable_slots()
     tree.pin_recovery((1,))
     assert checkpoint_drop_actions(tree) == []
     assert 0 not in tree.evictable_slots()
     tree.pin_recovery((1,), release=True)
-    assert checkpoint_drop_actions(tree) == pairs
+    assert checkpoint_drop_actions(tree) == []
     tree.lock(tree.entry_owner(1), unlock=True)
     tree.insert(torch.cat((tokens[:4], ids(4, 50))), ids(8, 200), (
         LogStateEntry(4, LogStateKind.CHECKPOINT, 4, 8, span_granules=1),
@@ -469,7 +502,7 @@ def test_locked_checkpoint_capacity_tracks_branch_and_protection_changes():
     assert set(tree.evictable_slots()) == {1}
     tree.check_integrity()
     tree.protect(first, False)
-    assert set(tree.evictable_slots()) == {0, 1}
+    assert set(tree.evictable_slots()) == {1}
     branch = tree.insert(torch.cat((tokens[:4], ids(4, 50))), ids(8, 200), (
         LogStateEntry(3, LogStateKind.CHECKPOINT, 4, 8, span_granules=1),
     )).node
@@ -483,8 +516,8 @@ def test_locked_checkpoint_capacity_tracks_branch_and_protection_changes():
     assert all(left != 0 for left, *_ in checkpoint_drop_actions(tree))
     tree.check_integrity()
     tree.protect(first, False)
-    assert set(tree.evictable_slots()) == {0, 1}
-    assert (0, 1, tree.checkpoint_timestamp(0)) in checkpoint_drop_actions(tree)
+    assert set(tree.evictable_slots()) == {1}
+    assert (0, 1, tree.checkpoint_timestamp(0)) not in checkpoint_drop_actions(tree)
     tree.check_integrity()
 
 
@@ -575,7 +608,6 @@ def test_recovery_stops_at_matched_granule():
     tree.check_integrity()
 
 
-
 def history(count, g=32, n=2):
     tree = LogRadixTree(g, torch.device('cpu'))
     tokens = torch.arange(count * g, dtype=torch.int32)
@@ -597,18 +629,17 @@ def test_storage_records_do_not_split_nodes_and_leaf_append_is_in_place():
     tree.check_integrity()
 
 
-@pytest.mark.parametrize('count,materialized,coalesced', [
-    (1, [], []), (2, [(0, 64)], []), (3, [(0, 64)], []),
-    (4, [(0, 64), (64, 128)], [(0, 128)]),
-    (8, [(0, 64), (64, 128), (128, 192), (192, 256)], [(0, 128), (128, 256)]),
+@pytest.mark.parametrize('count,materialized', [
+    (1, []), (2, [(0, 64)]), (3, [(0, 64)]),
+    (4, [(0, 64), (64, 128)]),
+    (8, [(0, 64), (64, 128), (128, 192), (192, 256)]),
 ])
-def test_materialize_complete_groups_then_plan_one_merge_pass(count, materialized, coalesced):
+def test_materialization_emits_disjoint_complete_groups(count, materialized):
     tree, tokens, entries, _, analyzer = history(count)
     plan = analyzer.analyze(tree, [tokens])
     assert [(p.begin, p.end) for p in plan.materialize] == materialized
-    assert [(p.begin, p.end) for p in plan.coalesce] == coalesced
     assert all(len(p.slots) == 2 for p in plan.materialize)
-    slots = [slot for group in plan.coalesce for slot in group.slots]
+    slots = [slot for group in plan.materialize for slot in group.slots]
     assert len(slots) == len(set(slots))
 
 
@@ -620,11 +651,10 @@ def test_batch_path_only_and_endpoint_limits_materialization():
     plan = analyzer.analyze(tree, [tokens[:96]])
     assert [(p.begin, p.end) for p in plan.materialize] == [(0, 64)]
     assert all(slot < 8 for item in plan.materialize for slot in item.slots)
-    assert plan.coalesce == ()
     assert len(tree._iter_nodes()) == 3
 
 
-def test_branch_split_preserves_records_and_stops_both_planning_stages():
+def test_branch_split_preserves_records_and_bounds_materialization():
     tree, tokens, entries, node, analyzer = history(7)
     branch = torch.cat((tokens[:128], torch.full((32,), 999, dtype=torch.int32)))
     child = tree.insert(branch, branch, (LogStateEntry(7, LogStateKind.LOG, 128, 160),)).node
@@ -633,7 +663,6 @@ def test_branch_split_preserves_records_and_stops_both_planning_stages():
     assert len(shared.entries) == 4
     plan = analyzer.analyze(tree, [tokens, branch])
     assert [(p.begin, p.end) for p in plan.materialize] == [(0, 64), (64, 128), (128, 192)]
-    assert [(p.begin, p.end) for p in plan.coalesce] == [(0, 128)]
     tree.check_integrity()
 
 
@@ -643,7 +672,6 @@ def test_short_shared_log_remains_and_unbranched_tail_can_grow():
     tree.insert(branch, branch, (LogStateEntry(3, LogStateKind.LOG, 32, 64),))
     plan = analyzer.analyze(tree, [tokens, branch])
     assert [(p.begin, p.end) for p in plan.materialize] == [(32, 96)]
-    assert plan.coalesce == ()
     assert tree.trace(tokens[:32]).node.entries == (entries[0],)
     extended = torch.cat((branch, torch.full((32,), 1000, dtype=torch.int32)))
     leaf = tree.trace(branch).node

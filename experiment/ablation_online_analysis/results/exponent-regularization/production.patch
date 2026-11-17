@@ -1,0 +1,2856 @@
+diff --git a/csrc/src/logstate.cpp b/csrc/src/logstate.cpp
+index c7b31a2..c369070 100644
+--- a/csrc/src/logstate.cpp
++++ b/csrc/src/logstate.cpp
+@@ -1,6 +1,8 @@
++#include <limits>
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <cmath>
+ #include <map>
+ #include <list>
+ #include <memory>
+@@ -211,158 +213,6 @@ Rows plan_materialize(const Rows& paths, const Rows& boundaries,
+   return grouped;
+ }
+ 
+-Result plan_coalesce(const Rows& paths, const Rows& boundaries, const Rows& locks,
+-                     const Rows& anchors,
+-                     Int granularity, bool diagnostics) {
+-  check(paths.size() == boundaries.size() && paths.size() == locks.size()
+-        && granularity > 0, "Invalid coalesce metadata");
+-  std::unordered_set<Int> used;
+-  std::map<std::string, Int> counts;
+-  Rows groups;
+-  auto add = [&](const std::string& key, Int value = 1) {
+-    if (diagnostics) {
+-      counts[key] += value;
+-    }
+-  };
+-  for (const auto& anchor : anchors) {
+-
+-    check(anchor.size() == 4 && anchor[0] >= 0 && anchor[0] < static_cast<Int>(paths.size())
+-          && anchor[2] >= 2, "Invalid coalesce anchor");
+-    const auto index = anchor[0];
+-    const auto path = entries(paths[index]);
+-    std::vector<Entry> selected;
+-    add("merge_anchors");
+-    for (auto entry : path) {
+-      if (entry.end > anchor[1]) {
+-        add("entries_beyond_match_endpoint");
+-        continue;
+-      }
+-      if (!entry.eligible) {
+-        add("entries_not_eligible_this_round");
+-        continue;
+-      }
+-      if (used.contains(entry.slot)) {
+-        continue;
+-      }
+-      if (entry.span < 0) {
+-        add("logs_not_materialized");
+-      }
+-      else {
+-        selected.push_back(entry);
+-      }
+-    }
+-    add("checkpoint_candidates", selected.size());
+-    if (selected.empty()) {
+-      add("anchors_without_eligible_entries");
+-      continue;
+-    }
+-    add(anchor[3] ? "anchors_with_stats" : "anchors_without_stats");
+-    add("anchors_intensity_" + std::to_string(anchor[2]));
+-    auto blocked = [&](Int begin, Int end) {
+-      return crosses_boundary(boundaries[index], begin, end);
+-    };
+-    auto locked = [&](Int position) {
+-      return std::find(locks[index].begin(), locks[index].end(), position) != locks[index].end();
+-    };
+-    std::vector<std::vector<Entry>> segments;
+-    std::vector<Entry> segment;
+-    for (const auto& entry : selected) {
+-      const bool entry_blocked = blocked(entry.begin, entry.end);
+-      const bool gap = !segment.empty() && segment.back().end != entry.begin;
+-      const bool lock = !segment.empty() && locked(segment.back().end);
+-      const bool protection = !segment.empty() && blocked(segment.back().begin, entry.end);
+-      add("protected_entries", entry_blocked);
+-      add("gaps", gap);
+-      add("lock_boundaries", lock);
+-      add("protected_boundaries", protection);
+-      if (entry_blocked || gap || lock || protection) {
+-        if (!segment.empty()) {
+-          segments.push_back(std::move(segment));
+-          segment.clear();
+-        }
+-      }
+-      if (!entry_blocked) {
+-        segment.push_back(entry);
+-      }
+-    }
+-    if (!segment.empty()) {
+-      segments.push_back(std::move(segment));
+-    }
+-    add("segments", segments.size());
+-    auto merge = [&](const std::vector<Entry>& group) {
+-      add("candidate_groups");
+-      for (const auto& entry : group) {
+-        if (used.contains(entry.slot)) {
+-          add("groups_already_planned");
+-          return;
+-        }
+-      }
+-      std::string reason;
+-      if (std::any_of(group.begin(), group.end(), [&](const auto& e) { return e.end - e.begin != granularity * e.span; })) {
+-        reason = "span_mismatch";
+-      }
+-      else {
+-        for (size_t i = 1; i < group.size(); ++i) {
+-          if (group[i - 1].span > group[i].span) {
+-            reason = "decreasing_span";
+-            break;
+-          }
+-          if (group[i - 1].end != group[i].begin) {
+-            reason = "discontinuity";
+-            break;
+-          }
+-          if (locked(group[i - 1].end)) {
+-            reason = "lock_boundary";
+-            break;
+-          }
+-        }
+-        if (reason.empty() && blocked(group.front().begin, group.back().end)) {
+-          reason = "protected_interval";
+-        }
+-      }
+-      if (!reason.empty()) {
+-        add("rejected_" + reason);
+-        return;
+-      }
+-      Vector output{group.front().begin, group.back().end, 0};
+-      for (const auto& entry : group) {
+-        output[2] += entry.span;
+-        output.push_back(entry.slot);
+-        output.push_back(entry.span);
+-        used.insert(entry.slot);
+-      }
+-      groups.push_back(List(output.begin(), output.end()));
+-      add("planned_groups");
+-      add("planned_slot_releases", group.size() - 1);
+-      const bool equal = std::all_of(group.begin(), group.end(), [&](const auto& e) { return e.span == group[0].span; });
+-      add(equal ? "same_span_groups" : "cross_span_groups");
+-      add("planned_covered_tokens", group.back().end - group.front().begin);
+-      add("planned_arity_" + std::to_string(group.size()));
+-    };
+-    for (const auto& values : segments) {
+-      add("segments_without_merge_pair", values.size() < 2);
+-      for (size_t begin = 0; begin < values.size();) {
+-        size_t end = begin + 1;
+-        while (end < values.size() && end - begin < static_cast<size_t>(anchor[2])
+-               && values[end - 1].span <= values[end].span) {
+-          ++end;
+-        }
+-        if (end - begin >= 2) {
+-          merge(std::vector<Entry>(values.begin() + begin, values.begin() + end));
+-        }
+-        begin = end;
+-      }
+-    }
+-  }
+-  tvm::ffi::Map<tvm::ffi::String, Int> diag;
+-  for (const auto& [key, value] : counts) {
+-    diag.Set(key, value);
+-  }
+-  Result result;
+-  result.Set("groups", groups);
+-  result.Set("diagnostics", diag);
+-  return result;
+-}
+ 
+ Rows read_rows(tvm::ffi::TensorView tensor) {
+   const auto data = cpu_ints(tensor);
+@@ -483,15 +333,15 @@ private:
+ template <typename NodeRows>
+ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& node_slots,
+                    const NodeRows& slots, const NodeRows& occupied, const List& config,
+-                   const NodeRows& checkpoint_actions) {
++                   const NodeRows& checkpoint_actions, tvm::ffi::TensorView models) {
+ 
+ 
+   check(nodes.size() == kv.size() && nodes.size() == node_slots.size()
+-        && config.size() == 11 && config[5] > 0 && config[10] >= 0,
++        && config.size() == 10 && config[5] > 0,
+         "Invalid eviction capacity metadata");
+   std::unordered_map<Int, Vector> slot_info;
+   for (const auto& row : slots) {
+-    check(row.size() == 3 && row[1] >= 0, "Invalid eviction slot");
++    check(row.size() == 5 && row[1] >= 0, "Invalid eviction slot");
+     slot_info.emplace(row[0], Vector(row.begin(), row.end()));
+   }
+   std::unordered_map<Int, Int> decay_occupied, decay_released, pages;
+@@ -561,138 +411,242 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
+   };
+ 
+ 
+-  std::vector<Vector> actions;
+-  std::unordered_set<Int> checkpoint_slots;
+-  for (const auto& row : checkpoint_actions) {
+-    check(row.size() >= 3 && row[0] != row[1], "Invalid checkpoint eviction action");
+-    actions.emplace_back(row.begin(), row.end());
+-    checkpoint_slots.insert(row[0]);
+-  }
+-  std::sort(actions.begin(), actions.end(), [](const Vector& left, const Vector& right) {
+-    return std::tie(left[2], left[0]) < std::tie(right[2], right[0]);
+-  });
+-  const auto retained_count = std::min(static_cast<size_t>(config[10]), actions.size());
+-  const auto cold_count = actions.size() - retained_count;
+-  std::vector<size_t> cold, order;
+-  for (size_t i = 0; i < cold_count; ++i) {
+-    cold.push_back(i);
+-  }
+-  while (!cold.empty()) {
+-    if (cold.size() == 1) {
+-      order.push_back(cold.front());
+-      break;
++  struct Density {
++    double tail = 0, atom = 0, g = 1;
++    bool default_order = false;
++    std::vector<double> probability{0.};
++    double prefix(double position) const {
++      auto i = static_cast<Int>(std::floor((tail - position) / g));
++      return probability[std::clamp<Int>(i, 0, probability.size() - 1)];
+     }
+-    std::vector<size_t> retained;
+-    for (size_t i = 0; i < cold.size(); ++i) {
+-      (i % 2 ? order : retained).push_back(cold[i]);
++    double mass(double begin, double end) const {
++      return std::max(0., prefix(begin) - prefix(end));
+     }
+-    cold = std::move(retained);
+-  }
+-  for (size_t i = cold_count; i < actions.size(); ++i) {
+-    order.push_back(i);
++  };
++  const bool online = models.size(0) != 0;
++  check(!online || (models.ndim() == 1 && models.is_contiguous() &&
++        models.device().device_type == kDLCPU && models.dtype().code == kDLFloat &&
++        models.dtype().bits == 64 && models.size(0) == static_cast<Int>(nodes.size() * 10)),
++        "Invalid eviction density models");
++  const auto *model_data = online ? static_cast<const double *>(models.data_ptr()) : nullptr;
++  std::unordered_map<Int, Density> densities;
++  std::vector<Int> model_ids(nodes.size());
++  for (size_t i = 0; online && i < nodes.size(); ++i) {
++    const auto *p = model_data + i * 10;
++    const auto id = static_cast<Int>(p[0]);
++    model_ids[i] = id;
++    if (densities.contains(id)) continue;
++    Density d;
++    d.default_order = p[9] != 0.;
++    d.tail = p[2]; d.atom = std::clamp(p[5], 0., 1.); d.g = p[6];
++    check(d.g > 0 && std::isfinite(p[3]) && std::isfinite(p[4]), "Invalid hit density");
++    const auto count = std::max<Int>(1, static_cast<Int>((d.tail - p[1]) / d.g));
++    for (Int j = 1; j <= count; ++j) {
++      const auto a = j * d.g;
++      const auto mass = std::exp(p[4] - p[3] * std::log(a)) * d.g;
++      d.probability.push_back(d.probability.back() + mass);
++    }
++    const auto scale = std::min(1., (1. - d.atom) / std::max(1e-300, d.probability.back()));
++    for (auto &v : d.probability) v *= scale;
++    densities.emplace(id, std::move(d));
++  }
++  std::unordered_map<Int, Vector> actions;
++  std::unordered_map<Int, Int> previous;
++  std::unordered_map<Int, Int> slot_node;
++  std::vector<Vector> ordered_slots(nodes.size());
++  for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
++    for (auto slot : node_slots[i]) {
++      slot_node.emplace(slot, i);
++      ordered_slots[i].push_back(slot);
++    }
++    std::sort(ordered_slots[i].begin(), ordered_slots[i].end(), [&](Int a, Int b) {
++      return slot_info.at(a)[4] < slot_info.at(b)[4];
++    });
++  }
++  for (const auto &row : checkpoint_actions) {
++    check(row.size() >= 4, "Invalid checkpoint eviction action");
++    check(slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
++          "Checkpoint action has an invalid owner");
++    check(row[1] < 0 || (slot_node.contains(row[1])
++          && slot_node.at(row[0]) == slot_node.at(row[1])),
++          "Checkpoint merging must stay inside one node");
++    actions.emplace(row[0], Vector(row.begin(), row.end()));
++    if (row[1] >= 0) previous[row[1]] = row[0];
+   }
+   std::unordered_map<Int, Int> successors;
+-  auto has_checkpoint = [&](Int index) {
+-    return std::any_of(node_slots[index].begin(), node_slots[index].end(),
+-        [&](Int slot) { return checkpoint_slots.contains(slot) && !released_set.contains(slot); });
++  auto successor = [&](Int slot) {
++    while (slot >= 0 && successors.contains(slot)) slot = successors.at(slot);
++    return slot;
+   };
+-  using LogPriority = std::tuple<Int, Int, Int>;
+-  std::priority_queue<LogPriority, std::vector<LogPriority>, std::greater<LogPriority>> logs;
+-  std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> checkpoints;
+-  std::unordered_map<Int, std::vector<size_t>> owners;
+-  std::vector<bool> queued(order.size());
+-  auto enqueue = [&](size_t rank) {
+-    if (!queued[rank] && !released_set.contains(actions[order[rank]][0])) {
+-      checkpoints.push(rank);
+-      queued[rank] = true;
+-    }
++  auto recovery_before = [&](Int index, Int slot) {
++    if (previous.contains(slot)) return static_cast<double>(slot_info.at(previous.at(slot))[4]);
++    const auto end = slot_info.at(slot)[4];
++    double restored = model_data[index * 10 + 7];
++    for (auto preceding : ordered_slots[index]) {
++      if (released_set.contains(preceding)) continue;
++      const auto &record = slot_info.at(preceding);
++      if (record[4] >= end) break;
++      if ((nodes[index][3] != 0 && record[2] < 0) || record[3] == restored)
++        restored = record[4];
++    }
++    return restored;
+   };
+-  for (size_t rank = 0; rank < order.size(); ++rank) {
+-    const auto& action = actions[order[rank]];
+-    if (action.size() > 3) {
+-      owners[action[3]].push_back(rank);
+-    }
+-    if (action[1] >= 0) {
+-      enqueue(rank);
+-    }
+-  }
+-  auto activate = [&](Int index) {
+-    if (index < 0 || !queue.is_leaf(index)) {
+-      return;
++  auto slot_credit = [&](Int slot) {
++    if (released_set.contains(slot)) return Int{0};
++    const auto &record = slot_info.at(slot);
++    Int credit = record[1];
++    if (record[2] >= 0 && decay_released[record[2]] + 1 == decay_occupied.at(record[2])) ++credit;
++    return credit;
++  };
++  auto prune_credit = [&](Int index) {
++    Int credit = 0;
++    std::unordered_map<Int, Int> decays;
++    for (auto slot : node_slots[index]) if (!released_set.contains(slot)) {
++      const auto &record = slot_info.at(slot);
++      credit += record[1];
++      if (record[2] >= 0) ++decays[record[2]];
++    }
++    for (const auto &[frame, count] : decays)
++      credit += decay_released[frame] + count == decay_occupied.at(frame);
++    for (size_t j = 0; j < kv[index].size(); j += 3) {
++      const auto found = pages.find(kv[index][j]);
++      const auto count = found == pages.end() ? 0 : found->second;
++      credit += count + kv[index][j + 1] == kv[index][j + 2];
++    }
++    return credit;
++  };
++  struct Candidate {
++    double phase, score;
++    Int timestamp, id, kind, version;
++    double cost_score = 0.;
++    bool operator>(const Candidate &o) const {
++      return std::tie(phase, score, timestamp, kind, id) >
++             std::tie(o.phase, o.score, o.timestamp, o.kind, o.id);
+     }
+-    if (has_checkpoint(index)) {
+-      for (const auto rank : owners[index]) {
+-        enqueue(rank);
++  };
++  using CandidateQueue = std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>>;
++  CandidateQueue candidates, default_candidates;
++  std::vector<Int> node_version(nodes.size());
++  std::unordered_map<Int, Int> action_version;
++  auto push_node = [&](Int index) {
++    if (index < 0 || !queue.is_leaf(index)) return;
++    const auto version = ++node_version[index];
++    Int checkpoints = 0;
++    for (auto slot : node_slots[index]) {
++      checkpoints += !released_set.contains(slot) && actions.contains(slot);
++      if (checkpoints > 1) return;
++    }
++    const bool log = nodes[index][3] == 0 && !node_slots[index].empty();
++    double phase = (log || nodes[index][2] == kEvictionExpand) ? 0. : 2., score = 0.;
++    const auto default_phase = phase;
++    if (online) {
++      phase = 0.;
++      const auto *p = model_data + index * 10;
++      const auto &density = densities.at(model_ids[index]);
++      double cost = 0., restored = p[7];
++      for (auto slot : ordered_slots[index]) {
++        if (released_set.contains(slot)) continue;
++        const auto &record = slot_info.at(slot);
++        if ((nodes[index][3] != 0 && record[2] < 0) || record[3] == restored) {
++          cost += std::max(0., record[4] - restored) * (density.atom + density.prefix(record[4]));
++          restored = record[4];
++        }
+       }
++      const auto credit = prune_credit(index);
++      score = credit ? cost / credit : std::numeric_limits<double>::infinity();
+     }
+-    else {
+-      logs.emplace(nodes[index][4], nodes[index][0], index);
+-    }
++    if (online && densities.at(model_ids[index]).default_order)
++      default_candidates.push({default_phase, 0., nodes[index][4], index, 0, version, score});
++    else candidates.push({phase, score, nodes[index][4], index, 0, version, score});
+   };
+-  for (const auto index : queue.leaves()) {
+-    activate(index);
+-  }
+-  auto prune_leaf = [&](Int index) {
+-    const auto parent = queue.take(index);
+-    prune(index);
+-    activate(parent);
++  auto push_action = [&](Int slot) {
++    const auto version = ++action_version[slot];
++    if (!actions.contains(slot) || released_set.contains(slot)) return;
++    const auto &action = actions.at(slot);
++    const auto right = successor(action[1]);
++    if (right < 0 || released_set.contains(right)) return;
++    const auto &left_record = slot_info.at(slot), &right_record = slot_info.at(right);
++    const auto left_span = left_record[4] - left_record[3];
++    const auto right_span = right_record[4] - right_record[3];
++    double phase = 1., score = std::max(left_span, right_span);
++    if (online) {
++      phase = 0.;
++      const auto distance = left_record[4] - recovery_before(action[3], slot);
++      const auto cost = std::max(0., distance)
++          * densities.at(model_ids[action[3]]).mass(left_record[4], right_record[4]);
++      const auto credit = slot_credit(slot);
++      score = credit ? cost / credit : std::numeric_limits<double>::infinity();
++    }
++    if (online && densities.at(model_ids[action[3]]).default_order)
++      default_candidates.push({1., static_cast<double>(std::max(left_span, right_span)),
++                               action[2], slot, 1, version, score});
++    else candidates.push({phase, score, action[2], slot, 1, version, score});
++  };
++  // Shared KV/decay credits change only for candidates referencing the changed frames.
++  std::unordered_map<Int, std::vector<Int>> kv_users, decay_users;
++  for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
++    for (size_t j = 0; j < kv[i].size(); j += 3) kv_users[kv[i][j]].push_back(i);
++    for (auto slot : node_slots[i]) if (slot_info.at(slot)[2] >= 0)
++      decay_users[slot_info.at(slot)[2]].push_back(i);
++  }
++  for (const auto index : queue.leaves()) push_node(index);
++  for (const auto &[slot, action] : actions) push_action(slot);
++  if (fits()) return result();
++  auto valid = [&](const Candidate &c) {
++    if (c.kind == 0) return c.version == node_version[c.id] && queue.is_leaf(c.id);
++    if (c.version != action_version[c.id] || released_set.contains(c.id)) return false;
++    const auto right = successor(actions.at(c.id)[1]);
++    return right >= 0 && !released_set.contains(right);
+   };
+   while (true) {
+-    while (!logs.empty() && !queue.is_leaf(std::get<2>(logs.top()))) {
+-      logs.pop();
+-    }
+-    if (!logs.empty()) {
+-      const auto index = std::get<2>(logs.top());
+-      logs.pop();
+-      if (nodes[index][2] == kEvictionExpand) {
+-        return Rows({List({-1})});
+-      }
+-      prune_leaf(index);
+-    }
+-    else {
+-      bool advanced = false;
+-      while (!checkpoints.empty()) {
+-        const auto rank = checkpoints.top();
+-        checkpoints.pop();
+-        queued[rank] = false;
+-        const auto& action = actions[order[rank]];
+-        if (released_set.contains(action[0])) {
+-          continue;
+-        }
+-        auto right = action[1];
+-        while (successors.contains(right)) {
+-          right = successors.at(right);
++    while (!candidates.empty() && !valid(candidates.top())) candidates.pop();
++    while (!default_candidates.empty() && !valid(default_candidates.top())) default_candidates.pop();
++    if (candidates.empty() && default_candidates.empty()) break;
++    bool use_default = candidates.empty();
++    if (!default_candidates.empty() && !candidates.empty()) {
++      auto next = default_candidates.top();
++      next.phase = 0.; next.score = next.cost_score;
++      use_default = candidates.top() > next;
++    }
++    auto &selected_queue = use_default ? default_candidates : candidates;
++    const auto c = selected_queue.top(); selected_queue.pop();
++    if (c.kind == 0) {
++      if (c.version != node_version[c.id] || !queue.is_leaf(c.id)) continue;
++      if (nodes[c.id][2] == kEvictionExpand) return Rows({List({-1})});
++      const auto parent = queue.take(c.id);
++      prune(c.id);
++      push_node(parent);
++      for (size_t j = 0; j < kv[c.id].size(); j += 3)
++        for (const auto user : kv_users[kv[c.id][j]]) push_node(user);
++      for (const auto slot : node_slots[c.id]) {
++        if (actions.contains(slot)) {
++          const auto right = successor(actions.at(slot)[1]);
++          successors[slot] = -1;
++          if (previous.contains(slot)) push_action(previous.at(slot));
++          if (right >= 0) previous.erase(right);
+         }
+-        if (right >= 0 && !released_set.contains(right)) {
+-          compressed.insert(compressed.end(), {action[0], right});
+-          successors.emplace(action[0], right);
+-          release(action[0]);
+-          if (action.size() > 3) {
+-            activate(action[3]);
+-          }
+-          advanced = true;
+-        }
+-        else if (action.size() > 3 && queue.is_leaf(action[3])) {
+-          for (size_t i = 3; i < action.size(); ++i) {
+-            if (i > 3 && has_checkpoint(action[i])) {
+-              break;
+-            }
+-            prune_leaf(action[i]);
+-          }
+-          advanced = true;
+-        }
+-        if (advanced) {
+-          break;
+-        }
+-      }
+-      if (!advanced) {
+-        return {};
+-      }
+-    }
+-    if (fits()) {
+-      return result();
+-    }
+-  }
++        const auto frame = slot_info.at(slot)[2];
++        if (frame >= 0) for (const auto user : decay_users[frame]) push_node(user);
++      }
++    } else {
++      if (c.version != action_version[c.id] || released_set.contains(c.id)) continue;
++      const auto right = successor(actions.at(c.id)[1]);
++      if (right < 0 || released_set.contains(right)) continue;
++      compressed.insert(compressed.end(), {c.id, right});
++      slot_info.at(right)[3] = slot_info.at(c.id)[3];
++      successors[c.id] = right;
++      release(c.id);
++      if (previous.contains(c.id)) {
++        previous[right] = previous.at(c.id);
++        push_action(previous.at(c.id));
++      } else previous.erase(right);
++      push_action(right);
++      push_node(slot_node.at(c.id));
++      push_node(slot_node.at(right));
++    }
++    if (fits()) return result();
++  }
++  return {};
+ }
+ 
+ class RecycleBin {
+@@ -701,16 +655,18 @@ public:
+     check(capacity >= 0, "Invalid recycle capacity");
+   }
+ 
+-  Int remember(const tvm::ffi::Array<tvm::ffi::Tensor>& parts,
+-               tvm::ffi::TensorView entry_rows, const List& protected_ends, const List& stats) {
++  Int remember(const tvm::ffi::Array<tvm::ffi::Tensor> &parts,
++               tvm::ffi::TensorView entry_rows, const List &protected_ends,
++               const List &stats) {
+     if (!capacity_) {
+       return 0;
+     }
+     auto tokens = read_prefix(parts);
+     std::vector<std::array<Int, 2>> logs;
+-    for (const auto& row : read_rows(entry_rows)) {
+-      check(row.size() == 2 && row[0] >= 0 && row[0] < row[1]
+-            && row[1] <= static_cast<Int>(tokens.size()), "Invalid recycled Log range");
++    for (const auto &row : read_rows(entry_rows)) {
++      check(row.size() == 2 && row[0] >= 0 && row[0] < row[1] &&
++                row[1] <= static_cast<Int>(tokens.size()),
++            "Invalid recycled Log range");
+       logs.push_back({row[0], row[1]});
+     }
+     if (logs.empty()) {
+@@ -720,14 +676,13 @@ public:
+     std::sort(protected_values.begin(), protected_values.end());
+     logs = merge_logs({}, logs);
+     auto it = records_.lower_bound(tokens);
+-    while (it != records_.end() && it->first.size() >= tokens.size()
+-           && std::equal(tokens.begin(), tokens.end(), it->first.begin())) {
++    while (it != records_.end() && it->first.size() >= tokens.size() &&
++           std::equal(tokens.begin(), tokens.end(), it->first.begin())) {
+       if (it->first.size() == tokens.size()) {
+         ++it;
+         continue;
+       }
+-      auto& record = it->second;
+-
++      auto &record = it->second;
+ 
+       auto refreshed = merge_logs(record.logs, logs);
+       Vector ends = record.protected_ends;
+@@ -737,6 +692,8 @@ public:
+       used_ -= bytes(it->first, record);
+       ids_.erase(record.id);
+       record.logs = std::move(refreshed);
++      set_stats(record,
++                merge_owners(record.stats, Vector(stats.begin(), stats.end())));
+       record.protected_ends = std::move(ends);
+       record.id = ++serial_;
+       *record.lru = record.id;
+@@ -744,52 +701,67 @@ public:
+       used_ += bytes(it->first, record);
+       ++it;
+     }
+-    Record record{++serial_, logs, protected_values, Vector(stats.begin(), stats.end()), {}};
++    Record record{++serial_,
++                  logs,
++                  protected_values,
++                  Vector(stats.begin(), stats.end()),
++                  {}};
+     if (const auto old = records_.find(tokens); old != records_.end()) {
+       record.logs = merge_logs(old->second.logs, logs);
+       record.protected_ends.insert(record.protected_ends.end(),
+-                                  old->second.protected_ends.begin(), old->second.protected_ends.end());
++                                   old->second.protected_ends.begin(),
++                                   old->second.protected_ends.end());
+       std::sort(record.protected_ends.begin(), record.protected_ends.end());
+-      record.protected_ends.erase(std::unique(record.protected_ends.begin(), record.protected_ends.end()),
++      record.protected_ends.erase(std::unique(record.protected_ends.begin(),
++                                              record.protected_ends.end()),
+                                   record.protected_ends.end());
+-      if (record.stats.empty()) {
+-        record.stats = old->second.stats;
+-      }
++      record.stats = merge_owners(old->second.stats, record.stats);
+     }
+     if (bytes(tokens, record) > capacity_) {
++      for (size_t i = 2; i < record.stats.size(); i += 3)
++        if (!owner_refs_.contains(record.stats[i]))
++          retired_.push_back(record.stats[i]);
+       trim();
+       return 0;
+     }
+     if (const auto old = records_.find(tokens); old != records_.end()) {
+       erase(old);
+     }
+-    auto [inserted, fresh] = records_.emplace(std::move(tokens), std::move(record));
++    auto [inserted, fresh] =
++        records_.emplace(std::move(tokens), std::move(record));
+     check(fresh, "Duplicate recycled prefix");
+     lru_.push_back(inserted->second.id);
+     inserted->second.lru = std::prev(lru_.end());
+     ids_[inserted->second.id] = inserted;
++    retain(inserted->second.stats);
+     used_ += bytes(inserted->first, inserted->second);
+     trim();
+     return inserted->second.id;
+   }
+ 
+   Vector match(tvm::ffi::TensorView query, Int start, Int granularity) {
+-    check(query.ndim() == 1 && query.is_contiguous() && query.device().device_type == kDLCPU
+-          && query.dtype().code == kDLInt && (query.dtype().bits == 32 || query.dtype().bits == 64)
+-          && start >= 0 && granularity > 0, "Invalid recycle query");
++    check(query.ndim() == 1 && query.is_contiguous() &&
++              query.device().device_type == kDLCPU &&
++              query.dtype().code == kDLInt &&
++              (query.dtype().bits == 32 || query.dtype().bits == 64) &&
++              start >= 0 && granularity > 0,
++          "Invalid recycle query");
+     Vector tokens(query.size(0));
+     for (Int i = 0; i < query.size(0); ++i) {
+-      tokens[i] = query.dtype().bits == 32 ? static_cast<const int32_t*>(query.data_ptr())[i]
+-                                         : static_cast<const Int*>(query.data_ptr())[i];
++      tokens[i] = query.dtype().bits == 32
++                      ? static_cast<const int32_t *>(query.data_ptr())[i]
++                      : static_cast<const Int *>(query.data_ptr())[i];
+     }
+     auto right = records_.lower_bound(tokens);
+     auto best = records_.end();
+     Int matched = start;
+     auto consider = [&](auto candidate) {
+       const auto limit = std::min(tokens.size(), candidate->first.size());
+-      const auto pair = std::mismatch(tokens.begin(), tokens.begin() + limit, candidate->first.begin());
+-      const auto length = (pair.first - tokens.begin()) / granularity * granularity;
+-      for (const auto& log : candidate->second.logs) {
++      const auto pair = std::mismatch(tokens.begin(), tokens.begin() + limit,
++                                      candidate->first.begin());
++      const auto length =
++          (pair.first - tokens.begin()) / granularity * granularity;
++      for (const auto &log : candidate->second.logs) {
+         const auto end = std::min(length, log[1]) / granularity * granularity;
+         if (end > matched && end > log[0]) {
+           matched = end;
+@@ -799,7 +771,6 @@ public:
+       return length;
+     };
+ 
+-
+     auto left = right;
+     while (left != records_.begin()) {
+       --left;
+@@ -824,9 +795,10 @@ public:
+     check(ids_.contains(id), "Expired recycled record");
+     const auto it = ids_.at(id);
+     Rows result({List(it->first.begin(), it->first.end()),
+-                 List(it->second.protected_ends.begin(), it->second.protected_ends.end()),
++                 List(it->second.protected_ends.begin(),
++                      it->second.protected_ends.end()),
+                  List(it->second.stats.begin(), it->second.stats.end())});
+-    for (const auto& log : it->second.logs) {
++    for (const auto &log : it->second.logs) {
+       result.push_back(List(log.begin(), log.end()));
+     }
+     return result;
+@@ -846,32 +818,82 @@ public:
+ 
+   Vector usage() const { return {used_, static_cast<Int>(records_.size())}; }
+ 
++  Vector retired_owners() {
++    Vector result;
++    for (auto id : retired_)
++      if (!owner_refs_.contains(id))
++        result.push_back(id);
++    retired_.clear();
++    return result;
++  }
++
+ private:
+-  static std::vector<std::array<Int, 2>> merge_logs(
+-      std::vector<std::array<Int, 2>> logs, const std::vector<std::array<Int, 2>>& added) {
++  static Vector merge_owners(const Vector &old, const Vector &added) {
++    std::vector<std::array<Int, 3>> rows;
++    for (const auto *values : {&old, &added}) {
++      check(values->size() % 3 == 0, "Invalid recycled owner ranges");
++      for (size_t i = 0; i < values->size(); i += 3)
++        rows.push_back({(*values)[i], (*values)[i + 1], (*values)[i + 2]});
++    }
++    std::stable_sort(rows.begin(), rows.end(),
++                     [](const auto &a, const auto &b) { return a[0] < b[0]; });
++    Vector result;
++    for (auto row : rows) {
++      if (!result.empty())
++        row[0] = std::max(row[0], result[result.size() - 2]);
++      if (row[0] < row[1])
++        result.insert(result.end(), row.begin(), row.end());
++    }
++    return result;
++  }
++  void retain(const Vector &stats) {
++    for (size_t i = 2; i < stats.size(); i += 3)
++      ++owner_refs_[stats[i]];
++  }
++  void release(const Vector &stats) {
++    for (size_t i = 2; i < stats.size(); i += 3) {
++      auto it = owner_refs_.find(stats[i]);
++      check(it != owner_refs_.end(), "Missing recycled owner reference");
++      if (!--it->second) {
++        retired_.push_back(it->first);
++        owner_refs_.erase(it);
++      }
++    }
++  }
++  template <typename RecordType>
++  void set_stats(RecordType &record, Vector stats) {
++    release(record.stats);
++    retain(stats);
++    record.stats = std::move(stats);
++  }
++  static std::vector<std::array<Int, 2>>
++  merge_logs(std::vector<std::array<Int, 2>> logs,
++             const std::vector<std::array<Int, 2>> &added) {
+     logs.insert(logs.end(), added.begin(), added.end());
+     std::sort(logs.begin(), logs.end());
+     std::vector<std::array<Int, 2>> result;
+-    for (const auto& log : logs) {
++    for (const auto &log : logs) {
+       if (!result.empty() && log[0] < result.back()[1]) {
+         result.back()[1] = std::max(result.back()[1], log[1]);
+-      }
+-      else {
++      } else {
+         result.push_back(log);
+       }
+     }
+     return result;
+   }
+ 
+-  static Vector read_prefix(const tvm::ffi::Array<tvm::ffi::Tensor>& parts) {
++  static Vector read_prefix(const tvm::ffi::Array<tvm::ffi::Tensor> &parts) {
+     Vector tokens;
+-    for (const auto& part : parts) {
+-      check(part.ndim() == 1 && part.is_contiguous() && part.device().device_type == kDLCPU
+-            && part.dtype().code == kDLInt && (part.dtype().bits == 32 || part.dtype().bits == 64),
++    for (const auto &part : parts) {
++      check(part.ndim() == 1 && part.is_contiguous() &&
++                part.device().device_type == kDLCPU &&
++                part.dtype().code == kDLInt &&
++                (part.dtype().bits == 32 || part.dtype().bits == 64),
+             "Recycle tokens must be contiguous CPU int32/int64");
+       for (Int i = 0; i < part.size(0); ++i) {
+-        tokens.push_back(part.dtype().bits == 32 ? static_cast<const int32_t*>(part.data_ptr())[i]
+-                                               : static_cast<const Int*>(part.data_ptr())[i]);
++        tokens.push_back(part.dtype().bits == 32
++                             ? static_cast<const int32_t *>(part.data_ptr())[i]
++                             : static_cast<const Int *>(part.data_ptr())[i]);
+       }
+     }
+     return tokens;
+@@ -886,14 +908,15 @@ private:
+   };
+   using Records = std::map<Vector, Record>;
+ 
+-  static Int bytes(const Vector& tokens, const Record& record) {
++  static Int bytes(const Vector &tokens, const Record &record) {
+ 
+-    return 256 + 8 * tokens.size() + 16 * record.logs.size()
+-           + 8 * (record.protected_ends.size() + record.stats.size());
++    return 256 + 8 * tokens.size() + 16 * record.logs.size() +
++           8 * (record.protected_ends.size() + record.stats.size());
+   }
+ 
+   void erase(Records::iterator it) {
+     used_ -= bytes(it->first, it->second);
++    release(it->second.stats);
+     ids_.erase(it->second.id);
+     lru_.erase(it->second.lru);
+     records_.erase(it);
+@@ -906,6 +929,8 @@ private:
+   }
+ 
+   Int capacity_, used_ = 0, serial_ = 0;
++  std::unordered_map<Int, Int> owner_refs_;
++  Vector retired_;
+   Records records_;
+   std::list<Int> lru_;
+   std::unordered_map<Int, Records::iterator> ids_;
+@@ -934,6 +959,8 @@ Result make_recycle_bin(Int capacity) {
+     [bin](Int id) { bin->discard(id); }));
+   result.Set("touch", tvm::ffi::Function::FromTyped(
+     [bin](Int id) { bin->touch(id); }));
++  result.Set("retired_owners", tvm::ffi::Function::FromTyped(
++    [bin]() { const auto ids=bin->retired_owners(); return List(ids.begin(),ids.end()); }));
+   result.Set("usage", tvm::ffi::Function::FromTyped(
+     [bin]() {
+       const auto values = bin->usage();
+@@ -949,7 +976,7 @@ struct Planner {
+   }
+ 
+   static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List& counts,
+-                                 const List& config) {
++                                 const List& config, tvm::ffi::TensorView models) {
+     check(counts.size() == 6, "Invalid eviction metadata groups");
+     const auto begin = cpu_ints(packed);
+     const auto end = begin + packed.shape()[0];
+@@ -968,7 +995,7 @@ struct Planner {
+     }
+     check(cursor == end, "Unexpected eviction metadata");
+     return write_rows(plan_eviction(groups[0], groups[1], groups[2], groups[3],
+-                                    groups[4], config, groups[5]));
++                                    groups[4], config, groups[5], models));
+   }
+ 
+   static tvm::ffi::Tensor materialize(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
+@@ -976,14 +1003,6 @@ struct Planner {
+     return write_rows(plan_materialize(read_rows(paths), read_rows(boundaries), read_rows(candidates), granularity, log_count));
+   }
+ 
+-  static Result coalesce(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
+-                         tvm::ffi::TensorView locks, tvm::ffi::TensorView anchors,
+-                         Int granularity, bool diagnostics) {
+-    auto result = plan_coalesce(read_rows(paths), read_rows(boundaries), read_rows(locks),
+-                                read_rows(anchors), granularity, diagnostics);
+-    result.Set("groups", write_rows(result.at("groups").cast<Rows>()));
+-    return result;
+-  }
+ 
+ };
+ 
+@@ -991,7 +1010,6 @@ struct Planner {
+ }
+ 
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
+-TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_coalesce, logssms::Planner::coalesce);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_eviction, logssms::Planner::eviction);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_recycle_bin, logssms::make_recycle_bin);
+diff --git a/python/logssms/cache/args.py b/python/logssms/cache/args.py
+index 1f55096..e5c9742 100644
+--- a/python/logssms/cache/args.py
++++ b/python/logssms/cache/args.py
+@@ -81,8 +81,8 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
+             choices=LOG_STATE_GRANULARITIES,
+             default=LogStateCacheConfig.granularity,
+             help=(
+-                "LogState prefix-match, recovery and intermediate prefill-chunk alignment in tokens. "
+-                "The physical page size remains fixed at 64 tokens."
++                "LogState storage, prefix-match, recovery and intermediate prefill-chunk "
++                "alignment in tokens."
+             ),
+         )
+         parser.add_argument(
+@@ -91,7 +91,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
+             dest="enable_merge_adjustment",
+             default=LogStateCacheConfig.enable_merge_adjustment,
+             metavar="{true,false}",
+-            help="Adapt LogState merge intensity from online branch-hit samples (default: true). Set false for binary merging.",
++            help="Use online hit density for unified LogState eviction (default: true). Set false for Log-first, binary Checkpoint thinning.",
+         )
+         parser.add_argument(
+             "--eager-state",
+@@ -113,19 +113,17 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
+             "--min-sampling-len",
+             type=int,
+             default=LogStateCacheConfig.min_sampling_len,
+-            help="Minimum observed chain length before fitting hit density.",
++            help="Token window for hit-density samples.",
+         )
+         parser.add_argument(
+-            "--max-merge-intensity",
+-            type=int,
+-            default=LogStateCacheConfig.max_merge_intensity,
+-            help="Maximum fitted LogState merge intensity.",
++            "--max-density-exponent", type=float,
++            default=LogStateCacheConfig.max_density_exponent,
++            help="Upper bound of the fitted hit-density exponent.",
+         )
+         parser.add_argument(
+-            "--default-merge-growth-rate",
+-            type=int,
+-            default=LogStateCacheConfig.default_merge_growth_rate,
+-            help="Merge-intensity multiplier when hit density cannot be fitted.",
++            "--hit-half-life", type=int,
++            default=LogStateCacheConfig.hit_half_life,
++            help="Hit-statistics half-life in admitted requests.",
+         )
+ 
+     @staticmethod
+@@ -136,8 +134,8 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
+             enable_memorized_evict=kwargs.pop("enable_memorized_evict"),
+             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
+             min_sampling_len=kwargs.pop("min_sampling_len"),
+-            max_merge_intensity=kwargs.pop("max_merge_intensity"),
+-            default_merge_growth_rate=kwargs.pop("default_merge_growth_rate"),
++            max_density_exponent=kwargs.pop("max_density_exponent"),
++            hit_half_life=kwargs.pop("hit_half_life"),
+         )
+ 
+ 
+diff --git a/python/logssms/cache/config.py b/python/logssms/cache/config.py
+index ecdd5a8..31c2ef6 100644
+--- a/python/logssms/cache/config.py
++++ b/python/logssms/cache/config.py
+@@ -57,9 +57,9 @@ class LogStateCacheConfig(BaseCacheConfig):
+     enable_eager_state       : bool = False
+     enable_memorized_evict   : bool = True
+     enable_merge_adjustment  : bool = True
+-    min_sampling_len         : int  = 1024
+-    max_merge_intensity      : int  = 16
+-    default_merge_growth_rate: int = 2
++    min_sampling_len         : int  = 8192
++    max_density_exponent     : float = 16.0
++    hit_half_life            : int = 1024
+ 
+     def __post_init__(self) -> None:
+         if self.granularity not in LOG_STATE_GRANULARITIES:
+@@ -69,10 +69,8 @@ class LogStateCacheConfig(BaseCacheConfig):
+             )
+         if self.min_sampling_len <= 0:
+             raise ValueError("Minimum sampling length must be positive.")
+-        if self.max_merge_intensity < 2:
+-            raise ValueError("Maximum merge intensity must be at least 2.")
+-        if self.default_merge_growth_rate < 1:
+-            raise ValueError("Default merge growth rate must be at least one.")
++        if self.max_density_exponent <= 0 or self.hit_half_life <= 0:
++            raise ValueError("Density exponent limit and hit half-life must be positive.")
+ 
+     @property
+     def prefill_alignment(self) -> int:
+diff --git a/python/logssms/cache/logstate/allocator.py b/python/logssms/cache/logstate/allocator.py
+index 98a4dac..6cd6d54 100644
+--- a/python/logssms/cache/logstate/allocator.py
++++ b/python/logssms/cache/logstate/allocator.py
+@@ -70,6 +70,14 @@ class LogStateAllocator:
+         self._reclaimable_decay_frames = 0
+         self._retired_resources: dict[int, RetiredResources] = {}
+ 
++    @property
++    def materialize_log_count(self) -> int:
++        return max(
++            self.checkpoint_log_count,
++            (self.payload_frames + self.conv_frames)
++            // (self.log_payload_frames + self.num_granules * self.conv_frames) + 1,
++        )
++
+     def set_reclaimable(self, slot: int, reclaimable: bool) -> None:
+         if reclaimable == (slot in self._reclaimable_slots):
+             return
+diff --git a/python/logssms/cache/logstate/evictor.py b/python/logssms/cache/logstate/evictor.py
+index fe76ba5..56b4d21 100644
+--- a/python/logssms/cache/logstate/evictor.py
++++ b/python/logssms/cache/logstate/evictor.py
+@@ -17,8 +17,8 @@ class LogStateEvictor:
+         self,
+         tree: LogRadixTree,
+         pool: MHALogStatePool,
+-        recent_checkpoint_limit: int,
+         *,
++        analyzer,
+         profile_enabled: bool,
+         profile_stats: dict,
+         allocation_samples: list[dict],
+@@ -27,7 +27,7 @@ class LogStateEvictor:
+         self.tree = tree
+         self.pool = pool
+         self.page_size = pool.page_size
+-        self.recent_checkpoint_limit = recent_checkpoint_limit
++        self.analyzer = analyzer
+         self.cached_page_tokens: dict[int, int] = {}
+         self._allocator = pool.allocator
+         self._profile_enabled = profile_enabled
+@@ -135,7 +135,13 @@ class LogStateEvictor:
+                     profile, "retry", retry_pool_timings
+                 )
+                 stage = now
+-            assert reserved is not None, "Eviction plan did not free the projected frames"
++            assert reserved is not None, (
++                "Eviction plan did not free the projected frames: "
++                f"free={self._allocator.free_frames}, "
++                f"required={self._allocator.required_frames(needed_pages, needed_states, needed_works)}, "
++                f"kv={needed_pages}, logs={needed_states}, works={needed_works}, "
++                f"slots={len(released_slots)}, checkpoint_drops={len(checkpoint_pairs)}"
++            )
+             if self._profile_enabled:
+                 self._record_lifecycle_event({
+                     "event": "eviction",
+@@ -187,7 +193,8 @@ class LogStateEvictor:
+ 
+         allocator = self._allocator
+         leaf_limit, tail_limit = 1, 16
+-        log_only = True
++        use_models = self.analyzer.enable_merge_adjustment and self.analyzer.has_internal_observations
++        log_only = not use_models
+         while True:
+             nodes, topology = (
+                 self.tree.log_eviction_snapshot(leaf_limit, tail_limit=tail_limit)
+@@ -212,6 +219,8 @@ class LogStateEvictor:
+                     slot,
+                     len(record.payload) + sum(map(len, record.conv)),
+                     -1 if record.decay is None else record.decay.frame,
++                    self.tree.entry_for_slot(slot).begin,
++                    self.tree.entry_for_slot(slot).end,
+                 ))
+                 if record.decay is not None:
+                     decay_frames.add(record.decay.frame)
+@@ -226,8 +235,10 @@ class LogStateEvictor:
+                 (allocator.free_frames, allocator._free_decay_records,
+                  allocator.payload_frames, allocator.conv_frames, allocator.num_granules,
+                  allocator.decay_records_per_frame, needed_pages, needed_states, needed_works,
+-                 allocator.log_payload_frames, self.recent_checkpoint_limit),
++                 allocator.log_payload_frames),
+                 () if log_only else self.tree.checkpoint_eviction_actions(nodes),
++                models=(self.analyzer.eviction_models(nodes)
++                        if use_models else None),
+             )
+             if rows:
+                 selected, pages, released, compressed = rows
+diff --git a/python/logssms/cache/logstate/manager.py b/python/logssms/cache/logstate/manager.py
+index c9bbdd8..8c1bcc4 100644
+--- a/python/logssms/cache/logstate/manager.py
++++ b/python/logssms/cache/logstate/manager.py
+@@ -1,37 +1,34 @@
+ from __future__ import annotations
+ 
+ import os
+-from collections import Counter, OrderedDict, deque
++from collections import Counter, OrderedDict
+ from contextlib import contextmanager
+ from dataclasses import dataclass, field, replace
+ from time import perf_counter_ns
+ from typing import TYPE_CHECKING, Sequence
+ 
+ import torch
+-
+-from logssms.core import Request
+-from logssms.utils import align_ceil, align_down, div_ceil, init_logger
+-from logssms.utils.torch_utils import make_device_vectors
+-
+ from logssms.cache.base import BaseCacheManager, CacheResources
+-from logssms.cache.logstate.metadata import LogStateCacheMetadata
+-from logssms.cache.factory import BaseCacheFactory, CachePlan, SUPPORTED_CACHE_FACTORIES
++from logssms.cache.factory import SUPPORTED_CACHE_FACTORIES, BaseCacheFactory, CachePlan
++from logssms.cache.logstate.frame_pool import MHALogStatePool
+ from logssms.cache.logstate.layout import (
+     LOG_STATE_GRANULARITY,
+     LOG_STATE_REPLAY_WINDOW,
+     LogStateSlotLayout,
+ )
+-from logssms.cache.logstate.frame_pool import MHALogStatePool
+-from logssms.cache.prefix_cache import BaseCacheHandle, MatchResult
++from logssms.cache.logstate.metadata import LogStateCacheMetadata
+ from logssms.cache.logstate.prefix_cache import (
+-    LogStateCacheHandle,
+-    LogStateRecovery,
+     LogRadixTrace,
+     LogRadixTree,
++    LogStateCacheHandle,
+     LogStateEntry,
+     LogStateKind,
+-    LogStateMergeStats,
++    LogStateRecovery,
+ )
++from logssms.cache.prefix_cache import BaseCacheHandle, MatchResult
++from logssms.core import Request
++from logssms.utils import align_ceil, align_down, div_ceil, init_logger
++from logssms.utils.torch_utils import make_device_vectors
+ 
+ from .evictor import LogStateEvictor
+ from .online_analysis_scheduler import (
+@@ -236,7 +233,6 @@ class _RequestCacheState:
+ 
+ 
+ class LogStateCacheManager(BaseCacheManager):
+-
+     def __init__(
+         self,
+         num_pages                : int,
+@@ -247,9 +243,9 @@ class LogStateCacheManager(BaseCacheManager):
+         granularity              : int  = LOG_STATE_GRANULARITY,
+         enable_memorized_evict   : bool = True,
+         enable_merge_adjustment  : bool = True,
+-        min_sampling_len         : int  = 1024,
+-        max_merge_intensity      : int  = 16,
+-        default_merge_growth_rate: int = 2,
++        min_sampling_len         : int  = 8192,
++        max_density_exponent     : float = 16.0,
++        hit_half_life            : int = 1024,
+     ) -> None:
+         pool = resources.linear_state
+         state_table = resources.state_table
+@@ -279,13 +275,15 @@ class LogStateCacheManager(BaseCacheManager):
+         ).lower() in ("1", "true", "yes")
+         self.analyzer = OnlineAnalysisScheduler(
+             granularity=granularity,
+-            checkpoint_log_count=pool.allocator.checkpoint_log_count,
++            checkpoint_log_count=pool.allocator.materialize_log_count,
+             enable_merge_adjustment=enable_merge_adjustment,
+             min_sampling_len=min_sampling_len,
+-            max_merge_intensity=max_merge_intensity,
+-            default_merge_growth_rate=default_merge_growth_rate,
++            max_density_exponent=max_density_exponent,
++            hit_half_life=hit_half_life,
+             profile_enabled=self._profile_enabled,
+         )
++        tree.analysis_factory = self.analyzer.make_hit_stats
++        self._sampled_queries: set[int] = set()
+         self._construction = LogStateConstruction(pool)
+         self._allocator = pool.allocator
+         self.recycle_bin = (
+@@ -367,7 +365,7 @@ class LogStateCacheManager(BaseCacheManager):
+         self.evictor = LogStateEvictor(
+             tree=tree,
+             pool=pool,
+-            recent_checkpoint_limit=work_state_table.shape[0] - 1,
++            analyzer=self.analyzer,
+             profile_enabled=self._profile_enabled,
+             profile_stats=self._profile_stats,
+             allocation_samples=self._profile_allocation_samples,
+@@ -495,41 +493,38 @@ class LogStateCacheManager(BaseCacheManager):
+             assert trace is not None and handle.trace_revision == self.tree.revision
+             source_node = trace.node
+ 
+-            if trace.matched_len > 0:
+-                while source_node.merge_stats is None and len(source_node.children) == 1:
+-                    source_node = next(iter(source_node.children.values()))
+-            source = source_node.merge_stats
++            source = source_node.analysis_owner
+             if source is not None and not source.origin <= trace.matched_len <= source.tail:
+                 source = None
+             continues_chain = (
+-                source is not None and trace.is_exact and trace.node.is_leaf()
+-                and not trace.node.is_locked
++                source is not None
++                and trace.is_exact
++                and trace.node.is_leaf()
+                 and source.tail == trace.matched_len == handle.cached_len
+             )
+             match_position = (
+                 trace.matched_len if recycle_match is None else
+                 max(trace.matched_len, recycle_match.matched_len)
+             )
+-            stats = source if continues_chain else self.analyzer.make_merge_stats(match_position)
+-            intensity = source.intensity if source is not None else 2
+-            if recycle_match is not None and recycle_match.branch.merge_stats:
+-                origin, tail, intensity, next_update, *hits = recycle_match.branch.merge_stats
+-                if recycle_match.matched_len == tail == len(recycle_match.branch.tokens):
+-
+-                    stats = LogStateMergeStats(
+-                        origin, tail, intensity, deque(hits),
+-                        None if next_update < 0 else next_update,
+-                    )
++            stats = source if continues_chain else self.analyzer.make_hit_stats(match_position)
++            if recycle_match is not None and recycle_match.analysis_owner is not None:
++                recycled_owner = recycle_match.analysis_owner
++                if recycled_owner.origin <= match_position <= recycled_owner.tail:
++                    source = recycled_owner
++                if recycle_match.matched_len == recycled_owner.tail:
++                    stats = recycled_owner
+         return MatchResult(
+             replace(
+                 handle,
+-                merge_stats=stats,
+-                source_merge_stats=source,
++                analysis_owner=stats,
++                source_analysis_owner=source,
++                query_uid=req.uid,
+                 match_position=match_position,
+                 recycle_match=recycle_match,
+                 restore_plan=self._plan_recycled_restore(
+-                    handle, recycle_match, (),
+-                    intensity=intensity,
++                    handle,
++                    recycle_match,
++                    (),
+                 ),
+                 request_end=req.input_len + req.output_len,
+                 protected_endpoints=protected,
+@@ -565,24 +560,20 @@ class LogStateCacheManager(BaseCacheManager):
+         current_pins = Counter(slot for req in reqs for slot in self._recovery_pins.get(
+             id(self._pending_matches.get(req.table_idx)), (None, ()))[1])
+         blocked = {slot for slot, refs in self.tree._recovery_slot_refs.items()
+-                   if refs > current_pins[slot]}
++                   if refs > current_pins[slot] or refs > 1}
+         for req, restore in restores:
+-            branches = points.get(req.uid, ())
+             handle = self._pending_matches[req.table_idx]
+             plan = self._plan_recycled_restore(
+-                handle, handle.recycle_match, branches,
+-                intensity=restore.plan.intensity, previous=restore.plan,
+-                blocked_slots=frozenset(blocked),
++                handle, handle.recycle_match, points.get(req.uid, ()),
++                previous=restore.plan, blocked_slots=frozenset(blocked),
+             )
+             assert plan is not None
+             restore.plan = plan
+-            blocked.update(entry.slot for checkpoint in plan.checkpoints for entry in checkpoint.gpu_entries)
+-            blocked.update(slot for item in plan.gpu_materialize for slot in item.slots)
+-            blocked.update(slot for item in plan.gpu_coalesce for slot in item.slots)
+             restore.slots = {
+                 checkpoint.end: slot for checkpoint in plan.checkpoints
+                 if (slot := self._checkpoint_output_slot(checkpoint)) is not None
+             }
++            blocked.update(entry.slot for entry in handle.match_entries)
+ 
+     def _checkpoint_output_slot(self, checkpoint: RecycledCheckpoint) -> int | None:
+         for entry in reversed(checkpoint.gpu_entries):
+@@ -601,7 +592,6 @@ class LogStateCacheManager(BaseCacheManager):
+         match        : RecycledMatch | None,
+         batch_branches: Sequence[int],
+         *,
+-        intensity    : int = 2,
+         previous     : RecycledRestorePlan | None = None,
+         blocked_slots: frozenset[int] = frozenset(),
+     ) -> RecycledRestorePlan | None:
+@@ -638,6 +628,31 @@ class LogStateCacheManager(BaseCacheManager):
+             pieces.extend((left, left + self.granularity, None, True)
+                           for left in range(begin, end, self.granularity))
+         pieces.sort(key=lambda item: (item[0], item[1]))
++        piece_owners = [
++            self.tree.entry_owner(entry).analysis_owner
++            if entry is not None
++            else next(
++                (
++                    log.analysis_owner
++                    for log in match.branch.logs
++                    if log.begin <= begin and end <= log.end
++                ),
++                None,
++            )
++            for begin, end, entry, _ in pieces
++        ]
++        boundaries = tuple(
++            sorted(
++                {
++                    *boundaries,
++                    *(
++                        pieces[i][0]
++                        for i in range(1, len(pieces))
++                        if piece_owners[i] is not piece_owners[i - 1]
++                    ),
++                }
++            )
++        )
+         rows = [value for index, (begin, end, entry, eligible) in enumerate(pieces)
+                 for value in (index, begin, end,
+                               entry.span_granules if entry is not None and entry.kind is LogStateKind.CHECKPOINT else -1,
+@@ -645,49 +660,31 @@ class LogStateCacheManager(BaseCacheManager):
+         candidates = [(0, index, int(entry is not None)) for index, (_, _, entry, eligible) in enumerate(pieces)
+                       if eligible and (entry is None or entry.kind is LogStateKind.LOG)]
+         materialize = planning.plan_materialize(
+-            [rows], [boundaries], candidates, self.granularity, self._allocator.checkpoint_log_count,
+-        )
+-        virtual = [(pieces[index][0], pieces[index][1], (index,), False)
+-                   for index, (_, _, entry, _) in enumerate(pieces)
+-                   if entry is not None and entry.kind is LogStateKind.CHECKPOINT]
+-        virtual.extend((pieces[candidates[group[0]][1]][0], pieces[candidates[group[-1]][1]][1],
+-                        tuple(candidates[index][1] for index in group), True)
+-                       for group in materialize)
+-        virtual.sort(key=lambda item: (item[0], item[1]))
+-        projected = [value for index, (begin, end, indices, _) in enumerate(virtual)
+-                     for value in (index, begin, end, (end - begin) // self.granularity,
+-                                   int(all(pieces[i][3] for i in indices)))]
+-        groups, _ = planning.plan_coalesce(
+-            [projected], [boundaries], [lock_boundaries],
+-            [(0, match.matched_len, intensity, int(self.enable_merge_adjustment))],
+-            self.granularity, False,
+-        )
+-        consumed = set()
+-        checkpoints, gpu_materialize, gpu_coalesce = [], [], []
+-        for group in groups:
+-            virtual_indices = group[3::2]
+-            consumed.update(virtual_indices)
+-            indices = tuple(index for i in virtual_indices for index in virtual[i][2])
+-            entries = tuple(pieces[index][2] for index in indices if pieces[index][2] is not None)
+-            if len(entries) == len(indices):
+-                gpu_coalesce.append(CheckpointCoalesce(
+-                    tuple(entry.slot for entry in entries),
+-                    tuple(entry.span_granules if entry.kind is LogStateKind.CHECKPOINT else 1 for entry in entries),
+-                    group[0], group[1], group[2],
+-                ))
+-            else:
+-                checkpoints.append(RecycledCheckpoint(group[0], group[1], entries))
+-        for index, (begin, end, indices, is_materialize) in enumerate(virtual):
+-            if index in consumed or not is_materialize:
+-                continue
++            [rows], [boundaries], candidates, self.granularity, self._allocator.materialize_log_count,
++        )
++        materialize = [group for group in materialize if (
++            sum(
++                (len(self._allocator.slot(pieces[candidates[index][1]][2].slot).payload)
++                 + sum(map(len, self._allocator.slot(pieces[candidates[index][1]][2].slot).conv)))
++                if pieces[candidates[index][1]][2] is not None else
++                self._allocator.log_payload_frames + self._allocator.num_granules * self._allocator.conv_frames
++                for index in group
++            ) > self._allocator.payload_frames + self._allocator.conv_frames
++        )]
++        checkpoints, gpu_materialize = [], []
++        for group in materialize:
++            indices = tuple(candidates[index][1] for index in group)
++            begin, end = pieces[indices[0]][0], pieces[indices[-1]][1]
+             entries = tuple(pieces[i][2] for i in indices if pieces[i][2] is not None)
+             if len(entries) == len(indices):
+-                gpu_materialize.append(MaterializeCandidate(tuple(entry.slot for entry in entries), begin, end))
++                gpu_materialize.append(MaterializeCandidate(
++                    tuple(entry.slot for entry in entries), begin, end,
++                ))
+             else:
+                 checkpoints.append(RecycledCheckpoint(begin, end, entries))
+         return RecycledRestorePlan(
+-            cached_len, match.matched_len, tuple(sorted(checkpoints, key=lambda item: item.end)),
+-            protected, tuple(gpu_materialize), tuple(gpu_coalesce), intensity, lock_boundaries,
++            cached_len, match.matched_len, tuple(checkpoints), protected,
++            tuple(gpu_materialize), (), lock_boundaries,
+         )
+ 
+     @property
+@@ -773,18 +770,6 @@ class LogStateCacheManager(BaseCacheManager):
+             for entry in checkpoint.gpu_entries
+         ):
+             return False
+-        if self.enable_merge_adjustment:
+-            assert isinstance(handle, LogStateCacheHandle)
+-            stats = handle.merge_stats
+-            if stats is not None and stats is handle.source_merge_stats and (
+-                handle.node.merge_stats is not stats
+-                or not handle.node.is_leaf() or handle.node.is_locked
+-                or handle.node.depth != stats.tail
+-            ):
+-
+-                if self._profile_enabled:
+-                    self._profile_stats["admission_rejections"] += 1
+-                return False
+         with self.record_schedule_step("capacity_before_lock"):
+             available = self.admission_capacity
+         if self._allocator.free_frames < total_len <= available:
+@@ -812,9 +797,9 @@ class LogStateCacheManager(BaseCacheManager):
+         if not self.enable_merge_adjustment:
+             return True
+         assert isinstance(handle, LogStateCacheHandle)
+-        self.analyzer.record_hit(
+-            handle.source_merge_stats, handle.match_position
+-        )
++        if handle.query_uid not in self._sampled_queries:
++            self._sampled_queries.add(handle.query_uid)
++            self.analyzer.record_hit(handle.source_analysis_owner, handle.match_position)
+         return True
+ 
+     @staticmethod
+@@ -1010,7 +995,7 @@ class LogStateCacheManager(BaseCacheManager):
+                 "decay_records_per_frame": self._allocator.decay_records_per_frame,
+             },
+             "aggregate": stats,
+-            "online_merge": self.analyzer.profile_result(),
++            "online_analysis": self.analyzer.profile_result(),
+             "match_samples": self._match_profile_samples,
+             "prefill_batches": self._profile_samples,
+             "cache_req_samples": self._cache_req_samples,
+@@ -1294,16 +1279,14 @@ class LogStateCacheManager(BaseCacheManager):
+             restore = self._recycled_restores.get(req.table_idx)
+             handle = req.cache_handle
+             cached_entries = ()
+-            merge_stats = None
++            analysis_owner = None
+             if isinstance(handle, LogStateCacheHandle):
+-                owner = handle.source_merge_stats
++                owner = handle.source_analysis_owner
+                 if owner is not None:
+-                    merge_stats = {
++                    analysis_owner = {
+                         "origin": owner.origin,
+                         "tail": owner.tail,
+-                        "intensity": owner.intensity,
+-                        "queued_hits": len(owner.hit_positions),
+-                        "next_update_tail": owner.next_update_tail,
++                        "queued_hits": len(owner.hits),
+                     }
+                 cached_entries = tuple(
+                     entry
+@@ -1311,44 +1294,59 @@ class LogStateCacheManager(BaseCacheManager):
+                     for entry in node.entries
+                     if entry.end <= handle.cached_len
+                 )
+-            result.append({
+-                "uid": req.uid,
+-                "protected_restore_positions": (
+-                    list(handle.protected_endpoints) if isinstance(handle, LogStateCacheHandle) else []
+-                ),
+-                "cached_len": req.cached_len,
+-                "device_len": req.device_len,
+-                "source_merge_stats": merge_stats,
+-                "recycle_restore_plan": None if restore is None else {
+-                    "gpu_hit": restore.plan.cached_len,
+-                    "cpu_hit": restore.plan.matched_len,
+-                    "checkpoints": [
+-                        {"begin": checkpoint.begin, "end": checkpoint.end,
+-                         "reuse_slot": checkpoint.gpu_entries[-1].slot if checkpoint.gpu_entries else None}
+-                        for checkpoint in restore.plan.checkpoints
+-                    ],
+-                },
+-                "recovery_log_slots": (
+-                    0 if recovery is None else len(recovery.logs)
+-                ),
+-                "recovery_has_checkpoint": bool(
+-                    recovery is not None
+-                    and recovery.base_checkpoint_slot is not None
+-                ),
+-                "cached_log_slots": len({
+-                    entry.slot for entry in cached_entries
+-                    if entry.kind is LogStateKind.LOG
+-                }),
+-                "cached_checkpoint_slots": len({
+-                    entry.slot for entry in cached_entries
+-                    if entry.kind is LogStateKind.CHECKPOINT
+-                }),
+-                "cached_checkpoint_span_granules": dict(sorted(Counter(
+-                    entry.span_granules for entry in cached_entries
+-                    if entry.kind is LogStateKind.CHECKPOINT
+-                ).items())),
+-                "live_log_granules": len(live),
+-            })
++            result.append(
++                {
++                    "uid": req.uid,
++                    "protected_restore_positions": (
++                        list(handle.protected_endpoints)
++                        if isinstance(handle, LogStateCacheHandle)
++                        else []
++                    ),
++                    "cached_len": req.cached_len,
++                    "device_len": req.device_len,
++                    "source_analysis_owner": analysis_owner,
++                    "recycle_restore_plan": None
++                    if restore is None
++                    else {
++                        "gpu_hit": restore.plan.cached_len,
++                        "cpu_hit": restore.plan.matched_len,
++                        "checkpoints": [
++                            {
++                                "begin": checkpoint.begin,
++                                "end": checkpoint.end,
++                                "reuse_slot": checkpoint.gpu_entries[-1].slot
++                                if checkpoint.gpu_entries
++                                else None,
++                            }
++                            for checkpoint in restore.plan.checkpoints
++                        ],
++                    },
++                    "recovery_log_slots": (0 if recovery is None else len(recovery.logs)),
++                    "recovery_has_checkpoint": bool(
++                        recovery is not None and recovery.base_checkpoint_slot is not None
++                    ),
++                    "cached_log_slots": len(
++                        {entry.slot for entry in cached_entries if entry.kind is LogStateKind.LOG}
++                    ),
++                    "cached_checkpoint_slots": len(
++                        {
++                            entry.slot
++                            for entry in cached_entries
++                            if entry.kind is LogStateKind.CHECKPOINT
++                        }
++                    ),
++                    "cached_checkpoint_span_granules": dict(
++                        sorted(
++                            Counter(
++                                entry.span_granules
++                                for entry in cached_entries
++                                if entry.kind is LogStateKind.CHECKPOINT
++                            ).items()
++                        )
++                    ),
++                    "live_log_granules": len(live),
++                }
++            )
+         return result
+ 
+     def prepare_batch(self, batch: Batch) -> None:
+@@ -1453,7 +1451,7 @@ class LogStateCacheManager(BaseCacheManager):
+         )
+         blocked |= frozenset(
+             slot for slot, refs in self.tree._recovery_slot_refs.items()
+-            if refs > current_pins[slot]
++            if refs > current_pins[slot] or refs > 1
+         )
+         if analysis_step_timing_ms is not None:
+             analysis_step_timing_ms["recycle_filter_ms"] = (
+@@ -1470,6 +1468,10 @@ class LogStateCacheManager(BaseCacheManager):
+             traces=traces,
+             pending=pending,
+         )
++        plan = replace(plan, materialize=tuple(
++            item for item in plan.materialize
++            if self._allocator.checkpoint_frame_savings(item.slots) > 0
++        ))
+         if recycled:
+             plan = replace(
+                 plan,
+@@ -1690,8 +1692,11 @@ class LogStateCacheManager(BaseCacheManager):
+             req.input_ids[: req.cached_len],
+             self.page_table[req.table_idx, : req.cached_len],
+             cache_len=insert_len,
+-            kv_frame_spans=((granule.begin, committed_ends[granule], granule.kv_offset // self.page_size)
+-                           for granule in full_pages),
++            analysis_owner=old_handle.analysis_owner,
++            kv_frame_spans=(
++                (granule.begin, committed_ends[granule], granule.kv_offset // self.page_size)
++                for granule in full_pages
++            ),
+         )
+         tree_insert_ms = (
+             (perf_counter_ns() - stage_start) / 1e6
+@@ -1792,23 +1797,52 @@ class LogStateCacheManager(BaseCacheManager):
+                     self.tree.protect_at(node, position)
+ 
+         merge_stats_start = perf_counter_ns() if self._profile_enabled else 0
+-        stats = old_handle.merge_stats
++        if restore is not None and old_handle.recycle_match is not None:
++            match = old_handle.recycle_match
++            bindings = [
++                (
++                    max(log.begin, insert.previous_len),
++                    min(log.end, insert.inserted_len, match.matched_len),
++                    log.analysis_owner,
++                )
++                for log in match.branch.logs
++            ]
++            if (
++                old_handle.analysis_owner is not None
++                and old_handle.analysis_owner.origin == match.matched_len
++            ):
++                bindings.append((
++                    max(match.matched_len, insert.previous_len),
++                    insert.inserted_len,
++                    old_handle.analysis_owner,
++                ))
++            owner_runs = []
++            for begin, end, owner in bindings:
++                if owner is None or begin >= end:
++                    continue
++                if owner_runs and owner_runs[-1][1] == begin and owner_runs[-1][2] is owner:
++                    owner_runs[-1] = (owner_runs[-1][0], end, owner)
++                else:
++                    owner_runs.append((begin, end, owner))
++            for begin, end, owner in owner_runs:
++                endpoint = self.tree._node_at_depth(insert.node, end)
++                if begin > 0:
++                    self.tree._node_at_depth(endpoint, begin)
++                node = endpoint
++                while not node.is_root() and node.depth > begin:
++                    assert begin <= node.begin and node.depth <= end
++                    node.analysis_owner = owner
++                    node = node.parent
++        stats = insert.node.analysis_owner
+         if stats is not None:
+-            self.analyzer.advance_merge_stats(
+-                stats, insert.inserted_len, owner_uuid=insert.node.uuid,
+-            )
+-            if insert.previous_len < insert.inserted_len:
+-                if old_handle.node.merge_stats is stats:
+-                    old_handle.node.merge_stats = None
+-                assert insert.node.merge_stats in (None, stats)
+-                insert.node.merge_stats = stats
+-        merge_stats_ms = (
++            self.analyzer.advance_hit_stats(stats, insert.inserted_len, owner_uuid=stats.uuid)
++        hit_stats_ms = (
+             (perf_counter_ns() - merge_stats_start) / 1e6
+             if self._profile_enabled else 0.0
+         )
+         new_handle = replace(
+             self.tree.make_handle(insert.node, insert.inserted_len),
+-            merge_stats=stats,
++            analysis_owner=stats,
+             protected_endpoints=tuple(sorted(protected_endpoints)),
+         )
+         self.unlock(old_handle)
+@@ -1854,6 +1888,7 @@ class LogStateCacheManager(BaseCacheManager):
+                 self._prefill_protection_key = ()
+                 self._prefill_protections = None
+             self._protected_prefixes.pop(req.uid, None)
++            self._sampled_queries.discard(req.uid)
+             recycled = request_state.recycle_match
+             request_state.recycle_match = None
+             if (
+@@ -1904,7 +1939,7 @@ class LogStateCacheManager(BaseCacheManager):
+                 "tree_insert_ms": tree_insert_ms,
+                 "tree_match_ms": tree_match_ms,
+                 "retain_kv_ms": retain_kv_ms,
+-                "merge_stats_ms": merge_stats_ms,
++                "hit_stats_ms": hit_stats_ms,
+                 "mapping_update_ms": mapping_update_ms,
+                 "work_slot_lookup_ms": work_slot_lookup_ms,
+                 "conv_copy_ms": conv_copy_ms,
+@@ -2062,7 +2097,7 @@ class LogStateCacheManager(BaseCacheManager):
+                 if self._allocator.checkpoint_frame_capacity(group.slots) < self._allocator.payload_frames:
+                     skips["insufficient_group_frames"] += 1
+                     continue
+-                if self._allocator.checkpoint_frame_savings(group.slots) < 0:
++                if self._allocator.checkpoint_frame_savings(group.slots) <= 0:
+                     skips["no_memory_gain"] += 1
+                     continue
+                 recovery = self.tree.recovery_at(self.tree.entry_owner(right), right.end)
+@@ -2276,7 +2311,6 @@ class LogStateCacheManager(BaseCacheManager):
+ 
+ 
+ class LogStateCacheFactory(BaseCacheFactory):
+-
+     def plan(
+         self,
+         config            : EngineConfig,
+@@ -2309,8 +2343,8 @@ class LogStateCacheFactory(BaseCacheFactory):
+             * config.dtype.itemsize
+             * config.model_config.num_attention_layers
+         )
+-        from logssms.models.config import AffineLogCacheSpec
+         from logssms.cache.factory import make_linear_cache_spec
++        from logssms.models.config import AffineLogCacheSpec
+ 
+         spec = make_linear_cache_spec(config.model_config)
+         if not isinstance(spec, AffineLogCacheSpec):
+@@ -2470,12 +2504,11 @@ class LogStateCacheFactory(BaseCacheFactory):
+                 config.cache_config.enable_merge_adjustment
+             ),
+             min_sampling_len=config.cache_config.min_sampling_len,
+-            max_merge_intensity=config.cache_config.max_merge_intensity,
+-            default_merge_growth_rate=(
+-                config.cache_config.default_merge_growth_rate
+-            ),
++            max_density_exponent=config.cache_config.max_density_exponent,
++            hit_half_life=config.cache_config.hit_half_life,
+         )
+ 
++
+ SUPPORTED_CACHE_FACTORIES.register("logstate")(LogStateCacheFactory())
+ 
+ __all__ = [
+diff --git a/python/logssms/cache/logstate/online_analysis_scheduler.py b/python/logssms/cache/logstate/online_analysis_scheduler.py
+index 49444ed..3695b8b 100644
+--- a/python/logssms/cache/logstate/online_analysis_scheduler.py
++++ b/python/logssms/cache/logstate/online_analysis_scheduler.py
+@@ -5,14 +5,19 @@ from collections import Counter, deque
+ from dataclasses import dataclass, replace
+ from time import perf_counter_ns
+ from typing import Sequence
++from weakref import WeakSet, WeakValueDictionary
+ 
+ import torch
+-
+ from logssms.utils import align_down
++
+ from .layout import LOG_STATE_GRANULARITY
+ from .prefix_cache import (
+-    LogRadixTrace, LogRadixTree, LogRadixTreeNode,
+-    LogStateEntry, LogStateKind, LogStateMergeStats,
++    LogRadixTrace,
++    LogRadixTree,
++    LogRadixTreeNode,
++    LogStateEntry,
++    LogStateKind,
++    LogStateHitStats,
+ )
+ 
+ 
+@@ -64,10 +69,10 @@ class MaterializeCandidate:
+ 
+ @dataclass(frozen=True)
+ class CheckpointCoalesce:
+-    slots        : tuple[int, ...]
++    slots: tuple[int, ...]
+     source_spans : tuple[int, ...]
+-    begin        : int
+-    end          : int
++    begin: int
++    end  : int
+     next_span    : int
+ 
+     @property
+@@ -84,12 +89,12 @@ class LogStatePlan:
+     protections      : tuple[BranchProtection, ...]
+     materialize      : tuple[MaterializeCandidate, ...]
+     coalesce         : tuple[CheckpointCoalesce, ...]
+-    merge_diagnostics: tuple[tuple[str, int], ...] = ()
++    merge_diagnostics: tuple[tuple[str, int | float], ...] = ()
+ 
+ 
+ @dataclass(frozen=True)
+ class _AnalysisEndpoint:
+-    node       : LogRadixTreeNode
++    node           : LogRadixTreeNode
+     matched_len: int
+ 
+ 
+@@ -101,205 +106,229 @@ class _PendingProtection:
+ 
+ 
+ class OnlineAnalysisScheduler:
+-
+     def __init__(
+         self,
+-        granularity              : int = LOG_STATE_GRANULARITY,
+-        checkpoint_log_count     : int = 1,
+-        enable_merge_adjustment  : bool = True,
+-        min_sampling_len         : int  = 1024,
+-        max_merge_intensity      : int  = 16,
+-        default_merge_growth_rate: int = 2,
+-        profile_enabled          : bool = False,
++        granularity: int = LOG_STATE_GRANULARITY,
++        checkpoint_log_count: int = 1,
++        enable_merge_adjustment: bool = True,
++        min_sampling_len: int = 8192,
++        max_density_exponent: float = 16.0,
++        hit_half_life: int = 1024,
++        profile_enabled: bool = False,
+     ) -> None:
+         assert granularity > 0 and checkpoint_log_count > 0
+-        assert min_sampling_len > 0
+-        assert max_merge_intensity >= 2
+-        assert default_merge_growth_rate >= 1
++        assert min_sampling_len > 0 and max_density_exponent > 0 and hit_half_life > 0
+         self.checkpoint_log_count = checkpoint_log_count
+         self.granularity = granularity
+         self.enable_merge_adjustment = enable_merge_adjustment
+         self.min_sampling_len = min_sampling_len
+-        self.max_merge_intensity = max_merge_intensity
+-        self.default_merge_growth_rate = default_merge_growth_rate
+-        self._merge_profile = (
+-            {"aggregate": Counter(), "timing_ms": Counter(),
+-             "updates": deque(maxlen=8192)}
++        self.max_density_exponent = max_density_exponent
++        self.hit_half_life = hit_half_life
++        self.query_count = 0
++        self._owners: WeakValueDictionary[int, LogStateHitStats] = WeakValueDictionary()
++        self._internal_owners: WeakSet[LogStateHitStats] = WeakSet()
++        self._observations = self._owned_hits = self._tail_hits = 0.0
++        self._analysis_profile = (
++            {"aggregate": Counter(), "updates": deque(maxlen=8192)}
+             if profile_enabled else None
+         )
+ 
+     def profile_result(self) -> dict | None:
+-        profile = self._merge_profile
+-        if profile is None:
++        if self._analysis_profile is None:
+             return None
+-        return {
+-            "enabled": self.enable_merge_adjustment,
+-            "min_sampling_len": self.min_sampling_len,
+-            "max_merge_intensity": self.max_merge_intensity,
+-            "default_merge_growth_rate": self.default_merge_growth_rate,
+-            "aggregate": dict(profile["aggregate"]),
+-            "timing_ms": dict(profile["timing_ms"]),
+-            "updates": list(profile["updates"]),
+-            "dropped_updates": max(
+-                0, profile["aggregate"]["interval_updates"] - len(profile["updates"])
++        return dict(
++            enabled=self.enable_merge_adjustment,
++            min_sampling_len=self.min_sampling_len,
++            hit_half_life=self.hit_half_life,
++            max_density_exponent=self.max_density_exponent,
++            queries=self.query_count,
++            aggregate=dict(self._analysis_profile["aggregate"]),
++            updates=list(self._analysis_profile["updates"]),
++            dropped_updates=max(
++                0, self._analysis_profile["aggregate"]["model_updates"]
++                - len(self._analysis_profile["updates"]),
+             ),
+-        }
++        )
+ 
+-    def make_merge_stats(self, origin: int) -> LogStateMergeStats | None:
++    @property
++    def has_internal_observations(self) -> bool:
++        return bool(self._internal_owners)
++
++    def make_hit_stats(self, origin: int) -> LogStateHitStats | None:
+         if not self.enable_merge_adjustment:
+             return None
+-        if self._merge_profile is not None:
+-            self._merge_profile["aggregate"]["owners_created"] += 1
+-        return LogStateMergeStats(
+-            origin=origin, tail=origin,
+-            next_update_tail=origin + self.min_sampling_len,
+-        )
++        stats = LogStateHitStats(origin=origin, tail=origin,
++                                query_begin=self.query_count,
++                                exposures=deque([(origin, self.query_count)]))
++        return stats
++
++    def record_hit(self, stats: LogStateHitStats | None, position: int) -> None:
++        self.query_count += 1
++        decay = math.exp2(-1 / self.hit_half_life)
++        self._observations = self._observations * decay + 1
++        self._owned_hits *= decay
++        self._tail_hits *= decay
++        if stats is not None and 0 < position and stats.origin <= position <= stats.tail:
++            self._owned_hits += 1
++            self._tail_hits += position == stats.tail
++            stats.hits.append((position, stats.tail, self.query_count))
++            if 0 < stats.tail - position <= self.min_sampling_len:
++                self._internal_owners.add(stats)
++            if len(stats.hits) == stats.hits.maxlen:
++                stats.query_begin = max(stats.query_begin, stats.hits[0][2] - 1)
++
++    def _prior(self) -> tuple[float, float]:
++        probability = ((self._owned_hits + 1) / (self._observations + 2)
++                       / max(1, len(self._owners)))
++        tail_fraction = (self._tail_hits + 1) / (self._owned_hits + 2)
++        return probability * (1 - tail_fraction), probability * tail_fraction
++
++    def _weight(self, query: int) -> float:
++        return math.exp2(-(self.query_count - query) / self.hit_half_life)
++
++    def _exposure(self, begin: int, end: int) -> float:
++        if end <= begin:
++            return 0.0
++        rate = math.log(2) / self.hit_half_life
++        return self._weight(end) * (-math.expm1(-rate * (end - begin))) / (-math.expm1(-rate))
++
++    def _bucket_exposures(self, stats: LogStateHitStats) -> list[float]:
++        count = min(self.min_sampling_len, stats.tail - stats.origin) // self.granularity
++        result = [0.0] * count
++        events = list(stats.exposures) or [(stats.tail, stats.query_begin)]
++        for i, (tail, begin) in enumerate(events):
++            end = events[i + 1][1] if i + 1 < len(events) else self.query_count
++            exposure = self._exposure(max(begin, stats.query_begin), end)
++            available = min(count, max(0, tail - stats.origin) // self.granularity)
++            for j in range(available):
++                result[j] += exposure
++        return result
+ 
+-    def record_hit(self, stats: LogStateMergeStats | None, position: int) -> None:
+-        profile = self._merge_profile
+-        start = perf_counter_ns() if profile is not None else 0
+-        if stats is None:
+-            outcome = "hits_without_owner"
+-        elif position <= 0:
+-            outcome = "hits_without_prefix"
+-        elif position < stats.origin:
+-            outcome = "hits_before_origin"
+-        elif position > stats.tail:
+-            outcome = "hits_after_tail"
+-        else:
+-            stats.hit_positions.append(position)
+-            outcome = "hits_recorded"
+-        if profile is not None:
+-            profile["aggregate"]["hit_attempts"] += 1
+-            profile["aggregate"][outcome] += 1
+-            profile["timing_ms"]["record_hit_ms"] += (
+-                perf_counter_ns() - start
+-            ) / 1e6
++    def _fit_hit_bins(
++        self, bins: dict[int, float], bucket_exposures: Sequence[float],
++    ) -> tuple[float, float]:
++        g = self.granularity
++        support = [(math.log((i + 1) * g), e * g)
++                   for i, e in enumerate(bucket_exposures) if e > 0]
++        total = sum(bins.values())
++        prior_mass = sum(g * ((i + 1) * g) ** -2 for i in range(max(1, len(bucket_exposures))))
++        internal_prior, _ = self._prior()
++        alpha, beta = 4.0 * internal_prior, 4.0 * prior_mass
++        if not support:
++            return 2.0, math.log(alpha / beta)
++        observed = sum(c * math.log((i + 1) * g) for i, c in bins.items())
++
++        def terms(k):
++            values = [e * math.exp(-k * x) for x, e in support]
++            return sum(values), sum(v * x for v, (x, _) in zip(values, support))
++
++        exponent = 2.0
++        if total:
++            lo, hi = 0.0, self.max_density_exponent
++            for _ in range(40):
++                mid = (lo + hi) / 2
++                mass, moment = terms(mid)
++                derivative = (total + alpha) * moment / (mass + beta) - observed - (mid - 2.0)
++                if derivative > 0:
++                    lo = mid
++                else:
++                    hi = mid
++                if hi - lo < 1e-6:
++                    break
++            exponent = (lo + hi) / 2
++        mass, _ = terms(exponent)
++        return exponent, math.log((total + alpha) / (mass + beta))
++
++    def refresh_models(self, owners: Sequence[LogStateHitStats | None]) -> None:
++        for owner in owners:
++            if owner is not None and owner.tail > owner.origin:
++                self._owners[owner.uuid] = owner
++        for stats in {id(owner): owner for owner in owners if owner is not None}.values():
++            if stats.fit_query == self.query_count:
++                continue
++            bins = Counter()
++            tail_hits = 0.0
++            latest_internal = -1
++            for position, tail, query in stats.hits:
++                distance = tail - position
++                weight = self._weight(query)
++                if distance == 0:
++                    tail_hits += weight
++                elif distance <= self.min_sampling_len:
++                    bins[(distance - 1) // self.granularity] += weight
++                    latest_internal = max(latest_internal, query)
++            exposures = self._bucket_exposures(stats)
++            refit = (
++                stats.log_amplitude is None
++                or stats.fit_query < 0
++                or latest_internal != stats.fitted_hit_query
++                or self.query_count - stats.exponent_query >= self.hit_half_life
++            )
++            if refit:
++                stats.exponent, stats.log_amplitude = self._fit_hit_bins(bins, exposures)
++                stats.fitted_hit_query = latest_internal
++                stats.exponent_query = self.query_count
++            else:
++                g = self.granularity
++                internal_prior, _ = self._prior()
++                beta = 4 * sum(g * ((i + 1) * g) ** -2 for i in range(max(1, len(exposures))))
++                mass = sum(e * g * ((i + 1) * g) ** -stats.exponent
++                           for i, e in enumerate(exposures))
++                stats.log_amplitude = math.log((sum(bins.values()) + 4 * internal_prior) / (mass + beta))
++            first_tail_query = next(
++                (query for tail, query in stats.exposures if tail > stats.origin),
++                self.query_count,
++            )
++            exposure = self._exposure(max(stats.query_begin, first_tail_query), self.query_count)
++            _, tail_prior = self._prior()
++            stats.tail_probability = min(1.0, (tail_hits + 4 * tail_prior) / (exposure + 4.0))
++            stats.fit_query = self.query_count
++            if self._analysis_profile is not None:
++                self._analysis_profile["aggregate"]["model_updates"] += 1
++                self._analysis_profile["aggregate"]["exponent_fits"] += int(refit and bool(bins))
++                self._analysis_profile["updates"].append(dict(
++                    owner_uuid=stats.uuid, query=self.query_count, exponent=stats.exponent,
++                    log_amplitude=stats.log_amplitude, tail_probability=stats.tail_probability,
++                    weighted_internal_hits=sum(bins.values()), exposure=exposure,
++                ))
+ 
+-    def advance_merge_stats(
+-        self,
+-        stats: LogStateMergeStats,
+-        tail : int,
+-        *,
+-        owner_uuid: int | None = None,
+-    ) -> None:
++    def advance_hit_stats(self, stats: LogStateHitStats, tail: int, **_) -> None:
++        if tail > stats.origin:
++            self._owners[stats.uuid] = stats
+         if tail <= stats.tail:
+             return
+-        profile = self._merge_profile
+-        start = perf_counter_ns() if profile is not None else 0
+-        updates = 0
+-        boundary = stats.next_update_tail
+-        if boundary is None:
+-            boundary = stats.origin + self.min_sampling_len
+-        while boundary <= tail:
+-            previous_intensity = stats.intensity
+-            details = {} if profile is not None else None
+-            sample_start = perf_counter_ns() if profile is not None else 0
+-            queued_hits = len(stats.hit_positions) if profile is not None else 0
+-            bins = {}
+-            remaining = deque()
+-            window_begin = boundary - self.min_sampling_len
+-            for position in stats.hit_positions:
+-                if position >= boundary:
+-                    remaining.append(position)
+-                elif position >= window_begin:
+-                    distance = max(self.granularity, boundary - position)
+-                    index = (distance - 1) // self.granularity
+-                    bins[index] = bins.get(index, 0) + 1
+-            stats.hit_positions = remaining
+-            sample_ms = (perf_counter_ns() - sample_start) / 1e6 if profile is not None else 0.0
+-            fit_start = perf_counter_ns() if profile is not None else 0
+-            fitted = self._fit_hit_bins(bins, details)
+-            fit_ms = (perf_counter_ns() - fit_start) / 1e6 if profile is not None else 0.0
+-            stats.intensity = (
+-                fitted if fitted is not None else
+-                min(
+-                    self.max_merge_intensity,
+-                    stats.intensity * self.default_merge_growth_rate,
+-                )
+-            )
+-            if profile is not None:
+-                assert details is not None
+-                counts = profile["aggregate"]
+-                counts["interval_updates"] += 1
+-                counts["fit_updates" if fitted is not None else "fallback_updates"] += 1
+-                counts[details["reason"]] += 1
+-                counts["sampled_hits"] += details["sampled_hits"]
+-                counts["retired_hits"] += queued_hits - len(stats.hit_positions)
+-                counts["intensity_changes"] += int(stats.intensity != previous_intensity)
+-                profile["timing_ms"]["fit_ms"] += fit_ms
+-                profile["timing_ms"]["sample_and_retire_ms"] += sample_ms
+-                profile["updates"].append({
+-                    "owner_uuid": owner_uuid,
+-                    "origin": stats.origin,
+-                    "tail_before": stats.tail,
+-                    "tail_after": tail,
+-                    "window_begin": boundary - self.min_sampling_len,
+-                    "window_end": boundary,
+-                    "queued_hits_before": queued_hits,
+-                    "queued_hits_after": len(stats.hit_positions),
+-                    "previous_intensity": previous_intensity,
+-                    "intensity": stats.intensity,
+-                    "fit_ms": fit_ms,
+-                    "sample_and_retire_ms": sample_ms,
+-                    **details,
+-                })
+-            updates += 1
+-            boundary += self.min_sampling_len
+-        stats.next_update_tail = boundary
++        stats.exposures.append((tail, self.query_count))
++        while len(stats.exposures) > 1 and stats.exposures[1][0] <= tail - self.min_sampling_len:
++            stats.exposures.popleft()
++            stats.query_begin = max(stats.query_begin, stats.exposures[0][1])
++        stats.hits = deque((hit for hit in stats.hits
++                            if hit[1] >= tail - self.min_sampling_len and hit[2] > stats.query_begin),
++                           maxlen=8192)
++        if not any(0 < past_tail - position <= self.min_sampling_len
++                   for position, past_tail, _ in stats.hits):
++            self._internal_owners.discard(stats)
+         stats.tail = tail
+-        if profile is not None:
+-            profile["aggregate"]["tail_advances"] += 1
+-            profile["aggregate"]["advances_below_update_boundary"] += int(updates == 0)
+-            profile["timing_ms"]["advance_stats_ms"] += (
+-                perf_counter_ns() - start
+-            ) / 1e6
+-
+-    def _fit_hit_bins(
+-        self,
+-        bins: dict[int, int],
+-        diagnostics: dict | None = None,
+-    ) -> int | None:
+-        if len(bins) < 2:
+-            if diagnostics is not None:
+-                diagnostics.update(
+-                    reason="no_hits" if not bins else "insufficient_bins",
+-                    sampled_hits=sum(bins.values()), occupied_bins=len(bins),
+-                )
+-            return None
++        stats.fit_query = -1
+ 
+-        xs = [math.log((index + 0.5) * self.granularity) for index in bins]
+-        ys = [math.log(count / self.granularity) for count in bins.values()]
+-        x_mean = sum(xs) / len(xs)
+-        y_mean = sum(ys) / len(ys)
+-        denominator = sum((value - x_mean) ** 2 for value in xs)
+-        if denominator == 0:
+-            if diagnostics is not None:
+-                diagnostics.update(
+-                    reason="degenerate_fit", sampled_hits=sum(bins.values()),
+-                    occupied_bins=len(bins),
+-                )
+-            return None
+-        slope = sum(
+-            (x - x_mean) * (y - y_mean)
+-            for x, y in zip(xs, ys, strict=True)
+-        ) / denominator
+-        fitted = math.floor(-slope)
+-        if diagnostics is not None:
+-            intercept = y_mean - slope * x_mean
+-            total_variance = sum((y - y_mean) ** 2 for y in ys)
+-            residual = sum(
+-                (y - intercept - slope * x) ** 2
+-                for x, y in zip(xs, ys, strict=True)
+-            )
+-            diagnostics.update(
+-                reason="fitted", sampled_hits=sum(bins.values()),
+-                occupied_bins=len(bins), slope=slope, exponent=-slope,
+-                floored_exponent=fitted,
+-                clamp=("min" if fitted < 2 else "max" if fitted > self.max_merge_intensity else None),
+-                r_squared=1 - residual / total_variance if total_variance > 0 else None,
+-            )
+-        return min(self.max_merge_intensity, max(2, fitted))
++    def eviction_models(self, segments) -> list[tuple]:
++        self.refresh_models([segment.node.analysis_owner for segment in segments])
++        result = []
++        for segment in segments:
++            stats = segment.node.analysis_owner
++            recovery_begin = (segment.begin if segment.recovery_begin is None
++                              else segment.recovery_begin)
++            if stats is None:
++                tail = max(self.granularity, segment.node.depth)
++                norm = sum(self.granularity * (j * self.granularity) ** -2
++                           for j in range(1, max(1, tail // self.granularity) + 1))
++                internal_prior, tail_prior = self._prior()
++                result.append((-segment.node.uuid - 1, 0, tail, 2., math.log(internal_prior / norm),
++                               tail_prior, self.granularity, recovery_begin, segment.end, 1))
++            else:
++                result.append((stats.uuid, stats.origin, max(stats.tail, segment.node.depth),
++                               stats.exponent, stats.log_amplitude, stats.tail_probability,
++                               self.granularity, recovery_begin, segment.end, int(stats.fitted_hit_query < 0)))
++        return result
+ 
+     def begin_round(
+         self, tree: LogRadixTree, traces: Sequence[LogRadixTrace],
+@@ -373,29 +402,9 @@ class OnlineAnalysisScheduler:
+                 perf_counter_ns() - step_start
+             ) / 1e6
+             step_start = perf_counter_ns()
+-        diagnostics = {} if collect_diagnostics else None
+-        coalesce = self._plan_coalesce(
+-            tree,
+-            round_info.eligible_slots,
+-            pending,
+-            materialize,
+-            endpoints,
+-            diagnostics,
+-            path_cache,
+-        )
+         if step_timing_ms is not None:
+-            step_timing_ms["coalesce_plan_ms"] = (
+-                perf_counter_ns() - step_start
+-            ) / 1e6
+-        return LogStatePlan(
+-            protections=tuple(protections),
+-            materialize=materialize,
+-            coalesce=coalesce,
+-            merge_diagnostics=(
+-                tuple(sorted(diagnostics.items()))
+-                if diagnostics is not None else ()
+-            ),
+-        )
++            step_timing_ms["coalesce_plan_ms"] = 0.0
++        return LogStatePlan(protections=tuple(protections), materialize=materialize, coalesce=())
+ 
+     def _analysis_paths(
+         self,
+@@ -604,108 +613,3 @@ class OnlineAnalysisScheduler:
+             ))
+         result.sort(key=lambda value: (value.begin, value.end, value.right_slot))
+         return tuple(result)
+-
+-    def _plan_coalesce(
+-        self,
+-        tree          : LogRadixTree,
+-        eligible_slots: frozenset[int],
+-        pending       : tuple[_PendingProtection, ...],
+-        materialize   : tuple[MaterializeCandidate, ...],
+-        endpoints     : tuple[_AnalysisEndpoint, ...],
+-        diagnostics   : dict[str, int] | None,
+-        path_cache    : dict,
+-    ) -> tuple[CheckpointCoalesce, ...]:
+-        if diagnostics is not None:
+-            diagnostics.update({
+-                "matched_endpoints": len(endpoints),
+-                "internal_endpoints": sum(
+-                    not endpoint.node.is_leaf() for endpoint in endpoints
+-                ),
+-                "leaf_endpoints": sum(
+-                    endpoint.node.is_leaf() for endpoint in endpoints
+-                ),
+-                "merge_anchors": 0,
+-                "anchors_without_eligible_entries": 0,
+-                "entries_beyond_match_endpoint": 0,
+-                "entries_not_eligible_this_round": 0,
+-                "logs_not_materialized": 0,
+-                "checkpoint_candidates": 0,
+-                "protected_entries": 0,
+-                "protected_boundaries": 0,
+-                "gaps": 0,
+-                "lock_boundaries": 0,
+-                "segments": 0,
+-                "segments_without_merge_pair": 0,
+-                "candidate_groups": 0,
+-                "groups_already_planned": 0,
+-                "rejected_decreasing_span": 0,
+-                "rejected_span_mismatch": 0,
+-                "rejected_discontinuity": 0,
+-                "rejected_lock_boundary": 0,
+-                "rejected_protected_interval": 0,
+-                "planned_groups": 0,
+-                "planned_slot_releases": 0,
+-                "same_span_groups": 0,
+-                "cross_span_groups": 0,
+-                "planned_covered_tokens": 0,
+-                "anchors_with_stats": 0,
+-                "anchors_without_stats": 0,
+-            })
+-        from logssms.kernel import logstate as planning
+-
+-        anchor_limits: dict[int, tuple[LogRadixTreeNode, int]] = {}
+-        for endpoint in endpoints:
+-            node = endpoint.node
+-            limit = min(node.depth, endpoint.matched_len)
+-            previous = anchor_limits.get(node.uuid)
+-            if previous is None or limit > previous[1]:
+-                anchor_limits[node.uuid] = (node, limit)
+-        if not anchor_limits:
+-            return ()
+-        paths = []
+-        anchors = []
+-        for node, matched_len in anchor_limits.values():
+-            stats = node.merge_stats if self.enable_merge_adjustment else None
+-            if stats is not None and stats.origin > matched_len:
+-                stats = None
+-            paths.append(self._planning_path(tree, node, eligible_slots, pending, path_cache))
+-            anchors.append((
+-                len(paths) - 1, matched_len,
+-                stats.intensity if stats is not None else 2,
+-                int(stats is not None),
+-            ))
+-        projected = {slot: item for item in materialize for slot in item.slots}
+-        projected_paths = []
+-        for path in paths:
+-            rows = []
+-            for index, entry in enumerate(path[0]):
+-                item = projected.get(entry.slot)
+-                if item is None:
+-                    rows.extend(path[1][index * 5:(index + 1) * 5])
+-                elif entry.slot == item.right_slot:
+-                    rows.extend((item.right_slot, item.begin, item.end,
+-                                 (item.end - item.begin) // self.granularity,
+-                                 1))
+-            projected_paths.append(rows)
+-        groups, native_diagnostics = planning.plan_coalesce(
+-            projected_paths, [path[2] for path in paths],
+-            [path[3] for path in paths], anchors,
+-            self.granularity,
+-            diagnostics is not None,
+-        )
+-        if diagnostics is not None:
+-            diagnostics.update(native_diagnostics)
+-        result = []
+-        for row in groups:
+-            values = tuple(row)
+-            slots, spans = [], []
+-            for slot, span in zip(values[3::2], values[4::2]):
+-                item = projected.get(slot)
+-                slots.extend((slot,) if item is None else item.slots)
+-                spans.extend((span,) if item is None else (1,) * len(item.slots))
+-            result.append(CheckpointCoalesce(
+-                slots=tuple(slots), source_spans=tuple(spans),
+-                begin=values[0], end=values[1], next_span=values[2],
+-            ))
+-        result.sort(key=lambda value: (value.begin, value.end, value.left_slot))
+-        return tuple(result)
+diff --git a/python/logssms/cache/logstate/prefix_cache.py b/python/logssms/cache/logstate/prefix_cache.py
+index c0a0c55..8867d44 100644
+--- a/python/logssms/cache/logstate/prefix_cache.py
++++ b/python/logssms/cache/logstate/prefix_cache.py
+@@ -8,7 +8,7 @@ from enum import Enum
+ from functools import cached_property
+ from heapq import heappop, heappush
+ from itertools import count
+-from typing import Any, Callable, Iterable, NamedTuple, TypeAlias, TYPE_CHECKING
++from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, TypeAlias
+ 
+ if TYPE_CHECKING:
+     from logssms.cache.logstate.recycler import (
+@@ -17,10 +17,8 @@ if TYPE_CHECKING:
+     )
+ 
+ import torch
+-
+-from logssms.utils import align_down
+-
+ from logssms.cache.prefix_cache import BaseCacheHandle, BasePrefixCache, MatchResult, SizeInfo
++from logssms.utils import align_down
+ 
+ _EVICTION_EXPAND = 2
+ 
+@@ -39,13 +37,22 @@ class LogStateKind(Enum):
+     CHECKPOINT = "checkpoint"
+ 
+ 
+-@dataclass
+-class LogStateMergeStats:
+-    origin          : int
+-    tail            : int
+-    intensity       : int = 2
+-    hit_positions   : deque[int] = field(default_factory=deque)
+-    next_update_tail: int | None = None
++@dataclass(eq=False)
++class LogStateHitStats:
++    origin        : int
++    tail          : int
++    hits          : deque[tuple[int, int, int]] = field(default_factory=lambda: deque(maxlen=8192))
++    exposures     : deque[tuple[int, int]] = field(default_factory=deque)
++    exponent      : float = 2.0
++    log_amplitude : float | None = None
++    tail_probability: float = 0.0
++    query_begin   : int = 0
++    fit_query     : int = -1
++    fitted_hit_query: int = -1
++    exponent_query: int = -1
++    uuid          : int = field(default_factory=lambda: next(LogStateHitStats.counter))
++
++    counter = count(1)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -95,7 +102,7 @@ class LogRadixTreeNode:
+         self._entries: list[LogStateEntry] = []
+         self._checkpoint_entries: list[LogStateEntry] = []
+         self._append_buffers: tuple[torch.Tensor, ...] = ()
+-        self.merge_stats: LogStateMergeStats | None = None
++        self.analysis_owner: LogStateHitStats | None = None
+ 
+     def initialize(
+         self,
+@@ -226,11 +233,12 @@ class LogStateRecovery:
+ 
+ @dataclass(frozen=True)
+ class LogStateCacheHandle(BaseCacheHandle):
+-    node              : LogRadixTreeNode
++    node            : LogRadixTreeNode
+     lock_node         : LogRadixTreeNode
+     recovery          : LogStateRecovery
+-    merge_stats       : LogStateMergeStats | None = None
+-    source_merge_stats: LogStateMergeStats | None = None
++    analysis_owner: LogStateHitStats | None = None
++    source_analysis_owner: LogStateHitStats | None = None
++    query_uid: int | None = None
+     match_position    : int = 0
+     recycle_match     : RecycledMatch | None = None
+     restore_plan      : RecycledRestorePlan | None = None
+@@ -253,7 +261,7 @@ class LogStateCacheHandle(BaseCacheHandle):
+ 
+ 
+ class LogRadixInsert(NamedTuple):
+-    node        : LogRadixTreeNode
++    node            : LogRadixTreeNode
+     previous_len: int
+     inserted_len: int
+ 
+@@ -265,13 +273,14 @@ class LogRadixEviction(NamedTuple):
+ 
+ @dataclass(frozen=True)
+ class LogRadixEvictionSegment:
+-    node: LogRadixTreeNode
+-    begin: int
+-    end: int
++    node            : LogRadixTreeNode
++    begin        : int
++    end          : int
+     uuid: int
+     parent_uuid: int
+     storage_slots: tuple[int, ...]
+     tree: LogRadixTree = field(repr=False, compare=False)
++    recovery_begin: int | None = None
+ 
+     @property
+     def depth(self) -> int:
+@@ -300,12 +309,11 @@ class LogRadixEvictionSegment:
+         return self.node.timestamp
+ 
+     @property
+-    def merge_stats(self):
+-        return self.node.merge_stats
++    def analysis_owner(self):
++        return self.node.analysis_owner
+ 
+ 
+ class LogRadixTree(BasePrefixCache):
+-
+     def __init__(
+         self,
+         granularity         : int,
+@@ -340,6 +348,7 @@ class LogRadixTree(BasePrefixCache):
+         self._recovery_slot_refs: dict[int, int] = {}
+         self._evictable_slots: dict[int, None] = {}
+         self._on_slot_reclaimable = on_slot_reclaimable
++        self.analysis_factory: Callable[[int], LogStateHitStats | None] | None = None
+ 
+     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+         usable_len = align_down(len(input_ids), self.granularity)
+@@ -459,6 +468,7 @@ class LogRadixTree(BasePrefixCache):
+         cache_len : int | None = None,
+         *,
+         kv_frame_spans: Iterable[tuple[int, int, int]] | None = None,
++        analysis_owner: LogStateHitStats | None = None,
+     ) -> LogRadixInsert:
+         assert len(input_ids) == len(kv_indices)
+         usable_len = align_down(len(input_ids), self.granularity)
+@@ -486,7 +496,19 @@ class LogRadixTree(BasePrefixCache):
+                 assert covered == inserted_len
+             suffix_ids = input_ids[previous_len:inserted_len]
+             suffix_kv = kv_indices[previous_len:inserted_len]
+-            if not node.is_root() and node.is_leaf() and not node.is_protected:
++            owner_boundary = (
++                analysis_owner is not None
++                and analysis_owner is not node.analysis_owner
++                and analysis_owner.origin == previous_len
++            )
++            if (
++                not node.is_root()
++                and node.is_leaf()
++                and not node.is_protected
++                and not owner_boundary
++            ):
++                if node.analysis_owner is None and self.analysis_factory is not None:
++                    node.analysis_owner = self.analysis_factory(node.begin)
+                 frame_ids = (torch.div(suffix_kv.to(device="cpu", dtype=torch.int32),
+                                       self.granularity, rounding_mode="floor")
+                              if kv_frames is None else kv_frames)
+@@ -505,6 +527,16 @@ class LogRadixTree(BasePrefixCache):
+                 new_node = LogRadixTreeNode(self.key_fn, self.granularity)
+                 new_node.initialize(suffix_ids, suffix_kv, kv_frames)
+                 new_node.set_parent(node)
++                if analysis_owner is not None and analysis_owner.origin == previous_len:
++                    new_node.analysis_owner = analysis_owner
++                elif not node.is_root() and len(node.children) == 1:
++                    new_node.analysis_owner = node.analysis_owner
++                elif self.analysis_factory is not None:
++                    new_node.analysis_owner = (
++                        analysis_owner
++                        if analysis_owner is not None and analysis_owner.origin == previous_len
++                        else self.analysis_factory(previous_len)
++                    )
+                 self._remove_leaf(node)
+                 self._add_leaf(new_node)
+                 if not node.is_root() and len(node.children) > 1:
+@@ -535,13 +567,15 @@ class LogRadixTree(BasePrefixCache):
+         else:
+             assert entry.span_granules is not None
+             assert entry.end - entry.begin == entry.span_granules * self.granularity
+-            assert entry.span_granules % self.checkpoint_log_count == 0
+         assert entry.slot not in self._entries_by_slot, (
+             f"Linear cache slot {entry.slot} is already owned by node "
+             f"{self.entry_owner(entry.slot).uuid}."
+         )
+         owner = self._find_owner(leaf, entry.end)
+-        assert entry.kind is LogStateKind.CHECKPOINT or entry.begin >= owner.begin
++        if entry.kind is LogStateKind.CHECKPOINT and entry.begin < owner.begin:
++            entry = replace(entry, begin=owner.begin,
++                            span_granules=(entry.end - owner.begin) // self.granularity)
++        assert entry.begin >= owner.begin
+         self._register_entry(owner, entry, checkpoint_timestamp)
+         self.revision += 1
+ 
+@@ -566,6 +600,7 @@ class LogRadixTree(BasePrefixCache):
+         prefix = LogRadixTreeNode(
+             self.key_fn, self.granularity, node.timestamp
+         )
++        prefix.analysis_owner = node.analysis_owner
+         prefix._key = node._key[:pos]
+         prefix._kv = node._kv[:pos]
+         prefix._kv_frames = node._kv_frames[:pos]
+@@ -604,6 +639,9 @@ class LogRadixTree(BasePrefixCache):
+             if entry.end <= split_depth:
+                 self._register_entry(prefix, entry, checkpoint_timestamp)
+             else:
++                if entry.kind is LogStateKind.CHECKPOINT and entry.begin < split_depth:
++                    entry = replace(entry, begin=split_depth,
++                                    span_granules=(entry.end - split_depth) // self.granularity)
+                 self._register_entry(node, entry, checkpoint_timestamp)
+ 
+         node._append_buffers = ()
+@@ -700,10 +738,11 @@ class LogRadixTree(BasePrefixCache):
+ 
+     def _eviction_segments(self, nodes, *, log_only=False, blocked=(), tail_limit=None):
+         selected = {node.uuid for node in nodes}
+-        terminal = {}
++        terminal, recoveries = {}, {}
+         segments, rows = [], []
+         for node in sorted(nodes, key=lambda value: (value.depth, value.uuid)):
+             parent = -1 if node.is_root() else terminal[node.parent.uuid]
++            recovery = 0 if node.is_root() else recoveries[node.parent.uuid]
+             source = node._entries
+             begin = node.begin
+             if tail_limit is not None and len(source) > tail_limit:
+@@ -712,6 +751,7 @@ class LogRadixTree(BasePrefixCache):
+                 if first < len(source):
+                     begin = source[first - 1].end
+                     source = source[first:]
++                    recovery = self.recovery_at(node, begin).position
+                     boundary = LogRadixEvictionSegment(
+                         node, node.begin, begin, len(segments), parent, (), self,
+                     )
+@@ -721,8 +761,15 @@ class LogRadixTree(BasePrefixCache):
+                     segments.append(boundary)
+                     parent = boundary.uuid
+             by_end: dict[int, list[LogStateEntry]] = {}
++            checkpoint_end = max((entry.end for entry in source
++                                  if entry.kind is LogStateKind.CHECKPOINT), default=begin)
++            if source and source[-1].kind is LogStateKind.CHECKPOINT:
++                checkpoint_end = node.depth
+             for entry in source:
+-                by_end.setdefault(entry.end, []).append(entry)
++                end = max(checkpoint_end, entry.end)
++                if entry is source[-1]:
++                    end = node.depth
++                by_end.setdefault(end, []).append(entry)
+             cuts = [begin, *by_end]
+             if cuts[-1] != node.depth:
+                 cuts.append(node.depth)
+@@ -730,7 +777,8 @@ class LogRadixTree(BasePrefixCache):
+             for begin, end in pairs:
+                 entries = by_end.get(end, ())
+                 segment = LogRadixEvictionSegment(node, begin, end, len(segments), parent,
+-                                                 tuple(entry.slot for entry in entries), self)
++                                                 tuple(entry.slot for entry in entries), self,
++                                                 recovery)
+                 checkpoint = any(entry.kind is LogStateKind.CHECKPOINT for entry in entries)
+                 unavailable = (node.is_root() or node.is_locked or node.uuid in blocked
+                                or any(entry.slot in self._recovery_slot_refs for entry in entries)
+@@ -742,7 +790,11 @@ class LogRadixTree(BasePrefixCache):
+                                   if entry.kind is LogStateKind.CHECKPOINT), default=node.timestamp)))
+                 segments.append(segment)
+                 parent = segment.uuid
++                for entry in entries:
++                    if entry.kind is LogStateKind.CHECKPOINT or entry.begin == recovery:
++                        recovery = entry.end
+             terminal[node.uuid] = parent
++            recoveries[node.uuid] = recovery
+         return segments, rows
+ 
+     def eviction_snapshot(self):
+@@ -785,12 +837,11 @@ class LogRadixTree(BasePrefixCache):
+             for entry in segment.entries:
+                 if entry.kind is not LogStateKind.CHECKPOINT:
+                     continue
++                if entry.slot in self._recovery_slot_refs:
++                    continue
+                 successor = self._checkpoint_successor(entry)
+-                tail = () if entry.slot in self._recovery_slot_refs else (index,)
+-                if not tail:
+-                    successor = None
+                 result.append((entry.slot, -1 if successor is None else successor.slot,
+-                               self._checkpoint_timestamps[entry.slot], *tail))
++                               self._checkpoint_timestamps[entry.slot], index))
+         return result
+ 
+     def drop_checkpoint(self, left_slot: int, right_slot: int) -> LogStateEntry:
+@@ -800,14 +851,10 @@ class LogRadixTree(BasePrefixCache):
+         assert left.end == right.begin
+         owner = self.entry_owner(right)
+         left_owner = self.entry_owner(left)
++        assert owner is left_owner
+         assert not (left_owner.is_protected and left.end == left_owner.depth)
+         assert left_slot not in self._recovery_slot_refs
+         assert right_slot not in self._recovery_slot_refs
+-        current = owner
+-        while current is not left_owner:
+-            current = current.parent
+-            assert not current.is_protected
+-            assert len(current.children) == 1
+         checkpoint_timestamp = self._checkpoint_timestamps[right_slot]
+         self.detach_entry(left_slot)
+         self.detach_entry(right_slot)
+@@ -831,13 +878,16 @@ class LogRadixTree(BasePrefixCache):
+             begin = target.begin
+             assert node.is_leaf() and not node.is_locked and not node.is_root()
+             assert target.depth == node.depth
++            entries = tuple(entry for entry in node.entries if entry.end > begin)
++            if any(entry.kind is LogStateKind.CHECKPOINT for entry in entries):
++                assert begin == node.begin
++                assert sum(entry.kind is LogStateKind.CHECKPOINT for entry in entries) == 1
+             if evicted_nodes is not None:
+                 evicted_nodes.append((node.uuid, begin, node.depth))
+             offset = begin - node.begin
+             evicted_kv.append(node.kv[offset:])
+             self.evictable_size -= node.depth - begin
+             self._update_kv_refs(node, -1)
+-            entries = tuple(entry for entry in node.entries if entry.end > begin)
+             evicted_entries.extend(entries)
+             for entry in entries:
+                 node._entries.remove(entry)
+@@ -1028,7 +1078,7 @@ class LogRadixTree(BasePrefixCache):
+                     unprunable_log_refs.update(entry.slot for entry in node._entries
+                                                if entry.kind is LogStateKind.LOG)
+                 for entry in node.entries:
+-                    if not (0 <= entry.begin < entry.end):
++                    if not (node.begin <= entry.begin < entry.end):
+                         raise RuntimeError(
+                             f"Node {node.uuid} owns invalid entry {entry}."
+                         )
+@@ -1372,15 +1422,6 @@ class LogRadixTree(BasePrefixCache):
+                 and candidate.begin == entry.end
+                 and candidate.slot not in self._recovery_slot_refs
+             ) else None
+-        while not node.is_protected and len(node.children) == 1:
+-            node = next(iter(node.children.values()))
+-            if node.entries:
+-                candidate = node.entries[0]
+-                return candidate if (
+-                    candidate.kind is LogStateKind.CHECKPOINT
+-                    and candidate.begin == entry.end
+-                        and candidate.slot not in self._recovery_slot_refs
+-                ) else None
+         return None
+ 
+     def _refresh_entry_neighbors(self, node: LogRadixTreeNode, position: int) -> None:
+@@ -1452,6 +1493,7 @@ class LogRadixTree(BasePrefixCache):
+             self._locked_kv_refs.pop(frame, None)
+         self._evictable_kv_count += int(refs > 0 and locked == 0)
+ 
++
+ __all__ = [
+     "LogRadixEviction",
+     "LogRadixInsert",
+@@ -1461,6 +1503,6 @@ __all__ = [
+     "LogStateCacheHandle",
+     "LogStateEntry",
+     "LogStateKind",
+-    "LogStateMergeStats",
++    "LogStateHitStats",
+     "LogStateRecovery",
+ ]
+diff --git a/python/logssms/cache/logstate/recycler.py b/python/logssms/cache/logstate/recycler.py
+index 03ebf3b..ede8ef0 100644
+--- a/python/logssms/cache/logstate/recycler.py
++++ b/python/logssms/cache/logstate/recycler.py
+@@ -6,16 +6,23 @@ from weakref import WeakValueDictionary
+ 
+ import torch
+ 
+-from .prefix_cache import LogRadixTree, LogRadixEvictionSegment, LogStateEntry, LogStateKind
++from .prefix_cache import (
++    LogRadixEvictionSegment,
++    LogRadixTree,
++    LogStateEntry,
++    LogStateKind,
++    LogStateHitStats,
++)
+ 
+ if TYPE_CHECKING:
+-    from .online_analysis_scheduler import MaterializeCandidate, CheckpointCoalesce
++    from .online_analysis_scheduler import CheckpointCoalesce, MaterializeCandidate
+ 
+ 
+ @dataclass(frozen=True)
+ class RecycledLog:
+     begin: int
+     end  : int
++    analysis_owner: LogStateHitStats | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -24,7 +31,10 @@ class RecycledBranch:
+     logs              : tuple[RecycledLog, ...]
+     protected_endpoints: frozenset[int]
+     _serial           : int = field(default=0, compare=False, repr=False)
+-    merge_stats       : tuple[int, ...] = ()
++
++    @property
++    def analysis_owner(self):
++        return self.logs[-1].analysis_owner if self.logs else None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -32,6 +42,17 @@ class RecycledMatch:
+     branch     : RecycledBranch
+     matched_len: int
+ 
++    @property
++    def analysis_owner(self):
++        return next(
++            (
++                log.analysis_owner
++                for log in reversed(self.branch.logs)
++                if log.begin < self.matched_len <= log.end
++            ),
++            None,
++        )
++
+     def matched_tokens(self, start: int) -> int:
+ 
+         return sum(
+@@ -42,21 +63,19 @@ class RecycledMatch:
+ 
+ @dataclass(frozen=True)
+ class RecycledCheckpoint:
+-    begin      : int
+-    end        : int
++    begin: int
++    end  : int
+     gpu_entries: tuple[LogStateEntry, ...] = ()
+ 
+ 
+ @dataclass(frozen=True)
+ class RecycledRestorePlan:
+-
+     cached_len         : int
+-    matched_len        : int
++    matched_len: int
+     checkpoints        : tuple[RecycledCheckpoint, ...]
+     protected_endpoints: frozenset[int]
+     gpu_materialize    : tuple[MaterializeCandidate, ...] = ()
+     gpu_coalesce       : tuple[CheckpointCoalesce, ...] = ()
+-    intensity          : int = 2
+     lock_boundaries    : frozenset[int] = frozenset()
+ 
+ 
+@@ -70,7 +89,6 @@ class _RecycledRestore:
+ 
+ 
+ class LogStateRecycleBin:
+-
+     def __init__(self, capacity_bytes: int) -> None:
+         from logssms.kernel import logstate as planning
+ 
+@@ -79,6 +97,7 @@ class LogStateRecycleBin:
+         self._native = planning.make_recycle_bin(capacity_bytes)
+         self._matches: WeakValueDictionary[int, RecycledBranch] = WeakValueDictionary()
+         self.revision = 0
++        self._owners: dict[int, LogStateHitStats] = {}
+ 
+     def remember(
+         self,
+@@ -97,18 +116,24 @@ class LogStateRecycleBin:
+         source = segment.node
+         path = tree.path(source)
+         keys = [part.key for part in path[:-1]] + [source.key[:segment.end - source.begin]]
+-        stats = source.merge_stats
++        stats = source.analysis_owner
++        if stats is not None:
++            self._owners[stats.uuid] = stats
+         self._native["remember"](
+             keys,
+             planning._pack(logs),
+-            [part.depth for part in path if part.is_protected
+-             and any(begin <= part.depth <= end for begin, end in logs)],
+-            [] if stats is None else [
+-                stats.origin, stats.tail, stats.intensity,
+-                -1 if stats.next_update_tail is None else stats.next_update_tail,
+-                *stats.hit_positions,
++            [
++                part.depth
++                for part in path
++                if part.is_protected and any(begin <= part.depth <= end for begin, end in logs)
+             ],
++            [] if stats is None else [v for begin, end in logs for v in (begin, end, stats.uuid)],
+         )
++        self._release_owners()
++
++    def _release_owners(self):
++        for owner_id in self._native["retired_owners"]():
++            self._owners.pop(owner_id, None)
+ 
+     def match(self, tokens: torch.Tensor, *, start: int, granularity: int) -> RecycledMatch | None:
+         from logssms.kernel import logstate as planning
+@@ -121,11 +146,27 @@ class LogStateRecycleBin:
+         branch = self._matches.get(serial)
+         if branch is None:
+             rows = planning._unpack(self._native["get"](serial, tokens))
+-            branch = RecycledBranch(
+-                tuple(rows[0]), tuple(RecycledLog(begin, end)
+-                                      for begin, end in rows[3:]), frozenset(rows[1]), serial,
+-                tuple(rows[2]),
+-            )
++            owner_ranges = list(zip(rows[2][::3], rows[2][1::3], rows[2][2::3]))
++            logs = []
++            for begin, end in rows[3:]:
++                boundaries = sorted(
++                    {
++                        begin,
++                        end,
++                        *(
++                            p
++                            for left, right, _ in owner_ranges
++                            for p in (left, right)
++                            if begin < p < end
++                        ),
++                    }
++                )
++                for left, right in zip(boundaries, boundaries[1:]):
++                    owner_id = next(
++                        (owner for a, b, owner in owner_ranges if a <= left and right <= b), None
++                    )
++                    logs.append(RecycledLog(left, right, self._owners.get(owner_id)))
++            branch = RecycledBranch(tuple(rows[0]), tuple(logs), frozenset(rows[1]), serial)
+             self._matches[serial] = branch
+         return RecycledMatch(branch, matched_len)
+ 
+@@ -134,6 +175,7 @@ class LogStateRecycleBin:
+             self.revision += 1
+             self._native["discard"](branch._serial)
+             del self._matches[branch._serial]
++            self._release_owners()
+ 
+     def touch(self, branch: RecycledBranch) -> None:
+         self._native["touch"](branch._serial)
+diff --git a/python/logssms/kernel/logstate.py b/python/logssms/kernel/logstate.py
+index 37bb8d3..1d39bff 100644
+--- a/python/logssms/kernel/logstate.py
++++ b/python/logssms/kernel/logstate.py
+@@ -6,7 +6,6 @@ from itertools import chain
+ from typing import TYPE_CHECKING, Sequence, TypeAlias
+ 
+ import torch
+-
+ from logssms.tvm import load_aot
+ 
+ if TYPE_CHECKING:
+@@ -48,11 +47,12 @@ def branch_protections(inputs: Sequence[torch.Tensor], forced: Rows,
+ 
+ 
+ def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
+-                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]] | None:
++                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows, models=None) -> list[list[int]] | None:
+     """Return a plan, [] for insufficient capacity, or None to expand a cold path."""
+     groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
+     result = _unpack(_load_logstate_module().plan_eviction(
+         _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
++        torch.tensor([] if models is None else models, dtype=torch.float64).flatten(),
+     ))
+     return None if result == [[-1]] else result
+ 
+@@ -66,12 +66,3 @@ def plan_materialize(paths: Rows, boundaries: Rows, candidates: Rows,
+     return _unpack(_load_logstate_module().plan_materialize(
+         _pack(paths), _pack(boundaries), _pack(candidates), granularity, log_count,
+     ))
+-
+-
+-def plan_coalesce(paths: Rows, boundaries: Rows, locks: Rows, anchors: Rows,
+-                  granularity: int, diagnostics: bool) -> tuple[list[list[int]], dict[str, int]]:
+-    result = _load_logstate_module().plan_coalesce(
+-        _pack(paths), _pack(boundaries), _pack(locks), _pack(anchors),
+-        granularity, diagnostics,
+-    )
+-    return _unpack(result["groups"]), dict(result["diagnostics"].items())

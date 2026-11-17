@@ -109,7 +109,7 @@ def test_memorized_checkpoint_prefill_matches_log_state(reuse, chunk_size):
             ctx.state_table.fill_(-1)
             if reuse:
                 pool.zero_state(works[2])
-                pool.coalesce_groups([tuple(logs)], [works[2]])
+                pool.materialize_groups([tuple(logs)], [works[2]])
         pool.zero_state(works[0])
         pool.zero_work_conv(works[0])
         backend = Mamba2LogStateBackend()
@@ -272,7 +272,7 @@ def test_mamba2_asymmetric_logs_materialize_without_losing_key_rows():
             expected[layer] *= decay[t].exp()[:, None, None]
             expected[layer] += key[t].float()[:, :, None] * value[t].float()[:, None, :]
     pool.kernels.restore(pool, [(None, [(slot, 0, 64) for slot in logs], works[0])])
-    pool.coalesce_groups([tuple(logs)], [works[0]])
+    pool.materialize_groups([tuple(logs)], [works[0]])
     actual = torch.stack([pool.read_states(torch.tensor([logs[-1]], device="cuda"), layer)[0]
                           for layer in range(2)])
     torch.testing.assert_close(actual.float(), expected, atol=2e-3, rtol=3e-2)

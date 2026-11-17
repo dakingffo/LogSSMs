@@ -111,7 +111,7 @@ def test_mixed_allocate_prepare_order_only_analyzes_prefill():
     decoding.device_len = 36
     prefilling = new_req(manager, torch.arange(1000, 1080, dtype=torch.int32), table_idx=1)
     with patch.object(manager.analyzer, "_find_protections", wraps=manager.analyzer._find_protections) as protections, patch.object(
-        manager.analyzer, "begin_round", wraps=manager.analyzer.begin_round,
+        manager.analyzer, "snapshot_prefill", wraps=manager.analyzer.snapshot_prefill,
     ) as analysis:
         manager.allocate([prefilling], phase="prefill")
         pending = manager._prefill_protections

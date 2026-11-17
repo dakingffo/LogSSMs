@@ -36,7 +36,7 @@ for name in ("e2e-baseline", "e2e-optimized"):
     samples = profile["engine_prepare"]["decode_batches"]
     e2e.append(dict(
         name=name, cache=report["points"]["4"]["cache"],
-        released_state_slots_from_merge=profile["cache"]["aggregate"]["released_state_slots_from_merge"],
+        released_state_slots_from_materialization=profile["cache"]["aggregate"]["released_state_slots_from_materialization"],
         profiled_decode_prepare_p50_ms=statistics.median(sample["cpu_total_ms"] for sample in samples),
     ))
 assert traces[0] == traces[1], "Different model outputs or subsequent request histories"

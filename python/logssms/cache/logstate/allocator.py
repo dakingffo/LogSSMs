@@ -70,6 +70,14 @@ class LogStateAllocator:
         self._reclaimable_decay_frames = 0
         self._retired_resources: dict[int, RetiredResources] = {}
 
+    @property
+    def materialize_log_count(self) -> int:
+        return max(
+            self.checkpoint_log_count,
+            (self.payload_frames + self.conv_frames)
+            // (self.log_payload_frames + self.num_granules * self.conv_frames) + 1,
+        )
+
     def set_reclaimable(self, slot: int, reclaimable: bool) -> None:
         if reclaimable == (slot in self._reclaimable_slots):
             return
@@ -333,7 +341,7 @@ class LogStateAllocator:
                 decay_masks[decay.frame] = decay_masks.get(decay.frame, 0) | (1 << decay.index)
         return savings + sum(mask == self._decay_masks[frame] for frame, mask in decay_masks.items())
 
-    def coalesce_to_checkpoint(self, slots: tuple[int, ...]) -> RetiredResources:
+    def materialize_group(self, slots: tuple[int, ...]) -> RetiredResources:
         assert len(slots) == len(set(slots)) and len(slots) >= 1
         assert self.checkpoint_frame_capacity(slots) >= self.payload_frames
         assert self.checkpoint_frame_savings(slots) >= 0, "Materialization must cover its expansion"

@@ -1,0 +1,23 @@
+{
+  "history": "/home/daking/PROJECT/LogSSMs/experiment/standard_multiturn/qwen36-logstate32-trees128-o256-mixed-noprofile-20261026-001446/history.json",
+  "output_cap": 256,
+  "gpu_count": 2,
+  "gpu": "NVIDIA A800 80GB",
+  "tp_size": 2,
+  "memory_ratio": 0.9,
+  "cache_bytes_per_rank": 47605350400,
+  "max_running_requests": 128,
+  "model": {
+    "name": "Qwen3.6-27B",
+    "attention_layers": 16,
+    "linear_layers": 48,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "linear_key_heads": 16,
+    "linear_value_heads": 48,
+    "linear_key_dim": 128,
+    "linear_value_dim": 128,
+    "conv_width": 4
+  },
+  "sha256": "0fe82beb8ddf4639b0155893bcf2771f373da71f0bb033e66019e9f87ce84c9e"
+}

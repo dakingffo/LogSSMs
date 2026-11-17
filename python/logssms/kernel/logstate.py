@@ -6,7 +6,6 @@ from itertools import chain
 from typing import TYPE_CHECKING, Sequence, TypeAlias
 
 import torch
-
 from logssms.tvm import load_aot
 
 if TYPE_CHECKING:
@@ -48,11 +47,12 @@ def branch_protections(inputs: Sequence[torch.Tensor], forced: Rows,
 
 
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
-                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows) -> list[list[int]] | None:
+                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows, models=None) -> list[list[int]] | None:
     """Return a plan, [] for insufficient capacity, or None to expand a cold path."""
     groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
     result = _unpack(_load_logstate_module().plan_eviction(
         _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
+        torch.tensor([] if models is None else models, dtype=torch.float64).flatten(),
     ))
     return None if result == [[-1]] else result
 
@@ -66,12 +66,3 @@ def plan_materialize(paths: Rows, boundaries: Rows, candidates: Rows,
     return _unpack(_load_logstate_module().plan_materialize(
         _pack(paths), _pack(boundaries), _pack(candidates), granularity, log_count,
     ))
-
-
-def plan_coalesce(paths: Rows, boundaries: Rows, locks: Rows, anchors: Rows,
-                  granularity: int, diagnostics: bool) -> tuple[list[list[int]], dict[str, int]]:
-    result = _load_logstate_module().plan_coalesce(
-        _pack(paths), _pack(boundaries), _pack(locks), _pack(anchors),
-        granularity, diagnostics,
-    )
-    return _unpack(result["groups"]), dict(result["diagnostics"].items())
