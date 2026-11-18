@@ -231,3 +231,26 @@ def test_all_zero_internal_manager_matches_default_enumeration(checkpoints, need
     with patch.object(manager.tree, 'log_eviction_snapshot', wraps=manager.tree.log_eviction_snapshot) as window:
         assert signature(manager.evictor.plan(needed, 0, 0)) == expected
         assert window.call_count > 0
+
+
+def test_model_refresh_promotes_a_candidate_below_the_old_heap_top():
+    from logssms.kernel.logstate import EvictionPlanner
+
+    nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 0, 1), (2, 0, 0, 0, 2)]
+    kv = [[], [10, 32, 32], [11, 32, 32]]
+    refs = [[], [1], [2]]
+    slots = [(1, 2, 20, 0, 32), (2, 2, 21, 0, 32)]
+    occupied = [(20, 1), (21, 1)]
+    config = (0, 0, 3, 0, 1, 1, 1, 0, 0, 2)
+    models = [(0, 0, 32, 2., -12., .5, 32, 0, 0, 0),
+              (1, 0, 32, 2., -12., .01, 32, 0, 32, 0),
+              (2, 0, 32, 2., -12., .9, 32, 0, 32, 0)]
+    assert plan_eviction(nodes, kv, refs, slots, occupied, config, [], models)[0] == [1]
+    planner = EvictionPlanner(nodes, kv, refs, slots, occupied, config, [], models,
+                              [(0, 0, 0), (32, 1, 0), (32, 2, 0)])
+    updated = [models[0], (*models[1][:5], .9, *models[1][6:]),
+               (*models[2][:5], .01, *models[2][6:])]
+    planner.refresh_models([0, 1, 2], updated)
+    expected = plan_eviction(nodes, kv, refs, slots, occupied, config, [], updated)
+    assert expected[0] == [2]
+    assert planner.plan(config, occupied) == expected

@@ -99,6 +99,7 @@ class LogRadixTreeNode:
         self._kv = torch.empty(0, dtype=torch.int32)
         self._kv_frames = torch.empty(0, dtype=torch.int32)
         self._kv_frame_counts: dict[int, int] = {}
+        self._frame_runs = None
         self._entries: list[LogStateEntry] = []
         self._checkpoint_entries: list[LogStateEntry] = []
         self._append_buffers: tuple[torch.Tensor, ...] = ()
@@ -121,6 +122,7 @@ class LogRadixTreeNode:
         self._kv_frame_counts = dict(Counter(self._kv_frames.tolist()))
 
     def append(self, keys: torch.Tensor, kv: torch.Tensor, frames: torch.Tensor) -> None:
+        self._frame_runs = None
         length, end = self.length, self.length + len(keys)
         if not self._append_buffers or self._append_buffers[0].numel() < end:
             capacity = max(end, max(1, length) * 2)
@@ -136,6 +138,33 @@ class LogRadixTreeNode:
             buffer[:end] for buffer in self._append_buffers
         )
         self._depth += len(keys)
+
+    def kv_frame_counts(self, begin: int, end: int) -> dict[int, int]:
+        assert 0 <= begin <= end <= self.length
+        if begin == end:
+            return {}
+        cached = self._frame_runs
+        if cached is None or cached[0] is not self._kv_frames:
+            ends, frames = [], []
+            for index, frame in enumerate(self._kv_frames.tolist(), 1):
+                if frames and frames[-1] == frame:
+                    ends[-1] = index
+                else:
+                    frames.append(frame)
+                    ends.append(index)
+            cached = self._frame_runs = (self._kv_frames, ends, frames)
+        _, ends, frames = cached
+        counts = {}
+        index = bisect_right(ends, begin)
+        while index < len(ends):
+            start = 0 if index == 0 else ends[index - 1]
+            if start >= end:
+                break
+            count = min(end, ends[index]) - max(begin, start)
+            frame = frames[index]
+            counts[frame] = counts.get(frame, 0) + count
+            index += 1
+        return counts
 
     def set_parent(self, parent: LogRadixTreeNode) -> None:
         self._parent = parent
@@ -154,6 +183,8 @@ class LogRadixTreeNode:
     @timestamp.setter
     def timestamp(self, value: int) -> None:
         self._timestamp = value
+        if self._log_leaf_tree is not None:
+            self._log_leaf_tree.access_revision += 1
         if self._log_leaf_index >= 0:
             self._log_leaf_tree._update_log_leaf(self)
 
@@ -301,8 +332,7 @@ class LogRadixEvictionSegment:
 
     @property
     def _kv_frame_counts(self) -> dict[int, int]:
-        return dict(Counter(self.node._kv_frames[
-            self.begin - self.node.begin:self.end - self.node.begin].tolist()))
+        return self.node.kv_frame_counts(self.begin - self.node.begin, self.end - self.node.begin)
 
     @property
     def timestamp(self) -> int:
@@ -333,6 +363,7 @@ class LogRadixTree(BasePrefixCache):
         self.locked_size = 0
         self.revision = 0
         self.lock_revision = 0
+        self.access_revision = 0
         self._lock_footprint_epoch = (-1, -1)
         self._lock_footprints: dict[int, tuple[int, tuple[int, ...]]] = {}
         self._entry_owners: dict[int, LogRadixTreeNode] = {}
@@ -394,6 +425,7 @@ class LogRadixTree(BasePrefixCache):
         )
 
     def touch_handle(self, handle: LogStateCacheHandle) -> None:
+        self.access_revision += 1
         tic = time.monotonic_ns()
         for node in handle.match_path:
             node.timestamp = tic
@@ -601,6 +633,7 @@ class LogRadixTree(BasePrefixCache):
             self.key_fn, self.granularity, node.timestamp
         )
         prefix.analysis_owner = node.analysis_owner
+        node._frame_runs = None
         prefix._key = node._key[:pos]
         prefix._kv = node._kv[:pos]
         prefix._kv_frames = node._kv_frames[:pos]
@@ -893,6 +926,7 @@ class LogRadixTree(BasePrefixCache):
                 node._entries.remove(entry)
                 self._unregister_entry(entry)
             if offset:
+                node._frame_runs = None
                 node._key = node._key[:offset]
                 node._kv = node._kv[:offset]
                 node._kv_frames = node._kv_frames[:offset]

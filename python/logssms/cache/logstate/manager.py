@@ -328,6 +328,8 @@ class LogStateCacheManager(BaseCacheManager):
             "eviction_candidate_windows": 0,
             "eviction_tail_expansions": 0,
             "eviction_full_snapshots": 0,
+            "eviction_planner_reuses": 0,
+            "eviction_model_refreshes": 0,
             "eviction_serialized_nodes": 0,
             "pressure_dropped_checkpoints": 0,
             "pressure_pruned_checkpoints": 0,
@@ -951,7 +953,19 @@ class LogStateCacheManager(BaseCacheManager):
         )
         stats["prepare_cpu_timing_ms"] = timing_totals
         allocation_phases: dict[str, dict] = {}
+        rebuild_causes: dict[str, dict] = {}
         for sample in self._profile_allocation_samples:
+            diagnostic = sample.get("planning", {})
+            if diagnostic.get("mode") == "rebuild":
+                key = "+".join(diagnostic["causes"])
+                group = rebuild_causes.setdefault(sample["phase"], {}).setdefault(
+                    key, {"calls": 0, "full_snapshots": 0, "total_ms": 0.0, "timing_ms": {}},
+                )
+                group["calls"] += 1
+                group["full_snapshots"] += diagnostic["full_snapshots"]
+                group["total_ms"] += diagnostic["total_ms"]
+                for name, elapsed in diagnostic["timing_ms"].items():
+                    group["timing_ms"][name] = group["timing_ms"].get(name, 0.0) + elapsed
             phase = allocation_phases.setdefault(sample["phase"], {
                 "calls": 0, "eviction_calls": 0, "evicted_nodes": 0,
                 "timing_ms": {}, "counts": {},
@@ -987,6 +1001,7 @@ class LogStateCacheManager(BaseCacheManager):
             "cache_req_samples": self._cache_req_samples,
             "allocation_profile": {
                 "phases": allocation_phases,
+                "rebuild_causes": rebuild_causes,
                 "samples": self._profile_allocation_samples,
             },
             "lifecycle_events": self._profile_lifecycle_events,

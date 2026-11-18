@@ -57,6 +57,25 @@ def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
     return None if result == [[-1]] else result
 
 
+class EvictionPlanner:
+    def __init__(self, nodes, kv, node_slots, slots, occupied, config, checkpoint_actions,
+                 models, order):
+        groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
+        self._planner = _load_logstate_module().make_eviction_planner(
+            _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
+            torch.tensor(models, dtype=torch.float64).flatten(), _pack(order),
+        )
+
+    def refresh_models(self, indices, models):
+        self._planner["refresh_models"](
+            indices, torch.tensor(models, dtype=torch.float64).flatten(),
+        )
+
+    def plan(self, config, occupied):
+        result = _unpack(self._planner["plan"](config, _pack(occupied)))
+        return None if result == [[-1]] else result
+
+
 def make_recycle_bin(capacity_bytes: int):
     return _load_logstate_module().make_recycle_bin(capacity_bytes)
 

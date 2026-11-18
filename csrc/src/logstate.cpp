@@ -324,87 +324,8 @@ private:
   std::unordered_set<Int> leaves_;
 };
 
-template <typename NodeRows>
-Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& node_slots,
-                   const NodeRows& slots, const NodeRows& occupied, const List& config,
-                   const NodeRows& checkpoint_actions, tvm::ffi::TensorView models) {
-
-
-  check(nodes.size() == kv.size() && nodes.size() == node_slots.size()
-        && config.size() == 10 && config[5] > 0,
-        "Invalid eviction capacity metadata");
-  std::unordered_map<Int, Vector> slot_info;
-  for (const auto& row : slots) {
-    check(row.size() == 5 && row[1] >= 0, "Invalid eviction slot");
-    slot_info.emplace(row[0], Vector(row.begin(), row.end()));
-  }
-  std::unordered_map<Int, Int> decay_occupied, decay_released, pages;
-  for (const auto& row : occupied) {
-    check(row.size() == 2 && row[1] > 0 && row[1] <= config[5], "Invalid decay occupancy");
-    decay_occupied.emplace(row[0], row[1]);
-  }
-  Int free = config[0], decay = config[1], kv_free = 0;
-  auto fits = [&]() {
-    const auto required_decay = (std::max(Int{0}, config[7] - decay) + config[5] - 1) / config[5];
-    const auto log_frames = config[9];
-    return config[6] + config[7] * log_frames + config[8] * config[2]
-           + (config[7] * config[4] + config[8]) * config[3] + required_decay <= free + kv_free;
-  };
-  EvictionQueue queue(nodes);
-  Vector selected, released, page_order, compressed;
-  std::unordered_set<Int> released_set;
-  auto release = [&](Int slot) {
-    check(slot_info.contains(slot), "Missing eviction slot");
-    check(released_set.insert(slot).second, "Duplicate eviction slot release");
-    const auto& record = slot_info.at(slot);
-    released.push_back(slot);
-    free += record[1];
-    if (record[2] >= 0) {
-      check(decay_occupied.contains(record[2]), "Missing decay frame occupancy");
-      if (++decay_released[record[2]] == decay_occupied.at(record[2])) {
-        ++free;
-        decay -= config[5] - 1;
-      }
-      else {
-        ++decay;
-      }
-    }
-  };
-  auto prune = [&](Int index) {
-    selected.push_back(index);
-    check(kv[index].size() % 3 == 0, "Invalid eviction KV references");
-    for (size_t i = 0; i < kv[index].size(); i += 3) {
-      const auto frame = kv[index][i];
-      auto [page, inserted] = pages.try_emplace(frame, 0);
-      if (inserted) {
-        page_order.push_back(frame);
-      }
-      auto& count = page->second;
-      count += kv[index][i + 1];
-      check(count <= kv[index][i + 2], "Eviction exceeds cached KV references");
-      kv_free += count == kv[index][i + 2];
-    }
-    for (const auto slot : node_slots[index]) {
-      if (released_set.contains(slot)) {
-        continue;
-      }
-      check(slot_info.contains(slot), "Missing eviction slot");
-      release(slot);
-    }
-  };
-  auto result = [&]() {
-    Vector page_counts;
-    for (const auto frame : page_order) {
-      page_counts.insert(page_counts.end(), {frame, pages.at(frame)});
-    }
-    std::sort(released.begin(), released.end());
-    return Rows({List(selected.begin(), selected.end()),
-                 List(page_counts.begin(), page_counts.end()),
-                 List(released.begin(), released.end()),
-                 List(compressed.begin(), compressed.end())});
-  };
-
-
+class EvictionPlanner {
+  using NodeRows = std::vector<Vector>;
   struct Density {
     double tail = 0, atom = 0, g = 1;
     bool default_order = false;
@@ -417,89 +338,161 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
       return std::max(0., prefix(begin) - prefix(end));
     }
   };
-  const bool online = models.size(0) != 0;
-  check(!online || (models.ndim() == 1 && models.is_contiguous() &&
-        models.device().device_type == kDLCPU && models.dtype().code == kDLFloat &&
-        models.dtype().bits == 64 && models.size(0) == static_cast<Int>(nodes.size() * 10)),
-        "Invalid eviction density models");
-  const auto *model_data = online ? static_cast<const double *>(models.data_ptr()) : nullptr;
-  std::unordered_map<Int, Density> densities;
-  std::vector<Int> model_ids(nodes.size());
-  for (size_t i = 0; online && i < nodes.size(); ++i) {
-    const auto *p = model_data + i * 10;
-    const auto id = static_cast<Int>(p[0]);
-    model_ids[i] = id;
-    if (densities.contains(id)) continue;
-    Density d;
-    d.default_order = p[9] != 0.;
-    d.tail = p[2]; d.atom = std::clamp(p[5], 0., 1.); d.g = p[6];
-    check(d.g > 0 && std::isfinite(p[3]) && std::isfinite(p[4]), "Invalid hit density");
-    const auto count = std::max<Int>(1, static_cast<Int>((d.tail - p[1]) / d.g));
-    for (Int j = 1; j <= count; ++j) {
-      const auto a = j * d.g;
-      const auto mass = std::exp(p[4] - p[3] * std::log(a)) * d.g;
-      d.probability.push_back(d.probability.back() + mass);
+  struct Candidate {
+    double phase, score;
+    Int timestamp, id, kind, version;
+    double cost_score = 0.;
+    Int depth = 0, owner = 0, begin = 0;
+    bool operator>(const Candidate &o) const {
+      return std::tie(phase, score, timestamp, kind, depth, owner, begin, id) >
+             std::tie(o.phase, o.score, o.timestamp, o.kind, o.depth, o.owner,
+                      o.begin, o.id);
     }
-    const auto scale = std::min(1., (1. - d.atom) / std::max(1e-300, d.probability.back()));
-    for (auto &v : d.probability) v *= scale;
-    densities.emplace(id, std::move(d));
-  }
-  std::unordered_map<Int, Vector> actions;
-  std::unordered_map<Int, Int> previous;
-  std::unordered_map<Int, Int> slot_node;
-  std::vector<Vector> ordered_slots(nodes.size());
-  for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-    for (auto slot : node_slots[i]) {
-      slot_node.emplace(slot, i);
-      ordered_slots[i].push_back(slot);
-    }
-    std::sort(ordered_slots[i].begin(), ordered_slots[i].end(), [&](Int a, Int b) {
-      return slot_info.at(a)[4] < slot_info.at(b)[4];
-    });
-  }
-  for (const auto &row : checkpoint_actions) {
-    check(row.size() >= 4, "Invalid checkpoint eviction action");
-    check(slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
-          "Checkpoint action has an invalid owner");
-    check(row[1] < 0 || (slot_node.contains(row[1])
-          && slot_node.at(row[0]) == slot_node.at(row[1])),
-          "Checkpoint merging must stay inside one node");
-    actions.emplace(row[0], Vector(row.begin(), row.end()));
-    if (row[1] >= 0) previous[row[1]] = row[0];
-  }
-  std::unordered_map<Int, Int> successors;
-  auto successor = [&](Int slot) {
-    while (slot >= 0 && successors.contains(slot)) slot = successors.at(slot);
-    return slot;
   };
-  auto recovery_before = [&](Int index, Int slot) {
-    if (previous.contains(slot)) return static_cast<double>(slot_info.at(previous.at(slot))[4]);
+  class CandidateQueue
+      : public std::priority_queue<Candidate, std::vector<Candidate>,
+                                   std::greater<Candidate>> {
+    using Base = std::priority_queue<Candidate, std::vector<Candidate>,
+                                     std::greater<Candidate>>;
+    bool collecting = false;
+
+  public:
+    void begin_update() {
+      this->c.clear();
+      collecting = true;
+    }
+    void push(const Candidate &candidate) {
+      if (collecting)
+        this->c.push_back(candidate);
+      else
+        Base::push(candidate);
+    }
+    void finish_update() {
+      std::make_heap(this->c.begin(), this->c.end(), this->comp);
+      collecting = false;
+    }
+  };
+
+  NodeRows nodes, kv, node_slots;
+  List config;
+  EvictionQueue<NodeRows> queue;
+  std::vector<double> model_storage;
+  const double *model_data = nullptr;
+  bool online;
+  std::unordered_map<Int, Vector> slot_info, actions;
+  std::unordered_map<Int, Int> decay_occupied, decay_released, pages,
+      page_delta;
+  Int free = 0, decay = 0, kv_free = 0;
+  Vector selected, released, page_order, compressed;
+  std::unordered_set<Int> released_set;
+  std::unordered_map<Int, Density> densities;
+  Vector model_ids, node_version;
+  std::vector<Vector> ordered_slots, order_keys;
+  std::unordered_map<Int, Int> previous, slot_node, successors, action_version;
+  std::unordered_map<Int, std::vector<Int>> kv_users, decay_users, owner_nodes;
+  std::unordered_map<Int, Int> pending_depths;
+  CandidateQueue candidates, default_candidates;
+
+  bool fits() {
+    const auto required_decay =
+        (std::max(Int{0}, config[7] - decay) + config[5] - 1) / config[5];
+    const auto log_frames = config[9];
+    return config[6] + config[7] * log_frames + config[8] * config[2] +
+               (config[7] * config[4] + config[8]) * config[3] +
+               required_decay <=
+           free + kv_free;
+  }
+  void release(Int slot) {
+    check(slot_info.contains(slot), "Missing eviction slot");
+    check(released_set.insert(slot).second, "Duplicate eviction slot release");
+    const auto &record = slot_info.at(slot);
+    released.push_back(slot);
+    free += record[1];
+    if (record[2] >= 0) {
+      check(decay_occupied.contains(record[2]),
+            "Missing decay frame occupancy");
+      if (++decay_released[record[2]] == decay_occupied.at(record[2])) {
+        ++free;
+        decay -= config[5] - 1;
+      } else {
+        ++decay;
+      }
+    }
+  }
+  void prune(Int index) {
+    selected.push_back(index);
+    check(kv[index].size() % 3 == 0, "Invalid eviction KV references");
+    for (size_t i = 0; i < kv[index].size(); i += 3) {
+      const auto frame = kv[index][i];
+      auto page = pages.try_emplace(frame, 0).first;
+      if (!page_delta.contains(frame))
+        page_order.push_back(frame);
+      auto &count = page->second;
+      count += kv[index][i + 1];
+      page_delta[frame] += kv[index][i + 1];
+      check(count <= kv[index][i + 2], "Eviction exceeds cached KV references");
+      kv_free += count == kv[index][i + 2];
+    }
+    for (const auto slot : node_slots[index]) {
+      if (released_set.contains(slot)) {
+        continue;
+      }
+      check(slot_info.contains(slot), "Missing eviction slot");
+      release(slot);
+    }
+  }
+  Rows result() {
+    Vector page_counts;
+    for (const auto frame : page_order) {
+      page_counts.insert(page_counts.end(), {frame, page_delta.at(frame)});
+    }
+    std::sort(released.begin(), released.end());
+    return Rows({List(selected.begin(), selected.end()),
+                 List(page_counts.begin(), page_counts.end()),
+                 List(released.begin(), released.end()),
+                 List(compressed.begin(), compressed.end())});
+  }
+  Int successor(Int slot) {
+    while (slot >= 0 && successors.contains(slot))
+      slot = successors.at(slot);
+    return slot;
+  }
+  double recovery_before(Int index, Int slot) {
+    if (previous.contains(slot))
+      return static_cast<double>(slot_info.at(previous.at(slot))[4]);
     const auto end = slot_info.at(slot)[4];
     double restored = model_data[index * 10 + 7];
     for (auto preceding : ordered_slots[index]) {
-      if (released_set.contains(preceding)) continue;
+      if (released_set.contains(preceding))
+        continue;
       const auto &record = slot_info.at(preceding);
-      if (record[4] >= end) break;
+      if (record[4] >= end)
+        break;
       if ((nodes[index][3] != 0 && record[2] < 0) || record[3] == restored)
         restored = record[4];
     }
     return restored;
-  };
-  auto slot_credit = [&](Int slot) {
-    if (released_set.contains(slot)) return Int{0};
+  }
+  Int slot_credit(Int slot) {
+    if (released_set.contains(slot))
+      return Int{0};
     const auto &record = slot_info.at(slot);
     Int credit = record[1];
-    if (record[2] >= 0 && decay_released[record[2]] + 1 == decay_occupied.at(record[2])) ++credit;
+    if (record[2] >= 0 &&
+        decay_released[record[2]] + 1 == decay_occupied.at(record[2]))
+      ++credit;
     return credit;
-  };
-  auto prune_credit = [&](Int index) {
+  }
+  Int prune_credit(Int index) {
     Int credit = 0;
     std::unordered_map<Int, Int> decays;
-    for (auto slot : node_slots[index]) if (!released_set.contains(slot)) {
-      const auto &record = slot_info.at(slot);
-      credit += record[1];
-      if (record[2] >= 0) ++decays[record[2]];
-    }
+    for (auto slot : node_slots[index])
+      if (!released_set.contains(slot)) {
+        const auto &record = slot_info.at(slot);
+        credit += record[1];
+        if (record[2] >= 0)
+          ++decays[record[2]];
+      }
     for (const auto &[frame, count] : decays)
       credit += decay_released[frame] + count == decay_occupied.at(frame);
     for (size_t j = 0; j < kv[index].size(); j += 3) {
@@ -508,30 +501,21 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
       credit += count + kv[index][j + 1] == kv[index][j + 2];
     }
     return credit;
-  };
-  struct Candidate {
-    double phase, score;
-    Int timestamp, id, kind, version;
-    double cost_score = 0.;
-    bool operator>(const Candidate &o) const {
-      return std::tie(phase, score, timestamp, kind, id) >
-             std::tie(o.phase, o.score, o.timestamp, o.kind, o.id);
-    }
-  };
-  using CandidateQueue = std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>>;
-  CandidateQueue candidates, default_candidates;
-  std::vector<Int> node_version(nodes.size());
-  std::unordered_map<Int, Int> action_version;
-  auto push_node = [&](Int index) {
-    if (index < 0 || !queue.is_leaf(index)) return;
+  }
+  void push_node(Int index) {
+    if (index < 0 || !queue.is_leaf(index))
+      return;
     const auto version = ++node_version[index];
+    const auto &order = order_keys[index];
     Int checkpoints = 0;
     for (auto slot : node_slots[index]) {
       checkpoints += !released_set.contains(slot) && actions.contains(slot);
-      if (checkpoints > 1) return;
+      if (checkpoints > 1)
+        return;
     }
     const bool log = nodes[index][3] == 0 && !node_slots[index].empty();
-    double phase = (log || nodes[index][2] == kEvictionExpand) ? 0. : 2., score = 0.;
+    double phase = (log || nodes[index][2] == kEvictionExpand) ? 0. : 2.,
+           score = 0.;
     const auto default_phase = phase;
     if (online) {
       phase = 0.;
@@ -539,10 +523,12 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
       const auto &density = densities.at(model_ids[index]);
       double cost = 0., restored = p[7];
       for (auto slot : ordered_slots[index]) {
-        if (released_set.contains(slot)) continue;
+        if (released_set.contains(slot))
+          continue;
         const auto &record = slot_info.at(slot);
         if ((nodes[index][3] != 0 && record[2] < 0) || record[3] == restored) {
-          cost += std::max(0., record[4] - restored) * (density.atom + density.prefix(record[4]));
+          cost += std::max(0., record[4] - restored) *
+                  (density.atom + density.prefix(record[4]));
           restored = record[4];
         }
       }
@@ -550,98 +536,283 @@ Rows plan_eviction(const NodeRows& nodes, const NodeRows& kv, const NodeRows& no
       score = credit ? cost / credit : std::numeric_limits<double>::infinity();
     }
     if (online && densities.at(model_ids[index]).default_order)
-      default_candidates.push({default_phase, 0., nodes[index][4], index, 0, version, score});
-    else candidates.push({phase, score, nodes[index][4], index, 0, version, score});
-  };
-  auto push_action = [&](Int slot) {
+      default_candidates.push({default_phase, 0., nodes[index][4], index, 0,
+                               version, score, order[0], order[1], order[2]});
+    else
+      candidates.push({phase, score, nodes[index][4], index, 0, version, score,
+                       order[0], order[1], order[2]});
+  }
+  void push_action(Int slot) {
     const auto version = ++action_version[slot];
-    if (!actions.contains(slot) || released_set.contains(slot)) return;
+    if (!actions.contains(slot) || released_set.contains(slot))
+      return;
     const auto &action = actions.at(slot);
     const auto right = successor(action[1]);
-    if (right < 0 || released_set.contains(right)) return;
-    const auto &left_record = slot_info.at(slot), &right_record = slot_info.at(right);
+    if (right < 0 || released_set.contains(right))
+      return;
+    const auto &left_record = slot_info.at(slot),
+               &right_record = slot_info.at(right);
     const auto left_span = left_record[4] - left_record[3];
     const auto right_span = right_record[4] - right_record[3];
     double phase = 1., score = std::max(left_span, right_span);
     if (online) {
       phase = 0.;
       const auto distance = left_record[4] - recovery_before(action[3], slot);
-      const auto cost = std::max(0., distance)
-          * densities.at(model_ids[action[3]]).mass(left_record[4], right_record[4]);
+      const auto cost =
+          std::max(0., distance) * densities.at(model_ids[action[3]])
+                                       .mass(left_record[4], right_record[4]);
       const auto credit = slot_credit(slot);
       score = credit ? cost / credit : std::numeric_limits<double>::infinity();
     }
     if (online && densities.at(model_ids[action[3]]).default_order)
-      default_candidates.push({1., static_cast<double>(std::max(left_span, right_span)),
-                               action[2], slot, 1, version, score});
-    else candidates.push({phase, score, action[2], slot, 1, version, score});
-  };
-  // Shared KV/decay credits change only for candidates referencing the changed frames.
-  std::unordered_map<Int, std::vector<Int>> kv_users, decay_users;
-  for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-    for (size_t j = 0; j < kv[i].size(); j += 3) kv_users[kv[i][j]].push_back(i);
-    for (auto slot : node_slots[i]) if (slot_info.at(slot)[2] >= 0)
-      decay_users[slot_info.at(slot)[2]].push_back(i);
+      default_candidates.push(
+          {1., static_cast<double>(std::max(left_span, right_span)), action[2],
+           slot, 1, version, score});
+    else
+      candidates.push({phase, score, action[2], slot, 1, version, score});
   }
-  for (const auto index : queue.leaves()) push_node(index);
-  for (const auto &[slot, action] : actions) push_action(slot);
-  if (fits()) return result();
-  auto valid = [&](const Candidate &c) {
-    if (c.kind == 0) return c.version == node_version[c.id] && queue.is_leaf(c.id);
-    if (c.version != action_version[c.id] || released_set.contains(c.id)) return false;
+  bool valid(const Candidate &c) {
+    if (c.kind == 0)
+      return c.version == node_version[c.id] && queue.is_leaf(c.id);
+    if (c.version != action_version[c.id] || released_set.contains(c.id))
+      return false;
     const auto right = successor(actions.at(c.id)[1]);
     return right >= 0 && !released_set.contains(right);
-  };
-  while (true) {
-    while (!candidates.empty() && !valid(candidates.top())) candidates.pop();
-    while (!default_candidates.empty() && !valid(default_candidates.top())) default_candidates.pop();
-    if (candidates.empty() && default_candidates.empty()) break;
-    bool use_default = candidates.empty();
-    if (!default_candidates.empty() && !candidates.empty()) {
-      auto next = default_candidates.top();
-      next.phase = 0.; next.score = next.cost_score;
-      use_default = candidates.top() > next;
-    }
-    auto &selected_queue = use_default ? default_candidates : candidates;
-    const auto c = selected_queue.top(); selected_queue.pop();
-    if (c.kind == 0) {
-      if (c.version != node_version[c.id] || !queue.is_leaf(c.id)) continue;
-      if (nodes[c.id][2] == kEvictionExpand) return Rows({List({-1})});
-      const auto parent = queue.take(c.id);
-      prune(c.id);
-      push_node(parent);
-      for (size_t j = 0; j < kv[c.id].size(); j += 3)
-        for (const auto user : kv_users[kv[c.id][j]]) push_node(user);
-      for (const auto slot : node_slots[c.id]) {
-        if (actions.contains(slot)) {
-          const auto right = successor(actions.at(slot)[1]);
-          successors[slot] = -1;
-          if (previous.contains(slot)) push_action(previous.at(slot));
-          if (right >= 0) previous.erase(right);
-        }
-        const auto frame = slot_info.at(slot)[2];
-        if (frame >= 0) for (const auto user : decay_users[frame]) push_node(user);
-      }
-    } else {
-      if (c.version != action_version[c.id] || released_set.contains(c.id)) continue;
-      const auto right = successor(actions.at(c.id)[1]);
-      if (right < 0 || released_set.contains(right)) continue;
-      compressed.insert(compressed.end(), {c.id, right});
-      slot_info.at(right)[3] = slot_info.at(c.id)[3];
-      successors[c.id] = right;
-      release(c.id);
-      if (previous.contains(c.id)) {
-        previous[right] = previous.at(c.id);
-        push_action(previous.at(c.id));
-      } else previous.erase(right);
-      push_action(right);
-      push_node(slot_node.at(c.id));
-      push_node(slot_node.at(right));
-    }
-    if (fits()) return result();
   }
-  return {};
-}
+
+  template <typename Indices>
+  void load_models(const Indices &indices, tvm::ffi::TensorView models) {
+    check(models.ndim() == 1 && models.is_contiguous() &&
+              models.device().device_type == kDLCPU &&
+              models.dtype().code == kDLFloat && models.dtype().bits == 64 &&
+              models.size(0) == static_cast<Int>(indices.size() * 10),
+          "Invalid eviction density models");
+    const auto *input = static_cast<const double *>(models.data_ptr());
+    for (size_t row = 0; row < indices.size(); ++row) {
+      const auto index = indices[row];
+      check(index >= 0 && index < static_cast<Int>(nodes.size()),
+            "Invalid eviction model index");
+      std::copy_n(input + row * 10, 10, model_storage.data() + index * 10);
+    }
+    densities.clear();
+    for (const auto i : indices) {
+      const auto *p = model_data + i * 10;
+      const auto id = static_cast<Int>(p[0]);
+      model_ids[i] = id;
+      if (densities.contains(id))
+        continue;
+      Density d;
+      d.default_order = p[9] != 0.;
+      d.tail = p[2];
+      d.atom = std::clamp(p[5], 0., 1.);
+      d.g = p[6];
+      check(d.g > 0 && std::isfinite(p[3]) && std::isfinite(p[4]),
+            "Invalid hit density");
+      const auto count =
+          std::max<Int>(1, static_cast<Int>((d.tail - p[1]) / d.g));
+      for (Int j = 1; j <= count; ++j) {
+        const auto a = j * d.g;
+        const auto mass = std::exp(p[4] - p[3] * std::log(a)) * d.g;
+        d.probability.push_back(d.probability.back() + mass);
+      }
+      const auto scale =
+          std::min(1., (1. - d.atom) / std::max(1e-300, d.probability.back()));
+      for (auto &v : d.probability)
+        v *= scale;
+      densities.emplace(id, std::move(d));
+    }
+  }
+
+public:
+  EvictionPlanner(std::array<NodeRows, 6> groups, const List &capacity,
+                  tvm::ffi::TensorView models, const Rows &order)
+      : nodes(std::move(groups[0])), kv(std::move(groups[1])),
+        node_slots(std::move(groups[2])), config(capacity), queue(nodes),
+        node_version(nodes.size()), ordered_slots(nodes.size()) {
+    const auto &slots = groups[3];
+    const auto &occupied = groups[4];
+    const auto &checkpoint_actions = groups[5];
+    for (const auto &row : order)
+      order_keys.emplace_back(row.begin(), row.end());
+    if (order_keys.empty())
+      for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i)
+        order_keys.push_back({0, -1, i});
+    check(order_keys.size() == nodes.size(),
+          "Invalid eviction ordering metadata");
+    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i)
+      owner_nodes[order_keys[i][1]].push_back(i);
+    check(nodes.size() == kv.size() && nodes.size() == node_slots.size() &&
+              config.size() == 10 && config[5] > 0,
+          "Invalid eviction capacity metadata");
+    for (const auto &row : slots) {
+      check(row.size() == 5 && row[1] >= 0, "Invalid eviction slot");
+      slot_info.emplace(row[0], Vector(row.begin(), row.end()));
+    }
+    for (const auto &row : occupied) {
+      check(row.size() == 2 && row[1] > 0 && row[1] <= config[5],
+            "Invalid decay occupancy");
+      decay_occupied.emplace(row[0], row[1]);
+    }
+    online = models.size(0) != 0;
+    model_ids.resize(nodes.size());
+    if (online) {
+      model_storage.resize(nodes.size() * 10);
+      model_data = model_storage.data();
+      Vector indices(nodes.size());
+      std::iota(indices.begin(), indices.end(), 0);
+      load_models(indices, models);
+    }
+    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
+      for (auto slot : node_slots[i]) {
+        slot_node.emplace(slot, i);
+        ordered_slots[i].push_back(slot);
+      }
+      std::sort(ordered_slots[i].begin(), ordered_slots[i].end(),
+                [&](Int a, Int b) {
+                  return slot_info.at(a)[4] < slot_info.at(b)[4];
+                });
+    }
+    for (const auto &row : checkpoint_actions) {
+      check(row.size() >= 4, "Invalid checkpoint eviction action");
+      check(slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
+            "Checkpoint action has an invalid owner");
+      check(row[1] < 0 || (slot_node.contains(row[1]) &&
+                           slot_node.at(row[0]) == slot_node.at(row[1])),
+            "Checkpoint merging must stay inside one node");
+      actions.emplace(row[0], Vector(row.begin(), row.end()));
+      if (row[1] >= 0)
+        previous[row[1]] = row[0];
+    }
+    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
+      for (size_t j = 0; j < kv[i].size(); j += 3)
+        kv_users[kv[i][j]].push_back(i);
+      for (auto slot : node_slots[i])
+        if (slot_info.at(slot)[2] >= 0)
+          decay_users[slot_info.at(slot)[2]].push_back(i);
+    }
+    for (const auto index : queue.leaves())
+      push_node(index);
+    for (const auto &[slot, action] : actions)
+      push_action(slot);
+  }
+  void refresh_models(const List &indices, tvm::ffi::TensorView models) {
+    check(online, "Cannot refresh a default eviction planner");
+    load_models(indices, models);
+    for (const auto &[owner, depth] : pending_depths)
+      for (const auto index : owner_nodes[owner])
+        order_keys[index][0] = depth;
+    pending_depths.clear();
+    candidates.begin_update();
+    default_candidates.begin_update();
+    for (const auto index : queue.leaves())
+      push_node(index);
+    for (const auto &[slot, action] : actions)
+      push_action(slot);
+    candidates.finish_update();
+    default_candidates.finish_update();
+  }
+  template <typename Occupancy>
+  Rows plan(const List &capacity, const Occupancy &occupancy) {
+    check(capacity.size() == 10, "Invalid eviction capacity metadata");
+    config = capacity;
+    free = config[0];
+    decay = config[1];
+    kv_free = 0;
+    selected.clear();
+    released.clear();
+    compressed.clear();
+    page_order.clear();
+    page_delta.clear();
+    for (const auto &row : occupancy) {
+      const auto frame = row[0], count = row[1] + decay_released[frame];
+      if (decay_occupied.at(frame) == count)
+        continue;
+      decay_occupied[frame] = count;
+      for (const auto user : decay_users[frame]) {
+        push_node(user);
+        for (const auto slot : node_slots[user])
+          if (!released_set.contains(slot) && actions.contains(slot))
+            push_action(slot);
+      }
+    }
+    for (const auto &[owner, depth] : pending_depths)
+      for (const auto index : owner_nodes[owner]) {
+        order_keys[index][0] = depth;
+        push_node(index);
+      }
+    pending_depths.clear();
+    if (fits())
+      return result();
+    while (true) {
+      while (!candidates.empty() && !valid(candidates.top()))
+        candidates.pop();
+      while (!default_candidates.empty() && !valid(default_candidates.top()))
+        default_candidates.pop();
+      if (candidates.empty() && default_candidates.empty())
+        break;
+      bool use_default = candidates.empty();
+      if (!default_candidates.empty() && !candidates.empty()) {
+        auto next = default_candidates.top();
+        next.phase = 0.;
+        next.score = next.cost_score;
+        use_default = candidates.top() > next;
+      }
+      auto &selected_queue = use_default ? default_candidates : candidates;
+      const auto c = selected_queue.top();
+      selected_queue.pop();
+      if (c.kind == 0) {
+        if (c.version != node_version[c.id] || !queue.is_leaf(c.id))
+          continue;
+        if (nodes[c.id][2] == kEvictionExpand)
+          return Rows({List({-1})});
+        const auto parent = queue.take(c.id);
+        prune(c.id);
+        if (parent >= 0 && order_keys[c.id][1] >= 0 &&
+            order_keys[parent][1] == order_keys[c.id][1])
+          pending_depths[order_keys[c.id][1]] = order_keys[c.id][2];
+        push_node(parent);
+        for (size_t j = 0; j < kv[c.id].size(); j += 3)
+          for (const auto user : kv_users[kv[c.id][j]])
+            push_node(user);
+        for (const auto slot : node_slots[c.id]) {
+          if (actions.contains(slot)) {
+            const auto right = successor(actions.at(slot)[1]);
+            successors[slot] = -1;
+            if (previous.contains(slot))
+              push_action(previous.at(slot));
+            if (right >= 0)
+              previous.erase(right);
+          }
+          const auto frame = slot_info.at(slot)[2];
+          if (frame >= 0)
+            for (const auto user : decay_users[frame])
+              push_node(user);
+        }
+      } else {
+        if (c.version != action_version[c.id] || released_set.contains(c.id))
+          continue;
+        const auto right = successor(actions.at(c.id)[1]);
+        if (right < 0 || released_set.contains(right))
+          continue;
+        compressed.insert(compressed.end(), {c.id, right});
+        slot_info.at(right)[3] = slot_info.at(c.id)[3];
+        successors[c.id] = right;
+        release(c.id);
+        if (previous.contains(c.id)) {
+          previous[right] = previous.at(c.id);
+          push_action(previous.at(c.id));
+        } else
+          previous.erase(right);
+        push_action(right);
+        push_node(slot_node.at(c.id));
+        push_node(slot_node.at(right));
+      }
+      if (fits())
+        return result();
+    }
+    return {};
+  }
+};
 
 class RecycleBin {
 public:
@@ -969,8 +1140,8 @@ struct Planner {
     return write_rows(branch_protections(inputs, read_rows(forced), granularity));
   }
 
-  static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List& counts,
-                                 const List& config, tvm::ffi::TensorView models) {
+  static std::array<std::vector<Vector>, 6> eviction_groups(
+      tvm::ffi::TensorView packed, const List &counts) {
     check(counts.size() == 6, "Invalid eviction metadata groups");
     const auto begin = cpu_ints(packed);
     const auto end = begin + packed.shape()[0];
@@ -988,8 +1159,30 @@ struct Planner {
       }
     }
     check(cursor == end, "Unexpected eviction metadata");
-    return write_rows(plan_eviction(groups[0], groups[1], groups[2], groups[3],
-                                    groups[4], config, groups[5], models));
+    return groups;
+  }
+  static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List &counts,
+                                 const List &config, tvm::ffi::TensorView models) {
+    auto groups = eviction_groups(packed, counts);
+    auto occupied = groups[4];
+    EvictionPlanner planner(std::move(groups), config, models, {});
+    return write_rows(planner.plan(config, occupied));
+  }
+  static Result make_eviction(tvm::ffi::TensorView packed, const List &counts,
+                             const List &config, tvm::ffi::TensorView models,
+                             tvm::ffi::TensorView order) {
+    auto planner = std::make_shared<EvictionPlanner>(
+        eviction_groups(packed, counts), config, models, read_rows(order));
+    Result result;
+    result.Set("plan", tvm::ffi::Function::FromTyped(
+      [planner](const List &capacity, tvm::ffi::TensorView occupied) {
+        return write_rows(planner->plan(capacity, read_rows(occupied)));
+      }));
+    result.Set("refresh_models", tvm::ffi::Function::FromTyped(
+      [planner](const List &indices, tvm::ffi::TensorView models) {
+        planner->refresh_models(indices, models);
+      }));
+    return result;
   }
 
   static tvm::ffi::Tensor materialize(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
@@ -1007,3 +1200,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_eviction, logssms::Planner::eviction);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_recycle_bin, logssms::make_recycle_bin);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_eviction_planner, logssms::Planner::make_eviction);

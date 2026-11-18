@@ -343,3 +343,121 @@ def test_equal_heat_candidate_order_matches_full_plan_for_different_chain_length
     for needed in (4, 40, 80):
         assert_full_plan_matches(manager, needed, needed)
     tree.check_integrity()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("checkpoints", [5, 12])
+def test_online_planner_reuses_candidates_without_changing_eviction(seed, checkpoints):
+    from logssms.cache.logstate.evictor import LogStateEvictor
+
+    manager = make_pressure_tree(chains=12, pages=12, checkpoints=checkpoints)
+    tree, analyzer = manager.tree, manager.analyzer
+    analyzer.enable_merge_adjustment = True
+    leaves = tuple(tree._leaves.values())
+    for leaf in leaves:
+        stats = analyzer.make_hit_stats(0)
+        analyzer.advance_hit_stats(stats, leaf.depth)
+        analyzer.record_hit(stats, 64)
+        leaf.analysis_owner = stats
+        leaf.timestamp = 1
+    rng = Random(seed)
+    reference = LogStateEvictor(
+        tree, manager.logstate_pool, analyzer=analyzer, profile_enabled=False,
+        profile_stats={}, allocation_samples=[], record_lifecycle_event=lambda _: None,
+    )
+    reference.cached_page_tokens = manager.evictor.cached_page_tokens
+    original = manager.evictor.plan
+    reused = 0
+    refreshed = 0
+
+    def compare(*args, **kwargs):
+        nonlocal reused, refreshed
+        before = manager.evictor._planner
+        model_changed = (
+            before is not None
+            and manager.evictor._planner_epoch == manager.evictor._eviction_epoch()
+            and manager.evictor._planner_model_epoch != manager.evictor._model_epoch()
+        )
+        expected = reference.plan(*args)
+        actual = original(*args, **kwargs)
+        reused += before is not None and manager.evictor._planner is before
+        if model_changed:
+            assert manager.evictor._planner is before
+            refreshed += 1
+        assert signature(actual) == signature(expected)
+        return actual
+
+    with patch.object(manager.evictor, "plan", side_effect=compare):
+        for step in range(40):
+            if step == 12:
+                # A miss still advances the global query clock.
+                analyzer.record_hit(None, 0)
+            if step == 16:
+                leaf = next(iter(tree._leaves.values()))
+                analyzer.record_hit(leaf.analysis_owner, leaf.depth)
+            if step == 20:
+                leaf = next(iter(tree._leaves.values()))
+                leaf.timestamp += 1
+            if step == 24:
+                leaf = next(iter(tree._leaves.values()))
+                pinned = (leaf.entries[-1].slot,)
+                tree.pin_recovery(pinned)
+            if step == 28:
+                tree.pin_recovery(pinned, release=True)
+            pages, slots, works = manager.evictor.allocate(1, 1)
+            assert len(pages) == len(slots) == 1 and not works
+            if rng.randrange(2):
+                manager.logstate_pool.retire_slots(slots)
+            tree.check_integrity()
+            manager._allocator.check_integrity()
+    assert reused > 10
+    assert refreshed >= 2
+
+
+def test_eviction_profile_records_rebuild_causes_and_stage_timings():
+    manager = make_pressure_tree(chains=8, pages=12, checkpoints=3)
+    tree, analyzer, evictor = manager.tree, manager.analyzer, manager.evictor
+    analyzer.enable_merge_adjustment = True
+    for leaf in tuple(tree._leaves.values()):
+        stats = analyzer.make_hit_stats(0)
+        analyzer.advance_hit_stats(stats, leaf.depth)
+        analyzer.record_hit(stats, 64)
+        leaf.analysis_owner = stats
+    evictor._profile_enabled = True
+
+    def allocate():
+        evictor.allocate(1, 1)
+        return evictor._profile_allocation_samples[-1]["planning"]
+
+    first = allocate()
+    assert first["causes"] == ["cold_start"]
+    assert first["mode"] == "rebuild" and first["full_snapshots"] == 1
+    assert allocate()["mode"] == "reuse"
+    leaf = next(iter(tree._leaves.values()))
+    leaf.timestamp += 1
+    assert allocate()["causes"] == ["access"]
+    pinned = (leaf.entries[-1].slot,)
+    tree.pin_recovery(pinned)
+    locked = allocate()
+    assert locked["causes"] == ["locks"]
+    assert locked["total_ms"] > 0
+    assert "eviction_snapshot_ms" in locked["timing_ms"]
+    assert "eviction_build_ms" in locked["timing_ms"]
+    tree.pin_recovery(pinned, release=True)
+
+
+def test_frame_range_index_matches_token_references_after_append():
+    from collections import Counter
+    from logssms.cache.logstate.prefix_cache import LogRadixTreeNode
+
+    manager = make_pressure_tree(chains=1)
+    node = LogRadixTreeNode(manager.tree.key_fn, 32)
+    frames = torch.tensor([3] * 16 + [5] * 32 + [3] * 16, dtype=torch.int32)
+    node.initialize(torch.arange(64, dtype=torch.int32), frames * 32, frames)
+    for append in (False, True):
+        if append:
+            extra = torch.tensor([7] * 16 + [5] * 16, dtype=torch.int32)
+            node.append(torch.arange(64, 96, dtype=torch.int32), extra * 32, extra)
+        for begin in range(0, node.length + 1, 8):
+            for end in range(begin, node.length + 1, 8):
+                assert list(node.kv_frame_counts(begin, end).items()) == list(Counter(node._kv_frames[begin:end].tolist()).items())

@@ -61,6 +61,7 @@ class LogStateAllocator:
         self._next_slot = 0
         self._free_slot_ids: list[int] = []
         self._decay_masks: dict[int, int] = {}
+        self.decay_counts: dict[int, int] = {}
         self._open_decay_frames: set[int] = set()
         self._free_decay_records = 0
         self._reclaimable_slots: set[int] = set()
@@ -111,9 +112,11 @@ class LogStateAllocator:
         occupied = self._decay_masks.get(frame, 0)
         self._reclaimable_decay_frames -= int(occupied != 0 and reclaimable == occupied)
         if mask:
+            self.decay_counts[frame] = mask.bit_count()
             self._decay_masks[frame] = mask
         else:
             self._decay_masks.pop(frame, None)
+            self.decay_counts.pop(frame, None)
         self._reclaimable_decay_frames += int(mask != 0 and reclaimable == mask)
 
     @property
@@ -396,6 +399,7 @@ class LogStateAllocator:
         self._free_slot_ids.append(slot)
 
     def check_integrity(self) -> None:
+        assert self.decay_counts == {frame: mask.bit_count() for frame, mask in self._decay_masks.items()}
         assert self._reclaimable_slots <= self._slots.keys()
         assert self.projected_free_capacity() == self.projected_free_capacity(self._reclaimable_slots)
         owned = list(self._kv) + list(self._free) + list(self._decay_masks)

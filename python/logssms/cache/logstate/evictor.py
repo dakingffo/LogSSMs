@@ -34,6 +34,14 @@ class LogStateEvictor:
         self._profile_stats = profile_stats
         self._profile_allocation_samples = allocation_samples
         self._record_lifecycle_event = record_lifecycle_event
+        self._planner = None
+        self._planner_epoch = None
+        self._planner_model_epoch = None
+        self._planner_segments = []
+        self._planner_decay_frames = ()
+        self._planning_timings = {}
+        self._planning_diagnostic = {}
+        self._slot_descriptions = {}
 
     def allocate(
         self,
@@ -67,11 +75,13 @@ class LogStateEvictor:
             stage = now
         if reserved is None:
             selected, page_counts, released_slots, checkpoint_pairs = self.plan(
-                needed_pages, needed_states, needed_works
+                needed_pages, needed_states, needed_works,
             )
             if profile is not None:
                 now = perf_counter_ns()
                 profile["timing_ms"]["eviction_plan_ms"] = (now - stage) / 1e6
+                profile["timing_ms"].update(self._planning_timings)
+                profile["planning"] = self._planning_diagnostic
                 profile["evicted_nodes"] = len(selected)
                 profile.setdefault("counts", {})["dropped_checkpoints"] = len(checkpoint_pairs)
                 stage = now
@@ -115,6 +125,8 @@ class LogStateEvictor:
             for slot in released_slots:
                 assert not self.tree.has_slot(slot)
 
+            for slot in released_slots:
+                self._slot_descriptions.pop(slot, None)
             self.pool.retire_slots(sorted(released_slots))
             if profile is not None:
                 now = perf_counter_ns()
@@ -142,6 +154,9 @@ class LogStateEvictor:
                 f"kv={needed_pages}, logs={needed_states}, works={needed_works}, "
                 f"slots={len(released_slots)}, checkpoint_drops={len(checkpoint_pairs)}"
             )
+            if self._planner is not None:
+                self._planner_epoch = self._eviction_epoch()
+
             if self._profile_enabled:
                 self._record_lifecycle_event({
                     "event": "eviction",
@@ -189,13 +204,58 @@ class LogStateEvictor:
     def plan(
         self, needed_pages: int, needed_states: int, needed_works: int,
     ) -> tuple[list[LogRadixEvictionSegment], dict[int, int], set[int], list[tuple[int, int]]]:
+        if not self._profile_enabled:
+            return self._plan(needed_pages, needed_states, needed_works)
+        start = perf_counter_ns()
+        previous, current = self._planner_epoch, self._eviction_epoch()
+        labels = ("structure", "locks", "access", "policy", "observations")
+        causes = ([name for name, old, new in zip(labels, previous, current, strict=True)
+                   if old != new] if self._planner is not None and previous is not None
+                  else ["cold_start"])
+        self._planning_diagnostic = {
+            "causes": causes, "query": self.analyzer.query_count,
+            "mode": "rebuild", "full_snapshots": 0,
+        }
+        try:
+            return self._plan(needed_pages, needed_states, needed_works)
+        finally:
+            self._planning_diagnostic["total_ms"] = (perf_counter_ns() - start) / 1e6
+            self._planning_diagnostic["timing_ms"] = dict(self._planning_timings)
+
+    def _plan(
+        self, needed_pages: int, needed_states: int, needed_works: int,
+    ) -> tuple[list[LogRadixEvictionSegment], dict[int, int], set[int], list[tuple[int, int]]]:
         from logssms.kernel import logstate as planning
 
+        self._planning_timings = {}
+        stage = perf_counter_ns() if self._profile_enabled else 0
+        config = self._eviction_capacity(needed_pages, needed_states, needed_works)
+        epoch = self._eviction_epoch()
+        if self._planner is not None and epoch == self._planner_epoch:
+            if self._model_epoch() != self._planner_model_epoch:
+                self._refresh_planner_models()
+                stage = perf_counter_ns() if self._profile_enabled else 0
+            occupied = [(frame, self._allocator.decay_counts.get(frame, 0))
+                        for frame in self._planner_decay_frames]
+            self._planning_stage("eviction_resource_ms", stage)
+            stage = perf_counter_ns() if self._profile_enabled else 0
+            rows = self._planner.plan(config, occupied)
+            self._planning_stage("eviction_select_ms", stage)
+            if rows:
+                if self._profile_enabled:
+                    self._profile_stats["eviction_planner_reuses"] += 1
+                    self._planning_diagnostic["mode"] = "reuse"
+                return self._consume_plan(rows)
+        if self._profile_enabled and not self._planning_diagnostic["causes"]:
+            self._planning_diagnostic["causes"] = ["planner_exhausted"]
+        self._planner = None
+        self._planner_segments = []
         allocator = self._allocator
         leaf_limit, tail_limit = 1, 16
         use_models = self.analyzer.enable_merge_adjustment and self.analyzer.has_internal_observations
         log_only = not use_models
         while True:
+            stage = perf_counter_ns() if self._profile_enabled else 0
             nodes, topology = (
                 self.tree.log_eviction_snapshot(leaf_limit, tail_limit=tail_limit)
                 if log_only else self.tree.eviction_snapshot()
@@ -208,38 +268,58 @@ class LogStateEvictor:
             if self._profile_enabled:
                 self._profile_stats["eviction_candidate_windows"] += int(log_only)
                 self._profile_stats["eviction_full_snapshots"] += int(not log_only)
+                self._planning_diagnostic["full_snapshots"] += int(not log_only)
                 self._profile_stats["eviction_serialized_nodes"] += len(nodes)
+            self._planning_stage("eviction_snapshot_ms", stage)
+            stage = perf_counter_ns() if self._profile_enabled else 0
             node_slots = [segment.eviction_slots for segment in nodes]
             slot_ids = {slot for row in node_slots for slot in row}
             slots = []
             decay_frames = set()
             for slot in slot_ids:
                 record = allocator.slot(slot)
-                slots.append((
-                    slot,
-                    len(record.payload) + sum(map(len, record.conv)),
-                    -1 if record.decay is None else record.decay.frame,
-                    self.tree.entry_for_slot(slot).begin,
-                    self.tree.entry_for_slot(slot).end,
-                ))
-                if record.decay is not None:
-                    decay_frames.add(record.decay.frame)
-            rows = planning.plan_eviction(
-                topology,
-                [[value for frame, count in segment._kv_frame_counts.items() for value in (
-                    frame, count, self.cached_page_tokens[frame * self.page_size],
-                )] if row[2] != _EVICTION_EXPAND else [] for segment, row in zip(nodes, topology, strict=True)],
-                node_slots,
-                slots,
-                [(frame, allocator._decay_masks[frame].bit_count()) for frame in decay_frames],
-                (allocator.free_frames, allocator._free_decay_records,
-                 allocator.payload_frames, allocator.conv_frames, allocator.num_granules,
-                 allocator.decay_records_per_frame, needed_pages, needed_states, needed_works,
-                 allocator.log_payload_frames),
-                () if log_only else self.tree.checkpoint_eviction_actions(nodes),
-                models=(self.analyzer.eviction_models(nodes)
-                        if use_models else None),
-            )
+                entry = self.tree.entry_for_slot(slot)
+                cached = self._slot_descriptions.get(slot)
+                if cached is None or cached[0] is not record or cached[1] is not entry:
+                    row = (slot, len(record.payload) + sum(map(len, record.conv)),
+                           -1 if record.decay is None else record.decay.frame,
+                           entry.begin, entry.end)
+                    cached = self._slot_descriptions[slot] = (record, entry, row)
+                slots.append(cached[2])
+                if cached[2][2] >= 0:
+                    decay_frames.add(cached[2][2])
+            kv = [[value for frame, count in segment._kv_frame_counts.items() for value in (
+                frame, count, self.cached_page_tokens[frame * self.page_size],
+            )] if row[2] != _EVICTION_EXPAND else []
+                  for segment, row in zip(nodes, topology, strict=True)]
+            occupied = [(frame, allocator.decay_counts.get(frame, 0)) for frame in decay_frames]
+            actions = () if log_only else self.tree.checkpoint_eviction_actions(nodes)
+            self._planning_stage("eviction_resource_ms", stage)
+            stage = perf_counter_ns() if self._profile_enabled else 0
+            models = self.analyzer.eviction_models(nodes) if use_models else None
+            self._planning_stage("eviction_models_ms", stage)
+            stage = perf_counter_ns() if self._profile_enabled else 0
+            if use_models:
+                self._planner = planning.EvictionPlanner(
+                    topology, kv, node_slots, slots, occupied, config, actions, models,
+                    [(segment.node.depth, segment.node.uuid, segment.begin) for segment in nodes],
+                )
+                self._planning_stage("eviction_build_ms", stage)
+                self._planner_model_epoch = self._model_epoch()
+                self._planner_segments = nodes
+                self._planner_decay_frames = tuple(decay_frames)
+                stage = perf_counter_ns() if self._profile_enabled else 0
+                rows = self._planner.plan(config, occupied)
+                self._planning_stage("eviction_select_ms", stage)
+                if rows:
+                    return self._consume_plan(rows)
+                self._planner = None
+                self._planner_segments = []
+            else:
+                rows = planning.plan_eviction(
+                    topology, kv, node_slots, slots, occupied, config, actions, models=models,
+                )
+                self._planning_stage("eviction_build_and_select_ms", stage)
             if rows:
                 selected, pages, released, compressed = rows
                 return ([nodes[index] for index in selected],
@@ -260,6 +340,52 @@ class LogStateEvictor:
             f"need_pages={needed_pages}, need_states={needed_states}, "
             f"free_frames={allocator.free_frames}."
         )
+
+    def _planning_stage(self, name: str, start: int) -> None:
+        if self._profile_enabled:
+            elapsed = (perf_counter_ns() - start) / 1e6
+            self._planning_timings[name] = self._planning_timings.get(name, 0.0) + elapsed
+
+    def _eviction_epoch(self):
+        return (self.tree.revision, self.tree.lock_revision, self.tree.access_revision,
+                self.analyzer.enable_merge_adjustment, self.analyzer.has_internal_observations)
+
+    def _model_epoch(self):
+        return self.analyzer.query_count, len(self.analyzer._owners)
+
+    def _refresh_planner_models(self) -> None:
+        stage = perf_counter_ns() if self._profile_enabled else 0
+        live = [(index, segment) for index, segment in enumerate(self._planner_segments)
+                if segment is not None]
+        live.sort(key=lambda item: (item[1].node.depth, item[1].node.uuid, item[1].begin))
+        models = self.analyzer.eviction_models([segment for _, segment in live])
+        self._planning_stage("eviction_models_ms", stage)
+        stage = perf_counter_ns() if self._profile_enabled else 0
+        self._planner.refresh_models([index for index, _ in live], models)
+        self._planner_model_epoch = self._model_epoch()
+        self._planning_stage("eviction_rescore_ms", stage)
+        if self._profile_enabled:
+            self._profile_stats["eviction_model_refreshes"] += 1
+
+    def _eviction_capacity(self, pages, logs, works):
+        allocator = self._allocator
+        return (allocator.free_frames, allocator._free_decay_records,
+                allocator.payload_frames, allocator.conv_frames, allocator.num_granules,
+                allocator.decay_records_per_frame, pages, logs, works,
+                allocator.log_payload_frames)
+
+    def _consume_plan(self, rows):
+        selected, pages, released, compressed = rows
+        segments = [self._planner_segments[index] for index in selected]
+        for index in selected:
+            self._planner_segments[index] = None
+        # Ownerless densities depend on the physical node's current endpoint.
+        if any(segment.node.analysis_owner is None for segment in segments):
+            self._planner = None
+            self._planner_segments = []
+        self._planner_epoch = None
+        return (segments, dict(zip(pages[::2], pages[1::2], strict=True)), set(released),
+                list(zip(compressed[::2], compressed[1::2], strict=True)))
 
     @staticmethod
     def _record_pool_timings(
