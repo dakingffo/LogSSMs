@@ -282,7 +282,7 @@ constexpr Int kEvictionExpand = 2;
 template <typename NodeRows>
 class EvictionQueue {
 public:
-  explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes), children_(nodes.size()) {
+  explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes), children_(nodes.size()), alive_(nodes.size(), true) {
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
       check(nodes[i].size() == 5 && nodes[i][2] >= 0 && nodes[i][2] <= kEvictionExpand,
             "Invalid eviction node");
@@ -302,6 +302,7 @@ public:
 
   Int take(Int index) {
     check(leaves_.erase(index) == 1, "Eviction node is not an unlocked leaf");
+    alive_[index] = false;
     const auto parent = indices_.find(nodes_[index][1]);
     if (parent != indices_.end() && !--children_[parent->second] && nodes_[parent->second][2] != kEvictionBlocked) {
       push(parent->second);
@@ -310,6 +311,11 @@ public:
     return -1;
   }
 
+  void update(Int index) {
+    if (alive_[index] && !children_[index] && nodes_[index][2] != kEvictionBlocked)
+      push(index);
+    else leaves_.erase(index);
+  }
   bool is_leaf(Int index) const { return leaves_.contains(index); }
   const std::unordered_set<Int>& leaves() const { return leaves_; }
 
@@ -320,6 +326,7 @@ private:
 
   const NodeRows& nodes_;
   Vector children_;
+  std::vector<bool> alive_;
   std::unordered_map<Int, Int> indices_;
   std::unordered_set<Int> leaves_;
 };
@@ -574,7 +581,7 @@ class EvictionPlanner {
   bool valid(const Candidate &c) {
     if (c.kind == 0)
       return c.version == node_version[c.id] && queue.is_leaf(c.id);
-    if (c.version != action_version[c.id] || released_set.contains(c.id))
+    if (!actions.contains(c.id) || c.version != action_version[c.id] || released_set.contains(c.id))
       return false;
     const auto right = successor(actions.at(c.id)[1]);
     return right >= 0 && !released_set.contains(right);
@@ -695,6 +702,39 @@ public:
     for (const auto &[slot, action] : actions)
       push_action(slot);
   }
+  void update_locks(const Rows &blocked, const Rows &checkpoint_rows) {
+    std::unordered_set<Int> affected;
+    for (const auto &row : blocked) {
+      check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(nodes.size()),
+            "Invalid eviction lock metadata");
+      const auto index = row[0];
+      if (nodes[index][2] == row[1]) continue;
+      nodes[index][2] = row[1];
+      queue.update(index);
+      push_node(index);
+    }
+    std::unordered_map<Int, Vector> updated;
+    for (const auto &row : checkpoint_rows) {
+      check(row.size() == 4 && slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
+            "Invalid checkpoint lock metadata");
+      updated.emplace(row[0], Vector(row.begin(), row.end()));
+    }
+    for (const auto &[slot, action] : actions)
+      if (!updated.contains(slot) || updated.at(slot) != action) {
+        ++action_version[slot]; affected.insert(action[3]);
+      }
+    for (const auto &[slot, action] : updated)
+      if (!actions.contains(slot) || actions.at(slot) != action) affected.insert(action[3]);
+    actions = std::move(updated);
+    previous.clear();
+    successors.clear();
+    for (const auto &[slot, action] : actions)
+      if (action[1] >= 0) previous[action[1]] = slot;
+    for (const auto index : affected) {
+      push_node(index);
+      for (const auto slot : node_slots[index]) if (actions.contains(slot)) push_action(slot);
+    }
+  }
   void refresh_models(const List &indices, tvm::ffi::TensorView models) {
     check(online, "Cannot refresh a default eviction planner");
     load_models(indices, models);
@@ -789,7 +829,7 @@ public:
               push_node(user);
         }
       } else {
-        if (c.version != action_version[c.id] || released_set.contains(c.id))
+        if (!actions.contains(c.id) || c.version != action_version[c.id] || released_set.contains(c.id))
           continue;
         const auto right = successor(actions.at(c.id)[1]);
         if (right < 0 || released_set.contains(right))
@@ -1177,6 +1217,10 @@ struct Planner {
     result.Set("plan", tvm::ffi::Function::FromTyped(
       [planner](const List &capacity, tvm::ffi::TensorView occupied) {
         return write_rows(planner->plan(capacity, read_rows(occupied)));
+      }));
+    result.Set("update_locks", tvm::ffi::Function::FromTyped(
+      [planner](tvm::ffi::TensorView blocked, tvm::ffi::TensorView actions) {
+        planner->update_locks(read_rows(blocked), read_rows(actions));
       }));
     result.Set("refresh_models", tvm::ffi::Function::FromTyped(
       [planner](const List &indices, tvm::ffi::TensorView models) {

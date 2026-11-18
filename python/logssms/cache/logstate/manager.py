@@ -330,6 +330,7 @@ class LogStateCacheManager(BaseCacheManager):
             "eviction_full_snapshots": 0,
             "eviction_planner_reuses": 0,
             "eviction_model_refreshes": 0,
+            "eviction_lock_refreshes": 0,
             "eviction_serialized_nodes": 0,
             "pressure_dropped_checkpoints": 0,
             "pressure_pruned_checkpoints": 0,

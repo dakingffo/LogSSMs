@@ -66,6 +66,9 @@ class EvictionPlanner:
             torch.tensor(models, dtype=torch.float64).flatten(), _pack(order),
         )
 
+    def update_locks(self, blocked, actions):
+        self._planner["update_locks"](_pack(blocked), _pack(actions))
+
     def refresh_models(self, indices, models):
         self._planner["refresh_models"](
             indices, torch.tensor(models, dtype=torch.float64).flatten(),

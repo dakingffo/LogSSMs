@@ -389,6 +389,11 @@ def test_online_planner_reuses_candidates_without_changing_eviction(seed, checkp
 
     with patch.object(manager.evictor, "plan", side_effect=compare):
         for step in range(40):
+            if step == 8:
+                locked_leaf = next(iter(tree._leaves.values()))
+                tree.lock(locked_leaf)
+            if step == 10:
+                tree.lock(locked_leaf, unlock=True)
             if step == 12:
                 # A miss still advances the global query clock.
                 analyzer.record_hit(None, 0)
@@ -441,8 +446,10 @@ def test_eviction_profile_records_rebuild_causes_and_stage_timings():
     locked = allocate()
     assert locked["causes"] == ["locks"]
     assert locked["total_ms"] > 0
-    assert "eviction_snapshot_ms" in locked["timing_ms"]
-    assert "eviction_build_ms" in locked["timing_ms"]
+    assert locked["mode"] == "reuse" and locked["full_snapshots"] == 0
+    assert "eviction_locks_ms" in locked["timing_ms"]
+    assert "eviction_snapshot_ms" not in locked["timing_ms"]
+    assert "eviction_build_ms" not in locked["timing_ms"]
     tree.pin_recovery(pinned, release=True)
 
 

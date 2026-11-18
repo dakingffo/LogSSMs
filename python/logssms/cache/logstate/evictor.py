@@ -231,6 +231,12 @@ class LogStateEvictor:
         stage = perf_counter_ns() if self._profile_enabled else 0
         config = self._eviction_capacity(needed_pages, needed_states, needed_works)
         epoch = self._eviction_epoch()
+        if (self._planner is not None and self._planner_epoch is not None
+                and epoch[:1] + epoch[2:] == self._planner_epoch[:1] + self._planner_epoch[2:]
+                and epoch[1] != self._planner_epoch[1]):
+            self._refresh_planner_locks()
+            self._planner_epoch = epoch
+            stage = perf_counter_ns() if self._profile_enabled else 0
         if self._planner is not None and epoch == self._planner_epoch:
             if self._model_epoch() != self._planner_model_epoch:
                 self._refresh_planner_models()
@@ -349,6 +355,22 @@ class LogStateEvictor:
     def _eviction_epoch(self):
         return (self.tree.revision, self.tree.lock_revision, self.tree.access_revision,
                 self.analyzer.enable_merge_adjustment, self.analyzer.has_internal_observations)
+
+    def _refresh_planner_locks(self) -> None:
+        stage = perf_counter_ns() if self._profile_enabled else 0
+        live = [(index, segment) for index, segment in enumerate(self._planner_segments)
+                if segment is not None]
+        blocked = [(index, int(segment.node.is_root() or segment.node.is_locked
+                               or any(slot in self.tree._recovery_slot_refs
+                                      for slot in segment.storage_slots if self.tree.has_slot(slot))))
+                   for index, segment in live]
+        actions = self.tree.checkpoint_eviction_actions([segment for _, segment in live])
+        actions = [(slot, right, timestamp, live[index][0])
+                   for slot, right, timestamp, index in actions]
+        self._planner.update_locks(blocked, actions)
+        self._planning_stage("eviction_locks_ms", stage)
+        if self._profile_enabled:
+            self._profile_stats["eviction_lock_refreshes"] += 1
 
     def _model_epoch(self):
         return self.analyzer.query_count, len(self.analyzer._owners)
