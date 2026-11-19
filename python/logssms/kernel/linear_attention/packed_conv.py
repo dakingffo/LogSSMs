@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from .layout import conv_pointer
+from .layout import conv_pointer, slotted_state_offset
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ def _conv_destination(
     if LOGSTATE:
         frame = tl.load(frames + slot * NUM_GRANULES + granule, slot >= 0, other=0).to(tl.int64)
         return storage + frame * FRAME_ELEMS + LAYER * C * S
-    return storage + slot.to(tl.int64) * SLOT_STRIDE + LAYER * LAYER_STRIDE
+    return storage + slotted_state_offset(slot, LAYER, SLOT_STRIDE, LAYER_STRIDE)
 
 
 @triton.jit(

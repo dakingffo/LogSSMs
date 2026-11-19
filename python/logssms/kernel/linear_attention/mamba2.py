@@ -6,7 +6,7 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
 from logssms.cache.logstate.layout import LOG_STATE_REPLAY_WINDOW
-from .layout import log_pointer, state_pointer
+from .layout import log_pointer, slotted_state_offset, state_pointer
 from .replay import reconstruct_tile
 from .tuning import decode_config, prefill_state_config
 from .state_io import (
@@ -229,9 +229,11 @@ def _mamba2_decode_kernel(
         decay_head = (Storage + decay_frame * FRAME_BYTES + decay_index * DECAY_BYTES).to(tl.pointer_type(tl.float32))
         position = tl.load(Positions + req)
     else:
-        state_head = State + read.to(tl.int64) * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE + head * K * V
+        state_head = (State + slotted_state_offset(read, LAYER, STATE_SLOT_STRIDE, STATE_LAYER_STRIDE)
+                      + head * K * V)
         write = tl.load(Write + req * WS)
-        destination = State + write.to(tl.int64) * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE + head * K * V
+        destination = (State + slotted_state_offset(write, LAYER, STATE_SLOT_STRIDE, STATE_LAYER_STRIDE)
+                       + head * K * V)
 
     if LOGSTATE and not EAGER:
         count = tl.load(Counts + req)

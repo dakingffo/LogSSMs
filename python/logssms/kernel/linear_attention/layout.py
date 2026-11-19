@@ -3,6 +3,11 @@ import triton.language as tl
 
 
 @triton.jit
+def slotted_state_offset(slot, layer, SLOT_STRIDE: tl.constexpr, LAYER_STRIDE: tl.constexpr):
+    return slot.to(tl.int64) * SLOT_STRIDE + layer.to(tl.int64) * LAYER_STRIDE
+
+
+@triton.jit
 def state_pointer(
     storage, frames, slot, layer, head, elements,
     HEADS: tl.constexpr, HEAD_BYTES: tl.constexpr,

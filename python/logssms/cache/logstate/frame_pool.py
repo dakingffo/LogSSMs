@@ -32,6 +32,7 @@ class MHALogStatePool:
         device              : torch.device,
         dtype               : torch.dtype,
         recurrent_type      : str = "gdn",
+        deterministic_reclamation: bool = False,
     ) -> None:
         layout = LogStateSlotLayout(
             page_size=page_size,
@@ -107,6 +108,7 @@ class MHALogStatePool:
         self._retired_releases: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
         self._retiring_slots: set[int] = set()
         self._retired_rebindings: list[tuple[torch.cuda.Event, tuple[RetiredResources, ...]]] = []
+        self.deterministic_reclamation = deterministic_reclamation
 
     @property
     def device(self) -> torch.device:
@@ -400,7 +402,9 @@ class MHALogStatePool:
                     timings.get("wait_materialization_ms", 0.0) + (now - stage) / 1e6
                 )
                 stage = now
-            self.poll_reclamation(timings)
+            self.poll_reclamation(
+                timings, completed_event=event if self.deterministic_reclamation else None,
+            )
             if timings is not None:
                 now = perf_counter_ns()
                 timings["retry_poll_reclamation_ms"] = (
@@ -436,6 +440,11 @@ class MHALogStatePool:
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(self.device))
             self._retired_materializations.append((event, tuple(slots)))
+            if self.deterministic_reclamation:
+                # This conversion does not credit its surplus until the slot is
+                # updated. Commit it at the same point on every rank.
+                event.synchronize()
+                self.poll_reclamation(completed_event=event)
         else:
             for slot in slots:
                 self.allocator.materialize(slot)
@@ -488,20 +497,42 @@ class MHALogStatePool:
     def retiring_slots(self) -> frozenset[int]:
         return frozenset(self._retiring_slots)
 
-    def poll_reclamation(self, timings: dict[str, float] | None = None) -> None:
-        rebindings = []
-        for event, records in self._retired_rebindings:
-            if event.query():
+    def poll_reclamation(
+        self, timings: dict[str, float] | None = None, *,
+        completed_event: torch.cuda.Event | None = None,
+    ) -> None:
+        # TP ranks must reclaim the same resources for a given allocation,
+        # independent of which local GPU finishes first.
+        if completed_event is None and self.deterministic_reclamation:
+            return
+        if completed_event is not None:
+            assert any(queue and queue[0][0] is completed_event for queue in (
+                self._retired_rebindings, self._retired_materializations, self._retired_releases,
+            )), "Reclamation must complete the selected queue head"
+
+        def ready(event: torch.cuda.Event) -> bool:
+            return completed_event is not None or event.query()
+
+        def select(queue):
+            if completed_event is None:
+                return queue, []
+            if queue and queue[0][0] is completed_event:
+                return [queue.pop(0)], queue
+            return (), queue
+
+        binding_events, rebindings = select(self._retired_rebindings)
+        for event, records in binding_events:
+            if ready(event):
                 for record in records:
                     self.allocator.release_retirement(record)
             else:
                 rebindings.append((event, records))
         self._retired_rebindings = rebindings
-        remaining = []
+        materialization_events, remaining = select(self._retired_materializations)
         completed = []
-        for event, slots in self._retired_materializations:
+        for event, slots in materialization_events:
             start = perf_counter_ns() if timings is not None else 0
-            if event.query():
+            if ready(event):
                 if timings is not None:
                     timings["reclamation_query_ms"] = (
                         timings.get("reclamation_query_ms", 0.0)
@@ -532,9 +563,9 @@ class MHALogStatePool:
                     )
                 remaining.append((event, slots))
         self._retired_materializations = remaining
-        remaining_releases = []
-        for event, slots in self._retired_releases:
-            if event.query():
+        release_events, remaining_releases = select(self._retired_releases)
+        for event, slots in release_events:
+            if ready(event):
                 self._release_slots(slots, timings=timings)
                 self._retiring_slots.difference_update(slots)
                 if timings is not None:

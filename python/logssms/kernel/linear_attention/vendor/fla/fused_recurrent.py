@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 from logssms.cache.logstate.layout import LOG_STATE_REPLAY_WINDOW
-from ...layout import log_pointer, state_pointer
+from ...layout import log_pointer, slotted_state_offset, state_pointer
 from ...tuning import decode_config
 
 from .op import exp
@@ -100,16 +100,14 @@ def _fused_recurrent_gated_delta_kernel(
         write_slot = tl.load(write_slots + batch_idx * WRITE_SLOT_STRIDE)
         state_ptr = (
             initial_state
-            + read_slot * STATE_SLOT_STRIDE
-            + LAYER * STATE_LAYER_STRIDE
+            + slotted_state_offset(read_slot, LAYER, STATE_SLOT_STRIDE, STATE_LAYER_STRIDE)
             + value_head * STATE_HEAD_STRIDE
             + k_offset[:, None] * HEAD_V_DIM
             + v_offset[None, :]
         )
         write_state_ptr = (
             initial_state
-            + write_slot * STATE_SLOT_STRIDE
-            + LAYER * STATE_LAYER_STRIDE
+            + slotted_state_offset(write_slot, LAYER, STATE_SLOT_STRIDE, STATE_LAYER_STRIDE)
             + value_head * STATE_HEAD_STRIDE
             + k_offset[:, None] * HEAD_V_DIM
             + v_offset[None, :]

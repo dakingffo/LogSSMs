@@ -11,6 +11,7 @@ from logssms.kernel.linear_attention.conv_decode import (
     _frame_element_offset,
     conv_decode,
 )
+from logssms.kernel.linear_attention.layout import slotted_state_offset
 from logssms.layers.gated_delta import GatedDeltaConfig
 
 
@@ -26,6 +27,25 @@ def test_logstate_decode_conv_uses_64_bit_frame_offsets():
     result = torch.empty(1, device="cuda", dtype=torch.int64)
     _large_frame_offset_kernel[(1,)](frame, result)
     assert result.item() == 1 << 31
+
+
+@triton.jit(do_not_specialize=["layer"])
+def _large_slotted_offset_kernel(slots, result, layer, layer_stride: tl.constexpr):
+    row = tl.program_id(0)
+    offset = slotted_state_offset(tl.load(slots + row), layer, 131072, layer_stride)
+    tl.store(result + row, offset)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_marconi_state_offsets_support_large_layer_stride():
+    slots = torch.tensor([0, 11333, 11337], device="cuda", dtype=torch.int32)
+    result = torch.empty_like(slots, dtype=torch.int64)
+    layer_stride = 1487011840
+    for layer in (0, 12, 13, 15):
+        _large_slotted_offset_kernel[(len(slots),)](slots, result, layer, layer_stride)
+        assert result.tolist() == [
+            slot * 131072 + layer * layer_stride for slot in (0, 11333, 11337)
+        ]
 
 
 def _config() -> GatedDeltaConfig:

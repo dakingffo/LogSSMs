@@ -1,10 +1,15 @@
 """CPU coverage of release IDs, deferred ownership, and pool event ordering."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, ExitStack, nullcontext
 from unittest.mock import patch
 
 import pytest
-from tests.core.test_logstate_cache_manager import make_manager
+import torch
+from logssms.core import SamplingParams
+from logssms.message import UserMsg
+from logssms.scheduler.prefill import PrefillAdder, PrefillManager
+from logssms.scheduler.table import TableManager
+from tests.core.test_logstate_cache_manager import cache_checkpoint_chain, make_manager
 
 
 @pytest.mark.parametrize("lazy", [False, True])
@@ -115,6 +120,21 @@ class _PendingEvent:
         self.queries += 1
         return self.ready
 
+    def record(self, _stream):
+        pass
+
+
+@contextmanager
+def _enqueue_cuda_events(pool, *events):
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            type(pool), "device", property(lambda _: torch.device("cuda")),
+        ))
+        stack.enter_context(patch("torch.cuda.Event", side_effect=events))
+        stack.enter_context(patch("torch.cuda.current_stream", return_value=None))
+        stack.enter_context(patch.object(pool, "_write_descriptors"))
+        yield
+
 
 def test_reserve_waits_only_for_enough_retired_capacity():
     pool = make_manager().logstate_pool
@@ -146,3 +166,161 @@ def test_rebinding_batch_queries_one_event_and_releases_all_records():
         assert event.queries == 2
         assert release.call_count == 128
         assert not pool._retired_rebindings
+
+
+def test_tp_reclamation_allocates_identical_frames_with_different_event_progress():
+    def setup(ready):
+        pool = make_manager().logstate_pool
+        pool.deterministic_reclamation = True
+        _, _, works = pool.reserve(works=3)
+        pool.reserve(kv=pool.allocator.free_frames)
+        events = [_PendingEvent() for _ in works]
+        for slot, event, complete in zip(works, events, ready, strict=True):
+            event.ready = complete
+            pool.allocator.set_reclaimable(slot, True)
+            pool._retiring_slots.add(slot)
+            pool._retired_releases.append((event, (slot,)))
+        return pool, events
+
+    fast, fast_events = setup((True, True, True))
+    slow, slow_events = setup((False, False, False))
+    assert fast.reserve(kv=1) == slow.reserve(kv=1)
+    assert fast.retiring_slots == slow.retiring_slots
+    assert [e.waits for e in fast_events] == [e.waits for e in slow_events] == [1, 0, 0]
+    assert fast.reserve(logs=1) == slow.reserve(logs=1)
+    fast.allocator.check_integrity()
+    slow.allocator.check_integrity()
+
+
+@pytest.mark.parametrize("deterministic, expected", [
+    (False, ((True, 0), (False, 0))),
+    (True, ((True, 1), (True, 1))),
+])
+def test_tp_materialization_credits_admission_independent_of_event_progress(
+    deterministic, expected,
+):
+    def admit(ready):
+        manager = make_manager(granularity=32)
+        pool = manager.logstate_pool
+        pool.deterministic_reclamation = deterministic
+        allocator = pool.allocator
+        # The dummy log already occupies the first decay frame. The last log
+        # is alone in the second frame so its conversion frees one frame.
+        _, logs, _ = pool.reserve(logs=allocator.decay_records_per_frame)
+        event = _PendingEvent()
+        event.ready = ready
+        handle = manager.tree.match_prefix(torch.arange(24, dtype=torch.int32)).cuda_handle
+        demand = manager.reservation_size(24 + 512, handle=handle)
+        assert 0 < demand <= allocator.free_frames
+        pool.reserve(kv=allocator.free_frames - demand + 1)
+        assert manager.admission_capacity == demand - 1
+        with (
+            patch.object(type(pool), "device", property(lambda _: torch.device("cuda"))),
+            patch("torch.cuda.Event", return_value=event),
+            patch("torch.cuda.current_stream", return_value=None),
+            patch.object(pool, "_write_descriptors"),
+        ):
+            pool.materialize(logs[-1])
+        result = manager.prefill_acquire(demand, handle)
+        allocator.check_integrity()
+        return result, event.waits
+
+    assert (admit(True), admit(False)) == expected
+
+
+@pytest.mark.parametrize("free_frames,expected_uids,expected_waits", [
+    (20, [687, 688], (0, 0)),
+    (1, [687], (1, 0)),
+    (0, [687], (1, 1)),
+])
+def test_tp_mixed_prefill_agrees_with_rebinding_and_release_pending(
+    free_frames, expected_uids, expected_waits,
+):
+    def schedule(binding_ready, release_ready):
+        manager = make_manager(granularity=32)
+        pool = manager.logstate_pool
+        pool.deterministic_reclamation = True
+        _, logs, works = pool.reserve(logs=2, works=3)
+        binding, release = _PendingEvent(), _PendingEvent()
+        binding.ready, release.ready = binding_ready, release_ready
+        pool.reserve(kv=pool.allocator.free_frames - free_frames)
+        with (
+            _enqueue_cuda_events(pool, binding, release),
+            patch("logssms.kernel.linear_attention.logstate.copy_states"),
+        ):
+            pool.materialize_groups([tuple(logs)], works[:1])
+            pool.retire_slots(works[1:])
+
+        table = TableManager(3, manager.page_table)
+        prefill = PrefillManager(table.token_pool, manager.page_size, manager)
+        for uid in (687, 688):
+            prefill.add_one_req(UserMsg(
+                uid, torch.arange(24, dtype=torch.int32) + uid * 32,
+                SamplingParams(max_tokens=1),
+            ))
+        adder = PrefillAdder(
+            token_budget=8192, reserved_size=0, cache_manager=manager, table_manager=table,
+            mixed_token_budget=128, mixed_partitions=((32, 32), (128,)),
+        )
+        with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):
+            batch = prefill.schedule_next_batch(adder, mixed_max_requests=2)
+        assert batch is not None and adder.use_mixed
+        assert [req.uid for req in batch.reqs] == expected_uids
+        if free_frames == 0:
+            manager.allocate(batch.reqs, phase="prefill")
+        assert (binding.waits, release.waits) == expected_waits
+        assert binding.queries == release.queries == 0
+        pool.allocator.check_integrity()
+        return (
+            [(req.uid, req.cached_len, req.extend_len, req.table_idx) for req in batch.reqs],
+            [req.uid for req in prefill.pending_list],
+            manager.admission_capacity,
+            pool.allocator._slots,
+            pool.allocator.decay_counts,
+            pool.allocator._free,
+        )
+
+    assert schedule(True, False) == schedule(False, True) == schedule(False, False)
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_tp_eviction_agrees_after_draining_pending_releases(online):
+    def evict(ready):
+        manager = make_manager(enable_merge_adjustment=online)
+        tokens, leaf, checkpoints = cache_checkpoint_chain(manager, (4, 2))
+        if online:
+            manager.analyzer.record_hit(leaf.analysis_owner, len(tokens) - 64)
+            assert manager.analyzer.has_internal_observations
+        pool = manager.logstate_pool
+        pool.deterministic_reclamation = True
+        _, _, works = pool.reserve(works=2)
+        retirement, eviction = _PendingEvent(), _PendingEvent()
+        retirement.ready, eviction.ready = ready, not ready
+        with _enqueue_cuda_events(pool, retirement):
+            pool.retire_slots(works)
+
+        demand = pool.allocator.free_frames + pool.allocator.required_frames(0, 0, 2) + 1
+        # More than free plus already queued capacity, but one dropped
+        # Checkpoint is enough. Let the actual eviction path retire it.
+        retire = pool.retire_slots
+
+        def retire_eviction(slots):
+            with _enqueue_cuda_events(pool, eviction):
+                retire(slots)
+
+        with (
+            patch.object(pool, "retire_slots", side_effect=retire_eviction),
+            patch.object(manager.evictor, "plan", wraps=manager.evictor.plan) as plan,
+        ):
+            allocation = manager._allocate(demand, 0)
+        plan.assert_called_once()
+        assert retirement.waits == eviction.waits == 1
+        remaining = tuple(manager.tree.iter_entries())
+        assert len(remaining) == 1
+        assert remaining[0].slot == checkpoints[-1].slot
+        assert manager.tree.match_prefix(tokens).cuda_handle.cached_len == len(tokens)
+        manager._return_slots(allocation[0], allocation[1])
+        manager.check_integrity()
+        return allocation, remaining
+
+    assert evict(True) == evict(False)

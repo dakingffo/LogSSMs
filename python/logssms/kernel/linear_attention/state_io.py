@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .layout import log_pointer, state_pointer
+from .layout import log_pointer, slotted_state_offset, state_pointer
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,8 @@ def _chunk_state_pointer(
             storage, payload_frames, slot, LAYER, head, offsets,
             HV, HEAD_PAYLOAD_BYTES, FRAME_BYTES, FRAMES_PER_SLOT,
         )
-    return storage + slot.to(tl.int64) * SLOT_STRIDE + LAYER * LAYER_STRIDE + head * HEAD_STRIDE + offsets
+    return (storage + slotted_state_offset(slot, LAYER, SLOT_STRIDE, LAYER_STRIDE)
+            + head * HEAD_STRIDE + offsets)
 
 
 @triton.jit

@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from .packed_conv import _scale_conv_input, _conv_input_scale_args
-from .layout import conv_pointer
+from .layout import conv_pointer, slotted_state_offset
 
 
 @triton.jit
@@ -58,8 +58,8 @@ def _conv_decode_kernel(
             work_base = 0
     else:
         state_ptr = StandardState
-        old_base = read_slot * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
-        new_base = write_slot * STATE_SLOT_STRIDE + LAYER * STATE_LAYER_STRIDE
+        old_base = slotted_state_offset(read_slot, LAYER, STATE_SLOT_STRIDE, STATE_LAYER_STRIDE)
+        new_base = slotted_state_offset(write_slot, LAYER, STATE_SLOT_STRIDE, STATE_LAYER_STRIDE)
         work_base = 0
 
     KERNEL_WIDTH: tl.constexpr = STATE_LEN + 1

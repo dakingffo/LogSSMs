@@ -2651,3 +2651,31 @@ def test_partial_cpu_recovery_restores_shared_owner_before_the_new_branch_owner(
     assert owner.tail == 256
     assert len(manager.tree._iter_nodes()) == 3
     manager.check_integrity()
+
+
+@pytest.mark.parametrize("granularity,split", [(16, 80), (32, 96)])
+def test_recycled_restore_refreshes_checkpoint_metadata_after_prefix_split(granularity, split):
+    manager = make_manager(num_pages=24, num_states=24, granularity=granularity,
+                           enable_merge_adjustment=True)
+    _gpu_tail_with_recycled_page(manager)
+    original = torch.arange(320, dtype=torch.int32)
+    first = new_req(manager, original, table_idx=0)
+    handle = first.cache_handle
+    checkpoint = handle.match_entries[0]
+    assert manager.tree.has_entry(checkpoint)
+    recovery = handle.recovery
+    second = new_req(manager, torch.cat((original[:split],
+                     torch.arange(1000, 1160, dtype=torch.int32))), table_idx=1)
+    assert not manager.tree.has_entry(checkpoint)
+    assert manager.tree.has_slot(checkpoint.slot)
+    assert checkpoint.slot in manager.tree._recovery_slot_refs
+    manager._prepare_prefill([first, second])
+    path, entries = manager._restore_prefix(handle)
+    assert any(node.depth == split and node.is_protected for node in path)
+    current = next(entry for entry in entries if entry.slot == checkpoint.slot)
+    assert current is not checkpoint and current.begin == split and current.end == 128
+    assert handle.recovery is recovery and handle.cached_len == 192
+    plan = manager._recycled_restores[0].plan
+    assert split in plan.protected_endpoints
+    assert all(manager.tree.has_entry(entry) for item in plan.checkpoints for entry in item.gpu_entries)
+    assert manager._profile_stats["eviction_rounds"] == 0

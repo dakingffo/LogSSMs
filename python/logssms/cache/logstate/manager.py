@@ -566,7 +566,7 @@ class LogStateCacheManager(BaseCacheManager):
                 checkpoint.end: slot for checkpoint in plan.checkpoints
                 if (slot := self._checkpoint_output_slot(checkpoint)) is not None
             }
-            blocked.update(entry.slot for entry in handle.match_entries)
+            blocked.update(entry.slot for entry in self._restore_prefix(handle)[1])
 
     def _checkpoint_output_slot(self, checkpoint: RecycledCheckpoint) -> int | None:
         for entry in reversed(checkpoint.gpu_entries):
@@ -578,6 +578,14 @@ class LogStateCacheManager(BaseCacheManager):
     def _apply_protections(self, protections: Sequence[BranchProtection]) -> None:
         for protection in protections:
             self.tree.protect_at(protection.node, protection.position)
+
+    def _restore_prefix(self, handle: LogStateCacheHandle):
+        if handle.trace_revision == self.tree.revision:
+            path, entries = handle.match_path, handle.match_entries
+        else:
+            path = self.tree.path(handle.node)
+            entries = (entry for node in path for entry in node.entries)
+        return path, tuple(entry for entry in entries if entry.end <= handle.cached_len)
 
     def _plan_recycled_restore(
         self,
@@ -593,8 +601,7 @@ class LogStateCacheManager(BaseCacheManager):
         from logssms.kernel import logstate as planning
 
         cached_len = handle.cached_len
-        gpu = tuple(entry for entry in handle.match_entries if entry.end <= cached_len)
-        path = handle.match_path
+        path, gpu = self._restore_prefix(handle)
         protected = frozenset((
             *match.branch.protected_endpoints, *batch_branches,
             *((match.matched_len,) if match.matched_len < len(match.branch.tokens) else ()),
@@ -2346,6 +2353,7 @@ class LogStateCacheFactory(BaseCacheFactory):
             dtype=dtype,
             granularity=config.cache_config.granularity,
             recurrent_type=spec.recurrent_type,
+            deterministic_reclamation=tp_info.size > 1,
         )
         assert (
             shared_pool.allocator.log_payload_frames
