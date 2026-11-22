@@ -78,12 +78,13 @@ def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills, cap
     ctx.page_table = (table[:, :, None] * page + torch.arange(page, device=device)).reshape(decodes + prefills, -1).int()
     set_global_ctx(ctx)
 
-    def batch(length):
-        lengths = [length // prefills + (i < length % prefills) for i in range(prefills)]
+    def batch(length, count=prefills):
+        lengths = [length // count + (i < length % count) for i in range(count)]
         reqs = [Request(torch.zeros(64 + n, dtype=torch.int32), i, 64, 1, i, None, None, 512)
                 for i, n in enumerate(lengths)]
         reqs += [Request(torch.zeros(18 + i, dtype=torch.int32), i + prefills, 17 + i, 1, i + prefills, None, None, 512) for i in range(decodes)]
-        result = Batch(reqs, "mixed", num_prefill_reqs=prefills)
+        result = Batch(reqs, "mixed", num_prefill_reqs=count)
+        result.prefill_partition = (capacity // prefills,) * prefills
         result.prefill_token_capacity = capacity
         result.padded_reqs = reqs
         result.prepared_indices = BatchIndices.make_mixed(result, device, page)[0]
@@ -94,6 +95,8 @@ def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills, cap
     try:
         static = batch(capacity)
         backend.make_mixed_capture(static, 512)
+        assert static.attn_metadata.prefill.wrapper._int_workspace_buffer is backend._mixed_wrappers[0]._int_workspace_buffer
+        assert static.attn_metadata.decode.wrapper._int_workspace_buffer is backend._mixed_wrappers[1]._int_workspace_buffer
         q = torch.randn(capacity + decodes, q_heads, head_dim, device=device, dtype=k.dtype)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -104,21 +107,24 @@ def test_mixed_graph_matches_separate_attention(head_dim, decodes, prefills, cap
         with torch.cuda.graph(graph):
             output = backend.forward(q, 0, static)
         before = k.clone(), v.clone()
-        for length in (capacity, 1, 31, 32, 63, 17, capacity):
-            length = min(capacity, max(length, prefills))
-            runtime = batch(length)
+        live = [(length, prefills) for length in (capacity, 1, 31, 32, 63, 17, capacity)]
+        if prefills > 1:
+            live.insert(1, (capacity - capacity // prefills, prefills - 1))
+        for length, count in live:
+            length = min(capacity, max(length, count))
+            runtime = batch(length, count)
             assert runtime.attn_metadata.prefill.wrapper is not runtime.attn_metadata.decode.wrapper
             expected_indices = torch.cat((
-                runtime.prepared_indices.cu_seqlens_q_gpu[1:prefills + 1] - 1,
+                runtime.prepared_indices.cu_seqlens_q_gpu[1:count + 1] - 1,
                 torch.arange(decodes, device=device, dtype=torch.int32) + capacity,
             ))
-            torch.testing.assert_close(runtime.attn_metadata.get_last_indices(prefills + decodes),
+            torch.testing.assert_close(runtime.attn_metadata.get_last_indices(count + decodes),
                                        expected_indices, check_dtype=False)
             q.normal_()
             backend.prepare_mixed_replay(static, runtime)
             graph.replay()
             actual = torch.cat((output[:length], output[capacity:])).clone()
-            p, d = Batch(runtime.reqs[:prefills], "prefill"), Batch(runtime.reqs[prefills:], "decode")
+            p, d = Batch(runtime.reqs[:count], "prefill"), Batch(runtime.reqs[count:], "decode")
             for part in (p, d):
                 part.padded_reqs = part.reqs
                 backend.prepare_metadata(part)

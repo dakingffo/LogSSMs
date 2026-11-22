@@ -284,8 +284,7 @@ class Scheduler(SchedulerIOMixin):
                         self.config.mixed_prefill_tokens if mixed_decode_cap > 0 else None
                     ),
                     mixed_partitions=(
-                        tuple(p for p in self.engine.mixed_graph_runner.partitions.values()
-                              if len(p) < self.config.max_running_req)
+                        self.engine.mixed_graph_runner.admission_buckets
                         if mixed_decode_cap > 0 else ()
                     ),
                 )
@@ -299,7 +298,8 @@ class Scheduler(SchedulerIOMixin):
             if not adder.use_mixed:
                 mixed_decode_cap = 0
             if batch is not None and mixed_decode_cap > 0:
-                mixed_decode_cap = min(mixed_decode_cap, self.config.max_running_req - batch.size)
+                partition = self.engine.mixed_graph_runner.partition(tuple(req.extend_len for req in batch.reqs))
+                mixed_decode_cap = min(mixed_decode_cap, self.config.max_running_req - len(partition))
                 with self.profiler.record_schedule_step("ar_select"):
                     decode = self.ar_manager.schedule_next_batch(max_requests=mixed_decode_cap)
                 if decode is not None:
@@ -307,6 +307,7 @@ class Scheduler(SchedulerIOMixin):
                         reqs=batch.reqs + decode.reqs, phase="mixed",
                         num_prefill_reqs=batch.size,
                     )
+                    batch.prefill_partition = partition
             elif batch is not None:
                 self.ar_manager.on_prefill_scheduled()
             else:

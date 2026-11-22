@@ -79,9 +79,10 @@ class FIMixedMetadata(BaseAttnMetadata):
     prefill: FIMetadata
     decode: FIMetadata
     prefill_capacity: int
+    prefill_count: int
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
-        count = len(self.prefill.seq_lens_cpu) - 1
+        count = self.prefill_count
         indices = self.prefill.get_last_indices(min(count, bs))
         if bs <= count:
             return indices
@@ -330,11 +331,22 @@ class FlashInferBackend(BaseAttnBackend):
         count = batch.prefill_count
         first_pages = int(k[count])
         padding = packet.prefill_padding
-        qo = torch.cat((q[:count + 1], q[count:count + 1] + padding))
-        kv = torch.cat((k[:count + 1], k[count:count + 1] + 1))
-        indices = torch.cat((pages[:first_pages], pages[:1]))
-        seq = torch.cat((packet.seq_lens_cpu[:count], packet.seq_lens_cpu.new_ones(1)))
-        last = torch.cat((packet.last_page_len_cpu[:count], packet.last_page_len_cpu.new_ones(1)))
+        unused_slots = max(0, len(batch.prefill_partition) - count)
+        assert padding >= unused_slots
+        # Give each unused slot one padding query. The last sequence consumes
+        # the rest of the padding and all padding sequences read a valid KV page.
+        qo = q[:count + 1]
+        if unused_slots:
+            steps = torch.arange(1, unused_slots + 2, dtype=k.dtype)
+            qo = torch.cat((qo, q[count] + steps[:-1]))
+            kv = torch.cat((k[:count + 1], k[count] + steps))
+        else:
+            kv = torch.cat((k[:count + 1], k[count:count + 1] + 1))
+        qo = torch.cat((qo, q[count:count + 1] + padding))
+        pad_sequences = unused_slots + 1
+        indices = torch.cat((pages[:first_pages], pages[:1].expand(pad_sequences)))
+        seq = torch.cat((packet.seq_lens_cpu[:count], packet.seq_lens_cpu.new_ones(pad_sequences)))
+        last = torch.cat((packet.last_page_len_cpu[:count], packet.last_page_len_cpu.new_ones(pad_sequences)))
         prefill = FIMetadata(
             qo, kv, qo.to(self.device, non_blocking=True), indices, last,
             self.qo_head_local, self.kv_head_local, self.config.head_dim,
@@ -348,7 +360,7 @@ class FlashInferBackend(BaseAttnBackend):
             page_size, "NONE", packet.seq_lens_cpu[count:], self.kvcache.dtype,
             self._mixed_wrappers[1],
         )
-        batch.attn_metadata = FIMixedMetadata(prefill, decode, int(qo[-1]))
+        batch.attn_metadata = FIMixedMetadata(prefill, decode, int(qo[-1]), count)
 
     def make_mixed_capture(self, batch: Batch, max_seq_len: int) -> None:
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
@@ -374,6 +386,9 @@ class FlashInferBackend(BaseAttnBackend):
                     workspace, **common, use_tensor_cores=self.use_tensor_cores,
                     paged_kv_indptr_buffer=kv, paged_kv_indices_buffer=pages,
                     paged_kv_last_page_len_buffer=last)
+            # Planning and replay are ordered on the model stream. The two
+            # parts need separate buffers because both plans precede replay.
+            wrapper._int_workspace_buffer = self._mixed_wrappers[index]._int_workspace_buffer
             planned = replace(source, wrapper=wrapper, cu_seqlens_q_gpu=qo, initialized=False)
             setattr(metadata, field, planned)
             self._initialize_metadata_once(planned)

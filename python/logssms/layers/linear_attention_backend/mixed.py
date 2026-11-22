@@ -60,13 +60,14 @@ def prepare_mixed_linear_metadata(
     prefill: Batch,
     decode: Batch,
     prefill_capacity: int,
+    prefill_slots: int | None = None,
 ) -> tuple[LinearAttnMetadata | LogStateLinearAttnMetadata,
            LinearAttnMetadata | LogStateLinearAttnMetadata]:
     """Normalize already-prepared metadata, install it, and return both dataclasses.
 
     Inputs to the prefill forward must have exactly ``prefill_capacity`` rows;
-    only the first sum(req.extend_len) output rows are meaningful. Request-level
-    arrays and cu_seqlens retain actual values and shapes. Decode must already be
+    only the first sum(req.extend_len) output rows are meaningful. Unused
+    prefill slots have zero-length sequences and disabled State writes. Decode must already be
     prepared for its padded bucket size, with ordinary dummy-request slots.
 
     GDN and Mamba2 support standard and LogState caches.
@@ -86,6 +87,10 @@ def prepare_mixed_linear_metadata(
     indices = pm.prefill_indices
     if indices is None or len(indices.cu_seqlens) != len(lengths) + 1:
         raise ValueError("prepare ordinary actual-length metadata before normalization")
+    requests = len(lengths)
+    slots = requests if prefill_slots is None else prefill_slots
+    if not requests <= slots <= prefill_capacity:
+        raise ValueError("invalid mixed prefill slot count")
 
     if isinstance(pm, LogStateLinearAttnMetadata):
         from logssms.core import get_global_ctx
@@ -94,7 +99,15 @@ def prepare_mixed_linear_metadata(
     else:
         chunk_size = 64
     pad = _MetadataPadding()
-    packed = _packed_pad(indices, prefill_capacity, len(lengths), chunk_size, pad)
+    packed = _packed_pad(indices, prefill_capacity, slots, chunk_size, pad)
+    missing = slots - requests
+    if missing:
+        packed = replace(
+            packed,
+            cu_seqlens=torch.cat((indices.cu_seqlens, indices.cu_seqlens[-1:].expand(missing))),
+            chunk_offsets=torch.cat((indices.chunk_offsets, indices.chunk_offsets[-1:].expand(missing))),
+            endings=pad(indices.endings, slots, -1),
+        )
     chunk_capacity = len(packed.chunk_indices)
     if pm.chunk_write_slots is None or pm.conv_token_slots is None:
         raise ValueError("mixed prefill requires direct-write metadata")
@@ -104,6 +117,8 @@ def prepare_mixed_linear_metadata(
         conv_token_slots=pad(pm.conv_token_slots, prefill_capacity, -1),
     )
     if isinstance(pm, LinearAttnMetadata):
+        if missing:
+            updates["baseline_slots"] = pad(pm.baseline_slots, slots, -1)
         # Checkpoints are at most one per chunk. Index padding reads the first
         # real snapshot/state; sentinel destinations suppress all padded writes.
         for name in ("checkpoint_slots", "checkpoint_chunks", "snapshot_rows", "snapshot_reqs"):
@@ -119,6 +134,14 @@ def prepare_mixed_linear_metadata(
             log_write_slots=pad(pm.log_write_slots, prefill_capacity, -1),
             conv_token_granules=pad(pm.conv_token_granules, prefill_capacity),
         )
+        if missing:
+            updates.update(
+                work_slots=pad(pm.work_slots, slots, -1),
+                conv_read_slots=torch.cat((pm.conv_read_slots, pm.conv_read_slots[:1].expand(missing))),
+                conv_read_granules=torch.cat((
+                    pm.conv_read_granules, pm.conv_read_granules[:1].expand(missing),
+                )),
+            )
     decode_updates = {}
     if isinstance(dm, LinearAttnMetadata):
         for name in ("slots", "read_slots", "write_slots"):

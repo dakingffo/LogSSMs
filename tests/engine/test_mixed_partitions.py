@@ -5,35 +5,45 @@ import pytest
 from logssms.cache.config import LogStateCacheConfig, NaiveCacheConfig, RadixCacheConfig
 from logssms.engine.mixed_graph import MixedGraphRunner
 from logssms.scheduler.prefill import PrefillAdder
-from logssms.utils.mixed import prefill_buckets, prefill_partitions
+from logssms.utils.mixed import prefill_buckets, prefill_partitions, select_prefill_partition
 
 
 @pytest.mark.parametrize("granularity,expected", [
-    (32, [(32,32,32,32), (64,32,32), (64,64), (128,)]),
-    (16, [(16,)*8, (32,)+(16,)*6, (32,32)+(16,)*4,
-          (32,32,32,16,16), (32,)*4, (64,32,32), (64,64), (128,)]),
+    (32, [(32,32,32,32), (64,64), (128,)]),
+    (16, [(16,)*8, (32,)*4, (64,64), (128,)]),
     (64, [(64,64), (128,)]),
 ])
 def test_partitions(granularity, expected):
     assert prefill_partitions(128, granularity) == tuple(expected)
 
 
-@pytest.mark.parametrize("budget", [64, 96, 128, 192, 256])
+@pytest.mark.parametrize("budget", [64, 96, 128, 160, 192, 256])
 @pytest.mark.parametrize("alignment", [16, 32, 64])
-def test_partitions_preserve_budget_and_cover_every_count(budget, alignment):
+def test_partitions_preserve_budget_and_halve_slot_count(budget, alignment):
     if budget % alignment:
         with pytest.raises(ValueError):
             prefill_partitions(budget, alignment)
         return
     parts = prefill_partitions(budget, alignment)
-    assert [len(p) for p in parts] == list(range(budget // alignment, 0, -1))
+    assert all(len(new) == (len(old) + 1) // 2 for old, new in zip(parts, parts[1:]))
+    assert len(parts[-1]) == 1
     assert all(sum(p) == budget and all(n % alignment == 0 for n in p) for p in parts)
-    assert all(all(a <= b for a,b in zip(old, new)) for old,new in zip(parts, parts[1:]))
+    assert all(new == tuple(sum(old[i:i + 2]) for i in range(0, len(old), 2))
+               for old, new in zip(parts, parts[1:]))
+
+
+def test_odd_budget_retains_the_last_unpaired_slot():
+    assert prefill_partitions(160, 32) == (
+        (32, 32, 32, 32, 32), (64, 64, 32), (128, 32), (160,),
+    )
+    buckets = prefill_buckets(160, 32)
+    assert select_prefill_partition(buckets, (64, 64, 32)) == (64, 64, 32)
+    assert select_prefill_partition(buckets, (32, 32, 32, 32)) == (32,) * 5
 
 
 @pytest.mark.parametrize("cache_config,expected", [
-    (LogStateCacheConfig(granularity=16), 72),
-    (LogStateCacheConfig(granularity=32), 37),
+    (LogStateCacheConfig(granularity=16), 50),
+    (LogStateCacheConfig(granularity=32), 32),
     (LogStateCacheConfig(granularity=64), 17),
     (NaiveCacheConfig(page_size=64), 17),
     (NaiveCacheConfig(page_size=128), 17),
@@ -81,7 +91,7 @@ def test_graph_enumeration(monkeypatch, cache_config, expected, maximum):
     if maximum >= 24:
         assert runner.padded_size(17) == runner.padded_size(24) == 24
         assert {24-len(p) for s,p in made if s == 24} == set(
-            range(24 - 128 // cache_config.prefill_alignment,24)
+            24 - len(p) for p in runner.buckets
         )
     if maximum == 32:
         assert runner.padded_size(25) == 32
@@ -93,6 +103,7 @@ def test_graph_enumeration(monkeypatch, cache_config, expected, maximum):
     (128, 16, [16, 32, 64, 128]),
     (128, 32, [32, 64, 128]),
     (128, 64, [64, 128]),
+    (160, 32, [32, 64, 160]),
     (32, 32, [32]),
     (96, 32, [32, 96]),
     (192, 32, [32, 96, 192]),
@@ -109,36 +120,33 @@ def test_prefill_bucket_capacities(budget, alignment, capacities):
     (32, [1], (32,)), (32, [32], (32,)), (32, [33], (64,)),
     (32, [65], (128,)), (32, [20,20], (32,32)),
     (32, [60,20], (64,64)), (32, [20,60], (64,64)),
-    (32, [20,20,20], (64,32,32)), (32, [32]*4, (32,)*4),
+    (32, [20,20,20], (32,32,32,32)), (32, [32]*4, (32,)*4),
     (16, [1], (16,)), (16, [1,1], (16,16)),
-    (16, [30,10,10], (32,16,16)),
+    (16, [30,10,10], (32,32,32,32)),
     (64, [1], (64,)), (64, [1,1], (64,64)),
 ])
 def test_select_smallest_bucket_without_reordering(alignment, lengths, expected):
     runner = MixedGraphRunner.__new__(MixedGraphRunner)
     runner.buckets = prefill_buckets(128, alignment)
-    runner.buckets_by_count = {
-        count: tuple(p for p in runner.buckets if len(p) == count)
-        for count in range(1, 128 // alignment + 1)
-    }
+    runner.admission_buckets = runner.buckets
     runner.sizes = [2,4,8,16,32]
     partition = runner.partition(lengths)
     assert partition == expected
     batch = SimpleNamespace(is_mixed=True, hidden_captor=None, size=len(lengths)+1,
                             prefill_partition=(),
-                            prefill_reqs=[SimpleNamespace(extend_len=n) for n in lengths])
+                            prefill_reqs=[SimpleNamespace(extend_len=n) for n in lengths],
+                            decode_reqs=[object()])
     key = runner._graph_key(batch)
     runner.graphs = {key: object()}
     assert runner.can_use_cuda_graph(batch)
     batch.prefill_partition = partition
     assert runner._graph_key(batch) == key
-    assert all(sum(p) >= sum(partition) for p in runner.buckets_by_count[len(lengths)]
-               if all(n <= cap for n,cap in zip(lengths,p)))
+    assert key[0] >= len(partition) + 1
 
 
 @pytest.mark.parametrize("lengths,expected", [
     ([32,32,32,32], [32,32,32,32]),
-    ([64,32,32], [64,32,32]),
+    ([64,32,32], [64,32]),
     ([32,96], [32,64]),
     ([100,1,1], [100]),
     ([1,100,1], [1,64]),

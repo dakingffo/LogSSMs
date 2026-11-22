@@ -100,7 +100,10 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 output = backend.forward_mixed(captured,inputs,**kwargs)
-            for lengths in (partition, [1]*len(partition), [max(1,n-1-i) for i,n in enumerate(partition)]):
+            live_lengths = (partition, [1]*len(partition), [max(1,n-1-i) for i,n in enumerate(partition)])
+            if len(partition) > 1:
+                live_lengths += (partition[:-1],)
+            for lengths in live_lengths:
                 live = batch(lengths, capacity)
                 p,d = live.mixed_parts
                 total = sum(lengths)
@@ -112,7 +115,7 @@ def test_every_partition_replays_live_lengths_without_changing_other_states(gran
                 states = tuple(t.clone() for t in buffers)
                 p.prefill_token_capacity = capacity
                 backend.prepare_metadata(p)
-                fresh = prepare_mixed_linear_metadata(p,d,capacity)
+                fresh = prepare_mixed_linear_metadata(p, d, capacity, len(partition))
                 copy_plan.copy(fresh)
                 reset()
                 graph.replay()

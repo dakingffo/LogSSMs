@@ -294,12 +294,13 @@ class Engine:
         prefill = Batch(batch.prefill_reqs, "prefill")
         decode = Batch(batch.decode_reqs, "decode")
         prefill.padded_reqs = prefill.reqs
-        size = self.mixed_graph_runner.padded_size(batch.size)
-        decode.padded_reqs = decode.reqs + [self.dummy_req] * (size - batch.size)
-        batch.padded_reqs = prefill.reqs + decode.padded_reqs
-        batch.prefill_partition = self.mixed_graph_runner.partition(
+        batch.prefill_partition = batch.prefill_partition or self.mixed_graph_runner.partition(
             tuple(req.extend_len for req in prefill.reqs)
         )
+        slots = len(batch.prefill_partition) + decode.size
+        size = self.mixed_graph_runner.padded_size(slots)
+        decode.padded_reqs = decode.reqs + [self.dummy_req] * (size - slots)
+        batch.padded_reqs = prefill.reqs + decode.padded_reqs
         batch.prefill_token_capacity = sum(batch.prefill_partition)
         prefill.prefill_token_capacity = batch.prefill_token_capacity
         assert all(req.extend_len <= capacity for req, capacity in zip(prefill.reqs, batch.prefill_partition))
@@ -347,7 +348,7 @@ class Engine:
                 for part in (prefill, decode):
                     self.linear_attn_backend.prepare_metadata(part)
                 prepare_mixed_linear_metadata(
-                    prefill, decode, batch.prefill_token_capacity,
+                    prefill, decode, batch.prefill_token_capacity, len(batch.prefill_partition),
                 )
         with stage("sampler_prepare"):
             params = [req.sampling_params for req in batch.reqs if not isinstance(req, ChunkedRequest)]

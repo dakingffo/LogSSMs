@@ -13,7 +13,7 @@ from logssms.scheduler.decode import DecodeManager
 from logssms.scheduler.prefill import PendingRequest, PrefillAdder, PrefillManager
 from logssms.scheduler.scheduler import Scheduler
 from logssms.server.args import parse_args
-from logssms.utils.mixed import prefill_partitions
+from logssms.utils.mixed import prefill_buckets, select_prefill_partition
 
 
 def request(uid, *, chunked=False):
@@ -65,8 +65,10 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
         decode_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
         piecewise_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False),
         mixed_graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _batch: False,
-            partitions={len(p): p for p in prefill_partitions(128, 32)}),
+            admission_buckets=tuple(p for p in prefill_buckets(128, 32) if len(p) < max_running)),
     )
+    runner = s.engine.mixed_graph_runner
+    runner.partition = lambda lengths: select_prefill_partition(runner.admission_buckets, lengths)
     s._report_stall = lambda _adder: None
     attempts = []
 
@@ -81,7 +83,7 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
 
 @pytest.mark.parametrize("count,limit,budget,size", [
     (1, 8, 16, 4), (2, 8, 16, 5), (3, 8, 16, 6),
-    (8, 6, 16, 6), (15, 16, 16, 16), (8, 8, 2, 5),
+    (8, 6, 16, 5), (15, 16, 16, 15), (8, 8, 2, 5),
     (20, 32, 32, 23), (20, 24, 32, 23),
 ])
 def test_mixed_request_capacity_and_only_selected_prefill_analyzed(monkeypatch, count, limit, budget, size):

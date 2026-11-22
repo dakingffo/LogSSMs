@@ -14,7 +14,7 @@ from logssms.layers.linear_attention_backend.mixed import (
 )
 from logssms.utils import init_logger
 from logssms.utils.batch import BatchIndices
-from logssms.utils.mixed import prefill_buckets, prefill_partitions
+from logssms.utils.mixed import prefill_buckets, select_prefill_partition
 
 
 logger = init_logger(__name__)
@@ -33,14 +33,8 @@ class MixedGraphRunner:
         self.graphs = {}
         self.sizes = []
         self.capacity = engine.config.mixed_prefill_tokens
-        self.partitions = {len(p): p for p in prefill_partitions(
-            self.capacity, engine.config.cache_config.prefill_alignment,
-        )}
         self.buckets = prefill_buckets(self.capacity, engine.config.cache_config.prefill_alignment)
-        self.buckets_by_count = {
-            count: tuple(p for p in self.buckets if len(p) == count)
-            for count in self.partitions
-        }
+        self.admission_buckets = tuple(p for p in self.buckets if len(p) < engine.config.max_running_req)
         self.backend = engine.attn_backend
         self.linear_backend = getattr(engine, "linear_attn_backend", None)
         maximum = min(engine.config.max_running_req, engine.decode_graph_runner.max_graph_bs)
@@ -118,14 +112,13 @@ class MixedGraphRunner:
         return self.sizes[bisect_left(self.sizes, size)] if self.sizes and size <= self.sizes[-1] else size
 
     def partition(self, lengths):
-        return next(p for p in self.buckets_by_count[len(lengths)]
-                    if all(n <= capacity for n, capacity in zip(lengths, p)))
+        return select_prefill_partition(self.admission_buckets, lengths)
 
     def _graph_key(self, batch):
         partition = batch.prefill_partition or self.partition(
             tuple(req.extend_len for req in batch.prefill_reqs)
         )
-        return self.padded_size(batch.size), partition
+        return self.padded_size(len(batch.decode_reqs) + len(partition)), partition
 
     def can_use_cuda_graph(self, batch):
         return (batch.is_mixed and batch.hidden_captor is None
