@@ -34,17 +34,16 @@ def log_offsets(layout, positions, columns, layer, heads, *, value, head_bytes):
     return offset + (heads * layout.granularity + positions % layout.granularity) * layout.head_k_dim + columns
 
 
-def eviction_range(tree, node):
-    from logssms.cache.logstate.prefix_cache import LogRadixEvictionSegment
-    return LogRadixEvictionSegment(
-        node, node.begin, node.depth, node.uuid, node.parent.uuid,
-        node.eviction_slots, tree,
+def eviction_node(tree, node):
+    from logssms.cache.logstate.prefix_cache import LogRadixEvictionNode
+    return LogRadixEvictionNode(
+        node, node.begin, node.depth, node.eviction_slots, tree,
     )
 
 
 def remember_log_tail(recycle, tree, node) -> None:
     for part in reversed(tree.path(node)):
-        recycle.remember(tree, eviction_range(tree, part))
+        recycle.remember(tree, eviction_node(tree, part))
 
 
 def recycled_bytes(branch):

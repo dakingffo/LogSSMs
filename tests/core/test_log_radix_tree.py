@@ -8,7 +8,7 @@ import torch
 from logssms.cache.logstate.online_analysis_scheduler import OnlineAnalysisScheduler
 from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry, LogStateKind
 from logssms.kernel import logstate as planning
-from tests.logstate_helpers import eviction_range, matched_kv
+from tests.logstate_helpers import eviction_node, matched_kv
 
 
 PAGE_SIZE = 4
@@ -27,26 +27,22 @@ def plan_kv_eviction(tree):
     totals = Counter()
     for node in tree._iter_nodes():
         totals.update(node._kv_frame_counts)
-    for log_only in (True, False):
-        nodes, topology = (tree.log_eviction_snapshot() if log_only
-                           else tree.eviction_snapshot())
-        if not nodes:
-            continue
-        slots = {slot for node in nodes for slot in node.eviction_slots}
-        result = planning.plan_eviction(
-            topology,
-            [[value for frame, count in node._kv_frame_counts.items()
-              for value in (frame, count, totals[frame])] for node in nodes],
-            [node.eviction_slots for node in nodes],
-            [(slot, 0, -1, tree.entry_for_slot(slot).begin, tree.entry_for_slot(slot).end) for slot in slots],
-            [], (0, 0, 0, 0, 1, 1, 1, 0, 0, 0),
-            [] if log_only else tree.checkpoint_eviction_actions(nodes),
-        )
-        if result:
-            selected, _, _, compressed = result
-            assert not compressed, "This fixture expects pruning without state thinning."
-            return [nodes[index] for index in selected]
-    return []
+    nodes, topology = tree.eviction_snapshot()
+    slots = {slot for node in nodes for slot in node.eviction_slots}
+    result = planning.plan_eviction(
+        topology,
+        [[value for frame, count in node.frame_counts.items()
+          for value in (frame, count, totals[frame])] for node in nodes],
+        [node.eviction_slots for node in nodes],
+        [(slot, 0, -1, tree.entry_for_slot(slot).begin, tree.entry_for_slot(slot).end) for slot in slots],
+        [], (0, 0, 0, 0, 1, 1, 1, 0, 0, 0),
+        tree.checkpoint_eviction_actions(nodes),
+    )
+    if not result:
+        return []
+    selected, _, _, compressed = result
+    assert not compressed
+    return [nodes[index] for index in selected]
 
 
 def checkpoint_drop_actions(tree):
@@ -222,7 +218,7 @@ def test_checkpoint_core_and_its_unrecoverable_kv_tail_are_one_eviction_unit():
     )).node
     segments, _ = tree.eviction_snapshot()
     assert len(segments) == 2
-    assert (segments[1].begin, segments[1].end, segments[1].storage_slots) == (0, 12, (0, 1))
+    assert (segments[1].begin, segments[1].end, segments[1].eviction_slots) == (0, 12, (0, 1))
     tree.drop_checkpoint(0, 1)
     eviction = tree.evict([segments[1]])
     assert len(eviction.kv_indices) == 12
@@ -280,23 +276,6 @@ def test_eviction_returns_kv_and_linear_slots_without_freeing_them():
     assert len(evicted.entries) >= 1
     assert {entry.slot for entry in evicted.entries}.issubset({3, 4, 5})
     tree.check_integrity()
-
-
-def test_evict_prefers_log_branch_over_older_checkpoint_branch():
-    tree = make_tree()
-    checkpoint = tree.insert(
-        ids(4), ids(4, 100),
-        (LogStateEntry(0, LogStateKind.CHECKPOINT, 0, 4, span_granules=1),),
-    ).node
-    log = tree.insert(
-        ids(4, 20), ids(4, 200),
-        (LogStateEntry(1, LogStateKind.LOG, 0, 4),),
-    ).node
-    tree._checkpoint_timestamps[0] = 1
-    log.timestamp = 2
-    assert [part.node for part in plan_kv_eviction(tree)] == [log]
-    tree.evict([eviction_range(tree, log)])
-    assert [part.node for part in plan_kv_eviction(tree)] == [checkpoint]
 
 
 def test_matching_refreshes_kv_path_but_only_the_selected_checkpoint():
@@ -396,13 +375,13 @@ def test_small_evictions_follow_global_lru_without_refreshing_access_times():
             node.timestamp = chain * 10
         leaves.append(leaf)
     timestamps = {node.uuid: node.timestamp for node in tree._iter_nodes()}
-    for _ in range(3):
+    for leaf in leaves[:3]:
         candidate, = plan_kv_eviction(tree)
-        assert candidate.node is leaves[0]
+        assert candidate.node is leaf
         tree.evict([candidate])
         tree.check_integrity()
         assert all(node.timestamp == timestamps[node.uuid] for node in tree._iter_nodes())
-    assert [part.node for part in plan_kv_eviction(tree)] == [leaves[1]]
+    assert [part.node for part in plan_kv_eviction(tree)] == [leaves[3]]
     tree.reset()
     assert plan_kv_eviction(tree) == []
 
@@ -508,7 +487,7 @@ def test_locked_checkpoint_capacity_tracks_branch_and_protection_changes():
     )).node
     assert set(tree.evictable_slots()) == {1, 3}
     tree.check_integrity()
-    tree.evict([eviction_range(tree, branch)])
+    tree.evict([eviction_node(tree, branch)])
     # Branch insertion installs protection independently of the child count.
     # Pruning the sibling must not silently remove that protection.
     assert first.is_protected and len(first.children) == 1
@@ -678,31 +657,6 @@ def test_short_shared_log_remains_and_unbranched_tail_can_grow():
     assert tree.insert(extended, extended, (LogStateEntry(4, LogStateKind.LOG, 64, 96),)).node is leaf
     plan = analyzer.analyze(tree, [extended])
     assert [p.slots for p in plan.materialize] == [(3, 4)]
-    tree.check_integrity()
-
-
-def test_eviction_trims_a_record_without_splitting_the_radix_node():
-    tree, tokens, entries, node, _ = history(5)
-    segments, _ = tree.eviction_snapshot()
-    assert len(tree._iter_nodes()) == 2
-    eviction = tree.evict([segments[-1]])
-    assert eviction.entries == (entries[-1],)
-    assert node.depth == 128 and len(node.entries) == 4
-    assert len(tree._iter_nodes()) == 2
-    tree.check_integrity()
-
-
-def test_recycler_remembers_only_the_evicted_tail_records():
-    from logssms.cache.logstate.recycler import LogStateRecycleBin
-    tree, tokens, entries, node, _ = history(5)
-    recycle = LogStateRecycleBin(1 << 20)
-    segments, _ = tree.eviction_snapshot()
-    recycle.remember(tree, segments[-1])
-    tree.evict([segments[-1]])
-    match = recycle.match(tokens, start=128, granularity=32)
-    assert match is not None
-    assert [(p.begin, p.end) for p in match.branch.logs] == [(128, 160)]
-    assert tree.match_prefix(tokens).cuda_handle.cached_len == 128
     tree.check_integrity()
 
 

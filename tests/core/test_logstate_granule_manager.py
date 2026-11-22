@@ -1,4 +1,4 @@
-from tests.logstate_helpers import eviction_range
+from tests.logstate_helpers import eviction_node
 import pytest
 import torch
 
@@ -53,7 +53,7 @@ def fill(manager, req):
                                           (3,[(64,'checkpoint'),(32,'log')]),
                                           (4,[(64,'checkpoint')]*2),
                                           (8,[(64,'checkpoint')]*4)])
-def test_production_prepare_materializes_without_checkpoint_thinning(count, expected):
+def test_prefill_materializes_complete_log_groups(count, expected):
     manager = make_manager()
     assert manager.logstate_pool.allocator.checkpoint_log_count == 2
     tokens = torch.arange(count*32, dtype=torch.int32)
@@ -68,52 +68,6 @@ def test_production_prepare_materializes_without_checkpoint_thinning(count, expe
     assert [(e.end-e.begin,e.kind.value) for e in entries] == expected
     assert len(manager.tree._iter_nodes()) == 2
     manager.cache_req(second,finished=True)
-    manager.check_integrity()
-
-
-def test_tail_eviction_keeps_checkpoint_and_remembers_log():
-    manager=make_manager()
-    tokens=torch.arange(96,dtype=torch.int32)
-    fill(manager,new_req(manager,tokens))
-    second=new_req(manager,torch.cat((tokens,torch.tensor([1000],dtype=torch.int32))))
-    manager.allocate([second],phase='prefill');manager.prepare_batch(Batch([second],'prefill'))
-    manager.cache_req(second,finished=True)
-    tree=manager.tree
-    segments,_=tree.eviction_snapshot()
-    tail=segments[-1]
-    assert tail.entries[0].kind is LogStateKind.LOG
-    manager.recycle_bin.remember(tree,tail)
-    kv = tail._kv_frame_counts
-    slots = tail.eviction_slots
-    tree.evict([tail])
-    manager.evictor._release_cached_kv(kv)
-    manager.logstate_pool.retire_slots(slots)
-    assert tree.match_prefix(tokens).cuda_handle.cached_len==64
-    assert manager.recycle_bin.match(tokens,start=64,granularity=32) is not None
-    assert len(tree._iter_nodes())==2
-    tree.check_integrity()
-
-
-def test_pressure_evicts_one_tail_granule_then_restores_with_current_gpu_shape():
-    manager = make_manager()
-    tokens = torch.arange(256, dtype=torch.int32)
-    fill(manager, new_req(manager, tokens))
-    pool = manager.logstate_pool
-    raw = pool.reserve(kv=pool.allocator.free_frames)[0]
-    new_kv, _, _ = manager.evictor.allocate(1, 0, recycle_bin=manager.recycle_bin)
-    assert manager.tree.trace(tokens).matched_len == 224
-    assert len(manager.tree._iter_nodes()) == 2
-    pool.release_kv([value // 32 for value in new_kv])
-    pool.release_kv(raw)
-    manager.check_integrity()
-    second = new_req(manager, torch.cat((tokens, torch.tensor([999], dtype=torch.int32))))
-    assert second.cached_len == 224
-    restore = manager._recycled_restores[second.table_idx].plan
-    assert any(checkpoint.end == 256 for checkpoint in restore.checkpoints)
-    fill(manager, second)
-    assert manager.tree.match_prefix(tokens).cuda_handle.cached_len == 256
-    assert all((entry.end - entry.begin) % 64 == 0 for entry in manager.tree.iter_entries()
-               if entry.kind is LogStateKind.CHECKPOINT)
     manager.check_integrity()
 
 
@@ -134,7 +88,7 @@ def remember(manager, tokens, begin, end):
     node.analysis_owner = trace.node.analysis_owner
     if node.analysis_owner is not None:
         node.analysis_owner.tail = max(node.analysis_owner.tail, end)
-    manager.recycle_bin.remember(ghost,eviction_range(ghost,node))
+    manager.recycle_bin.remember(ghost,eviction_node(ghost,node))
 
 
 def checkpoint_history(manager, spans):

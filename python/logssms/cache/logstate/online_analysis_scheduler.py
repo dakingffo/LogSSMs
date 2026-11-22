@@ -150,6 +150,8 @@ class OnlineAnalysisScheduler:
         self._owned_hits *= decay
         self._tail_hits *= decay
         if stats is not None and 0 < position and stats.origin <= position <= stats.tail:
+            if stats.tail_query_begin is None:
+                stats.tail_query_begin = stats.query_begin
             self._owned_hits += 1
             self._tail_hits += position == stats.tail
             stats.hits.append((position, stats.tail, self.query_count))
@@ -229,12 +231,16 @@ class OnlineAnalysisScheduler:
                 continue
             bins = Counter()
             tail_hits = 0.0
+            past_tail_hits = Counter()
             latest_internal = -1
             for position, tail, query in stats.hits:
                 distance = tail - position
                 weight = self._weight(query)
                 if distance == 0:
-                    tail_hits += weight
+                    if position == stats.tail:
+                        tail_hits += weight
+                    else:
+                        past_tail_hits[position] += weight
                 elif distance <= self.min_sampling_len:
                     bins[(distance - 1) // self.granularity] += weight
                     latest_internal = max(latest_internal, query)
@@ -256,13 +262,15 @@ class OnlineAnalysisScheduler:
                 mass = sum(e * g * ((i + 1) * g) ** -stats.exponent
                            for i, e in enumerate(exposures))
                 stats.log_amplitude = math.log((sum(bins.values()) + 4 * internal_prior) / (mass + beta))
-            first_tail_query = next(
-                (query for tail, query in stats.exposures if tail > stats.origin),
-                self.query_count,
-            )
-            exposure = self._exposure(max(stats.query_begin, first_tail_query), self.query_count)
+            start = stats.tail_query_begin
+            exposure = self._exposure(self.query_count if start is None else start, self.query_count)
             _, tail_prior = self._prior()
-            stats.tail_probability = min(1.0, (tail_hits + 4 * tail_prior) / (exposure + 4.0))
+            normalizer = exposure + 4.0
+            stats.tail_probability = (tail_hits + 4 * tail_prior) / normalizer
+            stats.past_tail_probabilities = tuple(
+                (position, weight / normalizer)
+                for position, weight in sorted(past_tail_hits.items()) if weight > 0
+            )
             stats.fit_query = self.query_count
             if self._analysis_profile is not None:
                 self._analysis_profile["aggregate"]["model_updates"] += 1
@@ -270,6 +278,7 @@ class OnlineAnalysisScheduler:
                 self._analysis_profile["updates"].append(dict(
                     owner_uuid=stats.uuid, query=self.query_count, exponent=stats.exponent,
                     log_amplitude=stats.log_amplitude, tail_probability=stats.tail_probability,
+                    past_tail_probabilities=stats.past_tail_probabilities,
                     weighted_internal_hits=sum(bins.values()), exposure=exposure,
                 ))
 
@@ -278,38 +287,71 @@ class OnlineAnalysisScheduler:
             self._owners[stats.uuid] = stats
         if tail <= stats.tail:
             return
+        if stats.tail_query_begin is None:
+            stats.tail_query_begin = self.query_count
         stats.exposures.append((tail, self.query_count))
         while len(stats.exposures) > 1 and stats.exposures[1][0] <= tail - self.min_sampling_len:
             stats.exposures.popleft()
             stats.query_begin = max(stats.query_begin, stats.exposures[0][1])
         stats.hits = deque((hit for hit in stats.hits
-                            if hit[1] >= tail - self.min_sampling_len and hit[2] > stats.query_begin),
-                           maxlen=8192)
-        if not any(0 < past_tail - position <= self.min_sampling_len
-                   for position, past_tail, _ in stats.hits):
+                            if hit[0] == hit[1] or (
+                                hit[1] >= tail - self.min_sampling_len and hit[2] > stats.query_begin
+                            )), maxlen=stats.hits.maxlen)
+        if any(position < tail and past_tail - position <= self.min_sampling_len
+               for position, past_tail, _ in stats.hits):
+            self._internal_owners.add(stats)
+        else:
             self._internal_owners.discard(stats)
         stats.tail = tail
         stats.fit_query = -1
 
-    def eviction_models(self, segments) -> list[tuple]:
-        self.refresh_models([segment.node.analysis_owner for segment in segments])
+    def eviction_models(self, snapshots) -> tuple[list[tuple], list[tuple[int, int, float]]]:
+        self.refresh_models([snapshot.node.analysis_owner for snapshot in snapshots])
         result = []
-        for segment in segments:
-            stats = segment.node.analysis_owner
-            recovery_begin = (segment.begin if segment.recovery_begin is None
-                              else segment.recovery_begin)
+        past_tails = {}
+        for snapshot in snapshots:
+            stats = snapshot.node.analysis_owner
             if stats is None:
-                tail = max(self.granularity, segment.node.depth)
+                tail = max(self.granularity, snapshot.node.depth)
                 norm = sum(self.granularity * (j * self.granularity) ** -2
                            for j in range(1, max(1, tail // self.granularity) + 1))
                 internal_prior, tail_prior = self._prior()
-                result.append((-segment.node.uuid - 1, 0, tail, 2., math.log(internal_prior / norm),
-                               tail_prior, self.granularity, recovery_begin, segment.end, 1))
+                result.append((-snapshot.node.uuid - 1, 0, tail, 2., math.log(internal_prior / norm),
+                               tail_prior, self.granularity, snapshot.recovery_begin, snapshot.end, 1))
             else:
-                result.append((stats.uuid, stats.origin, max(stats.tail, segment.node.depth),
+                if stats.past_tail_probabilities:
+                    past_tails[stats.uuid] = stats.past_tail_probabilities
+                use_default_order = stats.fitted_hit_query < 0 and not stats.past_tail_probabilities
+                result.append((stats.uuid, stats.origin, max(stats.tail, snapshot.node.depth),
                                stats.exponent, stats.log_amplitude, stats.tail_probability,
-                               self.granularity, recovery_begin, segment.end, int(stats.fitted_hit_query < 0)))
-        return result
+                               self.granularity, snapshot.recovery_begin, snapshot.end, int(use_default_order)))
+        return result, [(owner, position, probability) for owner, points in past_tails.items()
+                        for position, probability in points]
+
+    def active_density(self, owner: LogStateHitStats | None, tail: int):
+        g = self.granularity
+        bins = max(1, (tail - (0 if owner is None else owner.origin)) // g)
+        past = ()
+        if owner is not None and self.enable_merge_adjustment:
+            self.refresh_models([owner])
+            amplitude = math.exp(owner.log_amplitude)
+            masses = [g * amplitude * (j * g) ** -owner.exponent for j in range(1, bins + 1)]
+            past = owner.past_tail_probabilities
+            scale = min(1., max(0., 1. - owner.tail_probability - sum(p for _, p in past))
+                        / max(1e-300, sum(masses)))
+        else:
+            masses = [1. / (j * j) for j in range(1, bins + 1)]
+            scale = self._prior()[0] / sum(masses)
+        prefix = [0.]
+        for mass in masses:
+            prefix.append(prefix[-1] + mass * scale)
+
+        def mass(begin: int, end: int) -> float:
+            left = min(bins, max(0, (tail - begin) // g))
+            right = min(bins, max(0, (tail - end) // g))
+            return prefix[left] - prefix[right] + sum(p for x, p in past if begin <= x < end)
+
+        return mass
 
     def snapshot_prefill(
         self, tree: LogRadixTree, traces: Sequence[LogRadixTrace],

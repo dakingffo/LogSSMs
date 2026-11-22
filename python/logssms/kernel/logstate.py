@@ -46,37 +46,50 @@ def branch_protections(inputs: Sequence[torch.Tensor], forced: Rows,
     return _unpack(_load_logstate_module().branch_protections(inputs, _pack(forced), granularity))
 
 
+def _pack_models(models, past_tails) -> torch.Tensor:
+    if past_tails:
+        models = list(chain.from_iterable(chain(models, past_tails)))
+    return torch.tensor(models, dtype=torch.float64).flatten()
+
+
 def plan_eviction(nodes: Rows, kv: Rows, node_slots: Rows, slots: Rows,
-                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows, models=None) -> list[list[int]] | None:
-    """Return a plan, [] for insufficient capacity, or None to expand a cold path."""
+                  occupied: Rows, config: Sequence[int], checkpoint_actions: Rows, models=None,
+                  *, past_tails=()) -> list[list[int]]:
+    """Plan reclamation with the default ordering."""
     groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
     result = _unpack(_load_logstate_module().plan_eviction(
         _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
-        torch.tensor([] if models is None else models, dtype=torch.float64).flatten(),
+        _pack_models(() if models is None else models, past_tails),
     ))
-    return None if result == [[-1]] else result
+    return result
 
 
 class EvictionPlanner:
     def __init__(self, nodes, kv, node_slots, slots, occupied, config, checkpoint_actions,
-                 models, order):
-        groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions)
+                 models, order, materializations=(), *, past_tails=()):
+        groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions, materializations)
         self._planner = _load_logstate_module().make_eviction_planner(
             _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
-            torch.tensor(models, dtype=torch.float64).flatten(), _pack(order),
+            _pack_models(models, past_tails), _pack(order),
         )
 
     def update_locks(self, blocked, actions):
         self._planner["update_locks"](_pack(blocked), _pack(actions))
 
-    def refresh_models(self, indices, models):
-        self._planner["refresh_models"](
-            indices, torch.tensor(models, dtype=torch.float64).flatten(),
-        )
+    def refresh_models(self, indices, models, *, past_tails=()):
+        self._planner["refresh_models"](indices, _pack_models(models, past_tails))
 
-    def plan(self, config, occupied):
-        result = _unpack(self._planner["plan"](config, _pack(occupied)))
-        return None if result == [[-1]] else result
+    def plan(self, config, occupied, active_candidates=()):
+        packed = _pack(occupied)
+        if active_candidates:
+            result = self._planner["plan_with_active"](
+                config, packed, _pack([sources for _, sources in active_candidates]),
+                [score for score, _ in active_candidates],
+            )
+        else:
+            result = self._planner["plan"](config, packed)
+        result = _unpack(result)
+        return result
 
 
 def make_recycle_bin(capacity_bytes: int):

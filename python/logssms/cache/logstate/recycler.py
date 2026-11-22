@@ -7,7 +7,7 @@ from weakref import WeakValueDictionary
 import torch
 
 from .prefix_cache import (
-    LogRadixEvictionSegment,
+    LogRadixEvictionNode,
     LogRadixTree,
     LogStateEntry,
     LogStateKind,
@@ -100,20 +100,20 @@ class LogStateRecycleBin:
     def remember(
         self,
         tree: LogRadixTree,
-        segment: LogRadixEvictionSegment,
+        snapshot: LogRadixEvictionNode,
     ) -> None:
         from logssms.kernel import logstate as planning
 
         logs = [
             (entry.begin, entry.end)
-            for entry in segment.entries if entry.kind is LogStateKind.LOG
+            for entry in snapshot.entries if entry.kind is LogStateKind.LOG
         ]
         if self.capacity_bytes == 0 or not logs:
             return
         self.revision += 1
-        source = segment.node
+        source = snapshot.node
         path = tree.path(source)
-        keys = [part.key for part in path[:-1]] + [source.key[:segment.end - source.begin]]
+        keys = [part.key for part in path]
         stats = source.analysis_owner
         if stats is not None:
             self._owners[stats.uuid] = stats

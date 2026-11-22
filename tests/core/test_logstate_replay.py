@@ -92,7 +92,7 @@ def test_replay_uses_production_lifecycle_under_pressure(tmp_path, monkeypatch, 
     assert calls["init_with_handle"] == 15
     # The one-token reply finishes during prefill and needs only its final commit.
     assert calls["cache_req"] == 2 * 15 - 1
-    assert result["batches"][-1]["frames_after"]["work"] == result["checkpoint_frames"]
+    assert result["batches"][-1]["frames_after"]["work"] == 2 * result["checkpoint_frames"]
 
 
 @pytest.mark.parametrize("mode", ["default", "online"])

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tests.logstate_helpers import eviction_range
+from tests.logstate_helpers import eviction_node
 
 import os
 from unittest.mock import patch
@@ -194,8 +194,8 @@ def test_disable_memorized_evict_has_no_recycle_bin() -> None:
         torch.arange(PAGE_SIZE, dtype=torch.int32) + frames[1] * PAGE_SIZE,
         (LogStateEntry(slots[1], LogStateKind.LOG, 0, PAGE_SIZE),),
     ).node
-    manager.tree._checkpoint_timestamps[checkpoint.entries[0].slot] = 1
-    log.timestamp = 2
+    manager.tree._checkpoint_timestamps[checkpoint.entries[0].slot] = 2
+    log.timestamp = 1
     manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     needed_pages = manager._allocator.free_frames + 1
     selected, _, released, compressed = manager.evictor.plan(needed_pages, 0, 0)
@@ -1110,7 +1110,7 @@ def _gpu_tail_with_recycled_page(manager):
         LogStateEntry(40, LogStateKind.CHECKPOINT, 0, 128, span_granules=128//g),
         *(LogStateEntry(100+i,LogStateKind.LOG,left,left+g) for i,left in enumerate(range(128,256,g))),
     )).node
-    manager.recycle_bin.remember(ghost, eviction_range(ghost, node))
+    manager.recycle_bin.remember(ghost, eviction_node(ghost, node))
     return logs[0]
 
 
@@ -1231,7 +1231,7 @@ def test_recycled_checkpoint_commit_preserves_a_late_granule_branch(granularity,
     selected=sorted((part for part in segments if part.node is leaf),key=lambda part:part.end,reverse=True)
     page_counts=Counter();released=set()
     for part in selected:
-        page_counts.update(part._kv_frame_counts);released.update(part.eviction_slots)
+        page_counts.update(part.frame_counts);released.update(part.eviction_slots)
     with patch.object(manager.evictor,"plan",return_value=(selected,page_counts,released,[])):
         pages,logs,_=manager._allocate(manager._allocator.free_frames+1,0)
     manager._return_slots(pages,logs)
@@ -1268,7 +1268,7 @@ def test_pending_match_reuses_layout_but_invalidates_on_resource_ownership_chang
         manager.tree.protect(owner)
         fourth = manager.match_req(pending)
         assert fourth is not third
-        manager.recycle_bin.remember(manager.tree, eviction_range(manager.tree, owner))
+        manager.recycle_bin.remember(manager.tree, eviction_node(manager.tree, owner))
         assert manager.match_req(pending) is not fourth
         assert trace.call_count == 2  # Only protection changed tree layout metadata.
         assert plan.call_count == 5
@@ -2300,20 +2300,18 @@ def test_unfulfillable_pressure_compression_plan_does_not_change_checkpoint_layo
     manager.check_integrity()
 
 
-def test_unfulfillable_eviction_plan_preserves_cached_prefix():
+def test_unfulfillable_allocation_preserves_cached_kv():
     manager = make_manager()
     original_ids = torch.arange(130, dtype=torch.int32)
     req = new_req(manager, original_ids)
     manager.allocate([req])
     req.cached_len = len(original_ids)
     manager.cache_req(req, finished=True)
-    revision = manager.tree.revision
-    free_frames = manager._allocator.free_frames
+    kv = manager.tree.match_prefix(original_ids).cuda_handle.kv_indices.clone()
 
     with pytest.raises(LogStateCapacityError):
         manager._allocate(1000, 1000)
-    assert manager.tree.revision == revision
-    assert manager._allocator.free_frames == free_frames
+    torch.testing.assert_close(manager.tree.match_prefix(original_ids).cuda_handle.kv_indices, kv)
     manager.check_integrity()
 
 
@@ -2374,10 +2372,9 @@ def test_shared_key_merge_preserves_multiple_request_recoveries(branch):
         actual = pool.read_states(torch.tensor([manager._request_states[req.table_idx].work_slot], device="cuda"), 0)[0]
         torch.testing.assert_close(actual.float(), reference, atol=2e-4, rtol=5e-2)
         manager.unlock(req.cache_handle)
-    assert any(entry.kind is LogStateKind.CHECKPOINT for entry in manager.tree.iter_entries())
     if branch:
         assert manager.tree.has_slot(pages[0].state_slot)
-        assert pool.allocator.slot(pages[0].state_slot).kind == "checkpoint"
+        assert pool.allocator.slot(pages[0].state_slot).kind == "log"
     torch.cuda.synchronize()
     manager.check_integrity()
 

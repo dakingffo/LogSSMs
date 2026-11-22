@@ -6,34 +6,12 @@ import torch
 from logssms.kernel import logstate as planning
 
 
-def eviction_oracle(nodes):
-    from collections import defaultdict
-
-    rows = {row[0]: row for row in nodes}
-    indices = {row[0]: i for i, row in enumerate(nodes)}
-    children = defaultdict(set)
-    for row in nodes:
-        if row[1] in rows:
-            children[row[1]].add(row[0])
-    remaining = set(rows)
-    order = []
-    while True:
-        leaves = [uuid for uuid in remaining if not children[uuid] and not rows[uuid][2]]
-        if not leaves:
-            return order
-        uuid = min(leaves, key=lambda uuid: (rows[uuid][3], rows[uuid][4], uuid))
-        order.append(indices[uuid])
-        remaining.remove(uuid)
-        children[rows[uuid][1]].discard(uuid)
-
-
-def eviction_chains(count, length, checkpoint=False):
-    nodes = [(0, -1, 1, 0, 0)]
+def eviction_chains(count, length):
+    nodes = [(0, -1, 1, 0)]
     for chain in range(count):
         for position in range(length):
             uuid = len(nodes)
-            nodes.append((uuid, 0 if position == 0 else uuid - 1, 0,
-                          int(checkpoint), chain * 10 + position))
+            nodes.append((uuid, 0 if position == 0 else uuid - 1, 0, chain * 10 + position))
     return nodes
 
 
@@ -126,7 +104,7 @@ def assert_log_capacity_order(nodes, expected):
             assert pages == [] and compressed == []
 
 
-def test_log_pressure_globally_orders_cold_nodes_without_chain_rotation():
+def test_eviction_orders_unlocked_leaves_by_access_time():
     nodes = eviction_chains(6, 3)
     assert_log_capacity_order(nodes, [
         3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10, 15, 14, 13, 18, 17, 16,
@@ -135,8 +113,8 @@ def test_log_pressure_globally_orders_cold_nodes_without_chain_rotation():
 
 def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
     nodes = eviction_chains(5, 2)
-    uuid, parent, locked, kind, _ = nodes[1]
-    nodes[1] = (uuid, parent, locked, kind, 999)
+    uuid, parent, locked, _ = nodes[1]
+    nodes[1] = (uuid, parent, locked, 999)
     expected = [2, 4, 3, 6, 5, 8, 7, 10, 9, 1]
     assert_log_capacity_order(nodes, expected)
     # Input row order is not a chain identity or priority.
@@ -146,21 +124,11 @@ def test_eviction_uses_node_access_time_and_is_independent_of_row_order():
 
 
 def test_eviction_exposes_shared_parents_only_after_children_and_keeps_live_locks():
-    nodes = [(0, -1, 1, 0, 0), (1, 0, 0, 0, 1000),
-             (2, 1, 0, 0, 1), (3, 2, 0, 0, 1),
-             (4, 1, 0, 0, 2), (5, 4, 0, 0, 2),
-             (6, 0, 1, 0, 0), (7, 6, 0, 0, 3)]
+    nodes = [(0, -1, 1, 0), (1, 0, 0, 1000),
+             (2, 1, 0, 1), (3, 2, 0, 1),
+             (4, 1, 0, 2), (5, 4, 0, 2),
+             (6, 0, 1, 0), (7, 6, 0, 3)]
     assert_log_capacity_order(nodes, [3, 2, 5, 4, 7, 1])
-
-
-def test_small_capacity_requests_select_the_globally_coldest_leaf():
-    nodes = eviction_chains(4, 2)
-    refs = [[]] + [[i] for i in range(1, len(nodes))]
-    slots = [(i, 1, -1, 0, 32) for i in range(1, len(nodes))]
-    result = planning.plan_eviction(
-        nodes, [[] for _ in nodes], refs, slots, [], [0, 0, 1, 0, 1, 1, 1, 0, 0, 1], (),
-    )
-    assert result == [[2], [], [2], []]
 
 
 def test_native_protections_deduplicate_forced_and_batch_branches():
@@ -172,16 +140,3 @@ def test_native_protections_deduplicate_forced_and_batch_branches():
     ]
     with pytest.raises(RuntimeError, match="Invalid forced branch"):
         planning.branch_protections(inputs, [(0, 33)], 32)
-
-
-def test_partial_cold_chain_must_expand_before_evicting_a_warmer_chain():
-    nodes = [(0, -1, 1, 0, 0), (1, 0, 2, 0, 0),
-             (2, 1, 0, 0, 0), (3, 0, 0, 0, 1)]
-    kv = [[], [], [10, 1, 1], [11, 1, 1]]
-    slots = [[], [], [], []]
-    config = [0, 0, 1, 0, 1, 1, 1, 0, 0, 1]
-    assert planning.plan_eviction(nodes, kv, slots, [], [], config, []) == [
-        [2], [10, 1], [], [],
-    ]
-    config[6] = 2
-    assert planning.plan_eviction(nodes, kv, slots, [], [], config, []) is None

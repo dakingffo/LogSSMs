@@ -65,7 +65,7 @@ def test_model_refresh_is_lazy_and_misses_lower_the_amplitude():
 
 
 def test_tail_hits_are_weighted_and_old_distances_are_frozen():
-    scheduler = OnlineAnalysisScheduler(32, hit_half_life=8)
+    scheduler = OnlineAnalysisScheduler(32, hit_half_life=8, min_sampling_len=128)
     stats = scheduler.make_hit_stats(0)
     scheduler.advance_hit_stats(stats, 256)
     scheduler.record_hit(stats, 256)
@@ -73,12 +73,19 @@ def test_tail_hits_are_weighted_and_old_distances_are_frozen():
     scheduler.advance_hit_stats(stats, 288)
     assert [v[:2] for v in stats.hits] == [(256, 256), (224, 256)]
     scheduler.refresh_models([stats])
-    assert 0 < stats.tail_probability < 1
-    before = stats.tail_probability
+    point, = stats.past_tail_probabilities
+    assert point[0] == 256
+    assert point[1] == pytest.approx(2 ** (-1 / 8) / (5 + 2 ** (-1 / 8)))
+    _, tail_prior = scheduler._prior()
+    assert stats.tail_probability == pytest.approx(4 * tail_prior / (5 + 2 ** (-1 / 8)))
+    scheduler.advance_hit_stats(stats, 544)
     for _ in range(64):
         scheduler.record_hit(None, 0)
     scheduler.refresh_models([stats])
-    assert stats.tail_probability < before
+    decayed, = stats.past_tail_probabilities
+    assert decayed[0] == 256
+    assert 0 < decayed[1] < point[1]
+    assert scheduler.has_internal_observations
 
 
 def test_hit_updates_and_prefill_analysis_leave_density_fitting_lazy():
@@ -93,7 +100,8 @@ def test_hit_updates_and_prefill_analysis_leave_density_fitting_lazy():
     assert node.analysis_owner.log_amplitude is None
 
 
-def test_default_fallback_requires_zero_internal_observations():
+@pytest.mark.parametrize("observed_tail", [False, True])
+def test_default_fallback_requires_zero_internal_observations(observed_tail):
     scheduler = OnlineAnalysisScheduler(32, min_sampling_len=64)
     tree = LogRadixTree(32, torch.device("cpu"))
     tree.analysis_factory = scheduler.make_hit_stats
@@ -102,11 +110,13 @@ def test_default_fallback_requires_zero_internal_observations():
     stats = leaf.analysis_owner
     scheduler.advance_hit_stats(stats, 64)
     def flag():
-        return scheduler.eviction_models(tree.eviction_snapshot()[0])[-1][-1]
+        models, _ = scheduler.eviction_models(tree.eviction_snapshot()[0])
+        return models[-1][-1]
     assert flag() == 1
-    scheduler.record_hit(stats, 64)
-    assert flag() == 1
+    if observed_tail:
+        scheduler.record_hit(stats, 64)
+        assert flag() == 1
     scheduler.record_hit(stats, 32)
     assert flag() == 0
     scheduler.advance_hit_stats(stats, 256)
-    assert flag() == 1
+    assert flag() == int(not observed_tail)
