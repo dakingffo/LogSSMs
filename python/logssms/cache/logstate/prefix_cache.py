@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from bisect import bisect_right
 from collections import Counter, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
@@ -332,6 +333,30 @@ class LogRadixTree(BasePrefixCache):
         self._evictable_slots: dict[int, None] = {}
         self._on_slot_reclaimable = on_slot_reclaimable
         self.analysis_factory: Callable[[int], LogStateHitStats | None] | None = None
+        self._match_undo: list[Callable[[], None]] | None = None
+        self._match_touches: list[LogStateCacheHandle] = []
+
+    @contextmanager
+    def match_transaction(self):
+        assert self._match_undo is None
+        undo = self._match_undo = []
+        committed = False
+
+        def commit():
+            nonlocal committed
+            committed = True
+
+        try:
+            yield commit
+        finally:
+            self._match_undo = None
+            if committed:
+                for handle in self._match_touches:
+                    self.touch_handle(handle)
+            else:
+                for restore in reversed(undo):
+                    restore()
+            self._match_touches.clear()
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         usable_len = align_down(len(input_ids), self.granularity)
@@ -377,6 +402,9 @@ class LogRadixTree(BasePrefixCache):
         )
 
     def touch_handle(self, handle: LogStateCacheHandle) -> None:
+        if self._match_undo is not None:
+            self._match_touches.append(handle)
+            return
         self.access_revision += 1
         tic = time.monotonic_ns()
         for node in handle.match_path:
@@ -581,6 +609,14 @@ class LogRadixTree(BasePrefixCache):
         prefix = LogRadixTreeNode(
             self.key_fn, self.granularity, node.timestamp
         )
+        if self._match_undo is not None:
+            saved = node.__dict__.copy()
+            saved["_kv_frame_counts"] = node._kv_frame_counts.copy()
+            timestamps = {entry.slot: self._checkpoint_timestamps.get(entry.slot)
+                          for entry in node._entries}
+            self._match_undo.append(
+                lambda: self._undo_match_split(parent, prefix, node, saved, timestamps),
+            )
         prefix.analysis_owner = node.analysis_owner
         prefix._key = node._key[:pos]
         prefix._kv = node._kv[:pos]
@@ -637,6 +673,33 @@ class LogRadixTree(BasePrefixCache):
             self._refresh_checkpoint_neighbors(part)
         self.revision += 1
         return prefix
+
+    def _undo_match_split(self, parent, prefix, node, saved, timestamps) -> None:
+        for part in (prefix, node):
+            self._update_kv_refs(part, -1)
+            if part.is_locked:
+                self.locked_size -= part.length
+            else:
+                self.evictable_size -= part.length
+            entries, part._entries = part._entries, []
+            for entry in entries:
+                self._unregister_entry(entry)
+        entries = saved["_entries"]
+        node.__dict__.clear()
+        node.__dict__.update(saved)
+        node._entries = []
+        node._checkpoint_entries = []
+        node.set_parent(parent)
+        self._update_kv_refs(node, 1)
+        if node.is_locked:
+            self.locked_size += node.length
+        else:
+            self.evictable_size += node.length
+        for entry in entries:
+            self._register_entry(node, entry, timestamps[entry.slot])
+        for part in (parent, node):
+            self._refresh_checkpoint_neighbors(part)
+        self.revision += 1
 
     def lock(
         self, node: LogRadixTreeNode, unlock: bool = False,
@@ -709,6 +772,8 @@ class LogRadixTree(BasePrefixCache):
     ) -> None:
         assert not node.is_root()
         if node.is_protected != protected:
+            if self._match_undo is not None:
+                self._match_undo.append(lambda: self.protect(node, not protected))
             node.is_protected = protected
             self.revision += 1
             self._refresh_checkpoint_neighbors(node)
@@ -835,7 +900,6 @@ class LogRadixTree(BasePrefixCache):
             assert target.end == node.depth
             assert begin == node.begin
             entries = node.entries
-            assert len(node.checkpoint_slots) <= 1
             if evicted_nodes is not None:
                 evicted_nodes.append((node.uuid, begin, node.depth))
             evicted_kv.append(node.kv)

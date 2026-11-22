@@ -49,7 +49,8 @@ def test_prefill_overlap_carries_previous_batch_reservation_into_adder():
 
 def make_cache_stub(**methods):
     stub = SimpleNamespace(_schedule_profile_step=None, **methods)
-    for name in ("begin_prefill_admission", "admit_prefill", "_acquire_prefill", "record_schedule_step"):
+    for name in ("begin_prefill_admission", "_prefill_match_transaction", "admit_prefill", "_acquire_prefill",
+                 "_account_prefill", "record_schedule_step"):
         setattr(stub, name, MethodType(getattr(BaseCacheManager, name), stub))
     return stub
 

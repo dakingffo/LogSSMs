@@ -3,6 +3,24 @@ import pytest
 from logssms.kernel.logstate import EvictionPlanner, plan_eviction
 
 
+@pytest.mark.parametrize("online", [False, True])
+def test_leaf_with_checkpoints_separated_by_log_can_be_pruned_as_fallback(online):
+    nodes = [(0, -1, 1, 0), (1, 0, 0, 0), (2, 0, 0, 1)]
+    kv = [[], [10, 32, 32], [11, 32, 32]]
+    refs = [[], [1, 2, 3], [4]]
+    slots = [(1, 3, -1, 0, 32), (2, 1, 20, 32, 64),
+             (3, 3, -1, 64, 96), (4, 3, -1, 0, 32)]
+    actions = [(1, -1, 0, 1), (3, -1, 0, 1), (4, -1, 1, 2)]
+    models = [(i, 0, 96, 2., -12., 0.5, 32, 0, 96, 0) for i in range(3)] if online else None
+
+    def selected(need):
+        capacity = (0, 0, 3, 0, 1, 1, need, 0, 0, 3)
+        return plan_eviction(nodes, kv, refs, slots, [(20, 1)], capacity, actions, models)[0]
+
+    assert selected(1) == [2]
+    assert selected(5) == [2, 1]
+
+
 def test_active_reclamation_precedes_checkpoint_leaf_eviction():
     capacity = (0, 0, 3, 0, 1, 1, 1, 0, 0, 3)
     models = [(1, 0, 32, 2., -16., 0.01, 32, 0, end, 1) for end in (0, 32)]
@@ -75,8 +93,65 @@ def test_decode_reclaims_completed_logs_when_allocation_is_short():
         manager.check_integrity()
 
 
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize("history_confirmed", [True, False])
+def test_allocation_can_reclaim_an_active_request_outside_the_batch(phase, history_confirmed):
+    import torch
+    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from logssms.cache.logstate.evictor import LogStateCapacityError
+    from tests.core.test_logstate_cache_manager import make_manager, new_req
+
+    manager = make_manager(num_pages=24, num_states=24, granularity=32)
+    pool = manager.logstate_pool
+    pool.kernels = NumericalKernels()
+    g = manager.granularity
+    end = pool.allocator.materialize_log_count * g
+    tokens = torch.arange(end + 1, dtype=torch.int32)
+    with numerical_boundaries():
+        donor = new_req(manager, tokens[:1])
+        donor.max_device_len = end + g
+        manager.allocate([donor], phase="prefill")
+        donor.input_ids = tokens[:2]
+        donor.cached_len, donor.device_len = 1, 2
+        manager.cache_req(donor, finished=False)
+        donor.input_ids = tokens if history_confirmed else tokens[:-1]
+        donor.cached_len, donor.device_len = end, end + 1
+        manager.allocate([donor], phase="decode")
+        state = manager._request_states[donor.table_idx]
+        tail = state.live_granules[-1]
+        work = manager.work_state_table[donor.table_idx].clone()
+        kv = manager.page_table[donor.table_idx, :end + 1].clone()
+
+        receiver_tokens = torch.arange(g + 1, dtype=torch.int32) + 1000
+        receiver = new_req(manager, receiver_tokens[:1], table_idx=1)
+        receiver.max_device_len = 2 * g
+        if phase == "decode":
+            manager.allocate([receiver], phase="prefill")
+            receiver.input_ids = receiver_tokens[:2]
+            receiver.cached_len, receiver.device_len = 1, 2
+            manager.cache_req(receiver, finished=False)
+            receiver.cached_len, receiver.device_len = g, g + 1
+
+        required = pool.allocator.required_frames(1, 1, 0)
+        filled, _, _ = pool.reserve(kv=pool.allocator.free_frames - required + 1)
+        if history_confirmed:
+            manager.allocate([receiver], phase=phase)
+            assert state.compacted_end == end
+            assert manager._request_states[receiver.table_idx].live_granules[-1].state_slot is not None
+        else:
+            with pytest.raises(LogStateCapacityError):
+                manager.allocate([receiver], phase=phase)
+            assert state.compacted_end == 0
+
+        assert state.live_granules[-1] == tail
+        torch.testing.assert_close(manager.work_state_table[donor.table_idx], work)
+        torch.testing.assert_close(manager.page_table[donor.table_idx, :end + 1], kv)
+        pool.release_kv(filled)
+        pool.allocator.check_integrity()
+
+
 @pytest.mark.parametrize("completed_group", [False, True])
-def test_prefill_admission_uses_rolling_active_reservation(completed_group):
+def test_prefill_admission_counts_active_reclamation_without_executing_it(completed_group):
     import torch
     from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
     from logssms.core import SamplingParams
@@ -97,31 +172,121 @@ def test_prefill_admission_uses_rolling_active_reservation(completed_group):
         if not completed_group:
             active.input_ids = active.input_ids[:-1]
         state = cache._request_states[active.table_idx]
-        tail_slot = state.live_granules[-1].state_slot
+        granules = state.live_granules.copy()
+        state_table = cache.state_table[active.table_idx].clone()
         kv = cache.page_table[active.table_idx, :end + 1].clone()
 
         pending = PendingRequest(1, torch.arange(24, dtype=torch.int32) + 1000,
-                                 SamplingParams(max_tokens=1))
+                                 SamplingParams(max_tokens=1024))
         handle = cache.match_req(pending).cuda_handle
-        request_cost = cache._reservation_size(pending.input_len + pending.output_len, handle=handle)
+        request_cost = cache._request_prefill_peak(pending, handle)
+        assert request_cost < cache._reservation_size(pending.input_len + pending.output_len, handle=handle)
         admission = cache.begin_prefill_admission(((active, active.remain_len),), ())
-        full = admission.reserved
-        filled, _, _ = pool.reserve(kv=pool.allocator.free_frames - full - request_cost + 1)
+        target = admission.reserved + request_cost - 1
+        filled, _, _ = pool.reserve(kv=pool.allocator.free_frames - target)
         result = cache.admit_prefill(pending, admission, lambda _: 32, lambda: 1)
 
         assert isinstance(result, str) is not completed_group
-        assert state.compacted_end == (end if completed_group else 0)
-        assert state.live_granules[-1].state_slot == tail_slot
-        assert int(cache.state_table[active.table_idx, end]) == tail_slot
+        assert state.compacted_end == 0
+        assert state.live_granules == granules
+        torch.testing.assert_close(cache.state_table[active.table_idx], state_table)
         torch.testing.assert_close(cache.page_table[active.table_idx, :end + 1], kv)
-        if completed_group:
-            future_kv = (active.max_device_len - end) // cache.granularity - 1
-            assert cache._active_reservation(active, active.remain_len) == pool.allocator.required_frames(
-                future_kv, group, 0, free_decay_records=0,
-            )
-            assert admission.reserved < full
+        work = pool.allocator.payload_frames + pool.allocator.conv_frames
+        assert pool.allocator.free_frames == target - (work if completed_group else 0)
         pool.release_kv(filled)
         pool.allocator.check_integrity()
+
+
+def test_prefill_admission_counts_already_admitted_peaks():
+    import torch
+    from logssms.core import SamplingParams
+    from logssms.scheduler.prefill import PendingRequest
+    from tests.core.test_logstate_cache_manager import make_manager, new_req
+
+    cache = make_manager(num_pages=12, num_states=12, granularity=32)
+    pool = cache.logstate_pool
+    requests = [
+        PendingRequest(uid, torch.arange(24, dtype=torch.int32) + uid * 1000,
+                       SamplingParams(max_tokens=1))
+        for uid in (1, 2)
+    ]
+    handle = cache.match_req(requests[0]).cuda_handle
+    target = 2 * cache._request_prefill_peak(requests[0], handle) - 1
+    filled, _, _ = pool.reserve(kv=pool.allocator.free_frames - target)
+    admission = cache.begin_prefill_admission((), ())
+
+    first = cache.admit_prefill(requests[0], admission, lambda _: 32, lambda: 0)
+    assert not isinstance(first, str)
+    second = cache.admit_prefill(requests[1], admission, lambda _: 32, lambda: 1)
+    assert isinstance(second, str) and "peak=" in second
+    pool.release_kv(filled)
+
+
+def test_prefill_can_use_reclaimable_tree_capacity_for_its_immediate_allocation():
+    import torch
+    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from logssms.core import SamplingParams
+    from logssms.scheduler.prefill import PendingRequest
+    from tests.core.test_logstate_cache_manager import make_manager, new_req
+
+    cache = make_manager(num_pages=12, num_states=12, granularity=32)
+    pool = cache.logstate_pool
+    pool.kernels = NumericalKernels()
+    cached = new_req(cache, torch.arange(128, dtype=torch.int32))
+    cache.allocate([cached])
+    cached.cached_len = 128
+    cache.cache_req(cached, finished=True)
+
+    pending = PendingRequest(1, torch.arange(24, dtype=torch.int32) + 1000,
+                             SamplingParams(max_tokens=1))
+    handle = cache.match_req(pending).cuda_handle
+    work = pool.allocator.payload_frames + pool.allocator.conv_frames
+    peak = cache._request_prefill_peak(pending, handle)
+    filled, _, _ = pool.reserve(kv=pool.allocator.free_frames - work)
+    assert pool.allocator.free_frames < peak <= cache.admission_capacity
+    admission = cache.begin_prefill_admission((), ())
+    result = cache.admit_prefill(pending, admission, lambda _: 32, lambda: 0)
+    assert not isinstance(result, str)
+    assert cache.tree.size_info.evictable_size == 128
+    from logssms.core import Request
+
+    request = Request(pending.input_ids, 0, result.cached_len, pending.output_len, pending.uid,
+                      pending.sampling_params, result.handle, pending.input_len + pending.output_len)
+    with numerical_boundaries():
+        cache.allocate([request], phase="prefill")
+    pool.release_kv(filled)
+
+
+def test_rejected_prefill_rolls_back_prefix_split_and_protection():
+    import torch
+    from logssms.core import SamplingParams
+    from logssms.scheduler.prefill import PendingRequest
+    from tests.core.test_logstate_cache_manager import make_manager, new_req
+
+    cache = make_manager(num_pages=12, num_states=12, granularity=32)
+    ids = torch.arange(128, dtype=torch.int32)
+    original = new_req(cache, ids)
+    cache.allocate([original])
+    original.cached_len = len(ids)
+    cache.cache_req(original, finished=True)
+    tree = cache.tree
+    leaf = tree.trace(ids).node
+    entries = leaf.entries
+    capacity = cache.admission_capacity
+    timestamps = (leaf.timestamp, tree.access_revision)
+    pending = PendingRequest(9, torch.cat((ids[:64], torch.tensor([999], dtype=torch.int32))),
+                             SamplingParams(max_tokens=100000))
+    admission = cache.begin_prefill_admission((), ())
+
+    result = cache.admit_prefill(pending, admission, lambda _: 32, lambda: pytest.fail("allocated a row"))
+
+    assert isinstance(result, str)
+    assert tree.trace(ids).node is leaf
+    assert leaf.begin == 0 and leaf.entries == entries and not leaf.is_protected
+    assert (leaf.timestamp, tree.access_revision) == timestamps
+    assert cache.admission_capacity == capacity
+    assert not tree._recovery_slot_refs
+    cache.check_integrity()
 
 
 def run(need, *, locked=False):

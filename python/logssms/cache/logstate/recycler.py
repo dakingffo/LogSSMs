@@ -133,11 +133,13 @@ class LogStateRecycleBin:
         for owner_id in self._native["retired_owners"]():
             self._owners.pop(owner_id, None)
 
-    def match(self, tokens: torch.Tensor, *, start: int, granularity: int) -> RecycledMatch | None:
+    def match(
+        self, tokens: torch.Tensor, *, start: int, granularity: int, touch: bool = True,
+    ) -> RecycledMatch | None:
         from logssms.kernel import logstate as planning
 
         assert tokens.device.type == "cpu"
-        result = self._native["match"](tokens, start, granularity)
+        result = self._native["match"](tokens, start, granularity, touch)
         if len(result) == 0:
             return None
         serial, matched_len = result

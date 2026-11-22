@@ -127,6 +127,9 @@ class BaseCacheManager(ABC):
                         for req in inflight_prefill)
         return PrefillAdmission(active_decode, inflight_prefill, reserved)
 
+    def _prefill_match_transaction(self, req: PendingRequest):
+        return nullcontext(lambda: None)
+
     def admit_prefill(
         self,
         req: PendingRequest,
@@ -141,23 +144,24 @@ class BaseCacheManager(ABC):
             profile["reserved_size_before"] = admission.reserved
             profile["reserved_size_after"] = admission.reserved
         previous = req.chunked_req
-        if previous is None:
-            with self.record_schedule_step("match_req"):
-                match = self.match_req(req)
-            handle, cached_len = match.cuda_handle, match.cuda_handle.cached_len
-        else:
-            handle, cached_len = previous.cache_handle, previous.cached_len
-        remain_len = req.input_len - cached_len
-        budget = chunk_budget(remain_len)
-        chunk_size = self.plan_prefill_chunk(remain_len, budget)
-        if chunk_size <= 0:
-            return f"zero prefill chunk: remain={remain_len}, token_budget={budget}"
+        with self._prefill_match_transaction(req) as commit:
+            if previous is None:
+                with self.record_schedule_step("match_req"):
+                    match = self.match_req(req)
+                handle, cached_len = match.cuda_handle, match.cuda_handle.cached_len
+            else:
+                handle, cached_len = previous.cache_handle, previous.cached_len
+            remain_len = req.input_len - cached_len
+            budget = chunk_budget(remain_len)
+            chunk_size = self.plan_prefill_chunk(remain_len, budget)
+            if chunk_size <= 0:
+                return f"zero prefill chunk: remain={remain_len}, token_budget={budget}"
 
-        remaining = remain_len + req.output_len
-        if previous is None:
             rejection = self._acquire_prefill(req, handle, chunk_size, admission)
             if rejection is not None:
                 return rejection
+            commit()
+        if previous is None:
             with self.record_schedule_step("record_match"):
                 self.record_match(req, match, input_len=req.input_len)
             with self.record_schedule_step("table_allocate"):
@@ -167,11 +171,18 @@ class BaseCacheManager(ABC):
         else:
             table_idx = previous.table_idx
 
-        if previous is None or not any(current.uid == req.uid for current in admission.inflight_prefill):
-            admission.reserved += self._reservation_size(remaining, table_idx=table_idx)
+        allocation = PrefillAllocation(handle, table_idx, cached_len, chunk_size)
+        self._account_prefill(req, allocation, admission)
         if profile is not None:
             profile["reserved_size_after"] = admission.reserved
-        return PrefillAllocation(handle, table_idx, cached_len, chunk_size)
+        return allocation
+
+    def _account_prefill(
+        self, req: PendingRequest, allocation: PrefillAllocation, admission: PrefillAdmission,
+    ) -> None:
+        if req.chunked_req is None or not any(current.uid == req.uid for current in admission.inflight_prefill):
+            remaining = req.input_len - allocation.cached_len + req.output_len
+            admission.reserved += self._reservation_size(remaining, table_idx=allocation.table_idx)
 
     def _acquire_prefill(
         self,
@@ -180,6 +191,8 @@ class BaseCacheManager(ABC):
         chunk_size: int,
         admission: PrefillAdmission,
     ) -> str | None:
+        if req.chunked_req is not None:
+            return None
         request_cost = self._reservation_size(
             req.input_len - handle.cached_len + req.output_len, handle=handle,
         )

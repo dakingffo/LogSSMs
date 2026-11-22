@@ -535,8 +535,6 @@ class EvictionPlanner {
     Int checkpoints = 0;
     for (auto slot : node_slots[index]) {
       checkpoints += !released_set.contains(slot) && actions.contains(slot);
-      if (checkpoints > 1)
-        return;
     }
     double score = 0.;
     if (online) {
@@ -556,7 +554,7 @@ class EvictionPlanner {
       const auto credit = prune_credit(index);
       score = credit ? cost / credit : std::numeric_limits<double>::infinity();
     }
-    leaf_candidates.push({0., score, nodes[index][3], index, 0,
+    leaf_candidates.push({checkpoints > 1 ? 1. : 0., score, nodes[index][3], index, 0,
                           version, score, order[0], order[1], order[2]});
   }
   void push_action(Int slot) {
@@ -1091,7 +1089,7 @@ public:
     return inserted->second.id;
   }
 
-  Vector match(tvm::ffi::TensorView query, Int start, Int granularity) {
+  Vector match(tvm::ffi::TensorView query, Int start, Int granularity, bool touch_match) {
     check(query.ndim() == 1 && query.is_contiguous() &&
               query.device().device_type == kDLCPU &&
               query.dtype().code == kDLInt &&
@@ -1139,7 +1137,8 @@ public:
     if (best == records_.end()) {
       return {};
     }
-    lru_.splice(lru_.end(), lru_, best->second.lru);
+    if (touch_match)
+      lru_.splice(lru_.end(), lru_, best->second.lru);
     return {best->second.id, matched};
   }
 
@@ -1299,8 +1298,8 @@ Result make_recycle_bin(Int capacity) {
       return bin->remember(parts, entries, ends, stats);
     }));
   result.Set("match", tvm::ffi::Function::FromTyped(
-    [bin](tvm::ffi::TensorView query, Int start, Int granularity) {
-      const auto values = bin->match(query, start, granularity);
+    [bin](tvm::ffi::TensorView query, Int start, Int granularity, bool touch_match) {
+      const auto values = bin->match(query, start, granularity, touch_match);
       return List(values.begin(), values.end());
     }));
 
