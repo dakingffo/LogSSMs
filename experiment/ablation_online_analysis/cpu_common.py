@@ -17,7 +17,6 @@ from logssms.scheduler.prefill import PrefillManager
 from logssms.scheduler.profile import SchedulerProfiler
 from logssms.scheduler.scheduler import Scheduler
 from logssms.scheduler.table import TableManager
-from logssms.utils.mixed import prefill_buckets, prefill_partitions
 
 
 class CompletedEvent:
@@ -180,7 +179,7 @@ class RecordedEngine(Engine):
         self.profiler = SimpleNamespace(enabled=False)
         self.piecewise_graph_runner = None
         self.decode_graph_runner = SimpleNamespace(
-            max_graph_bs=self.config.max_running_req,
+            max_graph_bs=0,
             can_use_cuda_graph=lambda _: False,
             pad_batch=lambda batch: setattr(batch, "padded_reqs", batch.reqs),
         )
@@ -195,15 +194,7 @@ class RecordedEngine(Engine):
             torch.zeros(1, dtype=torch.int32), self.config.max_running_req, 0, 1, -1,
             SamplingParams(max_tokens=1), None, 2,
         )
-        runner = MixedGraphRunner.__new__(MixedGraphRunner)
-        runner.graphs, runner.sizes = {}, []
-        runner.partitions = {len(p): p for p in prefill_partitions(self.config.mixed_prefill_tokens, 32)}
-        runner.buckets = prefill_buckets(self.config.mixed_prefill_tokens, 32)
-        runner.buckets_by_count = {
-            count: tuple(p for p in runner.buckets if len(p) == count)
-            for count in runner.partitions
-        }
-        self.mixed_graph_runner = runner
+        self.mixed_graph_runner = MixedGraphRunner(self)
 
     def prepare_batch(self, batch, cache_manager):
         self.scheduler.observe_admissions(batch)
@@ -251,6 +242,7 @@ class ReplayScheduler(Scheduler):
             max_running_req=case["max_running_requests"], page_size=32,
             decode_batch_budget=case["max_running_requests"],
             scheduling_policy=scheduling_policy, mixed_prefill_tokens=128,
+            cache_config=SimpleNamespace(prefill_alignment=manager.granularity),
             model_config=SimpleNamespace(is_hybrid=True),
         )
         self.cache_manager = manager
@@ -259,7 +251,7 @@ class ReplayScheduler(Scheduler):
         self.device = torch.device("cpu")
         self.eos_token_id = -1
         self.ar_manager = DecodeManager(self.config, self.device, manager, self.table_manager, -1)
-        self.prefill_manager = PrefillManager(self.token_pool, 32, manager)
+        self.prefill_manager = PrefillManager(self.token_pool)
         self.prefill_budget = prefill_budget
         self.engine = RecordedEngine(self, manager, records, max_seq_len)
         self.stream = object()

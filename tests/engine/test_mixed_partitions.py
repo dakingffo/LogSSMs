@@ -152,7 +152,7 @@ def test_select_smallest_bucket_without_reordering(alignment, lengths, expected)
     ([1,100,1], [1,64]),
 ])
 def test_fcfs_chunk_limits_do_not_skip_or_reorder(lengths, expected):
-    adder = PrefillAdder(8192, 0, None, None, mixed_token_budget=128,
+    adder = PrefillAdder(8192, None, None, mixed_token_budget=128,
                         mixed_partitions=prefill_partitions(128,32))
     admitted = []
     for n in lengths:

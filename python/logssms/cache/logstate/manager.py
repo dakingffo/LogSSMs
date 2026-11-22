@@ -8,7 +8,7 @@ from time import perf_counter_ns
 from typing import TYPE_CHECKING, Sequence
 
 import torch
-from logssms.cache.base import BaseCacheManager, CacheResources
+from logssms.cache.base import BaseCacheManager, CacheResources, PrefillAdmission
 from logssms.cache.factory import SUPPORTED_CACHE_FACTORIES, BaseCacheFactory, CachePlan
 from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.cache.logstate.layout import (
@@ -215,6 +215,7 @@ class _RequestCacheState:
     live_granules      : list[_LiveGranule] = field(default_factory=list)
     recycle_match     : RecycledMatch | None = None
     live_granule_cursor: int = 0
+    compacted_end      : int = 0
 
     def live_granule_at(self, position: int) -> _LiveGranule | None:
         granules = self.live_granules
@@ -711,7 +712,78 @@ class LogStateCacheManager(BaseCacheManager):
         with self.record_schedule_step("frame_capacity"):
             return frames + kv_frames
 
-    def reservation_size(
+    def begin_prefill_admission(
+        self,
+        active_decode: tuple[tuple[Request, int], ...],
+        inflight_prefill: tuple[Request, ...],
+    ) -> PrefillAdmission:
+        reserved = sum(self._active_reservation(req, remaining) for req, remaining in active_decode)
+        reserved += sum(self._reservation_size(req.remain_len, table_idx=req.table_idx)
+                        for req in inflight_prefill)
+        return PrefillAdmission(active_decode, inflight_prefill, reserved)
+
+    def _active_reservation(self, req: Request, remaining: int) -> int:
+        state = self._request_states[req.table_idx]
+        # The rolling budget needs a private base that survives prefix eviction.
+        if not req.can_decode or not state.compacted_end:
+            return self._reservation_size(remaining, table_idx=req.table_idx)
+        begin = state.live_granules[-1].end
+        kv = max(0, div_ceil(state.request_end, self.page_size) - begin // self.page_size)
+        if kv == 0:
+            return 0
+        # Allow one complete group and the next slot while its last write is in flight.
+        group_size = self._allocator.materialize_log_count
+        handle = req.cache_handle
+        assert isinstance(handle, LogStateCacheHandle)
+        boundary = max(
+            state.compacted_end,
+            max(self._protected_prefixes.get(req.uid, ()), default=0),
+            max(handle.protected_endpoints, default=0),
+        )
+        buffered = 0
+        for granule in reversed(state.live_granules[-group_size:]):
+            if (granule.begin < boundary or granule.state_slot is None
+                    or granule.checkpoint_begin is not None
+                    or granule.end - granule.begin != self.granularity):
+                break
+            buffered += 1
+        logs = min(kv, group_size + 1 - buffered)
+        return self._allocator.required_frames(kv, logs, 0, free_decay_records=0)
+
+    def _acquire_prefill(
+        self, req: PendingRequest, handle: BaseCacheHandle, chunk_size: int, admission: PrefillAdmission,
+    ) -> str | None:
+        request_cost = self._reservation_size(
+            req.input_len - handle.cached_len + req.output_len, handle=handle,
+        )
+        with self.record_schedule_step("prefill_acquire"):
+            if self._try_pin_prefill(
+                admission.reserved + request_cost, handle, request_len=request_cost, admission=admission,
+            ):
+                return None
+        with self.record_schedule_step("rejection_diagnostics"):
+            return (f"cache admission rejected: request={request_cost}, "
+                    f"reserved={admission.reserved}, total={admission.reserved + request_cost}, "
+                    f"available={self.admission_capacity}, matched={handle.cached_len}")
+
+    def _reclaim_active_for_prefill(self, admission: PrefillAdmission, request_cost: int) -> bool:
+        active = {req: remaining for req, remaining in admission.active_decode if req.can_decode}
+        candidates = self._active_candidates(sorted(active))
+        while candidates:
+            action = min(candidates, key=lambda candidate: (candidate.score, candidate.request.uid))
+            req = action.request
+            previous = self._active_reservation(req, active[req])
+            result = self._apply_active(action)
+            admission.reserved += self._active_reservation(req, active[req]) - previous
+            if self._profile_enabled:
+                self._record_lifecycle_event({"event": "active_admission_reclamation", **result})
+            if admission.reserved + request_cost <= self.admission_capacity:
+                return True
+            candidates = [candidate for candidate in candidates if candidate.request is not req]
+            candidates.extend(self._active_candidates((req,)))
+        return False
+
+    def _reservation_size(
         self,
         token_len: int,
         *,
@@ -762,13 +834,14 @@ class LogStateCacheManager(BaseCacheManager):
             kv, kv - covered, states, free_decay_records=0,
         )
 
-    def prefill_acquire(
+    def _try_pin_prefill(
         self,
         total_len  : int,
         handle     : BaseCacheHandle,
         request_len: int | None = None,
+        *,
+        admission  : PrefillAdmission | None = None,
     ) -> bool:
-        del request_len
         if self._profile_enabled:
             self._profile_stats["admission_attempts"] += 1
         assert isinstance(handle, LogStateCacheHandle)
@@ -792,7 +865,8 @@ class LogStateCacheManager(BaseCacheManager):
                     slot for slot in sources if slot in self.tree._evictable_slots
                 }
                 available -= kv_frames + self._allocator.lock_frame_cost(unavailable)
-        if total_len > available:
+        can_reclaim_active = admission is not None and bool(admission.active_decode)
+        if total_len > available and not can_reclaim_active:
             if self._profile_enabled:
                 self._profile_stats["admission_rejections"] += 1
             return False
@@ -801,6 +875,10 @@ class LogStateCacheManager(BaseCacheManager):
             self.lock(handle)
         with self.record_schedule_step("capacity_after_lock"):
             admitted = total_len <= self.admission_capacity
+        if not admitted and can_reclaim_active:
+            assert admission is not None and request_len is not None
+            with self.record_schedule_step("prefill_active_reclamation"):
+                admitted = self._reclaim_active_for_prefill(admission, request_len)
         if not admitted:
             with self.record_schedule_step("unlock_rejected_handle"):
                 self.unlock(handle)
@@ -1178,9 +1256,7 @@ class LogStateCacheManager(BaseCacheManager):
                 self._profile_allocation_samples.append(profile)
             return
 
-        active_requests = ()
-        if phase == "decode":
-            active_requests = tuple(sorted(req for req, _, _, _ in allocation_info))
+        active_requests = reqs if phase == "decode" else ()
         kv_offsets, state_slots, direct_slots = self._allocate(
             needed, needed_logs, needed_checkpoints, profile=profile, active_requests=active_requests,
         )
@@ -1944,6 +2020,9 @@ class LogStateCacheManager(BaseCacheManager):
             self.lock(new_handle)
             request_state.live_granules = remaining
             request_state.live_granule_cursor = 0
+            request_state.compacted_end = max(
+                (granule.end for granule in remaining if granule.compacted_checkpoint), default=0,
+            )
         if self._profile_enabled:
             self._cache_req_samples.append({
                 "tag": req.profile_tag,
@@ -1967,6 +2046,10 @@ class LogStateCacheManager(BaseCacheManager):
         self._release_live_granules(req.table_idx, release)
         state.live_granules = keep
         state.live_granule_cursor = 0
+        if state.compacted_end > req.cached_len:
+            state.compacted_end = max(
+                (granule.end for granule in keep if granule.compacted_checkpoint), default=0,
+            )
         req.device_len = min(req.cached_len + 1, req.max_device_len)
 
     def commit_speculative(self, req: Request, C: int, num_sampled: int) -> None:
@@ -2048,7 +2131,7 @@ class LogStateCacheManager(BaseCacheManager):
                 continue
             # Overlap advances the device length at submission. Host tokens
             # advance only after the result of the producing forward is ready.
-            completed = min(req.cached_len, len(req.input_ids) - 1)
+            completed = req.confirmed_decode_prefix_len
             state = self._request_states[req.table_idx]
             granules = state.live_granules
             if not granules or granules[0].end > completed:
@@ -2126,7 +2209,8 @@ class LogStateCacheManager(BaseCacheManager):
 
     def _apply_active(self, action: _ActiveReclamation) -> dict:
         row = action.request.table_idx
-        granules = self._request_states[row].live_granules
+        state = self._request_states[row]
+        granules = state.live_granules
         first, last = (granules[index] for index in (action.indices[0], action.indices[-1]))
         sources = tuple(granules[index].state_slot for index in action.indices[:-1])
         pool = self.logstate_pool
@@ -2146,6 +2230,7 @@ class LogStateCacheManager(BaseCacheManager):
         granules[action.indices[-1]] = replace(
             last, checkpoint_begin=action.begin, compacted_checkpoint=True,
         )
+        state.compacted_end = max(state.compacted_end, last.end)
         pool.retire_slots(sources)
         return dict(
             kind="materialize" if action.logs else "merge", uid=action.request.uid,
@@ -2165,7 +2250,7 @@ class LogStateCacheManager(BaseCacheManager):
             needed_pages, needed_states, needed_works, profile,
             recycle_bin=self.recycle_bin,
             active_candidates=(
-                (lambda: self._active_candidates(active_requests)) if active_requests else None
+                (lambda: self._active_candidates(sorted(active_requests))) if active_requests else None
             ),
             apply_active=self._apply_active if active_requests else None,
         )

@@ -14,12 +14,13 @@ from logssms.core import (
     Batch, 
     Context 
 )
-from logssms.utils import init_logger, align_ceil
+from logssms.utils import init_logger
 
 from .ar import ForwardInput, ForwardOutput
 
 if TYPE_CHECKING:
     from logssms.cache import BaseCacheHandle, BaseCacheManager
+    from logssms.cache.base import PrefillAdmission
     from logssms.message import UserMsg
 
     from .table import TableManager
@@ -52,9 +53,9 @@ class PendingRequest:
 @dataclass
 class PrefillAdder:
     token_budget : int
-    reserved_size: int
     cache_manager: BaseCacheManager
     table_manager: TableManager
+    admission    : PrefillAdmission | None = None
     profiler     : SchedulerProfiler | None = None
     mixed_token_budget: int | None = None
     mixed_partitions: tuple[tuple[int, ...], ...] = ()
@@ -91,65 +92,9 @@ class PrefillAdder:
         complete = [cap for cap in candidates if cap >= desired]
         return min(self.token_budget, min(complete) if complete else max(candidates))
 
-    def _try_allocate_one(
-        self,
-        req: PendingRequest,
-    ) -> tuple[BaseCacheHandle, int, int] | None:
-        if self.table_manager.available_size == 0:
-            self.rejection_reason = "no free request table slot"
-            return None
-
-
-        with self._profile_step("match_req"):
-            match = self.cache_manager.match_req(req)
-        handle = match.cuda_handle
-        cached_len = handle.cached_len
-        remain_len = req.input_len - cached_len
+    def _remaining_prefill_budget(self, remain_len: int) -> int:
         self._select_budget(remain_len)
-        chunk_size = self.cache_manager.plan_prefill_chunk(
-            remain_len, self._chunk_budget(remain_len)
-        )
-        if chunk_size == 0:
-            self.rejection_reason = (
-                f"zero prefill chunk: remain={remain_len}, "
-                f"token_budget={self.token_budget}"
-            )
-            return None
-
-
-        estimated_len = self.cache_manager.reservation_size(
-            remain_len + req.output_len, handle=handle,
-        )
-        total_len = estimated_len + self.reserved_size
-        with self._profile_step("prefill_acquire"):
-            admitted = self.cache_manager.prefill_acquire(
-                total_len, handle, request_len=estimated_len
-            )
-        if not admitted:
-            with self._profile_step("rejection_diagnostics"):
-                self.rejection_reason = (
-                    f"cache admission rejected: request={estimated_len}, "
-                    f"reserved={self.reserved_size}, total={total_len}, "
-                    f"available={self.cache_manager.admission_capacity}, "
-                    f"matched={cached_len}"
-                )
-            return None
-
-        with self._profile_step("record_match"):
-            self.cache_manager.record_match(
-                req, match, input_len=req.input_len
-            )
-
-        with self._profile_step("table_allocate"):
-            table_idx = self.table_manager.allocate()
-        if cached_len > 0:
-            with self._profile_step("cached_token_copy"):
-                device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-                device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-        with self._profile_step("init_with_handle"):
-            self.cache_manager.init_with_handle(table_idx, handle)
-
-        return handle, table_idx, chunk_size
+        return self._chunk_budget(remain_len)
 
     def _add_one_req(
         self,
@@ -171,9 +116,6 @@ class PrefillAdder:
         self.token_budget -= chunk_size
         if self.use_mixed:
             self._mixed_lengths.append(chunk_size)
-        self.reserved_size += self.cache_manager.reservation_size(
-            remain_len + pending_req.output_len, table_idx=table_idx,
-        )
 
         with self._profile_step("input_token_copy"):
             device_ids = self.table_manager.token_pool[table_idx, cached_len: cached_len + chunk_size]
@@ -201,18 +143,18 @@ class PrefillAdder:
             return self._try_add_one(pending_req)
         with self.profiler.record_schedule_request(pending_req) as sample:
             sample["token_budget_before"] = self.token_budget
-            sample["reserved_size_before"] = self.reserved_size
             self.rejection_reason = None
-            req = self._try_add_one(pending_req)
+            req = self._try_add_one(pending_req, profile=sample)
             sample["admitted"] = req is not None
             sample["rejection_reason"] = self.rejection_reason
             sample["cached_len"] = None if req is None else req.cached_len
             sample["chunk_size"] = None if req is None else req.extend_len
             sample["token_budget_after"] = self.token_budget
-            sample["reserved_size_after"] = self.reserved_size
             return req
 
-    def _try_add_one(self, pending_req: PendingRequest) -> Request | ChunkedRequest | None:
+    def _try_add_one(
+        self, pending_req: PendingRequest, *, profile: dict | None = None,
+    ) -> Request | ChunkedRequest | None:
         if self.token_budget <= 0:
             self.rejection_reason = "prefill token budget exhausted"
             return None
@@ -220,51 +162,30 @@ class PrefillAdder:
             self.rejection_reason = "mixed partition capacity exhausted"
             return None
 
-        if chunked_req := pending_req.chunked_req:
-            remain_len = pending_req.input_len - chunked_req.cached_len
-            self._select_budget(remain_len)
-            chunk_size = self.cache_manager.plan_prefill_chunk(
-                remain_len, self._chunk_budget(remain_len)
-            )
-            if chunk_size == 0:
-                self.rejection_reason = (
-                    f"zero prefill chunk: remain={remain_len}, "
-                    f"token_budget={self.token_budget}"
-                )
-                return None
-            return self._add_one_req(
-                pending_req=pending_req,
-                cache_handle=chunked_req.cache_handle,
-                table_idx=chunked_req.table_idx,
-                cached_len=chunked_req.cached_len,
-                chunk_size=chunk_size,
-            )
+        if pending_req.chunked_req is None and self.table_manager.available_size == 0:
+            self.rejection_reason = "no free request table slot"
+            return None
 
-        if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, chunk_size = resource
-            return self._add_one_req(
-                pending_req=pending_req,
-                cache_handle=cache_handle,
-                table_idx=table_idx,
-                cached_len=cache_handle.cached_len,
-                chunk_size=chunk_size,
-            )
-
-        return None
+        assert self.admission is not None
+        result = self.cache_manager.admit_prefill(
+            pending_req, self.admission, self._remaining_prefill_budget,
+            lambda: self.table_manager.allocate(), profile=profile,
+        )
+        if isinstance(result, str):
+            self.rejection_reason = result
+            return None
+        if pending_req.chunked_req is None and result.cached_len:
+            with self._profile_step("cached_token_copy"):
+                device_ids = self.table_manager.token_pool[result.table_idx][:result.cached_len]
+                device_ids.copy_(pending_req.input_ids[:result.cached_len].pin_memory(), non_blocking=True)
+        return self._add_one_req(pending_req, *result)
 
 
 class PrefillManager:
-    def __init__(
-        self,
-        token_pool : torch.Tensor,
-        page_size  : int,
-        cache_manager: BaseCacheManager | None = None,
-    ):
+    def __init__(self, token_pool: torch.Tensor):
         self.token_pool = token_pool
         self.pending_list: list[PendingRequest] = []
-        self.inflight_reqs: dict[int, Request] = dict()
-        self.page_size = page_size
-        self.cache_manager = cache_manager
+        self.inflight_reqs: dict[int, Request] = {}
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingRequest(
@@ -275,22 +196,6 @@ class PrefillManager:
             return_token_ids=req.return_token_ids,
         ))
 
-    @property
-    def need_tokens(self) -> int:
-        return sum(
-            align_ceil(req.remain_len, self.page_size)
-            for req in self.inflight_reqs.values()
-        )
-
-    @property
-    def need_capacity(self) -> int:
-        if self.cache_manager is None:
-            return self.need_tokens
-        return sum(
-            self.cache_manager.reservation_size(req.remain_len, table_idx=req.table_idx)
-            for req in self.inflight_reqs.values()
-        )
-        
     def schedule_next_batch(
         self, adder: PrefillAdder, max_requests: int | None = None,
         *, mixed_max_requests: int | None = None,

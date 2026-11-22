@@ -210,7 +210,7 @@ def test_tp_materialization_credits_admission_independent_of_event_progress(
         event = _PendingEvent()
         event.ready = ready
         handle = manager.tree.match_prefix(torch.arange(24, dtype=torch.int32)).cuda_handle
-        demand = manager.reservation_size(24 + 512, handle=handle)
+        demand = manager._reservation_size(24 + 512, handle=handle)
         assert 0 < demand <= allocator.free_frames
         pool.reserve(kv=allocator.free_frames - demand + 1)
         assert manager.admission_capacity == demand - 1
@@ -221,7 +221,7 @@ def test_tp_materialization_credits_admission_independent_of_event_progress(
             patch.object(pool, "_write_descriptors"),
         ):
             pool.materialize(logs[-1])
-        result = manager.prefill_acquire(demand, handle)
+        result = manager._try_pin_prefill(demand, handle)
         allocator.check_integrity()
         return result, event.waits
 
@@ -252,14 +252,15 @@ def test_tp_mixed_prefill_agrees_with_rebinding_and_release_pending(
             pool.retire_slots(works[1:])
 
         table = TableManager(3, manager.page_table)
-        prefill = PrefillManager(table.token_pool, manager.page_size, manager)
+        prefill = PrefillManager(table.token_pool)
         for uid in (687, 688):
             prefill.add_one_req(UserMsg(
                 uid, torch.arange(24, dtype=torch.int32) + uid * 32,
                 SamplingParams(max_tokens=1),
             ))
         adder = PrefillAdder(
-            token_budget=8192, reserved_size=0, cache_manager=manager, table_manager=table,
+            token_budget=8192, cache_manager=manager, table_manager=table,
+            admission=manager.begin_prefill_admission((), ()),
             mixed_token_budget=128, mixed_partitions=((32, 32), (128,)),
         )
         with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):

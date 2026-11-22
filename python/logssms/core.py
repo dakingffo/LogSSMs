@@ -75,6 +75,11 @@ class Request:
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
 
+    @property
+    def confirmed_decode_prefix_len(self) -> int:
+        """Prefix processed before the last host-visible sampled token."""
+        return min(self.cached_len, len(self.input_ids) - 1)
+
     def extend_device_n(self, n: int) -> None:
         self.device_len += min(n, self.max_device_len - self.device_len)
 

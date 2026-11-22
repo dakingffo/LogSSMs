@@ -82,9 +82,7 @@ class Scheduler(SchedulerIOMixin):
 
         self.decode_manager = self.ar_manager
         self.verify_manager = self.ar_manager
-        self.prefill_manager = PrefillManager(
-            self.token_pool, config.page_size, self.cache_manager,
-        )
+        self.prefill_manager = PrefillManager(self.token_pool)
         self.prefill_budget = config.max_prefill_tokens
         self.profiler = SchedulerProfiler(
             self.device, self.cache_manager,
@@ -273,9 +271,12 @@ class Scheduler(SchedulerIOMixin):
             with self.profiler.record_schedule_step("reservation"):
                 adder = PrefillAdder(
                     token_budget=self.prefill_budget,
-                    reserved_size=(
-                        (self.ar_manager.need_capacity + self.prefill_manager.need_capacity)
-                        if self.prefill_manager.runnable else 0
+                    admission=(
+                        self.cache_manager.begin_prefill_admission(
+                            self.ar_manager.prefill_reservations(),
+                            tuple(self.prefill_manager.inflight_reqs.values()),
+                        )
+                        if self.prefill_manager.runnable else None
                     ),
                     cache_manager=self.cache_manager,
                     table_manager=self.table_manager,

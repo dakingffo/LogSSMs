@@ -14,6 +14,7 @@ from logssms.scheduler.prefill import PendingRequest, PrefillAdder, PrefillManag
 from logssms.scheduler.scheduler import Scheduler
 from logssms.server.args import parse_args
 from logssms.utils.mixed import prefill_buckets, select_prefill_partition
+from tests.core.test_prefill_overlap import make_cache_stub
 
 
 def request(uid, *, chunked=False):
@@ -26,10 +27,10 @@ def request(uid, *, chunked=False):
 
 
 def manager(count=0, budget=16):
-    cache = SimpleNamespace(
+    cache = make_cache_stub(
         lazy_free_region=nullcontext,
         cache_req=lambda *_args, **_kwargs: None,
-        reservation_size=lambda n, **_kwargs: n,
+        _reservation_size=lambda n, **_kwargs: n,
     )
     result = DecodeManager(
         SimpleNamespace(page_size=1, decode_batch_budget=budget),
@@ -47,7 +48,7 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
     )
     s.ar_manager = manager(count, budget)
     s.cache_manager = s.ar_manager.cache_manager
-    s.prefill_manager = PrefillManager(s.ar_manager.token_pool, 1, s.cache_manager)
+    s.prefill_manager = PrefillManager(s.ar_manager.token_pool)
     s.prefill_manager.pending_list = [
         PendingRequest(i, torch.arange(8), SamplingParams(max_tokens=20))
         for i in (24, 25, 26)
@@ -74,7 +75,7 @@ def scheduler(monkeypatch, count=3, max_running=8, budget=16, policy="mixed", ad
 
     def add(adder, pending):
         adder._select_budget(pending.input_len)
-        attempts.append((pending.uid, adder.token_budget, adder.reserved_size))
+        attempts.append((pending.uid, adder.token_budget, adder.admission))
         return request(pending.uid) if admitted else None
 
     monkeypatch.setattr("logssms.scheduler.prefill.PrefillAdder.try_add_one", add)
@@ -182,7 +183,7 @@ def test_head_remaining_tokens_choose_prefill_or_mixed(
     cache = s.cache_manager
     cache.match_req = match
     cache.plan_prefill_chunk = min
-    cache.prefill_acquire = lambda *_args, **_kwargs: True
+    cache._try_pin_prefill = lambda *_args, **_kwargs: True
     cache.record_match = lambda *_args, **_kwargs: None
     cache.record_prefill_wait = lambda *_args: None
     cache.init_with_handle = lambda *_args: None
@@ -227,16 +228,18 @@ def test_reservation_scans_only_when_prefill_pending(monkeypatch, policy, pendin
     s, attempts = scheduler(monkeypatch, policy=policy)
     if not pending:
         s.prefill_manager.pending_list.clear()
+    previous = request(23, chunked=True)
+    s.prefill_manager.inflight_reqs[23] = previous
     calls = []
-    def reserve(name, value):
-        calls.append(name)
-        return value
-    monkeypatch.setattr(DecodeManager, "need_capacity", property(lambda _: reserve("ar", 320)))
-    monkeypatch.setattr(PrefillManager, "need_capacity", property(lambda _: reserve("prefill", 128)))
+    def reserve(tokens, *, table_idx):
+        calls.append((table_idx, tokens))
+        return tokens
+    s.cache_manager._reservation_size = reserve
     batch = s._schedule_next_batch()
     if pending:
-        assert calls == ["ar", "prefill"]
-        assert attempts[0][2] == 448
+        assert calls == [(1, 20), (2, 20), (3, 20), (23, 20)]
+        assert attempts[0][2].reserved == 80
+        assert attempts[0][2].inflight_prefill == (previous,)
         assert batch.phase == ("mixed" if policy == "mixed" else "prefill")
     else:
         assert calls == [] and attempts == []
@@ -253,7 +256,7 @@ def test_mixed_policy_decode_fallback_rotates(monkeypatch):
 
 
 def test_mixed_chunk_continuation_keeps_pending_order_and_abort_frontier():
-    p = PrefillManager(torch.zeros((32, 64), dtype=torch.int32), 1)
+    p = PrefillManager(torch.zeros((32, 64), dtype=torch.int32))
     p.pending_list = [
         PendingRequest(i, torch.arange(12), SamplingParams(max_tokens=20))
         for i in (0, 1)
@@ -316,7 +319,7 @@ def test_mixed_advance_and_process_use_per_request_phase(chunked):
     inp = ForwardInput(batch, None, (torch.empty(0), torch.empty(0)), mapping)
     tokens = torch.tensor([-1 if chunked else 7, 8], dtype=torch.int32)
     out = ForwardOutput(tokens, tokens, None)
-    p = PrefillManager(m.token_pool, 1)
+    p = PrefillManager(m.token_pool)
     p.advance_for_next_schedule(None, inp, out)
     assert prefill.cached_len == 2 and decode.cached_len == 1
     assert m.token_pool[0, 2].item() == (0 if chunked else 7)

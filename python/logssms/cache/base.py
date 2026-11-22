@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import os
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Callable, NamedTuple, Sequence
 
 import torch
 
@@ -34,6 +34,22 @@ class CacheResources:
     linear_state    : StateCachePool | None
     state_table     : torch.Tensor | None
     work_state_table: torch.Tensor | None
+
+
+@dataclass
+class PrefillAdmission:
+    """Active requests and reservations for one prefill scheduling pass."""
+
+    active_decode: tuple[tuple[Request, int], ...] = ()
+    inflight_prefill: tuple[Request, ...] = ()
+    reserved: int = 0
+
+
+class PrefillAllocation(NamedTuple):
+    handle: BaseCacheHandle
+    table_idx: int
+    cached_len: int
+    chunk_size: int
 
 
 class BaseCacheManager(ABC):
@@ -100,7 +116,83 @@ class BaseCacheManager(ABC):
     def unlock(self, handle: BaseCacheHandle) -> None:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
-    def reservation_size(
+    def begin_prefill_admission(
+        self,
+        active_decode: tuple[tuple[Request, int], ...],
+        inflight_prefill: tuple[Request, ...],
+    ) -> PrefillAdmission:
+        reserved = sum(self._reservation_size(tokens, table_idx=req.table_idx)
+                       for req, tokens in active_decode)
+        reserved += sum(self._reservation_size(req.remain_len, table_idx=req.table_idx)
+                        for req in inflight_prefill)
+        return PrefillAdmission(active_decode, inflight_prefill, reserved)
+
+    def admit_prefill(
+        self,
+        req: PendingRequest,
+        admission: PrefillAdmission,
+        chunk_budget: Callable[[int], int],
+        allocate_table: Callable[[], int],
+        *,
+        profile: dict | None = None,
+    ) -> PrefillAllocation | str:
+        """Prepare a prefill chunk or return its rejection reason."""
+        if profile is not None:
+            profile["reserved_size_before"] = admission.reserved
+            profile["reserved_size_after"] = admission.reserved
+        previous = req.chunked_req
+        if previous is None:
+            with self.record_schedule_step("match_req"):
+                match = self.match_req(req)
+            handle, cached_len = match.cuda_handle, match.cuda_handle.cached_len
+        else:
+            handle, cached_len = previous.cache_handle, previous.cached_len
+        remain_len = req.input_len - cached_len
+        budget = chunk_budget(remain_len)
+        chunk_size = self.plan_prefill_chunk(remain_len, budget)
+        if chunk_size <= 0:
+            return f"zero prefill chunk: remain={remain_len}, token_budget={budget}"
+
+        remaining = remain_len + req.output_len
+        if previous is None:
+            rejection = self._acquire_prefill(req, handle, chunk_size, admission)
+            if rejection is not None:
+                return rejection
+            with self.record_schedule_step("record_match"):
+                self.record_match(req, match, input_len=req.input_len)
+            with self.record_schedule_step("table_allocate"):
+                table_idx = allocate_table()
+            with self.record_schedule_step("init_with_handle"):
+                self.init_with_handle(table_idx, handle)
+        else:
+            table_idx = previous.table_idx
+
+        if previous is None or not any(current.uid == req.uid for current in admission.inflight_prefill):
+            admission.reserved += self._reservation_size(remaining, table_idx=table_idx)
+        if profile is not None:
+            profile["reserved_size_after"] = admission.reserved
+        return PrefillAllocation(handle, table_idx, cached_len, chunk_size)
+
+    def _acquire_prefill(
+        self,
+        req: PendingRequest,
+        handle: BaseCacheHandle,
+        chunk_size: int,
+        admission: PrefillAdmission,
+    ) -> str | None:
+        request_cost = self._reservation_size(
+            req.input_len - handle.cached_len + req.output_len, handle=handle,
+        )
+        total = admission.reserved + request_cost
+        with self.record_schedule_step("prefill_acquire"):
+            if self._try_pin_prefill(total, handle, request_len=request_cost):
+                return None
+        with self.record_schedule_step("rejection_diagnostics"):
+            return (f"cache admission rejected: request={request_cost}, "
+                    f"reserved={admission.reserved}, total={total}, "
+                    f"available={self.admission_capacity}, matched={handle.cached_len}")
+
+    def _reservation_size(
         self,
         token_len: int,
         *,
@@ -113,7 +205,7 @@ class BaseCacheManager(ABC):
     def admission_capacity(self) -> int:
         return self.available_size
 
-    def prefill_acquire(
+    def _try_pin_prefill(
         self,
         total_len  : int,
         handle     : BaseCacheHandle,

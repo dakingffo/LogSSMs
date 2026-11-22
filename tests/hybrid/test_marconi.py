@@ -75,12 +75,12 @@ def test_fragmented_state_admission_rejects_before_init():
     held = allocator.allocate(len(allocator.free))
     allocator.release(held[::2])
     handle = manager.match_req(SimpleNamespace(input_ids=torch.arange(64))).cuda_handle
-    needed = manager.reservation_size(64, handle=handle)
+    needed = manager._reservation_size(64, handle=handle)
     assert manager.available_size >= needed
-    assert not manager.prefill_acquire(needed, handle)
+    assert not manager._try_pin_prefill(needed, handle)
     assert not manager.requests
     allocator.release(held[1::2])
-    assert manager.prefill_acquire(needed, handle)
+    assert manager._try_pin_prefill(needed, handle)
     before = len(allocator.free)
     manager.init_with_handle(0, handle)
     assert before - len(allocator.free) == 3 * manager.plan.layout.state_blocks
@@ -106,7 +106,7 @@ def test_admission_does_not_evict_for_future_kv():
     assert handle.cached_len == 0
     total = len(p.allocator.free) + 1
     assert total < manager.available_size
-    assert manager.prefill_acquire(total, handle)
+    assert manager._try_pin_prefill(total, handle)
     assert len(manager.tree.nodes) == 1
     assert not manager.tree.evicted
     manager.unlock(handle)
@@ -167,7 +167,7 @@ def test_double_state_aligned_tail_and_decode_swaps(end):
     initial_free = len(p.allocator.free)
     ids = torch.arange(end, dtype=torch.int32)
     handle = manager.match_req(SimpleNamespace(input_ids=ids)).cuda_handle
-    assert manager.prefill_acquire(manager.reservation_size(end, handle=handle), handle)
+    assert manager._try_pin_prefill(manager._reservation_size(end, handle=handle), handle)
     manager.init_with_handle(0, handle)
     entry = manager.requests[0]
     assert len(entry.states) == 2
@@ -453,7 +453,7 @@ def test_manager_tail_and_branch_lifecycle(model):
         pending = SimpleNamespace(input_ids=torch.tensor(tokens, dtype=torch.int32))
         handle = manager.match_req(pending).cuda_handle
         assert handle.cached_len == expected_hit
-        assert manager.prefill_acquire(manager.reservation_size(len(tokens), handle=handle), handle)
+        assert manager._try_pin_prefill(manager._reservation_size(len(tokens), handle=handle), handle)
         manager.init_with_handle(0, handle)
         req = Request(input_ids=pending.input_ids, table_idx=0, cached_len=handle.cached_len,
                       output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=handle,

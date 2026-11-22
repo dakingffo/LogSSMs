@@ -147,7 +147,7 @@ class MarconiCacheManager(BaseCacheManager):
     def available_size(self):
         return len(self.pool.allocator.free) + self.tree.reclaimable_blocks()
 
-    def reservation_size(self, token_len, *, handle=None, table_idx=None):
+    def _reservation_size(self, token_len, *, handle=None, table_idx=None):
         state_blocks = self.plan.layout.state_blocks
         entry = self.requests.get(table_idx)
         if entry is None:
@@ -161,7 +161,7 @@ class MarconiCacheManager(BaseCacheManager):
             states * layout.state_groups, layout.state_blocks_per_group,
         )
 
-    def prefill_acquire(self, total_len, handle, request_len=None):
+    def _try_pin_prefill(self, total_len, handle, request_len=None):
         if total_len > self.admission_capacity:
             return False
         self.lock(handle)

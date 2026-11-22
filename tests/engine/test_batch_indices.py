@@ -173,7 +173,7 @@ def test_compact_chunk_writes_match_aligned_outputs(phase):
     assert packet.table_ids.tolist() == [2, 0, 3]
     assert packet.seq_lens_cpu.tolist() == [4, 3, 1]
     pool = torch.full((4, 16), 99, dtype=torch.int32)
-    manager = PrefillManager(pool, 32)
+    manager = PrefillManager(pool)
     output = SimpleNamespace(next_tokens_gpu=torch.tensor([-1, 7], dtype=torch.int32))
     manager.advance_for_next_schedule(None, (batch, None, None, packet.write_tuple), output)
     assert pool[0, 3].item() == (99 if phase == "verify" else 7)
@@ -190,7 +190,7 @@ def test_all_chunk_prefill_has_empty_compact_writes():
     packet = BatchIndices.make(batch, torch.device("cpu"), 32)
     assert all(vector.numel() == 0 for vector in packet.write_tuple)
     pool = torch.full((1, 16), 99, dtype=torch.int32)
-    PrefillManager(pool, 32).advance_for_next_schedule(
+    PrefillManager(pool).advance_for_next_schedule(
         None, (batch, None, None, packet.write_tuple),
         SimpleNamespace(next_tokens_gpu=torch.tensor([-1], dtype=torch.int32)),
     )

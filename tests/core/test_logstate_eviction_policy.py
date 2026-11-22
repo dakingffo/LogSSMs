@@ -75,6 +75,55 @@ def test_decode_reclaims_completed_logs_when_allocation_is_short():
         manager.check_integrity()
 
 
+@pytest.mark.parametrize("completed_group", [False, True])
+def test_prefill_admission_uses_rolling_active_reservation(completed_group):
+    import torch
+    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from logssms.core import SamplingParams
+    from logssms.scheduler.prefill import PendingRequest
+    from tests.core.test_logstate_cache_manager import make_manager, new_req
+
+    cache = make_manager(num_pages=32, num_states=64, granularity=32, max_seq_len=2048)
+    pool = cache.logstate_pool
+    pool.kernels = NumericalKernels()
+    group = pool.allocator.materialize_log_count
+    end = group * cache.granularity
+    tokens = torch.arange(end + 1, dtype=torch.int32)
+    with numerical_boundaries():
+        active = new_req(cache, tokens)
+        active.max_device_len = end + 1024
+        cache.allocate([active])
+        active.cached_len = end
+        if not completed_group:
+            active.input_ids = active.input_ids[:-1]
+        state = cache._request_states[active.table_idx]
+        tail_slot = state.live_granules[-1].state_slot
+        kv = cache.page_table[active.table_idx, :end + 1].clone()
+
+        pending = PendingRequest(1, torch.arange(24, dtype=torch.int32) + 1000,
+                                 SamplingParams(max_tokens=1))
+        handle = cache.match_req(pending).cuda_handle
+        request_cost = cache._reservation_size(pending.input_len + pending.output_len, handle=handle)
+        admission = cache.begin_prefill_admission(((active, active.remain_len),), ())
+        full = admission.reserved
+        filled, _, _ = pool.reserve(kv=pool.allocator.free_frames - full - request_cost + 1)
+        result = cache.admit_prefill(pending, admission, lambda _: 32, lambda: 1)
+
+        assert isinstance(result, str) is not completed_group
+        assert state.compacted_end == (end if completed_group else 0)
+        assert state.live_granules[-1].state_slot == tail_slot
+        assert int(cache.state_table[active.table_idx, end]) == tail_slot
+        torch.testing.assert_close(cache.page_table[active.table_idx, :end + 1], kv)
+        if completed_group:
+            future_kv = (active.max_device_len - end) // cache.granularity - 1
+            assert cache._active_reservation(active, active.remain_len) == pool.allocator.required_frames(
+                future_kv, group, 0, free_decay_records=0,
+            )
+            assert admission.reserved < full
+        pool.release_kv(filled)
+        pool.allocator.check_integrity()
+
+
 def run(need, *, locked=False):
     # One chain with two Checkpoints and a tail Log. Each state has 3 payload
     # frames; the Log leaf also owns one KV frame.

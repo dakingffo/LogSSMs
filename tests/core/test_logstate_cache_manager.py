@@ -226,7 +226,7 @@ def test_schedule_profile_capacity_and_work_breakdown(monkeypatch, enabled):
         with profiler.record_schedule_step("match_req"):
             handle = manager.match_req(pending).cuda_handle
         with profiler.record_schedule_step("prefill_acquire"):
-            assert manager.prefill_acquire(PAGE_SIZE, handle)
+            assert manager._try_pin_prefill(PAGE_SIZE, handle)
         with profiler.record_schedule_step("init_with_handle"):
             manager.init_with_handle(0, handle)
         if sample is not None:
@@ -316,7 +316,7 @@ def test_admission_capacity_still_rechecks_after_lock_and_rolls_back():
     after = manager.available_size
     manager.unlock(handle)
     assert after < before
-    assert not manager.prefill_acquire(after + 1, handle)
+    assert not manager._try_pin_prefill(after + 1, handle)
     assert manager.available_size == before
     assert not handle.lock_node.is_locked
     manager.check_integrity()
@@ -337,7 +337,7 @@ def test_failed_admission_projects_locks_without_mutation():
     epoch = manager.tree.lock_revision
     with patch.object(manager.tree, "lock_handle", side_effect=AssertionError):
         for _ in range(10):
-            assert not manager.prefill_acquire(after + 1, handle)
+            assert not manager._try_pin_prefill(after + 1, handle)
     assert manager.tree.lock_revision == epoch
     assert manager.admission_capacity == before
     manager.check_integrity()
@@ -356,7 +356,7 @@ def test_admission_final_capacity_check_still_rolls_back():
 
     with patch.object(type(manager), "admission_capacity", new_callable=PropertyMock,
                       side_effect=[1000, 0]):
-        assert not manager.prefill_acquire(1, handle)
+        assert not manager._try_pin_prefill(1, handle)
     assert not handle.lock_node.is_locked
     manager.check_integrity()
 
@@ -714,11 +714,11 @@ def test_adaptive_sampling_records_hit_only_after_successful_admission():
         sampling_params=SamplingParams(max_tokens=16),
     )
     failed = manager.match_req(pending).cuda_handle
-    assert not manager.prefill_acquire(manager.available_size + 1, failed)
+    assert not manager._try_pin_prefill(manager.available_size + 1, failed)
     assert tuple(source.hits) == ()
 
     admitted = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(PAGE_SIZE, admitted)
+    assert manager._try_pin_prefill(PAGE_SIZE, admitted)
     assert sum(p == tail for p, tail, _ in source.hits) == 1
     manager.unlock(admitted)
 
@@ -737,7 +737,7 @@ def test_manager_exports_online_analysis_profile_and_cache_req_timing():
         sampling_params=SamplingParams(max_tokens=16),
     )
     match = manager.match_req(pending)
-    assert manager.prefill_acquire(PAGE_SIZE, match.cuda_handle)
+    assert manager._try_pin_prefill(PAGE_SIZE, match.cuda_handle)
     profile = manager.profile_result()
     online = profile["online_analysis"]
     assert online["enabled"]
@@ -830,7 +830,7 @@ def test_internal_fork_keeps_original_statistics_and_starts_an_empty_owner():
     assert tuple(hit[0] for hit in original.hits) == (192,)
     assert manager.tree.trace(req.input_ids).node.analysis_owner is original
     assert handle.source_analysis_owner is original
-    assert manager.prefill_acquire(PAGE_SIZE, handle)
+    assert manager._try_pin_prefill(PAGE_SIZE, handle)
     assert tuple(hit[0] for hit in original.hits) == (192, 128)
     assert not handle.analysis_owner.hits
     manager.unlock(handle)
@@ -850,11 +850,11 @@ def test_repeated_admission_uses_one_shared_owner_and_one_query_sample():
     first = manager.match_req(pending).cuda_handle
     second = manager.match_req(pending).cuda_handle
     assert first.analysis_owner is second.analysis_owner
-    assert manager.prefill_acquire(PAGE_SIZE, first)
-    assert manager.prefill_acquire(PAGE_SIZE, second)
+    assert manager._try_pin_prefill(PAGE_SIZE, first)
+    assert manager._try_pin_prefill(PAGE_SIZE, second)
     retry = manager.match_req(pending).cuda_handle
     assert retry.analysis_owner is first.analysis_owner
-    assert manager.prefill_acquire(PAGE_SIZE, retry)
+    assert manager._try_pin_prefill(PAGE_SIZE, retry)
     assert manager.analyzer.query_count == 1
     manager.unlock(retry)
     manager.unlock(second)
@@ -1293,12 +1293,12 @@ def test_prefill_selection_skips_branch_analysis_when_request_slots_are_full():
     from logssms.scheduler.prefill import PrefillAdder, PrefillManager
 
     manager = make_manager()
-    prefill = PrefillManager(torch.empty((1, 512), dtype=torch.int32), PAGE_SIZE, manager)
+    prefill = PrefillManager(torch.empty((1, 512), dtype=torch.int32))
     prefill.pending_list = [
         PendingRequest(uid, torch.arange(257, dtype=torch.int32), SamplingParams(max_tokens=16))
         for uid in range(128)
     ]
-    adder = PrefillAdder(8192, 0, manager, SimpleNamespace(available_size=0))
+    adder = PrefillAdder(8192, manager, SimpleNamespace(available_size=0))
     with (
         patch.object(manager.analyzer, "_find_protections") as branches,
         patch.object(manager, "match_req") as match,
@@ -1316,7 +1316,7 @@ def test_recycled_restore_analyzes_only_the_selected_prefill_batch():
     _gpu_tail_with_recycled_page(manager)
     first = new_req(manager, torch.arange(321, dtype=torch.int32), table_idx=0)
     second = new_req(manager, torch.cat((torch.arange(224), torch.arange(33) + 1000)).int(), table_idx=1)
-    prefill = PrefillManager(torch.empty((1, 512), dtype=torch.int32), PAGE_SIZE, manager)
+    prefill = PrefillManager(torch.empty((1, 512), dtype=torch.int32))
     prefill.pending_list = [
         PendingRequest(99, torch.cat((torch.arange(208), torch.arange(49) + 2000)).int(),
                        SamplingParams(max_tokens=16)),
@@ -1386,10 +1386,10 @@ def test_prefill_protects_existing_branch_before_reusing_recycled_sources(
     )).node
     remember_log_tail(manager.recycle_bin, ghost, node)
     table = TableManager(MAX_RUNNING_REQ, manager.page_table)
-    prefill = PrefillManager(table.token_pool, PAGE_SIZE, manager)
+    prefill = PrefillManager(table.token_pool)
     prefill.pending_list = [PendingRequest(7, branch, SamplingParams(max_tokens=16))]
     with patch.object(torch.Tensor, "pin_memory", lambda self, *args, **kwargs: self):
-        batch = prefill.schedule_next_batch(PrefillAdder(512, 0, manager, table))
+        batch = prefill.schedule_next_batch(PrefillAdder(512, manager, table, manager.begin_prefill_admission((), ())))
     assert batch is not None
     req, = batch.reqs
     assert req.cached_len == 64
@@ -1639,7 +1639,7 @@ def test_recycled_batch_branch_preserves_granule_boundary(head_ratio, granularit
     costs = []
     for item in pending:
         handle = manager.match_req(item).cuda_handle
-        costs.append(manager.reservation_size(item.input_len + item.output_len - handle.cached_len, handle=handle))
+        costs.append(manager._reservation_size(item.input_len + item.output_len - handle.cached_len, handle=handle))
     free = manager._allocator.free_frames
     first = new_req(manager, first_ids, table_idx=1)
     sibling = new_req(manager, sibling_ids, table_idx=2)
@@ -1761,8 +1761,8 @@ def test_admission_reserves_capacity_without_allocating_future_pages():
         sampling_params=SamplingParams(max_tokens=127),
     )
     handle = manager.match_req(pending).cuda_handle
-    cost = manager.reservation_size(128, handle=handle)
-    assert manager.prefill_acquire(cost, handle, request_len=cost)
+    cost = manager._reservation_size(128, handle=handle)
+    assert manager._try_pin_prefill(cost, handle, request_len=cost)
     assert manager._allocator.free_frames == initial_free
     manager.init_with_handle(0, handle)
     work_units = manager._allocator.payload_frames + manager._allocator.conv_frames
@@ -1799,7 +1799,7 @@ def test_admission_rejects_unfulfillable_logical_reservation():
     handle = manager.match_req(pending).cuda_handle
     initial_free = manager._allocator.free_frames
 
-    assert not manager.prefill_acquire(
+    assert not manager._try_pin_prefill(
         initial_free * manager.page_size, handle,
         request_len=(manager.num_pages + 1) * manager.page_size,
     )
@@ -1822,7 +1822,7 @@ def test_logical_admission_does_not_evict_cached_prefix():
         sampling_params=SamplingParams(max_tokens=16),
     )
     handle = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(manager.admission_capacity, handle)
+    assert manager._try_pin_prefill(manager.admission_capacity, handle)
     assert manager._allocator.free_frames == free_units
     assert manager.tree.size_info.evictable_size == cached_size
     manager.unlock(handle)
@@ -1853,7 +1853,7 @@ def test_allocation_evicts_only_as_many_cached_leaves_as_needed():
         sampling_params=SamplingParams(max_tokens=16),
     )
     handle = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(manager.reservation_size(2 * PAGE_SIZE, handle=handle), handle)
+    assert manager._try_pin_prefill(manager._reservation_size(2 * PAGE_SIZE, handle=handle), handle)
     manager.init_with_handle(0, handle)
     req = Request(
         input_ids=input_ids,
@@ -1913,9 +1913,9 @@ def test_admitted_requests_can_allocate_their_full_reserved_suffixes():
             sampling_params=SamplingParams(max_tokens=127),
         )
         handle = manager.match_req(pending).cuda_handle
-        reserved = sum(manager.reservation_size(req.remain_len, table_idx=req.table_idx) for req in reqs)
-        cost = manager.reservation_size(2 * PAGE_SIZE, handle=handle)
-        assert manager.prefill_acquire(reserved + cost, handle)
+        reserved = sum(manager._reservation_size(req.remain_len, table_idx=req.table_idx) for req in reqs)
+        cost = manager._reservation_size(2 * PAGE_SIZE, handle=handle)
+        assert manager._try_pin_prefill(reserved + cost, handle)
         manager.init_with_handle(index, handle)
         reqs.append(Request(
             input_ids=pending.input_ids,
@@ -1950,7 +1950,7 @@ def test_unadmittable_request_stays_pending_without_allocating():
     filler=manager.logstate_pool.reserve(kv=manager._allocator.free_frames)[0]
 
     table = TableManager(MAX_RUNNING_REQ, manager.page_table)
-    prefill = PrefillManager(table.token_pool, PAGE_SIZE)
+    prefill = PrefillManager(table.token_pool)
     pending = PendingRequest(
         uid=0,
         input_ids=torch.tensor([7], dtype=torch.int32),
@@ -1958,7 +1958,7 @@ def test_unadmittable_request_stays_pending_without_allocating():
     )
     prefill.pending_list.append(pending)
 
-    assert prefill.schedule_next_batch(PrefillAdder(64, 0, manager, table)) is None
+    assert prefill.schedule_next_batch(PrefillAdder(64, manager, table, manager.begin_prefill_admission((), ()))) is None
     assert prefill.pending_list == [pending]
     assert table.available_size == MAX_RUNNING_REQ
     assert set(manager._request_states) == {active.table_idx}
@@ -1967,7 +1967,7 @@ def test_unadmittable_request_stays_pending_without_allocating():
     manager.cache_req(active, finished=True)
     # This CPU lifecycle test needs the token copy, not CUDA pinned host memory.
     with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor):
-        batch = prefill.schedule_next_batch(PrefillAdder(64, 0, manager, table))
+        batch = prefill.schedule_next_batch(PrefillAdder(64, manager, table, manager.begin_prefill_admission((), ())))
     assert batch is not None and batch.size == 1
     assert prefill.pending_list == []
     manager.allocate(batch.reqs)
@@ -2191,7 +2191,7 @@ def test_recovery_inputs_are_pinned_only_until_work_is_constructed():
     pending = PendingRequest(17, torch.cat((tokens[:128], torch.tensor([999], dtype=torch.int32))),
                              SamplingParams(max_tokens=16))
     handle = manager.match_req(pending).cuda_handle
-    assert manager.prefill_acquire(0, handle)
+    assert manager._try_pin_prefill(0, handle)
     assert manager.tree._recovery_slot_refs == {entries[1].slot: 1}
     req = Request(input_ids=pending.input_ids, table_idx=0, cached_len=128,
                   output_len=16, uid=17, sampling_params=pending.sampling_params,

@@ -152,7 +152,7 @@ def test_prefix_match_snapshot_survives_chunked_prefill(profile):
     pending = PendingRequest(0, tokens, SamplingParams(max_tokens=8))
     requests = []
     for _ in range(3):
-        request = PrefillAdder(4, 0, manager, table).try_add_one(pending)
+        request = PrefillAdder(4, manager, table, manager.begin_prefill_admission((), ())).try_add_one(pending)
         assert request is not None
         requests.append(request)
         request.complete_to_device_len()
