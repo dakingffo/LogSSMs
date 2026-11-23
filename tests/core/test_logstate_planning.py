@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from logssms.kernel import logstate as planning
+from tests.logstate_helpers import plan_eviction
 
 
 def eviction_chains(count, length):
@@ -91,7 +92,7 @@ def assert_log_capacity_order(nodes, expected):
     refs = [[uuid] if parent >= 0 else [] for uuid, parent, *_ in nodes]
     slots = [(slot, 1, -1, 0, 32) for row in refs for slot in row]
     for needed in range(1, len(expected) + 2):
-        result = planning.plan_eviction(
+        result = plan_eviction(
             nodes, [[] for _ in nodes], refs, slots, [],
             [0, 0, 1, 0, 1, 1, needed, 0, 0, 1], (),
         )

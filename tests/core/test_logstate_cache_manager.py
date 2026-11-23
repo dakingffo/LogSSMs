@@ -11,7 +11,7 @@ import torch
 
 from logssms.cache import CacheResources
 from logssms.cache.logstate.frame_pool import MHALogStatePool
-from logssms.cache.logstate.evictor import LogStateCapacityError
+from logssms.cache.logstate.evictor import LogStateCapacityError, ReclamationPlan
 from logssms.cache.logstate.manager import LogStateCacheManager
 from logssms.cache.logstate.online_analysis_scheduler import (
     LogStatePrefillPlan,
@@ -35,6 +35,56 @@ PAGE_SIZE = 64
 GRANULARITY = 64
 MAX_RUNNING_REQ = 3
 MAX_SEQ_LEN = 512
+
+
+def test_inflight_prefill_retains_its_publication_checkpoint():
+    manager = make_manager(num_pages=40, num_states=40, granularity=32, max_seq_len=1024)
+    pool = manager.logstate_pool
+    tokens = torch.arange(960, dtype=torch.int32)
+
+    def append_checkpoints(begin, ends):
+        end = ends[-1]
+        kv, _, slots = pool.reserve(kv=(end - begin) // 32, works=len(ends))
+        for slot in slots:
+            pool.commit_checkpoint(slot)
+        offsets = [frame * 32 for frame in kv]
+        for offset in offsets:
+            manager.evictor.cached_page_tokens[offset] = 32
+        indices = torch.cat([
+            torch.arange(offset, offset + 32, dtype=torch.int32) for offset in offsets
+        ])
+        if begin:
+            prefix = manager.tree.path(manager.tree.trace(tokens[:begin]).node)
+            indices = torch.cat((*[node.kv for node in prefix], indices))
+        entries = tuple(
+            LogStateEntry(slot, LogStateKind.CHECKPOINT, left, right, (right - left) // 32)
+            for slot, left, right in zip(slots, [begin, *ends[:-1]], ends, strict=True)
+        )
+        return manager.tree.insert(tokens[:end], indices, entries).node, slots
+
+    leaf, (_, anchor) = append_checkpoints(0, [768, 864])
+    manager.tree.protect_at(leaf, 768)
+    cold = new_req(manager, torch.arange(32, dtype=torch.int32) + 2000, table_idx=1)
+    manager.allocate([cold])
+    cold.cached_len = len(cold.input_ids)
+    manager.cache_req(cold, finished=True)
+    req = new_req(manager, tokens[:880])
+    assert req.cached_len == 864
+    manager.allocate([req], phase="prefill")
+    manager.prepare_batch(Batch([req], "prefill"))
+
+    # The preceding overlap batch publishes the longer KV and State first.
+    leaf, _ = append_checkpoints(864, [960])
+    assert leaf.depth == 960
+    pages, _, _ = manager._allocate(pool.allocator.free_frames + 1, 0)
+    pool.release_kv([offset // 32 for offset in pages])
+
+    req.cached_len = len(req.input_ids)
+    manager.cache_req(req, finished=False)
+    assert req.cache_handle.cached_len == 864
+    assert req.cache_handle.recovery.base_checkpoint_slot == anchor
+    manager.cache_req(req, finished=True)
+    manager.check_integrity()
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
@@ -198,7 +248,8 @@ def test_disable_memorized_evict_has_no_recycle_bin() -> None:
     log.timestamp = 1
     manager.evictor.cached_page_tokens.update({frame * PAGE_SIZE: PAGE_SIZE for frame in frames})
     needed_pages = manager._allocator.free_frames + 1
-    selected, _, released, compressed = manager.evictor.plan(needed_pages, 0, 0)
+    plan = manager.evictor.plan(needed_pages, 0, 0)
+    selected, released, compressed = plan.leaves, set(plan.retired_slots), plan.checkpoint_merges
     assert [part.node for part in selected] == [log]
     assert released == {slots[1]} and compressed == []
     pages, states, works = manager._allocate(needed_pages, 0)
@@ -1232,7 +1283,8 @@ def test_recycled_checkpoint_commit_preserves_a_late_granule_branch(granularity,
     page_counts=Counter();released=set()
     for part in selected:
         page_counts.update(part.frame_counts);released.update(part.eviction_slots)
-    with patch.object(manager.evictor,"plan",return_value=(selected,page_counts,released,[])):
+    plan = ReclamationPlan(selected, list(page_counts.items()), sorted(released), [], (), None)
+    with patch.object(manager.evictor, "plan", return_value=plan):
         pages,logs,_=manager._allocate(manager._allocator.free_frames+1,0)
     manager._return_slots(pages,logs)
     assert all(manager.tree.has_entry(e) for e in shared)
@@ -1866,11 +1918,9 @@ def test_allocation_evicts_only_as_many_cached_leaves_as_needed():
         max_device_len=len(input_ids) + 16,
     )
     filler=manager.logstate_pool.reserve(kv=max(0,manager._allocator.free_frames-3))[0]
-    with patch.object(
-        manager.tree, "evict", wraps=manager.tree.evict
-    ) as evict:
+    with patch.object(manager.tree, "prune", wraps=manager.tree.prune) as prune:
         manager.allocate([req])
-    assert evict.call_count == 1
+    prune.assert_called_once()
     req.cached_len = len(input_ids)
     manager.cache_req(req, finished=True)
 
@@ -2139,7 +2189,7 @@ def test_heat_thinning_preserves_recovery_with_nonmonotonic_endpoint_timestamps(
         for record in (pool.allocator.slot(left.slot), pool.allocator.slot(middle.slot))
     )
     needed_pages = pool.allocator.free_frames + released_frames
-    assert manager.evictor.plan(needed_pages, 0, 0)[3] == [
+    assert manager.evictor.plan(needed_pages, 0, 0).checkpoint_merges == [
         (middle.slot, right.slot), (left.slot, right.slot),
     ]
     pages, states, _ = manager._allocate(needed_pages, 0)
@@ -2185,7 +2235,7 @@ def test_active_kv_chain_can_thin_states_without_touching_its_work():
     manager.check_integrity()
 
 
-def test_recovery_inputs_are_pinned_only_until_work_is_constructed():
+def test_recovery_inputs_stay_pinned_until_prefill_is_published():
     manager = make_manager()
     tokens, _, entries = cache_checkpoint_chain(manager, (1, 1, 1))
     pending = PendingRequest(17, torch.cat((tokens[:128], torch.tensor([999], dtype=torch.int32))),
@@ -2205,8 +2255,7 @@ def test_recovery_inputs_are_pinned_only_until_work_is_constructed():
     # Isolate ownership/copy semantics from materialization CUDA arithmetic.
     with patch.object(manager.analyzer, "analyze", return_value=LogStatePrefillPlan((), ())):
         manager.prepare_batch(Batch([req], "prefill"))
-    assert manager.tree._recovery_slot_refs == {}
-    assert manager._recovery_pins == {}
+    assert manager.tree._recovery_slot_refs == {entries[1].slot: 1}
     torch.testing.assert_close(manager.logstate_pool.read_states(
         torch.tensor([manager._request_states[0].work_slot]), 0,
     ), expected)
@@ -2216,8 +2265,16 @@ def test_recovery_inputs_are_pinned_only_until_work_is_constructed():
     actions = manager.tree.checkpoint_eviction_actions(nodes)
     drops = [(left, right) for left, right, *_ in actions if right >= 0]
     assert all(left != entries[1].slot for left, _ in drops)
-    assert (entries[0].slot, entries[1].slot) in drops
+    assert (entries[0].slot, entries[1].slot) not in drops
     req.cached_len = 129
+    manager.cache_req(req, finished=False)
+    assert manager.tree._recovery_slot_refs == {}
+    assert manager._recovery_pins == {}
+    nodes, _ = manager.tree.eviction_snapshot()
+    actions = manager.tree.checkpoint_eviction_actions(nodes)
+    assert (entries[0].slot, entries[1].slot) in {
+        (left, right) for left, right, *_ in actions if right >= 0
+    }
     manager.cache_req(req, finished=True)
     manager.check_integrity()
 

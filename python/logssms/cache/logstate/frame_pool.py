@@ -460,6 +460,23 @@ class MHALogStatePool:
 
         copy_states(self, sources, destinations)
 
+    def construct_checkpoint(
+        self,
+        base: int | None,
+        logs: Sequence[tuple[int, int, int]],
+        work: int,
+        slots: tuple[int, ...],
+        *,
+        absorb: bool = False,
+    ) -> None:
+        self.kernels.restore(self, [(base, logs, work)])
+        if absorb:
+            assert base is not None
+            self.copy_states([work], [base])
+            self.copy_conv_snapshot(slots[-1], 0, base)
+        else:
+            self.materialize_groups([slots], [work])
+
     def materialize_groups(self, groups: Sequence[tuple[int, ...]], works: Sequence[int]) -> None:
         from logssms.kernel.linear_attention.logstate import copy_states
 

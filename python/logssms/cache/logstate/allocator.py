@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
+from .metadata import ReclamationChanges
+
 
 @dataclass(frozen=True)
 class DecayRecord:
@@ -62,6 +64,8 @@ class LogStateAllocator:
         self._free_slot_ids: list[int] = []
         self._decay_masks: dict[int, int] = {}
         self.decay_counts: dict[int, int] = {}
+        self.decay_changes = ReclamationChanges()
+        self.slot_changes = ReclamationChanges()
         self._open_decay_frames: set[int] = set()
         self._free_decay_records = 0
         self._reclaimable_slots: set[int] = set()
@@ -111,6 +115,7 @@ class LogStateAllocator:
         reclaimable = self._reclaimable_decay_masks.get(frame, 0)
         occupied = self._decay_masks.get(frame, 0)
         self._reclaimable_decay_frames -= int(occupied != 0 and reclaimable == occupied)
+        self.decay_changes.record(frame)
         if mask:
             self.decay_counts[frame] = mask.bit_count()
             self._decay_masks[frame] = mask
@@ -326,6 +331,7 @@ class LogStateAllocator:
         self._slots[slot] = LinearCacheSlot(
             record.payload[:self.payload_frames], (record.conv[-1],), None, "checkpoint"
         )
+        self.slot_changes.record(slot)
         if reclaimable:
             self.set_reclaimable(slot, True)
         return released
@@ -356,6 +362,8 @@ class LogStateAllocator:
         frames = [frame for record in reversed(records) for frame in record.payload]
         frames.extend(frame for record in records for conv in record.conv for frame in conv if frame not in terminal)
         payload, surplus = tuple(frames[:self.payload_frames]), tuple(frames[self.payload_frames:])
+        for slot in slots:
+            self.slot_changes.record(slot)
         for slot in slots[:-1]:
             self._slots[slot] = LinearCacheSlot((), (), None, "checkpoint")
         self._slots[slots[-1]] = LinearCacheSlot(payload, (terminal,), None, "checkpoint")
@@ -382,6 +390,7 @@ class LogStateAllocator:
         self._slots[slot] = LinearCacheSlot(
             record.payload, record.conv, None, "checkpoint"
         )
+        self.slot_changes.record(slot)
 
     def release_kv(self, frames: list[int] | tuple[int, ...]) -> None:
         assert len(frames) == len(set(frames)) and set(frames) <= self._kv

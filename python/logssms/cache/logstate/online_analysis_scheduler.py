@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 from collections import Counter, deque
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from time import perf_counter_ns
 from typing import Sequence
-from weakref import WeakSet, WeakValueDictionary
+from weakref import WeakValueDictionary
 
 import torch
 from logssms.utils import align_down
@@ -19,6 +20,11 @@ from .prefix_cache import (
     LogStateKind,
     LogStateHitStats,
 )
+
+
+@lru_cache(maxsize=512)
+def _prior_bucket_mass(granularity: int, bins: int) -> float:
+    return sum(granularity * (j * granularity) ** -2 for j in range(1, bins + 1))
 
 
 @dataclass(frozen=True)
@@ -107,7 +113,6 @@ class OnlineAnalysisScheduler:
         self.hit_half_life = hit_half_life
         self.query_count = 0
         self._owners: WeakValueDictionary[int, LogStateHitStats] = WeakValueDictionary()
-        self._internal_owners: WeakSet[LogStateHitStats] = WeakSet()
         self._observations = self._owned_hits = self._tail_hits = 0.0
         self._analysis_profile = (
             {"aggregate": Counter(), "updates": deque(maxlen=8192)}
@@ -131,10 +136,6 @@ class OnlineAnalysisScheduler:
             ),
         )
 
-    @property
-    def has_internal_observations(self) -> bool:
-        return bool(self._internal_owners)
-
     def make_hit_stats(self, origin: int) -> LogStateHitStats | None:
         if not self.enable_merge_adjustment:
             return None
@@ -155,8 +156,6 @@ class OnlineAnalysisScheduler:
             self._owned_hits += 1
             self._tail_hits += position == stats.tail
             stats.hits.append((position, stats.tail, self.query_count))
-            if 0 < stats.tail - position <= self.min_sampling_len:
-                self._internal_owners.add(stats)
             if len(stats.hits) == stats.hits.maxlen:
                 stats.query_begin = max(stats.query_begin, stats.hits[0][2] - 1)
 
@@ -194,7 +193,7 @@ class OnlineAnalysisScheduler:
         support = [(math.log((i + 1) * g), e * g)
                    for i, e in enumerate(bucket_exposures) if e > 0]
         total = sum(bins.values())
-        prior_mass = sum(g * ((i + 1) * g) ** -2 for i in range(max(1, len(bucket_exposures))))
+        prior_mass = _prior_bucket_mass(g, max(1, len(bucket_exposures)))
         internal_prior, _ = self._prior()
         alpha, beta = 4.0 * internal_prior, 4.0 * prior_mass
         if not support:
@@ -223,10 +222,11 @@ class OnlineAnalysisScheduler:
         return exponent, math.log((total + alpha) / (mass + beta))
 
     def refresh_models(self, owners: Sequence[LogStateHitStats | None]) -> None:
-        for owner in owners:
-            if owner is not None and owner.tail > owner.origin:
+        unique = {id(owner): owner for owner in owners if owner is not None}.values()
+        for owner in unique:
+            if owner.tail > owner.origin:
                 self._owners[owner.uuid] = owner
-        for stats in {id(owner): owner for owner in owners if owner is not None}.values():
+        for stats in unique:
             if stats.fit_query == self.query_count:
                 continue
             bins = Counter()
@@ -258,7 +258,7 @@ class OnlineAnalysisScheduler:
             else:
                 g = self.granularity
                 internal_prior, _ = self._prior()
-                beta = 4 * sum(g * ((i + 1) * g) ** -2 for i in range(max(1, len(exposures))))
+                beta = 4 * _prior_bucket_mass(g, max(1, len(exposures)))
                 mass = sum(e * g * ((i + 1) * g) ** -stats.exponent
                            for i, e in enumerate(exposures))
                 stats.log_amplitude = math.log((sum(bins.values()) + 4 * internal_prior) / (mass + beta))
@@ -297,24 +297,19 @@ class OnlineAnalysisScheduler:
                             if hit[0] == hit[1] or (
                                 hit[1] >= tail - self.min_sampling_len and hit[2] > stats.query_begin
                             )), maxlen=stats.hits.maxlen)
-        if any(position < tail and past_tail - position <= self.min_sampling_len
-               for position, past_tail, _ in stats.hits):
-            self._internal_owners.add(stats)
-        else:
-            self._internal_owners.discard(stats)
         stats.tail = tail
         stats.fit_query = -1
 
     def eviction_models(self, snapshots) -> tuple[list[tuple], list[tuple[int, int, float]]]:
-        self.refresh_models([snapshot.node.analysis_owner for snapshot in snapshots])
+        if self.enable_merge_adjustment:
+            self.refresh_models([snapshot.node.analysis_owner for snapshot in snapshots])
         result = []
         past_tails = {}
         for snapshot in snapshots:
-            stats = snapshot.node.analysis_owner
+            stats = snapshot.node.analysis_owner if self.enable_merge_adjustment else None
             if stats is None:
                 tail = max(self.granularity, snapshot.node.depth)
-                norm = sum(self.granularity * (j * self.granularity) ** -2
-                           for j in range(1, max(1, tail // self.granularity) + 1))
+                norm = _prior_bucket_mass(self.granularity, tail // self.granularity)
                 internal_prior, tail_prior = self._prior()
                 result.append((-snapshot.node.uuid - 1, 0, tail, 2., math.log(internal_prior / norm),
                                tail_prior, self.granularity, snapshot.recovery_begin, snapshot.end, 1))
@@ -329,29 +324,17 @@ class OnlineAnalysisScheduler:
                         for position, probability in points]
 
     def active_density(self, owner: LogStateHitStats | None, tail: int):
+        from logssms.kernel.logstate import ActiveDensity
+
         g = self.granularity
         bins = max(1, (tail - (0 if owner is None else owner.origin)) // g)
-        past = ()
-        if owner is not None and self.enable_merge_adjustment:
-            self.refresh_models([owner])
-            amplitude = math.exp(owner.log_amplitude)
-            masses = [g * amplitude * (j * g) ** -owner.exponent for j in range(1, bins + 1)]
-            past = owner.past_tail_probabilities
-            scale = min(1., max(0., 1. - owner.tail_probability - sum(p for _, p in past))
-                        / max(1e-300, sum(masses)))
-        else:
-            masses = [1. / (j * j) for j in range(1, bins + 1)]
-            scale = self._prior()[0] / sum(masses)
-        prefix = [0.]
-        for mass in masses:
-            prefix.append(prefix[-1] + mass * scale)
-
-        def mass(begin: int, end: int) -> float:
-            left = min(bins, max(0, (tail - begin) // g))
-            right = min(bins, max(0, (tail - end) // g))
-            return prefix[left] - prefix[right] + sum(p for x, p in past if begin <= x < end)
-
-        return mass
+        if owner is None or not self.enable_merge_adjustment:
+            return ActiveDensity(tail, g, bins, 0., 2., 0., self._prior()[0], ())
+        self.refresh_models([owner])
+        return ActiveDensity(
+            tail, g, bins, math.exp(owner.log_amplitude), owner.exponent,
+            owner.tail_probability, 0., owner.past_tail_probabilities,
+        )
 
     def snapshot_prefill(
         self, tree: LogRadixTree, traces: Sequence[LogRadixTrace],

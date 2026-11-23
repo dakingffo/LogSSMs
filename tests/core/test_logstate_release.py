@@ -291,7 +291,6 @@ def test_tp_eviction_agrees_after_draining_pending_releases(online):
         tokens, leaf, checkpoints = cache_checkpoint_chain(manager, (4, 2))
         if online:
             manager.analyzer.record_hit(leaf.analysis_owner, len(tokens) - 64)
-            assert manager.analyzer.has_internal_observations
         pool = manager.logstate_pool
         pool.deterministic_reclamation = True
         _, _, works = pool.reserve(works=2)

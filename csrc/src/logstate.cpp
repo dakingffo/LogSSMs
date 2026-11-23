@@ -1,6 +1,7 @@
 #include <limits>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cmath>
 #include <map>
@@ -31,7 +32,6 @@ using Int = int64_t;
 using Vector = std::vector<Int>;
 using List = tvm::ffi::Array<Int>;
 using Rows = tvm::ffi::Array<List>;
-using Scores = tvm::ffi::Array<double>;
 using Result = tvm::ffi::Map<tvm::ffi::String, tvm::ffi::Any>;
 
 void check(bool value, const char* message) {
@@ -222,15 +222,18 @@ Rows read_rows(tvm::ffi::TensorView tensor) {
   return result;
 }
 
+tvm::ffi::Tensor make_int_tensor(Int size) {
+  return tvm::ffi::Tensor::FromEnvAlloc(
+      TVMFFIEnvTensorAlloc, tvm::ffi::ShapeView(&size, 1),
+      DLDataType{kDLInt, 64, 1}, DLDevice{kDLCPU, 0});
+}
+
 tvm::ffi::Tensor write_rows(const Rows& rows) {
   Int size = 0;
   for (const auto& row : rows) {
     size += 1 + row.size();
   }
-  auto result = tvm::ffi::Tensor::FromEnvAlloc(
-    TVMFFIEnvTensorAlloc, tvm::ffi::ShapeView(&size, 1),
-    DLDataType{kDLInt, 64, 1}, DLDevice{kDLCPU, 0}
-  );
+  auto result = make_int_tensor(size);
   auto data = static_cast<Int*>(result.data_ptr());
   for (const auto& row : rows) {
     *data++ = row.size();
@@ -283,19 +286,29 @@ constexpr Int kEvictionBlocked = 1;
 template <typename NodeRows>
 class EvictionQueue {
 public:
-  explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes), children_(nodes.size()), alive_(nodes.size(), true) {
-    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-      check(nodes[i].size() == 4 && nodes[i][2] >= 0 && nodes[i][2] <= kEvictionBlocked,
+  explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes) { reset(); }
+
+  void reset() {
+    children_.assign(nodes_.size(), 0);
+    alive_.assign(nodes_.size(), true);
+    indices_.clear();
+    leaves_.clear();
+    for (Int i = 0; i < static_cast<Int>(nodes_.size()); ++i) {
+      if (nodes_[i].empty()) {
+        alive_[i] = false;
+        continue;
+      }
+      check(nodes_[i].size() == 4 && nodes_[i][2] >= 0 && nodes_[i][2] <= kEvictionBlocked,
             "Invalid eviction node");
-      check(indices_.emplace(nodes[i][0], i).second, "Duplicate eviction node");
+      check(indices_.emplace(nodes_[i][0], i).second, "Duplicate eviction node");
     }
-    for (const auto& node : nodes) {
-      if (indices_.contains(node[1])) {
+    for (const auto& node : nodes_) {
+      if (!node.empty() && indices_.contains(node[1])) {
         ++children_[indices_.at(node[1])];
       }
     }
-    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-      if (!children_[i] && nodes[i][2] != kEvictionBlocked) {
+    for (Int i = 0; i < static_cast<Int>(nodes_.size()); ++i) {
+      if (alive_[i] && !children_[i] && nodes_[i][2] != kEvictionBlocked) {
         push(i);
       }
     }
@@ -318,6 +331,7 @@ public:
     else leaves_.erase(index);
   }
   bool is_leaf(Int index) const { return leaves_.contains(index); }
+  bool can_materialize(Int index) const { return alive_.at(index) && nodes_[index][2] == 0; }
   const std::unordered_set<Int>& leaves() const { return leaves_; }
 
 private:
@@ -356,6 +370,119 @@ class EvictionPlanner {
       return std::max(0., prefix(begin) - prefix(end));
     }
   };
+  struct Sum {
+    double value = 0., error = 0.;
+    void add(double x) {
+      const double result = value + x;
+      error += std::abs(value) >= std::abs(x) ? (value - result) + x : (x - result) + value;
+      value = result;
+    }
+    double total() const { return error && std::isfinite(error) ? value + error : value; }
+  };
+
+  struct ActiveDensity {
+    Int tail, g, bins;
+    std::vector<double> prefix{0.};
+    std::vector<std::pair<Int, double>> past;
+
+    ActiveDensity(const double *p, const double *end) : tail(p[0]), g(p[1]), bins(p[2]) {
+      check(g > 0 && bins >= 1 && p[7] >= 0 && p[7] <= (end - p - 8) / 2,
+            "Invalid active density");
+      const auto prior = p[6];
+      Sum total, past_mass;
+      std::vector<double> masses;
+      masses.reserve(bins);
+      for (Int j = 1; j <= bins; ++j) {
+        const double mass = prior > 0. ? 1. / (j * j) : g * p[3] * std::pow(j * g, -p[4]);
+        masses.push_back(mass);
+        total.add(mass);
+      }
+      for (Int j = 0; j < static_cast<Int>(p[7]); ++j) {
+        const auto pos = p[8 + 2 * j], probability = p[9 + 2 * j];
+        past.emplace_back(pos, probability);
+        past_mass.add(probability);
+      }
+      const auto scale = prior > 0. ? prior / total.total() :
+          std::min(1., std::max(0., 1. - p[5] - past_mass.total()) /
+                       std::max(1e-300, total.total()));
+      prefix.reserve(bins + 1);
+      for (auto mass : masses)
+        prefix.push_back(prefix.back() + mass * scale);
+    }
+
+    double mass(Int begin, Int end) const {
+      auto bucket = [&](Int position) {
+        return std::min(bins, std::max(Int{0}, tail - position) / g);
+      };
+      Sum atoms;
+      for (const auto &[position, probability] : past)
+        if (begin <= position && position < end) atoms.add(probability);
+      return prefix[bucket(begin)] - prefix[bucket(end)] + atoms.total();
+    }
+  };
+
+  struct ActiveCandidate {
+    const Int *begin, *end;
+    Int frames;
+    double cost;
+    double score() const { return cost / frames; }
+  };
+
+  static std::vector<ActiveCandidate> active_costs(tvm::ffi::TensorView geometry,
+                                                   tvm::ffi::TensorView density) {
+    const auto *packed = cpu_ints(geometry);
+    const auto size = geometry.size(0);
+    if (!size)
+      return {};
+    check(size >= 2 && packed[0] >= 0 && packed[0] <= (size - 2) / 8 &&
+              packed[1] >= 0 && packed[1] <= size - 2 - 8 * packed[0],
+          "Invalid active reclamation geometry");
+    check(density.ndim() == 1 && density.is_contiguous() &&
+              density.device().device_type == kDLCPU && density.dtype().code == kDLFloat &&
+              density.dtype().bits == 64,
+          "Invalid active density parameters");
+    const auto *cursor = static_cast<const double *>(density.data_ptr());
+    const auto *model_end = cursor + density.size(0);
+    std::vector<ActiveDensity> models;
+    while (cursor < model_end) {
+      check(model_end - cursor >= 8, "Truncated active density");
+      models.emplace_back(cursor, model_end);
+      cursor += 8 + 2 * static_cast<Int>(cursor[7]);
+    }
+    const auto count = packed[0];
+    const auto *dep = packed + 2 + count * 8;
+    const auto *dep_end = dep + packed[1];
+    const auto *decay = dep_end;
+    std::vector<ActiveCandidate> result;
+    result.reserve(count);
+    for (Int i = 0; i < count; ++i) {
+      const auto *row = packed + 2 + i * 8;
+      check(row[0] >= 0 && row[0] < static_cast<Int>(models.size()) &&
+                row[6] >= dep - (packed + 2 + count * 8) && row[6] <= packed[1] &&
+                row[7] % 2 == 0 && row[7] >= decay - dep_end && row[7] <= packed + size - dep_end,
+            "Invalid active reclamation offsets");
+      const auto &model = models[row[0]];
+      Int frames = row[5];
+      for (; decay < dep_end + row[7]; decay += 2)
+        frames += decay[0] == decay[1];
+      check(frames > 0, "Invalid active reclamation capacity");
+      double cost = 0.;
+      if (row[4]) {
+        Sum increments;
+        for (auto x = row[1] + model.g; x < row[3]; x += model.g)
+          increments.add((x - row[1]) * model.mass(x, x + model.g));
+        cost = row[4] / 64. + increments.total();
+      } else {
+        cost = (row[2] - row[1]) * model.mass(row[2], row[3]);
+      }
+      const auto *next = packed + 2 + count * 8 + row[6];
+      result.push_back({dep, next, frames, cost});
+      dep = next;
+    }
+    check(dep == dep_end && decay == packed + size, "Unexpected active reclamation metadata");
+    return result;
+  }
+
   struct Candidate {
     double phase, score;
     Int timestamp, id, kind, version;
@@ -391,13 +518,27 @@ class EvictionPlanner {
     }
   };
 
+  static constexpr size_t kSlotRecordSize = 6;
+  struct SlotRecord {
+    Int frames, decay, begin, end;
+    bool checkpoint;
+  };
+
+  template <typename Row>
+  static SlotRecord read_slot(const Row &row, size_t offset = 0) {
+    check(row.size() >= offset + kSlotRecordSize, "Truncated eviction slot");
+    const auto frames = row[offset + 1], decay = row[offset + 2], kind = row[offset + 5];
+    check(frames >= 0 && (kind == 1 || (kind == 0 && decay >= 0)), "Invalid eviction slot");
+    return {frames, decay, row[offset + 3], row[offset + 4], kind == 1};
+  }
+
   NodeRows nodes, kv, node_slots;
   List config;
   EvictionQueue<NodeRows> queue;
   std::vector<double> model_storage;
   const double *model_data = nullptr;
-  bool online;
-  std::unordered_map<Int, Vector> slot_info, actions;
+  std::unordered_map<Int, SlotRecord> slot_info;
+  std::unordered_map<Int, Vector> actions;
   std::unordered_map<Int, Int> decay_occupied, decay_released, pages,
       page_delta;
   Int free = 0, decay = 0, kv_free = 0;
@@ -412,6 +553,7 @@ class EvictionPlanner {
   CandidateQueue candidates, default_candidates, leaf_candidates;
   NodeRows materializations;
   std::vector<size_t> materialization_starts;
+  std::vector<Vector> node_materializations;
 
   bool fits() {
     const auto required_decay =
@@ -427,11 +569,11 @@ class EvictionPlanner {
     check(released_set.insert(slot).second, "Duplicate eviction slot release");
     const auto &record = slot_info.at(slot);
     released.push_back(slot);
-    free += record[1];
-    if (record[2] >= 0) {
-      check(decay_occupied.contains(record[2]),
+    free += record.frames;
+    if (record.decay >= 0) {
+      check(decay_occupied.contains(record.decay),
             "Missing decay frame occupancy");
-      if (++decay_released[record[2]] == decay_occupied.at(record[2])) {
+      if (++decay_released[record.decay] == decay_occupied.at(record.decay)) {
         ++free;
         decay -= config[5] - 1;
       } else {
@@ -461,21 +603,35 @@ class EvictionPlanner {
       release(slot);
     }
   }
-  Rows result(const Vector *materialize = nullptr, Int active_action = -1) {
-    Vector page_counts;
-    for (const auto frame : page_order) {
-      page_counts.insert(page_counts.end(), {frame, page_delta.at(frame)});
-    }
+  tvm::ffi::Tensor result(const Vector *materialize = nullptr, Int active_action = -1,
+                          const ActiveCandidate *active = nullptr) {
     std::sort(released.begin(), released.end());
-    Rows rows({List(selected.begin(), selected.end()),
-               List(page_counts.begin(), page_counts.end()),
-               List(released.begin(), released.end()),
-               List(compressed.begin(), compressed.end())});
+    const auto action_size = materialize ? materialize->size() + 1 : active ? 5 : 0;
+    auto packed = make_int_tensor(4 + selected.size() + 2 * page_order.size() +
+                                  released.size() + compressed.size() + action_size);
+    auto data = static_cast<Int *>(packed.data_ptr());
+    auto write = [&](const Vector &row) {
+      *data++ = row.size();
+      data = std::copy(row.begin(), row.end(), data);
+    };
+    write(selected);
+    *data++ = 2 * page_order.size();
+    for (const auto frame : page_order) {
+      *data++ = frame;
+      *data++ = page_delta.at(frame);
+    }
+    write(released);
+    write(compressed);
     if (materialize)
-      rows.push_back(List(materialize->begin(), materialize->end()));
-    if (active_action >= 0)
-      rows.push_back(List({active_action}));
-    return rows;
+      write(*materialize);
+    else if (active) {
+      *data++ = 4;
+      *data++ = -2;
+      *data++ = active_action;
+      *data++ = active->frames;
+      *data = std::bit_cast<Int>(active->cost);
+    }
+    return packed;
   }
   Int successor(Int slot) {
     while (slot >= 0 && successors.contains(slot))
@@ -484,17 +640,17 @@ class EvictionPlanner {
   }
   double recovery_before(Int index, Int slot) {
     if (previous.contains(slot))
-      return static_cast<double>(slot_info.at(previous.at(slot))[4]);
-    const auto end = slot_info.at(slot)[4];
+      return static_cast<double>(slot_info.at(previous.at(slot)).end);
+    const auto end = slot_info.at(slot).end;
     double restored = model_data[index * 10 + 7];
     for (auto preceding : ordered_slots[index]) {
       if (released_set.contains(preceding))
         continue;
       const auto &record = slot_info.at(preceding);
-      if (record[4] >= end)
+      if (record.end >= end)
         break;
-      if (record[2] < 0 || record[3] == restored)
-        restored = record[4];
+      if (record.checkpoint || record.begin == restored)
+        restored = record.end;
     }
     return restored;
   }
@@ -502,9 +658,9 @@ class EvictionPlanner {
     if (released_set.contains(slot))
       return Int{0};
     const auto &record = slot_info.at(slot);
-    Int credit = record[1];
-    if (record[2] >= 0 &&
-        decay_released[record[2]] + 1 == decay_occupied.at(record[2]))
+    Int credit = record.frames;
+    if (record.decay >= 0 &&
+        decay_released[record.decay] + 1 == decay_occupied.at(record.decay))
       ++credit;
     return credit;
   }
@@ -514,9 +670,9 @@ class EvictionPlanner {
     for (auto slot : node_slots[index])
       if (!released_set.contains(slot)) {
         const auto &record = slot_info.at(slot);
-        credit += record[1];
-        if (record[2] >= 0)
-          ++decays[record[2]];
+        credit += record.frames;
+        if (record.decay >= 0)
+          ++decays[record.decay];
       }
     for (const auto &[frame, count] : decays)
       credit += decay_released[frame] + count == decay_occupied.at(frame);
@@ -536,24 +692,21 @@ class EvictionPlanner {
     for (auto slot : node_slots[index]) {
       checkpoints += !released_set.contains(slot) && actions.contains(slot);
     }
-    double score = 0.;
-    if (online) {
-      const auto *p = model_data + index * 10;
-      const auto &density = densities.at(model_ids[index]);
-      double cost = 0., restored = p[7];
-      for (auto slot : ordered_slots[index]) {
-        if (released_set.contains(slot))
-          continue;
-        const auto &record = slot_info.at(slot);
-        if (record[2] < 0 || record[3] == restored) {
-          cost += std::max(0., record[4] - restored) *
-                  (density.atom + density.prefix(record[4]));
-          restored = record[4];
-        }
+    const auto *p = model_data + index * 10;
+    const auto &density = densities.at(model_ids[index]);
+    double cost = 0., restored = p[7];
+    for (auto slot : ordered_slots[index]) {
+      if (released_set.contains(slot))
+        continue;
+      const auto &record = slot_info.at(slot);
+      if (record.checkpoint || record.begin == restored) {
+        cost += std::max(0., record.end - restored) *
+                (density.atom + density.prefix(record.end));
+        restored = record.end;
       }
-      const auto credit = prune_credit(index);
-      score = credit ? cost / credit : std::numeric_limits<double>::infinity();
     }
+    const auto credit = prune_credit(index);
+    const auto score = credit ? cost / credit : std::numeric_limits<double>::infinity();
     leaf_candidates.push({checkpoints > 1 ? 1. : 0., score, nodes[index][3], index, 0,
                           version, score, order[0], order[1], order[2]});
   }
@@ -567,24 +720,19 @@ class EvictionPlanner {
       return;
     const auto &left_record = slot_info.at(slot),
                &right_record = slot_info.at(right);
-    const auto left_span = left_record[4] - left_record[3];
-    const auto right_span = right_record[4] - right_record[3];
-    double phase = 1., score = std::max(left_span, right_span);
-    if (online) {
-      phase = 0.;
-      const auto distance = left_record[4] - recovery_before(action[3], slot);
-      const auto cost =
-          std::max(0., distance) * densities.at(model_ids[action[3]])
-                                       .mass(left_record[4], right_record[4]);
-      const auto credit = slot_credit(slot);
-      score = credit ? cost / credit : std::numeric_limits<double>::infinity();
-    }
-    if (online && densities.at(model_ids[action[3]]).default_order)
+    const auto left_span = left_record.end - left_record.begin;
+    const auto right_span = right_record.end - right_record.begin;
+    const auto &density = densities.at(model_ids[action[3]]);
+    const auto distance = left_record.end - recovery_before(action[3], slot);
+    const auto cost = std::max(0., distance) * density.mass(left_record.end, right_record.end);
+    const auto credit = slot_credit(slot);
+    const auto score = credit ? cost / credit : std::numeric_limits<double>::infinity();
+    if (density.default_order)
       default_candidates.push(
           {1., static_cast<double>(std::max(left_span, right_span)), action[2],
            slot, 1, version, score});
     else
-      candidates.push({phase, score, action[2], slot, 1, version, score});
+      candidates.push({0., score, action[2], slot, 1, version, score});
   }
   bool valid(const Candidate &c) {
     if (c.kind == 0)
@@ -599,7 +747,7 @@ class EvictionPlanner {
     std::optional<Candidate> best;
     for (Int i = 0; i < static_cast<Int>(materializations.size()); ++i) {
       const auto &row = materializations[i];
-      if (released_set.contains(row[0]) || released_set.contains(row.back()))
+      if (row.empty() || released_set.contains(row[0]) || released_set.contains(row.back()))
         continue;
       const auto start = materialization_starts[i];
       if (std::any_of(row.begin() + 2, row.begin() + start, [&](Int source) {
@@ -607,14 +755,14 @@ class EvictionPlanner {
           }))
         continue;
       const auto index = slot_node.at(row.back());
-      const auto begin = slot_info.at(row[start])[3], end = slot_info.at(row.back())[4];
+      const auto begin = slot_info.at(row[start]).begin, end = slot_info.at(row.back()).end;
       const auto &density = densities.at(model_ids[index]);
       const bool absorb = row[1] < 0;
       bool feasible = true;
       Int credit = absorb ? 0 : -(config[2] + config[3]);
       // Reconstruction runs over cached rank updates instead of the model.
       // Express its launch and replay work in equivalent prefill tokens.
-      const auto replay_begin = row[0] < 0 ? 0 : slot_info.at(row[0])[4];
+      const auto replay_begin = row[0] < 0 ? 0 : slot_info.at(row[0]).end;
       double cost = (end - replay_begin) / 64.;
       if (absorb) {
         const auto owner = slot_node.at(row[0]);
@@ -630,10 +778,10 @@ class EvictionPlanner {
           break;
         }
         const auto &record = slot_info.at(slot);
-        credit += record[1];
-        ++records[record[2]];
-        if (record[4] < end)
-          cost += (record[4] - begin) * density.mass(record[4], record[4] + density.g);
+        credit += record.frames;
+        ++records[record.decay];
+        if (record.end < end)
+          cost += (record.end - begin) * density.mass(record.end, record.end + density.g);
       }
       if (!feasible || credit <= 0)
         continue;
@@ -708,6 +856,34 @@ class EvictionPlanner {
     }
   }
 
+  size_t materialization_start(const Vector &row) const {
+    check(row.size() >= 3 &&
+              (row[1] < 0 || slot_node.contains(row[1])) &&
+              slot_node.contains(row.back()) &&
+              (row[0] < 0 || (slot_info.contains(row[0]) && slot_info.at(row[0]).checkpoint)),
+          "Invalid pressure materialization");
+    check(row[1] >= 0 || (row[0] >= 0 && slot_node.at(row[0]) == slot_node.at(row.back())),
+          "Log tail absorption must stay inside one node");
+    auto cursor = row[0] < 0 ? 0 : slot_info.at(row[0]).end;
+    size_t start = 2;
+    for (; start < row.size() && row[start] < 0; ++start) {
+      const auto &record = slot_info.at(-row[start] - 2);
+      check(row[1] >= 0 && !record.checkpoint && record.begin == cursor,
+            "Invalid ancestor Log recovery");
+      cursor = record.end;
+    }
+    for (size_t j = start; j < row.size(); ++j) {
+      const auto &record = slot_info.at(row[j]);
+      check(!record.checkpoint && record.begin == cursor, "Noncontiguous pressure materialization");
+      cursor = record.end;
+    }
+    if (row[1] >= 0) {
+      const auto &tail = slot_info.at(row[1]);
+      check(!tail.checkpoint && tail.end >= cursor, "Invalid pressure materialization tail boundary");
+    }
+    return start;
+  }
+
 public:
   EvictionPlanner(std::array<NodeRows, 7> groups, const List &capacity,
                   tvm::ffi::TensorView models, const Rows &order)
@@ -715,14 +891,11 @@ public:
         node_slots(std::move(groups[2])), config(capacity), queue(nodes),
         node_version(nodes.size()), ordered_slots(nodes.size()),
         materializations(std::move(groups[6])) {
-    const auto &slots = groups[3];
+    auto &slots = groups[3];
     const auto &occupied = groups[4];
-    const auto &checkpoint_actions = groups[5];
+    auto &checkpoint_actions = groups[5];
     for (const auto &row : order)
       order_keys.emplace_back(row.begin(), row.end());
-    if (order_keys.empty())
-      for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i)
-        order_keys.push_back({0, -1, i});
     check(order_keys.size() == nodes.size(),
           "Invalid eviction ordering metadata");
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i)
@@ -730,119 +903,314 @@ public:
     check(nodes.size() == kv.size() && nodes.size() == node_slots.size() &&
               config.size() == 10 && config[5] > 0,
           "Invalid eviction capacity metadata");
-    for (const auto &row : slots) {
-      check(row.size() == 5 && row[1] >= 0, "Invalid eviction slot");
-      slot_info.emplace(row[0], Vector(row.begin(), row.end()));
+    for (auto &row : slots) {
+      const auto record = read_slot(row);
+      slot_info.emplace(row[0], record);
     }
     for (const auto &row : occupied) {
       check(row.size() == 2 && row[1] > 0 && row[1] <= config[5],
             "Invalid decay occupancy");
       decay_occupied.emplace(row[0], row[1]);
     }
-    online = models.size(0) != 0;
     model_ids.resize(nodes.size());
-    if (online) {
-      model_storage.resize(nodes.size() * 10);
-      model_data = model_storage.data();
-      Vector indices(nodes.size());
-      std::iota(indices.begin(), indices.end(), 0);
-      load_models(indices, models);
-    }
+    model_storage.resize(nodes.size() * 10);
+    model_data = model_storage.data();
+    Vector indices(nodes.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    load_models(indices, models);
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
+      bool ordered = true;
+      auto end = std::numeric_limits<Int>::min();
       for (auto slot : node_slots[i]) {
         slot_node.emplace(slot, i);
-        ordered_slots[i].push_back(slot);
+        const auto next_end = slot_info.at(slot).end;
+        ordered &= end < next_end;
+        end = next_end;
       }
-      std::sort(ordered_slots[i].begin(), ordered_slots[i].end(),
-                [&](Int a, Int b) {
-                  return slot_info.at(a)[4] < slot_info.at(b)[4];
-                });
+      auto &ordered_row = ordered_slots[i];
+      ordered_row = node_slots[i];
+      if (!ordered)
+        std::sort(ordered_row.begin(), ordered_row.end(), [&](Int a, Int b) {
+          return slot_info.at(a).end < slot_info.at(b).end;
+        });
     }
-    for (const auto &row : materializations) {
-      check(online && row.size() >= 3 &&
-                (row[1] < 0 || slot_node.contains(row[1])) &&
-                slot_node.contains(row.back()) &&
-                (row[0] < 0 || (slot_info.contains(row[0]) && slot_info.at(row[0])[2] < 0)),
-            "Invalid pressure materialization");
-      check(row[1] >= 0 || (row[0] >= 0 && slot_node.at(row[0]) == slot_node.at(row.back())),
-            "Log tail absorption must stay inside one node");
-      auto cursor = row[0] < 0 ? 0 : slot_info.at(row[0])[4];
-      size_t start = 2;
-      for (; start < row.size() && row[start] < 0; ++start) {
-        const auto &record = slot_info.at(-row[start] - 2);
-        check(row[1] >= 0 && record[2] >= 0 && record[3] == cursor,
-              "Invalid ancestor Log recovery");
-        cursor = record[4];
-      }
-      materialization_starts.push_back(start);
-      for (size_t j = start; j < row.size(); ++j) {
-        const auto &record = slot_info.at(row[j]);
-        check(record[2] >= 0 && record[3] == cursor, "Noncontiguous pressure materialization");
-        cursor = record[4];
-      }
-      if (row[1] >= 0) {
-        const auto &tail = slot_info.at(row[1]);
-        check(tail[2] >= 0 && tail[4] >= cursor, "Invalid pressure materialization tail boundary");
-      }
+    node_materializations.resize(nodes.size());
+    for (size_t id = 0; id < materializations.size(); ++id) {
+      const auto &row = materializations[id];
+      materialization_starts.push_back(materialization_start(row));
+      node_materializations[slot_node.at(row.back())].push_back(id);
     }
-    for (const auto &row : checkpoint_actions) {
+    for (auto &row : checkpoint_actions) {
       check(row.size() >= 4, "Invalid checkpoint eviction action");
       check(slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
             "Checkpoint action has an invalid owner");
       check(row[1] < 0 || (slot_node.contains(row[1]) &&
                            slot_node.at(row[0]) == slot_node.at(row[1])),
             "Checkpoint merging must stay inside one node");
-      actions.emplace(row[0], Vector(row.begin(), row.end()));
-      if (row[1] >= 0)
-        previous[row[1]] = row[0];
+      const auto slot = row[0], right = row[1];
+      actions.emplace(slot, std::move(row));
+      if (right >= 0)
+        previous[right] = slot;
     }
     for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
       for (size_t j = 0; j < kv[i].size(); j += 3)
         kv_users[kv[i][j]].push_back(i);
       for (auto slot : node_slots[i])
-        if (slot_info.at(slot)[2] >= 0)
-          decay_users[slot_info.at(slot)[2]].push_back(i);
+        if (slot_info.at(slot).decay >= 0)
+          decay_users[slot_info.at(slot).decay].push_back(i);
     }
     for (const auto index : queue.leaves())
       push_node(index);
     for (const auto &[slot, action] : actions)
       push_action(slot);
   }
-  void update_locks(const Rows &blocked, const Rows &checkpoint_rows) {
-    std::unordered_set<Int> affected;
-    for (const auto &row : blocked) {
+  bool replace_materialized_node(Int index, Int timestamp, const Rows &records,
+                                 const Rows &checkpoint_rows, const Rows &frontiers,
+                                 const Rows &groups) {
+    if (!pages.empty() || !queue.can_materialize(index))
+      return false;
+
+    remove_node_slots(index);
+    install_node_slots(index, records);
+    install_checkpoint_actions(checkpoint_rows);
+    size_t first = 0;
+    for (const auto &row : frontiers) {
+      check(row.size() == 3 && row[0] >= 0 && row[0] < static_cast<Int>(nodes.size()) &&
+                row[2] >= 0 && row[2] <= static_cast<Int>(groups.size() - first),
+            "Invalid replacement recovery frontier");
+      const auto owner = row[0];
+      set_materializations(owner, groups, first, row[2]);
+      first += row[2];
+      if (model_storage[owner * 10 + 7] != row[1]) {
+        model_storage[owner * 10 + 7] = row[1];
+        push_node(owner);
+        for (const auto slot : node_slots[owner])
+          if (actions.contains(slot)) push_action(slot);
+      }
+    }
+    check(first == groups.size(), "Unexpected replacement materializations");
+
+    nodes[index][3] = timestamp;
+    push_node(index);
+    for (const auto slot : node_slots[index])
+      if (actions.contains(slot))
+        push_action(slot);
+    return true;
+  }
+
+  void remove_node_slots(Int index) {
+    auto &slots = node_slots[index];
+    for (const auto slot : slots) {
+      const auto frame = slot_info.at(slot).decay;
+      if (frame >= 0)
+        std::erase(decay_users.at(frame), index);
+      ++action_version[slot];
+      actions.erase(slot);
+      successors.erase(slot);
+      previous.erase(slot);
+      released_set.erase(slot);
+      slot_node.erase(slot);
+      slot_info.erase(slot);
+    }
+    slots.clear();
+    ordered_slots[index].clear();
+  }
+
+  template <typename Records>
+  void install_node_slots(Int index, const Records &records) {
+    auto &slots = node_slots[index];
+    for (const auto &row : records) {
+      const auto record = read_slot(row);
+      const auto slot = row[0], frame = record.decay;
+      check(!slot_node.contains(slot),
+            "Invalid replacement slot ownership");
+      slots.push_back(slot);
+      slot_node.emplace(slot, index);
+      slot_info.emplace(slot, record);
+      if (frame >= 0)
+        decay_users[frame].push_back(index);
+    }
+    ordered_slots[index] = slots;
+  }
+
+  template <typename Checkpoints>
+  void install_checkpoint_actions(const Checkpoints &checkpoint_rows) {
+    for (const auto &row : checkpoint_rows) {
+      check(row.size() == 4 && slot_node.at(row[0]) == row[3] &&
+                (row[1] < 0 || slot_node.at(row[1]) == row[3]),
+            "Invalid replacement checkpoint action");
+      actions.emplace(row[0], Vector(row.begin(), row.end()));
+      if (row[1] >= 0)
+        previous[row[1]] = row[0];
+    }
+  }
+
+  void set_materializations(Int index, const Rows &groups, size_t first, size_t count) {
+    auto &ids = node_materializations[index];
+    while (ids.size() < count) {
+      ids.push_back(materializations.size());
+      materializations.emplace_back();
+      materialization_starts.push_back(0);
+    }
+    for (size_t i = 0; i < count; ++i) {
+      const auto id = ids[i];
+      const auto &source = groups[first + i];
+      auto &row = materializations[id];
+      row.assign(source.begin(), source.end());
+      materialization_starts[id] = materialization_start(row);
+      check(slot_node.at(row.back()) == index, "Invalid replacement materialization owner");
+    }
+    for (size_t i = count; i < ids.size(); ++i)
+      materializations[ids[i]].clear();
+  }
+
+  void rebase(Int size, const List &removed, const Rows &rows, const List &indices,
+              tvm::ffi::TensorView models, const Rows &order) {
+    check(size >= static_cast<Int>(nodes.size()) && !rows.empty() &&
+              order.size() == indices.size(),
+          "Invalid eviction rebase");
+    const auto &header = rows[0];
+    check(header.size() == 5, "Invalid eviction rebase header");
+    const auto nodes_count = header[0], actions_count = header[1], groups_count = header[2];
+    const auto occupancy_count = header[3], kv_count = header[4];
+    check(nodes_count >= 0 && actions_count >= 0 && groups_count >= 0 &&
+              occupancy_count >= 0 && kv_count >= 0 &&
+              1 + 4 * nodes_count + actions_count + groups_count + occupancy_count + kv_count ==
+                  static_cast<Int>(rows.size()),
+          "Invalid eviction rebase metadata");
+    nodes.resize(size);
+    node_slots.resize(size);
+    ordered_slots.resize(size);
+    node_materializations.resize(size);
+    kv.resize(size);
+    order_keys.resize(size);
+    node_version.resize(size);
+    model_ids.resize(size);
+    model_storage.resize(size * 10);
+    model_data = model_storage.data();
+
+    auto clear_node = [&](Int index) {
+      check(index >= 0 && index < size, "Invalid eviction rebase node");
+      remove_node_slots(index);
+      for (size_t j = 0; j < kv[index].size(); j += 3)
+        std::erase(kv_users.at(kv[index][j]), index);
+      kv[index].clear();
+      nodes[index].clear();
+      set_materializations(index, {}, 0, 0);
+    };
+    for (const auto index : removed)
+      clear_node(index);
+    for (Int i = 0; i < nodes_count; ++i) {
+      const auto &row = rows[1 + i * 4];
+      check(row.size() == 4, "Invalid replacement topology");
+      clear_node(row[0]);
+    }
+    for (Int i = 0; i < nodes_count; ++i) {
+      const auto first = 1 + i * 4;
+      const auto &row = rows[first];
+      const auto index = row[0];
+      nodes[index].assign(row.begin(), row.end());
+      const auto &kv_row = rows[first + 1];
+      check(kv_row.size() % 3 == 0, "Invalid replacement KV metadata");
+      kv[index].assign(kv_row.begin(), kv_row.end());
+      for (size_t j = 0; j < kv_row.size(); j += 3)
+        kv_users[kv_row[j]].push_back(index);
+      const auto &slot_row = rows[first + 2];
+      check(slot_row.size() % kSlotRecordSize == 0, "Invalid replacement slot metadata");
+      for (size_t j = 0; j < slot_row.size(); j += kSlotRecordSize) {
+        const auto record = read_slot(slot_row, j);
+        const auto slot = slot_row[j], frame = record.decay;
+        check(slot_node.emplace(slot, index).second, "Duplicate replacement slot");
+        node_slots[index].push_back(slot);
+        slot_info.emplace(slot, record);
+        if (frame >= 0)
+          decay_users[frame].push_back(index);
+      }
+      ordered_slots[index] = node_slots[index];
+    }
+    const auto action_first = 1 + 4 * nodes_count;
+    const auto group_first = action_first + actions_count;
+    const auto occupied_first = group_first + groups_count;
+    const auto kv_first = occupied_first + occupancy_count;
+    install_checkpoint_actions(Rows(rows.begin() + action_first, rows.begin() + group_first));
+    size_t group = group_first;
+    for (Int i = 0; i < nodes_count; ++i) {
+      const auto &count = rows[4 + i * 4];
+      check(count.size() == 1 && count[0] >= 0 &&
+                count[0] <= static_cast<Int>(occupied_first - group),
+            "Invalid replacement group count");
+      set_materializations(rows[1 + i * 4][0], rows, group, count[0]);
+      group += count[0];
+    }
+    check(group == static_cast<size_t>(occupied_first), "Unexpected replacement groups");
+    decay_occupied.clear();
+    for (Int i = occupied_first; i < kv_first; ++i) {
+      const auto &row = rows[i];
+      decay_occupied.emplace(row[0], row[1]);
+    }
+    for (Int i = kv_first; i < static_cast<Int>(rows.size()); ++i) {
+      const auto &row = rows[i];
+      const auto found = kv_users.find(row[0]);
+      if (found == kv_users.end())
+        continue;
+      for (const auto index : found->second)
+        for (size_t j = 0; j < kv[index].size(); j += 3)
+          if (kv[index][j] == row[0]) {
+            kv[index][j + 2] = row[1];
+            break;
+          }
+    }
+    pages.clear();
+    decay_released.clear();
+    released_set.clear();
+    successors.clear();
+    previous.clear();
+    for (const auto &[slot, action] : actions)
+      if (action[1] >= 0) previous[action[1]] = slot;
+    pending_depths.clear();
+    owner_nodes.clear();
+    for (size_t i = 0; i < indices.size(); ++i) {
+      const auto index = indices[i];
+      const auto &row = order[i];
+      order_keys[index].assign(row.begin(), row.end());
+      owner_nodes[row[1]].push_back(index);
+    }
+    queue.reset();
+    refresh_models(indices, models);
+  }
+
+  void update_locks(Int num_blocked, const Rows &rows) {
+    check(num_blocked > 0 && num_blocked <= static_cast<Int>(rows.size()),
+          "Invalid eviction lock update");
+    for (Int i = 0; i < num_blocked; ++i) {
+      const auto &row = rows[i];
       check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(nodes.size()),
             "Invalid eviction lock metadata");
       const auto index = row[0];
-      if (nodes[index][2] == row[1]) continue;
       nodes[index][2] = row[1];
       queue.update(index);
-      push_node(index);
+      for (const auto slot : node_slots[index]) {
+        ++action_version[slot];
+        actions.erase(slot);
+        previous.erase(slot);
+        successors.erase(slot);
+      }
     }
-    std::unordered_map<Int, Vector> updated;
-    for (const auto &row : checkpoint_rows) {
+    for (Int i = num_blocked; i < static_cast<Int>(rows.size()); ++i) {
+      const auto &row = rows[i];
       check(row.size() == 4 && slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
             "Invalid checkpoint lock metadata");
-      updated.emplace(row[0], Vector(row.begin(), row.end()));
+      actions.emplace(row[0], Vector(row.begin(), row.end()));
+      if (row[1] >= 0) previous[row[1]] = row[0];
     }
-    for (const auto &[slot, action] : actions)
-      if (!updated.contains(slot) || updated.at(slot) != action) {
-        ++action_version[slot]; affected.insert(action[3]);
-      }
-    for (const auto &[slot, action] : updated)
-      if (!actions.contains(slot) || actions.at(slot) != action) affected.insert(action[3]);
-    actions = std::move(updated);
-    previous.clear();
-    successors.clear();
-    for (const auto &[slot, action] : actions)
-      if (action[1] >= 0) previous[action[1]] = slot;
-    for (const auto index : affected) {
+    for (Int i = 0; i < num_blocked; ++i) {
+      const auto index = rows[i][0];
       push_node(index);
-      for (const auto slot : node_slots[index]) if (actions.contains(slot)) push_action(slot);
+      for (const auto slot : node_slots[index])
+        if (actions.contains(slot)) push_action(slot);
     }
   }
   void refresh_models(const List &indices, tvm::ffi::TensorView models) {
-    check(online, "Cannot refresh a default eviction planner");
     load_models(indices, models);
     for (const auto &[owner, depth] : pending_depths)
       for (const auto index : owner_nodes[owner])
@@ -860,10 +1228,9 @@ public:
     leaf_candidates.finish_update();
   }
   template <typename Occupancy>
-  Rows plan(const List &capacity, const Occupancy &occupancy,
-            const Rows &active_sources = {}, const Scores &active_scores = {}) {
+  tvm::ffi::Tensor plan(const List &capacity, const Occupancy &occupancy,
+                       tvm::ffi::TensorView active_geometry, tvm::ffi::TensorView active_models) {
     check(capacity.size() == 10, "Invalid eviction capacity metadata");
-    check(active_sources.size() == active_scores.size(), "Invalid active-request eviction candidates");
     config = capacity;
     free = config[0];
     decay = config[1];
@@ -893,6 +1260,13 @@ public:
     pending_depths.clear();
     if (fits())
       return result();
+    const auto active = active_costs(active_geometry, active_models);
+    std::optional<Candidate> active_action;
+    auto valid_active = [&](const ActiveCandidate &candidate) {
+      return std::none_of(candidate.begin, candidate.end, [&](Int slot) {
+        return released_set.contains(slot);
+      });
+    };
     auto discard_stale = [&](CandidateQueue &heap) {
       while (!heap.empty() && !valid(heap.top()))
         heap.pop();
@@ -901,46 +1275,44 @@ public:
       const auto materialize = pressure_materialization();
       discard_stale(candidates);
       discard_stale(default_candidates);
-      std::optional<Candidate> active_action;
-      for (Int i = 0; i < static_cast<Int>(active_scores.size()); ++i) {
-        const auto &sources = active_sources[i];
-        if (std::any_of(sources.begin(), sources.end(),
-                        [&](Int slot) { return released_set.contains(slot); }))
-          continue;
-        const auto score = active_scores[i];
-        Candidate candidate{0., score, std::numeric_limits<Int>::max(), i, 3, 0, score};
-        if (!active_action || *active_action > candidate)
-          active_action = candidate;
+      if (!active_action || !valid_active(active[active_action->id])) {
+        active_action.reset();
+        for (Int i = 0; i < static_cast<Int>(active.size()); ++i) {
+          if (!valid_active(active[i]))
+            continue;
+          const auto score = active[i].score();
+          Candidate candidate{0., score, std::numeric_limits<Int>::max(), i, 3, 0, score};
+          if (!active_action || *active_action > candidate)
+            active_action = candidate;
+        }
       }
       auto conversion = materialize;
       if (active_action && (!conversion || active_action->score < conversion->score))
         conversion = active_action;
-      if (conversion) {
-        auto better = [&](const CandidateQueue &heap) {
-          if (heap.empty())
-            return false;
-          auto head = heap.top();
-          head.phase = 0.;
-          head.score = head.cost_score;
-          return *conversion > head;
-        };
-        if (!better(candidates) && !better(default_candidates)) {
-          return conversion->kind == 3 ? result(nullptr, conversion->id) :
-                                         result(&materializations[conversion->id]);
+      CandidateQueue *selected_queue = nullptr;
+      std::optional<Candidate> merge;
+      if (!candidates.empty()) {
+        selected_queue = &candidates;
+        merge = candidates.top();
+      }
+      if (!default_candidates.empty()) {
+        auto next = default_candidates.top();
+        next.phase = 0.;
+        next.score = next.cost_score;
+        if (!merge || *merge > next) {
+          selected_queue = &default_candidates;
+          merge = next;
         }
       }
-      auto *selected_queue = &candidates;
-      if (candidates.empty() && default_candidates.empty()) {
+      if (conversion && (!merge || !(*conversion > *merge))) {
+        return conversion->kind == 3 ? result(nullptr, conversion->id, &active[conversion->id]) :
+                                       result(&materializations[conversion->id]);
+      }
+      if (!selected_queue) {
         discard_stale(leaf_candidates);
         if (leaf_candidates.empty())
           break;
         selected_queue = &leaf_candidates;
-      } else if (!default_candidates.empty()) {
-        auto next = default_candidates.top();
-        next.phase = 0.;
-        next.score = next.cost_score;
-        if (candidates.empty() || candidates.top() > next)
-          selected_queue = &default_candidates;
       }
       const auto c = selected_queue->top();
       selected_queue->pop();
@@ -965,7 +1337,7 @@ public:
             if (right >= 0)
               previous.erase(right);
           }
-          const auto frame = slot_info.at(slot)[2];
+          const auto frame = slot_info.at(slot).decay;
           if (frame >= 0)
             for (const auto user : decay_users[frame])
               push_node(user);
@@ -977,7 +1349,7 @@ public:
         if (right < 0 || released_set.contains(right))
           continue;
         compressed.insert(compressed.end(), {c.id, right});
-        slot_info.at(right)[3] = slot_info.at(c.id)[3];
+        slot_info.at(right).begin = slot_info.at(c.id).begin;
         successors[c.id] = right;
         release(c.id);
         if (previous.contains(c.id)) {
@@ -993,9 +1365,9 @@ public:
         return result();
       }
     }
-    if (!active_scores.empty() && (!selected.empty() || !released.empty()))
+    if (!active.empty() && (!selected.empty() || !released.empty()))
       return result();
-    return {};
+    return make_int_tensor(0);
   }
 };
 
@@ -1328,7 +1700,7 @@ struct Planner {
 
   static std::array<std::vector<Vector>, 7> eviction_groups(
       tvm::ffi::TensorView packed, const List &counts) {
-    check(counts.size() == 6 || counts.size() == 7, "Invalid eviction metadata groups");
+    check(counts.size() == 7, "Invalid eviction metadata groups");
     const auto begin = cpu_ints(packed);
     const auto end = begin + packed.shape()[0];
     auto cursor = begin;
@@ -1347,13 +1719,6 @@ struct Planner {
     check(cursor == end, "Unexpected eviction metadata");
     return groups;
   }
-  static tvm::ffi::Tensor eviction(tvm::ffi::TensorView packed, const List &counts,
-                                 const List &config, tvm::ffi::TensorView models) {
-    auto groups = eviction_groups(packed, counts);
-    auto occupied = groups[4];
-    EvictionPlanner planner(std::move(groups), config, models, {});
-    return write_rows(planner.plan(config, occupied));
-  }
   static Result make_eviction(tvm::ffi::TensorView packed, const List &counts,
                              const List &config, tvm::ffi::TensorView models,
                              tvm::ffi::TensorView order) {
@@ -1361,22 +1726,30 @@ struct Planner {
         eviction_groups(packed, counts), config, models, read_rows(order));
     Result result;
     result.Set("plan", tvm::ffi::Function::FromTyped(
-      [planner](const List &capacity, tvm::ffi::TensorView occupied) {
-        return write_rows(planner->plan(capacity, read_rows(occupied)));
-      }));
-    result.Set("plan_with_active", tvm::ffi::Function::FromTyped(
       [planner](const List &capacity, tvm::ffi::TensorView occupied,
-                tvm::ffi::TensorView active_sources, const Scores &active_scores) {
-        return write_rows(planner->plan(capacity, read_rows(occupied),
-                                       read_rows(active_sources), active_scores));
+                tvm::ffi::TensorView active_geometry, tvm::ffi::TensorView active_models,
+                Int num_blocked, tvm::ffi::TensorView locks,
+                const List &model_indices, tvm::ffi::TensorView models) {
+        if (num_blocked)
+          planner->update_locks(num_blocked, read_rows(locks));
+        if (!model_indices.empty())
+          planner->refresh_models(model_indices, models);
+        return planner->plan(capacity, read_rows(occupied), active_geometry, active_models);
       }));
-    result.Set("update_locks", tvm::ffi::Function::FromTyped(
-      [planner](tvm::ffi::TensorView blocked, tvm::ffi::TensorView actions) {
-        planner->update_locks(read_rows(blocked), read_rows(actions));
+    result.Set("rebase", tvm::ffi::Function::FromTyped(
+      [planner](Int size, const List &removed, tvm::ffi::TensorView geometry,
+                const List &indices, tvm::ffi::TensorView models, tvm::ffi::TensorView order,
+                const List &capacity, tvm::ffi::TensorView active_geometry,
+                tvm::ffi::TensorView active_models) {
+        planner->rebase(size, removed, read_rows(geometry), indices, models, read_rows(order));
+        return planner->plan(capacity, Rows{}, active_geometry, active_models);
       }));
-    result.Set("refresh_models", tvm::ffi::Function::FromTyped(
-      [planner](const List &indices, tvm::ffi::TensorView models) {
-        planner->refresh_models(indices, models);
+    result.Set("replace_materialized_node", tvm::ffi::Function::FromTyped(
+      [planner](Int index, Int timestamp, tvm::ffi::TensorView records,
+                tvm::ffi::TensorView actions, tvm::ffi::TensorView frontiers,
+                tvm::ffi::TensorView groups) {
+        return planner->replace_materialized_node(index, timestamp, read_rows(records),
+            read_rows(actions), read_rows(frontiers), read_rows(groups));
       }));
     return result;
   }
@@ -1394,7 +1767,6 @@ struct Planner {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_eviction, logssms::Planner::eviction);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_recycle_bin, logssms::make_recycle_bin);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_eviction_planner, logssms::Planner::make_eviction);

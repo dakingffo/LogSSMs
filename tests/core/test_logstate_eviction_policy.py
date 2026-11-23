@@ -1,6 +1,7 @@
 import pytest
 
-from logssms.kernel.logstate import EvictionPlanner, plan_eviction
+from logssms.kernel.logstate import EvictionPlanner
+from tests.logstate_helpers import eviction_slot_records, plan_eviction
 
 
 @pytest.mark.parametrize("online", [False, True])
@@ -26,11 +27,15 @@ def test_active_reclamation_precedes_checkpoint_leaf_eviction():
     models = [(1, 0, 32, 2., -16., 0.01, 32, 0, end, 1) for end in (0, 32)]
     planner = EvictionPlanner(
         [(0, -1, 1, 0), (1, 0, 0, 0)],
-        [[], [9, 32, 32]], [[], [1]], [(1, 3, -1, 0, 32)], [], capacity,
+        [[], [9, 32, 32]], [[], [1]], [(1, 3, -1, 0, 32, 1)], [], capacity,
         [(1, -1, 0, 1)], models, [(32, 1, 0)] * 2,
     )
-    result = planner.plan(capacity, [], [(1., ())])
-    assert result == [[], [], [], [], [0]]
+    from logssms.kernel.logstate import ActiveCost, ActiveDensity
+
+    candidate = ActiveCost(ActiveDensity(32, 32, 1, 0., 2., 0., 1., ()),
+                           0, 32, 32, 0, 1, (), ())
+    result = planner.plan(capacity, [], [candidate])
+    assert result == [[], [], [], [], [-2, 0, 1, 0]]
     assert planner.plan(capacity, []) == [[1], [9, 32], [1], []]
 
 
@@ -345,7 +350,6 @@ def test_pressure_materialization_preserves_kv_and_respects_pins(pinned, adjustm
             analyzer.record_hit(stats, 32)
             for _ in range(32):
                 analyzer.record_hit(stats, len(tokens))
-        assert analyzer.has_internal_observations == (adjustment == "fitted")
     manager.evictor.cached_page_tokens.update({frame * 32: 32 for frame in kv})
     if pinned:
         tree.pin_recovery((slots[1],))
@@ -540,14 +544,13 @@ def test_model_refresh_promotes_a_candidate_below_the_old_heap_top():
               (1, 0, 32, 2., -12., .01, 32, 0, 32, 0),
               (2, 0, 32, 2., -12., .9, 32, 0, 32, 0)]
     assert plan_eviction(nodes, kv, refs, slots, occupied, config, [], models)[0] == [1]
-    planner = EvictionPlanner(nodes, kv, refs, slots, occupied, config, [], models,
+    planner = EvictionPlanner(nodes, kv, refs, eviction_slot_records(slots), occupied, config, [], models,
                               [(0, 0, 0), (32, 1, 0), (32, 2, 0)])
     updated = [models[0], (*models[1][:5], .9, *models[1][6:]),
                (*models[2][:5], .01, *models[2][6:])]
-    planner.refresh_models([0, 1, 2], updated)
     expected = plan_eviction(nodes, kv, refs, slots, occupied, config, [], updated)
     assert expected[0] == [2]
-    assert planner.plan(config, occupied) == expected
+    assert planner.plan(config, occupied, models=([0, 1, 2], updated, ())) == expected
 
 
 def test_merge_cost_preserves_a_previously_observed_tail():
@@ -567,9 +570,9 @@ def test_merge_cost_preserves_a_previously_observed_tail():
     assert plan_eviction(*args, past_tails=[(1, 576, .008)])[3] == [2, 3]
     assert plan_eviction(*args, past_tails=[(1, 768, .008)])[3] == [1, 2]
 
-    planner = EvictionPlanner(*args, [(0, 0, 0), (960, 1, 0)])
-    planner.refresh_models([0, 1], models, past_tails=[(1, 576, .008)])
-    assert planner.plan(config, [])[3] == [2, 3]
+    planner = EvictionPlanner(nodes, kv, refs, eviction_slot_records(slots), [], config,
+                              actions, models, [(0, 0, 0), (960, 1, 0)])
+    assert planner.plan(config, [], models=([0, 1], models, [(1, 576, .008)]))[3] == [2, 3]
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
@@ -671,7 +674,6 @@ def test_pressure_materializes_leaf_using_ancestor_log(with_checkpoint):
     stats = leaf.analysis_owner = analyzer.make_hit_stats(0)
     analyzer.advance_hit_stats(stats, len(tokens))
     analyzer.record_hit(stats, 32)
-    assert analyzer.has_internal_observations
     manager.evictor.cached_page_tokens.update({frame * 32: 32 for frame in kv})
     with numerical_boundaries(), patch.object(pool.kernels, "restore", wraps=pool.kernels.restore) as restore:
         pages, _, _ = manager._allocate(pool.allocator.free_frames + 1, 0)

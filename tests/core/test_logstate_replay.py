@@ -53,7 +53,7 @@ def test_replay_uses_production_lifecycle_under_pressure(tmp_path, monkeypatch, 
 
     assert ReplayScheduler.overlap_loop is Scheduler.overlap_loop
     calls = Counter()
-    for name in ("match_req", "prefill_acquire", "init_with_handle", "allocate",
+    for name in ("match_req", "admit_prefill", "init_with_handle", "allocate",
                  "prepare_batch", "cache_req"):
         original = getattr(LogStateCacheManager, name)
 

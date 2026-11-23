@@ -85,7 +85,6 @@ def test_tail_hits_are_weighted_and_old_distances_are_frozen():
     decayed, = stats.past_tail_probabilities
     assert decayed[0] == 256
     assert 0 < decayed[1] < point[1]
-    assert scheduler.has_internal_observations
 
 
 def test_hit_updates_and_prefill_analysis_leave_density_fitting_lazy():

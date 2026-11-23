@@ -7,8 +7,7 @@ import torch
 
 from logssms.cache.logstate.online_analysis_scheduler import OnlineAnalysisScheduler
 from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry, LogStateKind
-from logssms.kernel import logstate as planning
-from tests.logstate_helpers import eviction_node, matched_kv
+from tests.logstate_helpers import eviction_node, matched_kv, plan_eviction
 
 
 PAGE_SIZE = 4
@@ -29,7 +28,7 @@ def plan_kv_eviction(tree):
         totals.update(node._kv_frame_counts)
     nodes, topology = tree.eviction_snapshot()
     slots = {slot for node in nodes for slot in node.eviction_slots}
-    result = planning.plan_eviction(
+    result = plan_eviction(
         topology,
         [[value for frame, count in node.frame_counts.items()
           for value in (frame, count, totals[frame])] for node in nodes],

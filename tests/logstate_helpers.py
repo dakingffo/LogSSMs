@@ -1,6 +1,7 @@
 import torch
 
 from logssms.cache.logstate.frame_pool import MHALogStatePool
+from logssms.kernel.logstate import EvictionPlanner
 
 
 def decay_view(pool: MHALogStatePool, slot: int) -> torch.Tensor:
@@ -93,3 +94,20 @@ def write_head(
     indices = _head_indices(pool, slot, layer, head, state=state)[index]
     values = torch.as_tensor(values, dtype=pool.dtype, device=pool.device)
     pool.storage.view(pool.dtype).flatten()[indices] = values.flatten() if values.ndim else values
+
+
+def eviction_slot_records(slots):
+    return [(*row, int(row[2] < 0)) for row in slots]
+
+
+def plan_eviction(nodes, kv, node_slots, slots, occupied, config, actions, models=None, *, past_tails=()):
+    if models is None:
+        # Isolate timestamps and span ordering without assigning locality to synthetic rows.
+        models = [(index, 0, 32, 2., -1000., 0., 32, 0, 32, 1)
+                  for index in range(len(nodes))]
+    order = [(0, uuid, index) for index, (uuid, *_) in enumerate(nodes)]
+    planner = EvictionPlanner(
+        nodes, kv, node_slots, eviction_slot_records(slots), occupied, config, actions, models, order,
+        past_tails=past_tails,
+    )
+    return planner.plan(config, occupied)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from bisect import bisect_right
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,7 @@ from logssms.cache.logstate.prefix_cache import (
 )
 from logssms.cache.prefix_cache import BaseCacheHandle, MatchResult
 from logssms.core import Request
+from logssms.kernel.logstate import ActiveCost
 from logssms.utils import align_ceil, align_down, div_ceil, init_logger
 from logssms.utils.torch_utils import make_device_vectors
 
@@ -205,6 +207,8 @@ class _ActiveReclamation:
     tree_sources: tuple[int, ...] = ()
     base        : int | None = None
     logs        : tuple[tuple[int, int, int], ...] = ()
+    decay_frames: tuple[tuple[int, int], ...] = ()
+    native_cost : ActiveCost | None = None
 
     @property
     def score(self) -> float:
@@ -222,6 +226,7 @@ class _RequestCacheState:
     live_granule_cursor: int = 0
     compacted_end      : int = 0
     decode_recovery    : tuple[int, LogStateCacheHandle, LogStateRecovery] | None = None
+    reclamation_geometry: tuple[tuple, list[_ActiveReclamation]] | None = None
 
     def live_granule_at(self, position: int) -> _LiveGranule | None:
         granules = self.live_granules
@@ -1709,13 +1714,28 @@ class LogStateCacheManager(BaseCacheManager):
             ) / 1e6
         construction_start = perf_counter_ns() if self._profile_enabled else 0
         construction, materialization_commit = self._construct_checkpoints(batch, restore_works, plan)
-        handles = tuple(id(self._pending_matches[req.table_idx]) for req in batch.reqs
-                        if req.table_idx in self._pending_matches
-                        and id(self._pending_matches[req.table_idx]) in self._recovery_pins)
-        if handles:
-            for handle_id in handles:
-                self._release_recovery(handle_id)
         self._detach_recycled_sources(batch)
+        for req in batch.reqs:
+            recovery = self.pending_recoveries.get(req.table_idx)
+            if recovery is None or recovery.position == 0:
+                continue
+            handle = self._pending_matches[req.table_idx]
+            restore = self._recycled_restores.get(req.table_idx)
+            if restore is not None and restore.detached:
+                boundary = min(
+                    (checkpoint.begin for checkpoint in restore.plan.checkpoints
+                     if checkpoint.begin < recovery.position < checkpoint.end
+                     and any(entry.slot in restore.detached for entry in checkpoint.gpu_entries)),
+                    default=recovery.position,
+                )
+                recovery = self.tree.recovery_at(handle.node, boundary)
+            # The next overlap iteration may reclaim a Checkpoint after another
+            # request extends this leaf. Keep the publication frontier recoverable
+            # until cache_req releases the original handle.
+            slots = recovery.log_slots
+            if recovery.base_checkpoint_slot is not None:
+                slots = (recovery.base_checkpoint_slot, *slots)
+            self._pin_recovery(handle, slots)
         construction_submit_cpu_ms = (
             (perf_counter_ns() - construction_start) / 1e6
             if self._profile_enabled else 0.0
@@ -2106,6 +2126,7 @@ class LogStateCacheManager(BaseCacheManager):
             self.lock(new_handle)
             request_state.decode_request = req
             request_state.live_granules = remaining
+            request_state.reclamation_geometry = None
             request_state.live_granule_cursor = 0
             request_state.compacted_end = max(
                 (granule.end for granule in remaining if granule.compacted_checkpoint), default=0,
@@ -2132,6 +2153,7 @@ class LogStateCacheManager(BaseCacheManager):
         release = [granule for granule in granules if granule.begin >= req.cached_len]
         self._release_live_granules(req.table_idx, release)
         state.live_granules = keep
+        state.reclamation_geometry = None
         state.live_granule_cursor = 0
         if state.compacted_end > req.cached_len:
             state.compacted_end = max(
@@ -2210,24 +2232,19 @@ class LogStateCacheManager(BaseCacheManager):
 
     def _active_candidates(
         self, requests: Sequence[Request], *, score_candidates: bool = True,
+        scores: dict[Request, tuple[list[_ActiveReclamation], int, list[_ActiveReclamation]]] | None = None,
     ) -> list[_ActiveReclamation]:
         result = []
         g = self.granularity
         count = self._allocator.materialize_log_count
-        checkpoint_frames = self._allocator.payload_frames + self._allocator.conv_frames
         for req in requests:
             if not req.can_decode or req.extend_len != 1:
                 continue
-            # Overlap advances the device length at submission. Host tokens
-            # advance only after the result of the producing forward is ready.
             completed = req.confirmed_decode_prefix_len
             state = self._request_states[req.table_idx]
             granules = state.live_granules
-            if not granules or granules[0].end > completed:
-                continue
-            if not state.compacted_end and (
-                len(granules) < count or granules[count - 1].end > completed
-            ):
+            eligible = bisect_right(granules, completed, key=lambda entry: entry.end)
+            if not eligible or (not state.compacted_end and eligible < count):
                 continue
             handle = req.cache_handle
             assert isinstance(handle, LogStateCacheHandle)
@@ -2236,74 +2253,112 @@ class LogStateCacheManager(BaseCacheManager):
             if handle.node.depth > handle.cached_len or handle.node.children:
                 trace = self.tree.trace(req.input_ids[:align_down(completed, g)])
                 protected.update(node.depth for node in self.tree.path(trace.node) if node.is_protected)
-
-            # Track published sources because the same plan can reclaim them.
             recovery = self._decode_recovery(state, handle)
-            base = recovery.base_checkpoint_slot
-            tree_sources = tuple(slot for slot in (base, *recovery.log_slots) if slot is not None)
-            logs = [(e.slot, 0, e.end - e.begin) for e in recovery.logs]
-            cursor = recovery.position
-            base_end = recovery.logs[0].begin if recovery.logs else cursor
-            group = []
-            previous_checkpoint = None
-            materialization_found = False
-            mass = None
-            for index, entry in enumerate(granules):
-                if entry.end > completed:
-                    break
-                if entry.state_slot is None:
-                    continue
-                slot_record = self._allocator.slot(entry.state_slot)
-                if entry.checkpoint_begin is not None:
-                    if slot_record.kind == "checkpoint":
-                        base, base_end, cursor = entry.state_slot, entry.end, entry.end
-                        tree_sources, logs = (), []
-                    group.clear()
-                    if (entry.compacted_checkpoint and previous_checkpoint is not None):
-                        left = granules[previous_checkpoint]
-                        if (left.end == entry.checkpoint_begin and left.end not in protected):
-                            cost = 0.
-                            if score_candidates:
-                                if mass is None:
-                                    mass = self.analyzer.active_density(handle.analysis_owner, completed)
-                                cost = (left.end - left.checkpoint_begin) * mass(left.end, entry.end)
-                            result.append(_ActiveReclamation(
-                                req, (previous_checkpoint, index), left.checkpoint_begin,
-                                entry.end, checkpoint_frames, cost,
-                            ))
-                    previous_checkpoint = index if entry.compacted_checkpoint else None
-                    continue
-                if materialization_found or entry.begin != cursor:
-                    continue
-                assert slot_record.kind == "log"
-                cursor = entry.end
-                logs.append((entry.state_slot, 0, entry.end - entry.begin))
-                if entry.begin in protected:
-                    group.clear()
-                if entry.end - entry.begin != g or any(entry.begin < p < entry.end for p in protected):
-                    group.clear()
-                    continue
-                group.append(index)
-                if len(group) != count:
-                    continue
-                slots = tuple(granules[i].state_slot for i in group)
+            key = (eligible, recovery, protected)
+            cached = state.reclamation_geometry
+            if cached is None or cached[0] != key:
+                geometry = self._active_geometry(req, state, eligible, recovery, protected)
+                state.reclamation_geometry = (key, geometry)
+            else:
+                geometry = cached[1]
+            if not geometry:
+                continue
+            owner_count = len(self.analyzer._owners)
+            if not score_candidates:
+                result.extend(self._refresh_active_savings(req, geometry))
+                continue
+            cached_scores = scores.get(req) if scores is not None else None
+            if cached_scores is not None and cached_scores[0] is geometry and cached_scores[1] == owner_count:
+                result.extend(cached_scores[2])
+                continue
+            first = len(result)
+            density = self.analyzer.active_density(handle.analysis_owner, completed)
+            for action in geometry:
+                boundary = granules[action.indices[0]].end
+                replay = sum(end - begin for _, begin, end in action.logs)
+                native_cost = ActiveCost(
+                    density, action.begin, boundary, action.end, replay,
+                    action.frames, action.decay_frames, action.tree_sources,
+                )
+                result.append(replace(action, native_cost=native_cost))
+            if scores is not None:
+                scores[req] = geometry, owner_count, result[first:]
+        return result
+
+    def _active_geometry(
+        self, req: Request, state: _RequestCacheState, eligible: int,
+        recovery: LogStateRecovery, protected: set[int],
+    ) -> list[_ActiveReclamation]:
+        granules = state.live_granules
+        g = self.granularity
+        count = self._allocator.materialize_log_count
+        checkpoint_frames = self._allocator.payload_frames + self._allocator.conv_frames
+        result = []
+        base = recovery.base_checkpoint_slot
+        tree_sources = tuple(slot for slot in (base, *recovery.log_slots) if slot is not None)
+        logs = [(e.slot, 0, e.end - e.begin) for e in recovery.logs]
+        cursor = recovery.position
+        group = []
+        previous_checkpoint = None
+        materialization_found = False
+        for index in range(eligible):
+            entry = granules[index]
+            if entry.state_slot is None:
+                continue
+            if entry.checkpoint_begin is not None:
+                if self._allocator.slot(entry.state_slot).kind == "checkpoint":
+                    base, cursor = entry.state_slot, entry.end
+                    tree_sources, logs = (), []
+                group.clear()
+                if (entry.compacted_checkpoint and previous_checkpoint is not None):
+                    left = granules[previous_checkpoint]
+                    if (left.end == entry.checkpoint_begin and left.end not in protected):
+                        result.append(_ActiveReclamation(
+                            req, (previous_checkpoint, index), left.checkpoint_begin,
+                            entry.end, checkpoint_frames, 0.,
+                        ))
+                previous_checkpoint = index if entry.compacted_checkpoint else None
+                continue
+            if materialization_found or entry.begin != cursor:
+                continue
+            assert self._allocator.slot(entry.state_slot).kind == "log"
+            cursor = entry.end
+            logs.append((entry.state_slot, 0, entry.end - entry.begin))
+            if entry.begin in protected:
+                group.clear()
+            if entry.end - entry.begin != g or any(entry.begin < p < entry.end for p in protected):
+                group.clear()
+                continue
+            group.append(index)
+            if len(group) != count:
+                continue
+            begin = granules[group[0]].begin
+            slots = tuple(granules[i].state_slot for i in group)
+            capacity = self._allocator.checkpoint_frame_capacity(slots) - self._allocator.payload_frames
+            decays = Counter(self._allocator.slot(slot).decay.frame for slot in slots)
+            result.append(_ActiveReclamation(
+                req, tuple(group), begin, entry.end, capacity, 0.,
+                tree_sources, base, tuple(logs), tuple(decays.items()),
+            ))
+            if not state.compacted_end:
+                break
+            materialization_found = True
+        return result
+
+    def _refresh_active_savings(
+        self, req: Request, actions: list[_ActiveReclamation],
+    ) -> list[_ActiveReclamation]:
+        granules = self._request_states[req.table_idx].live_granules
+        result = []
+        for action in actions:
+            if action.logs:
+                slots = tuple(granules[i].state_slot for i in action.indices)
+                # Other requests may free records in a shared decay frame.
                 frames = self._allocator.checkpoint_frame_savings(slots)
                 assert frames > 0
-                begin = granules[group[0]].begin
-                cost = 0.
-                if score_candidates:
-                    if mass is None:
-                        mass = self.analyzer.active_density(handle.analysis_owner, completed)
-                    cost = (entry.end - base_end) / 64.
-                    cost += sum((x - begin) * mass(x, x + g)
-                                for x in range(begin + g, entry.end, g))
-                result.append(_ActiveReclamation(
-                    req, tuple(group), begin, entry.end, frames, cost,
-                    tree_sources, base, tuple(logs),
-                ))
-                if not state.compacted_end:
-                    break
-                materialization_found = True
+                if frames != action.frames:
+                    action = replace(action, frames=frames)
+            result.append(action)
         return result
 
     def _decode_recovery(
@@ -2331,8 +2386,7 @@ class LogStateCacheManager(BaseCacheManager):
             work = self._pressure_work_slot
             slots = (*sources, last.state_slot)
             frames = self._allocator.checkpoint_frame_savings(slots)
-            pool.kernels.restore(pool, [(action.base, action.logs, work)])
-            pool.materialize_groups([slots], [work])
+            pool.construct_checkpoint(action.base, action.logs, work, slots)
             state_table[row, first.begin:last.end].fill_(-1)
         for index in action.indices[:-1]:
             granules[index] = replace(granules[index], state_slot=None, checkpoint_begin=None,
@@ -2341,6 +2395,7 @@ class LogStateCacheManager(BaseCacheManager):
             last, checkpoint_begin=action.begin, compacted_checkpoint=True,
         )
         state.compacted_end = max(state.compacted_end, last.end)
+        state.reclamation_geometry = None
         pool.retire_slots(sources)
         return dict(
             kind="materialize" if action.logs else "merge", uid=action.request.uid,
@@ -2358,9 +2413,10 @@ class LogStateCacheManager(BaseCacheManager):
     ) -> tuple[list[int], list[int], list[int]]:
         requests = ()
         candidates: dict[Request, list[_ActiveReclamation]] = {}
+        scores = {}
         revision = -1
 
-        def active_candidates():
+        def active_candidates(changed_leaf):
             nonlocal requests, revision
             if not requests:
                 by_row = {req.table_idx: req for req in decode_requests}
@@ -2369,29 +2425,25 @@ class LogStateCacheManager(BaseCacheManager):
                         by_row[row] = state.decode_request
                 requests = tuple(sorted(by_row.values()))
             if revision != self.tree.revision:
-                candidates.clear()
+                if changed_leaf is None:
+                    candidates.clear()
+                else:
+                    for req in requests:
+                        if req.cache_handle.node is changed_leaf:
+                            candidates.pop(req, None)
                 revision = self.tree.revision
             result = []
             for req in requests:
                 actions = candidates.get(req)
                 if actions is None:
-                    actions = candidates[req] = self._active_candidates((req,))
-                    result.extend(actions)
-                    continue
-                for action in actions:
-                    if action.logs:
-                        granules = self._request_states[req.table_idx].live_granules
-                        slots = tuple(granules[i].state_slot for i in action.indices)
-                        # Other requests may free records in a shared decay frame.
-                        frames = self._allocator.checkpoint_frame_savings(slots)
-                        if frames != action.frames:
-                            action = replace(action, frames=frames)
-                    result.append(action)
+                    actions = candidates[req] = self._active_candidates((req,), scores=scores)
+                result.extend(actions)
             return result
 
-        def apply_active(action: _ActiveReclamation):
+        def apply_active(action: _ActiveReclamation, frames: int, cost: float):
             candidates.pop(action.request, None)
-            return self._apply_active(action)
+            scores.pop(action.request, None)
+            return self._apply_active(replace(action, frames=frames, cost=cost))
 
         return self.evictor.allocate(
             needed_pages, needed_states, needed_works, profile,
@@ -2493,6 +2545,7 @@ class LogStateCacheManager(BaseCacheManager):
                 continue
             recovery = self.tree.recovery_at(handle.node, original.position)
             assert recovery.position == original.position
+            self.pending_recoveries[req.table_idx] = recovery
             refreshed.append(RestoreTask(
                 self._request_states[req.table_idx].work_slot, recovery.base_checkpoint_slot, recovery.logs,
                 recovery.conv_slot, recovery.conv_granule, 0,
