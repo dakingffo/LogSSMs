@@ -110,7 +110,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
         self.float_workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            256 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,

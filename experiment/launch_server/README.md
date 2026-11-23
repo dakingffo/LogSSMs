@@ -11,8 +11,8 @@ python experiment/launch_server/launch_logssms.py \
   --cache-type logstate --granularity 32 --port 28300
 ```
 
-LogState materializes Log groups under capacity pressure by default. Set
-`--hit-materialization true` to also materialize eligible groups on prefill hits.
+LogState materializes eligible Log groups on prefill hits by default. Set
+`--hit-materialization false` to materialize only under capacity pressure.
 
 For autoregressive benchmarks, set `--max-running-requests` and omit
 `--max-decode-tokens`: the decode token budget defaults to the same value.

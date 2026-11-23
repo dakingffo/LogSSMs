@@ -107,7 +107,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             dest="enable_hit_materialization",
             default=LogStateCacheConfig.enable_hit_materialization,
             metavar="{true,false}",
-            help="Materialize reusable Log groups on prefill hits (default: false).",
+            help="Materialize reusable Log groups on prefill hits (default: %(default)s).",
         )
         parser.add_argument(
             "--min-sampling-len",

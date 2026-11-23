@@ -428,7 +428,7 @@ def test_cli_scheduling_fields_reach_engine_config(tmp_path, policy):
     assert config.mixed_prefill_tokens == 192
 
 
-@pytest.mark.parametrize("value, expected", [(None, False), ("false", False), ("true", True)])
+@pytest.mark.parametrize("value, expected", [(None, True), ("false", False), ("true", True)])
 def test_cli_logstate_hit_materialization(tmp_path, value, expected):
     argv = ["--model", str(tmp_path), "--dummy-weight", "--dtype", "float32", "--cache-type", "logstate"]
     if value is not None:
