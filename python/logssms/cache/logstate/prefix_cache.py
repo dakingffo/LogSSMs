@@ -8,13 +8,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
 from itertools import count
-from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple, Sequence, TypeAlias
-
-if TYPE_CHECKING:
-    from logssms.cache.logstate.recycler import (
-        RecycledMatch,
-        RecycledRestorePlan,
-    )
+from typing import Any, Callable, Iterable, NamedTuple, Sequence, TypeAlias
 
 import torch
 from logssms.cache.prefix_cache import BaseCacheHandle, BasePrefixCache, MatchResult, SizeInfo
@@ -285,15 +279,12 @@ class LogStateCacheHandle(BaseCacheHandle):
     source_analysis_owner: LogStateHitStats | None = None
     query_uid: int | None = None
     match_position    : int = 0
-    recycle_match     : RecycledMatch | None = None
-    restore_plan      : RecycledRestorePlan | None = None
     request_end       : int = 0
     protected_endpoints: tuple[int, ...] = ()
     match_trace       : LogRadixTrace | None = field(default=None, compare=False)
     trace_revision    : int = field(default=-1, compare=False)
     trace_input_len   : int = field(default=0, compare=False)
     match_path        : tuple[LogRadixTreeNode, ...] = field(default=(), compare=False, repr=False)
-    match_entries     : tuple[LogStateEntry, ...] = field(default=(), compare=False, repr=False)
     kv_parts          : tuple[torch.Tensor, ...] = field(default=(), compare=False, repr=False)
 
     @cached_property
@@ -431,7 +422,6 @@ class LogRadixTree(BasePrefixCache):
             trace_revision=self.revision,
             trace_input_len=usable_len,
             match_path=path,
-            match_entries=entries,
             kv_parts=tuple(part.kv for part in path) if path else (self.empty_tensor,),
         )
         self.touch_handle(handle)
@@ -1012,7 +1002,6 @@ class LogRadixTree(BasePrefixCache):
             lock_node=lock_node,
             recovery=recovery,
             match_path=path,
-            match_entries=entries,
             kv_parts=tuple(part.kv for part in path) if path else (self.empty_tensor,),
         )
 
@@ -1027,9 +1016,6 @@ class LogRadixTree(BasePrefixCache):
             endpoint = endpoint.parent
         trace = LogRadixTrace(endpoint, position, position - endpoint.begin)
         return self._recovery_for_trace(trace)[0]
-
-    def has_entry(self, entry: LogStateEntry) -> bool:
-        return id(entry) in self._entry_owners
 
     def entry_owner(
         self,

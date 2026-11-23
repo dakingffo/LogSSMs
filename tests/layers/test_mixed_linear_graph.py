@@ -24,12 +24,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 LENGTHS = [128, 1, 31, 32, 63, 64, 65, 127, 128]
 
 
-@pytest.mark.parametrize("kind,checkpoints", [
-    ("gdn_radix", False), ("gdn_logstate", False), ("gdn_logstate", True),
-    ("mamba2_radix", False), ("mamba2_logstate", False), ("mamba2_logstate", True),
-    ("mamba2_logstate_falcon05b", False),
+@pytest.mark.parametrize("kind", [
+    "gdn_radix", "gdn_logstate", "mamba2_radix", "mamba2_logstate", "mamba2_logstate_falcon05b",
 ])
-def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
+def test_p128_graph_replay_matches_actual_length_eager(kind):
     clear_global_ctx()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -90,9 +88,6 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
         batch.positions = torch.arange(length, dtype=torch.int32, device=device)
         batch.out_loc = batch.positions
         batch.cache_metadata = LogStateCacheMetadata(first_offsets=[0])
-        if checkpoints and length >= 64:
-            batch.cache_metadata.checkpoint_ranges = [(0, 0, 64)]
-            batch.cache_metadata.checkpoint_writes = [(63, 3)]
         req = _make_request(5, 6)
         req.table_idx = 1
         decode = Batch([req], "decode")
@@ -152,12 +147,12 @@ def test_p128_graph_replay_matches_actual_length_eager(kind, checkpoints):
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(actual[:length], expected, rtol=0, atol=0,
-                                       msg=f"{kind}, checkpoints={checkpoints}, L={length}: output")
+                                       msg=f"{kind}, L={length}: output")
             for observed, reference, baseline in zip(buffers, expected_buffers, initial):
                 # Whole-pool equality covers final states, conv/log snapshots,
                 # inactive slots, unused granules and unwritten decay records.
                 torch.testing.assert_close(observed, reference, rtol=0, atol=0,
-                                           msg=f"{kind}, checkpoints={checkpoints}, L={length}: pool")
+                                           msg=f"{kind}, L={length}: pool")
                 untouched = reference == baseline
                 assert torch.equal(observed[untouched], baseline[untouched])
         assert torch.cuda.max_memory_reserved() < 500 * 1024**2

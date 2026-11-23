@@ -49,7 +49,7 @@ arrival, FCFS admission, batch selection, result processing and deferred request
 release. `Engine.prepare_batch()` performs cache allocation and preparation.
 `PrefillAdder`, `PrefillManager`, `DecodeManager` and `LogStateCacheManager` execute
 their normal implementations. Matching, branch protection, online observations,
-memorized restoration, State adoption and KV deduplication are not reimplemented
+State adoption and KV deduplication are not reimplemented
 by this experiment.
 
 The scheduling policy is mixed, with an 8192-token ordinary prefill budget, a

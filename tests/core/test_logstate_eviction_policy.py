@@ -1,3 +1,4 @@
+from tests.logstate_helpers import materialize_pool_log
 import pytest
 
 from logssms.kernel.logstate import EvictionPlanner
@@ -328,7 +329,7 @@ def test_pressure_materialization_preserves_kv_and_respects_pins(pinned, adjustm
     pool.kernels = NumericalKernels()
     group = pool.allocator.materialize_log_count
     kv, slots, _ = pool.reserve(kv=group + 1, logs=group + 1)
-    pool.materialize(slots[0])
+    materialize_pool_log(pool, slots[0])
     tokens = torch.arange(32 * len(slots), dtype=torch.int32)
     indices = torch.cat([torch.arange(frame * 32, (frame + 1) * 32, dtype=torch.int32)
                          for frame in kv])
@@ -370,7 +371,6 @@ def test_pressure_materialization_preserves_kv_and_respects_pins(pinned, adjustm
     assert tree.match_prefix(tokens).recoverable_len == len(tokens)
     assert tree.checkpoint_timestamp(slots[-1]) > log_timestamp
     assert tree.match_prefix(tokens[:64]).recoverable_len == 32
-    assert not len(manager.recycle_bin)
     assert set(kv) <= pool.allocator.allocated_kv
     manager._return_slots(pages, [])
     manager.check_integrity()
@@ -520,7 +520,7 @@ def test_actual_allocator_accepts_the_projected_reservation(online, seed):
     manager.logstate_pool.kernels = NumericalKernels()
     with numerical_boundaries():
         pages, logs, works = manager.evictor.allocate(
-            rng.randrange(1, 6), rng.randrange(1, 6), 1, recycle_bin=manager.recycle_bin
+            rng.randrange(1, 6), rng.randrange(1, 6), 1
         )
     manager.tree.check_integrity()
     manager._allocator.check_integrity()
@@ -588,7 +588,7 @@ def test_pressure_group_advances_after_materialization(granularity):
     count = pool.allocator.materialize_log_count
     size = 2 * count + 2
     kv, slots, _ = pool.reserve(kv=size, logs=size)
-    pool.materialize(slots[0])
+    materialize_pool_log(pool, slots[0])
     tokens = torch.arange(granularity * size, dtype=torch.int32)
     indices = torch.cat([torch.arange(frame * granularity, (frame + 1) * granularity,
                                       dtype=torch.int32) for frame in kv])
@@ -619,7 +619,7 @@ def test_pressure_treats_short_log_tails_as_one_unit(logs, with_checkpoint, monk
     size = logs + int(with_checkpoint)
     kv, slots, _ = pool.reserve(kv=size, logs=size)
     if with_checkpoint:
-        pool.materialize(slots[0])
+        materialize_pool_log(pool, slots[0])
     tokens = torch.arange(32 * size, dtype=torch.int32)
     indices = torch.cat([torch.arange(frame * 32, (frame + 1) * 32,
                                       dtype=torch.int32) for frame in kv])
@@ -637,7 +637,6 @@ def test_pressure_treats_short_log_tails_as_one_unit(logs, with_checkpoint, monk
         assert set(kv) <= pool.allocator.allocated_kv
     else:
         assert tree.trace(tokens).matched_len == 0
-        assert len(manager.recycle_bin) == 1
     manager._return_slots(pages, [])
     manager.check_integrity()
 
@@ -658,7 +657,7 @@ def test_pressure_materializes_leaf_using_ancestor_log(with_checkpoint):
     size = ancestor + pool.allocator.materialize_log_count
     kv, slots, _ = pool.reserve(kv=size, logs=size)
     if with_checkpoint:
-        pool.materialize(slots[0])
+        materialize_pool_log(pool, slots[0])
     tokens = torch.arange(32 * size, dtype=torch.int32)
     indices = torch.cat([torch.arange(frame * 32, (frame + 1) * 32,
                                       dtype=torch.int32) for frame in kv])

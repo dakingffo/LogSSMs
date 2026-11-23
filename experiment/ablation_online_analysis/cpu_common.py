@@ -87,7 +87,7 @@ class MetadataPool(MHALogStatePool):
         self.validate_conv(output_slot, output_granule)
 
 
-def make_manager(case, mode, max_seq_len, window, half_life):
+def make_manager(case, mode, max_seq_len, window, half_life, *, enable_hit_materialization=False):
     model, tp, g = case["model"], case["tp_size"], 32
     assert tp == case["gpu_count"] == 2
     frame_bytes = (2 * model["attention_layers"] * g * (model["kv_heads"] // tp)
@@ -116,7 +116,8 @@ def make_manager(case, mode, max_seq_len, window, half_life):
         manager = LogStateCacheManager(
             num_pages=pool.allocator.num_frames - 1, num_states=pool.allocator.num_frames,
             num_work_states=rows, page_size=g, resources=resources, granularity=g,
-            enable_memorized_evict=True, enable_merge_adjustment=mode == "online",
+            enable_merge_adjustment=mode == "online",
+            enable_hit_materialization=enable_hit_materialization,
             min_sampling_len=window, hit_half_life=half_life,
         )
     # Only the CPU planner's instrumentation is enabled; no CUDA timing events.

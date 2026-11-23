@@ -27,7 +27,7 @@ POLICIES = {
     "radix256": ("--cache-type", "radix", "--page-size", "256"),
     "logstate32": (
         "--cache-type", "logstate", "--granularity", "32",
-        "--memorized-evict", "true", "--eager-state", "false",
+        "--eager-state", "false",
     ),
 }
 DEFAULT_SERVER_FLAGS = (

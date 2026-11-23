@@ -157,7 +157,7 @@ def test_prefill_log_direct_matches_separate_store(granularity, dim, dtype, head
     slots = torch.tensor([logs[0]] + [logs[1]] * 17 + [logs[2]] * 64 + [logs[3]],
                          dtype=torch.int32, device=pool.device)
     positions = torch.cat([torch.arange(n, device=pool.device) % 64 for n in lengths]).int()
-    # A memorized Checkpoint interval must not be overwritten as a Log.
+    # Negative slots suppress Log writes.
     slots[1:9] = -1
     query = torch.nn.functional.normalize(torch.randn(1, total, 2, dim, device=pool.device), dim=-1).to(dtype)
     key = torch.nn.functional.normalize(torch.randn_like(query).float(), dim=-1).to(dtype)

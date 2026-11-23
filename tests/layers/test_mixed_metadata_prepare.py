@@ -13,10 +13,9 @@ def expected_writes(ctx, batch):
     granularity = ctx.linear_state.layout.granularity
     out_loc = batch.out_loc.tolist()
     state_table = ctx.state_table.tolist()
-    checkpoints = dict(batch.cache_metadata.checkpoint_writes)
     chunk_writes, conv_slots, conv_granules, log_slots = [], [], [], []
     token_begin = 0
-    for req_index, req in enumerate(batch.reqs):
+    for req in batch.reqs:
         length = req.extend_len
         first = out_loc[token_begin] % 64
         writes = [-1] * ((length + granularity - 1) // granularity)
@@ -24,18 +23,10 @@ def expected_writes(ctx, batch):
             position = req.cached_len + row
             global_row = token_begin + row
             log = state_table[req.table_idx][position]
-            excluded = any(i == req_index and begin <= position < end
-                           for i, begin, end in batch.cache_metadata.checkpoint_ranges)
-            log_slots.append(-1 if excluded else log)
+            log_slots.append(log)
             slot, granule = -1, 0
             if (first + row + 1) % granularity == 0 or row + 1 == length:
-                if not excluded:
-                    slot, granule = log, (out_loc[global_row] % 64) // granularity
-                if global_row in checkpoints:
-                    slot = checkpoints[global_row]
-                    granule = (0 if ctx.linear_state.allocator.slot(slot).kind == "work"
-                               else ctx.linear_state.layout.num_granules - 1)
-                    writes[row // granularity] = slot
+                slot, granule = log, (out_loc[global_row] % 64) // granularity
             conv_slots.append(slot)
             conv_granules.append(granule)
         chunk_writes.extend(writes)
@@ -75,8 +66,7 @@ def test_mixed_copy_plan_validates_before_writing(invalid):
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
 @pytest.mark.parametrize("begin,length", [(0, 1), (16, 31), (32, 65), (0, 128)])
-@pytest.mark.parametrize("checkpoint", [False, True])
-def test_direct_mixed_prefill_maps_match_boundaries(granularity, begin, length, checkpoint):
+def test_direct_mixed_prefill_maps_match_boundaries(granularity, begin, length):
     clear_global_ctx()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ctx = _make_context(device, granularity)
@@ -85,9 +75,6 @@ def test_direct_mixed_prefill_maps_match_boundaries(granularity, begin, length, 
     batch.positions = torch.arange(begin, begin + length, device=device, dtype=torch.int32)
     batch.out_loc = batch.positions
     batch.cache_metadata = LogStateCacheMetadata(first_offsets=[begin % 64])
-    if checkpoint:
-        batch.cache_metadata.checkpoint_ranges = [(0, begin, begin + length)]
-        batch.cache_metadata.checkpoint_writes = [(length - 1, 3)]
     backend = GatedDeltaLogStateBackend()
     try:
         expected = expected_writes(ctx, batch)
@@ -106,7 +93,7 @@ def test_direct_mixed_prefill_maps_match_boundaries(granularity, begin, length, 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("granularity", [16, 32, 64])
-def test_direct_prefill_variable_requests_and_checkpoint_ranges(device, granularity):
+def test_direct_prefill_variable_requests(device, granularity):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     clear_global_ctx()
@@ -125,8 +112,6 @@ def test_direct_prefill_variable_requests_and_checkpoint_ranges(device, granular
                                  for start, length in zip(starts, lengths)])
     batch.out_loc = batch.positions
     batch.cache_metadata = LogStateCacheMetadata(first_offsets=[start % 64 for start in starts])
-    batch.cache_metadata.checkpoint_ranges = [(2, 16, 529), (3, 64, 1088), (3, 1600, 2112)]
-    batch.cache_metadata.checkpoint_writes = [(640, 3), (1664, 3), (2688, 3)]
     set_global_ctx(ctx)
     backend = GatedDeltaLogStateBackend()
     try:

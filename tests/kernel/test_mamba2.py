@@ -1,4 +1,3 @@
-from logssms.cache.logstate.metadata import LogStateCacheMetadata
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,7 +12,6 @@ from logssms.kernel.linear_attention.conv_decode import conv_decode
 from logssms.layers.mamba2 import Mamba2Config
 from logssms.kernel.linear_attention.vendor.fla import ChunkStateIO
 from logssms.layers.linear_attention_backend.standard import PackedLinearIndices
-from tests.utils import clear_global_ctx
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -82,74 +80,6 @@ def make_logstate(config, batch_size=2, granularity=32):
     reservation = pool.reserve(logs=batch_size, works=2 * batch_size)
     assert reservation is not None
     return pool, reservation
-
-
-@pytest.mark.parametrize("reuse", [False, True])
-@pytest.mark.parametrize("chunk_size", [64, 128])
-def test_memorized_checkpoint_prefill_matches_log_state(reuse, chunk_size):
-    from logssms.core import Batch, Context, Request, SamplingParams, set_global_ctx
-    from logssms.layers.linear_attention_backend.mamba2_logstate import Mamba2LogStateBackend
-
-    torch.manual_seed(79)
-    config = Mamba2Config(4, 1, 64, 128, 3, 0)
-    x = torch.randn(128, config.conv_dim, device="cuda", dtype=torch.bfloat16) * .1
-    dt = torch.randn(128, 4, device="cuda", dtype=torch.bfloat16) - 2
-    weight = torch.randn(config.conv_dim, 1, 4, device="cuda", dtype=x.dtype) * .02
-    A, bias, D = (torch.randn(4, device="cuda") * .1 for _ in range(3))
-
-    def run(direct):
-        pool, (kv, logs, works) = make_logstate(config)
-        ctx = Context(page_size=64)
-        ctx.linear_state = pool
-        ctx.page_table = torch.arange(128, device="cuda", dtype=torch.int32)[None]
-        ctx.state_table = torch.tensor(logs, device="cuda", dtype=torch.int32).repeat_interleave(64)[None]
-        ctx.work_state_table = torch.tensor([[works[0]]], device="cuda", dtype=torch.int32)
-        target = logs[-1] if reuse else works[1]
-        if direct:
-            ctx.state_table.fill_(-1)
-            if reuse:
-                pool.zero_state(works[2])
-                pool.materialize_groups([tuple(logs)], [works[2]])
-        pool.zero_state(works[0])
-        pool.zero_work_conv(works[0])
-        backend = Mamba2LogStateBackend()
-        set_global_ctx(ctx)
-        try:
-            outputs = []
-            for begin in range(0, 128, chunk_size):
-                end = begin + chunk_size
-                req = Request(torch.arange(end, dtype=torch.int32), 0, begin, 1, 0,
-                              SamplingParams(), None, 129)
-                batch = Batch([req], "prefill")
-                batch.positions = ctx.page_table[0, begin:end]
-                batch.out_loc = batch.positions
-                batch.cache_metadata = LogStateCacheMetadata(first_offsets=[0])
-                if direct:
-                    batch.cache_metadata.checkpoint_ranges = [(0, 0, 128)]
-                    if end == 128:
-                        batch.cache_metadata.checkpoint_writes = [(chunk_size - 1, target)]
-                backend.prepare_metadata(batch)
-                outputs.append(backend.forward(x[begin:end], dt[begin:end], weight,
-                                               None, A, bias, D, config, batch))
-            state = pool.read_states(torch.tensor([target if direct else works[0]], device="cuda"), 0).clone()
-            if not direct:
-                pool.kernels.restore(pool, [(None, [(slot, 0, 64) for slot in logs], works[3])])
-                restored = pool.read_states(torch.tensor([works[3]], device="cuda"), 0)
-                torch.testing.assert_close(restored, state, atol=2e-3, rtol=2e-2)
-            conv = pool.read_conv(
-                torch.tensor([target if direct else logs[1]], device="cuda"),
-                torch.tensor([pool.layout.num_granules - 1 if reuse or not direct else 0], device="cuda"), 0,
-            ).clone()
-            torch.cuda.synchronize()
-            return torch.cat(outputs), state, conv
-        finally:
-            clear_global_ctx()
-
-    expected, state, conv = run(False)
-    actual, restored, restored_conv = run(True)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    torch.testing.assert_close(restored, state, atol=0, rtol=0)
-    torch.testing.assert_close(restored_conv, conv, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("eager", [False, True])

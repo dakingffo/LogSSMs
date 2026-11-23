@@ -102,12 +102,12 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             help="Write the LogState decode work state after every token instead of replaying logs within a granule.",
         )
         parser.add_argument(
-            "--memorized-evict",
+            "--hit-materialization",
             type=parse_bool,
-            dest="enable_memorized_evict",
-            default=LogStateCacheConfig.enable_memorized_evict,
+            dest="enable_hit_materialization",
+            default=LogStateCacheConfig.enable_hit_materialization,
             metavar="{true,false}",
-            help="Remember evicted cache layout on CPU (default: true). Set false to disable memorized eviction.",
+            help="Materialize reusable Log groups on prefill hits (default: false).",
         )
         parser.add_argument(
             "--min-sampling-len",
@@ -131,11 +131,11 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
         return LogStateCacheConfig(
             granularity=kwargs.pop("granularity"),
             enable_eager_state=kwargs.pop("enable_eager_state"),
-            enable_memorized_evict=kwargs.pop("enable_memorized_evict"),
             enable_merge_adjustment=kwargs.pop("enable_merge_adjustment"),
             min_sampling_len=kwargs.pop("min_sampling_len"),
             max_density_exponent=kwargs.pop("max_density_exponent"),
             hit_half_life=kwargs.pop("hit_half_life"),
+            enable_hit_materialization=kwargs.pop("enable_hit_materialization"),
         )
 
 

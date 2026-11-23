@@ -148,33 +148,28 @@ def pad_metadata(sources, outputs, fills, chunk_tails):
 
 
 @triton.jit(do_not_specialize=["count"])
-def _logstate_prefill_writes_kernel(logs, offsets, plan, output, count,
-                                    GRANULARITY: tl.constexpr, BLOCK: tl.constexpr):
+def _logstate_prefill_conv_kernel(logs, offsets, plan, output, count,
+                                  GRANULARITY: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = row < count
-    slot = tl.load(logs + row, mask, other=-1)
-    position = tl.load(offsets + row, mask, other=0)
-    conv = tl.load(plan + row, mask, other=-1)
-    granule = tl.load(plan + count + row, mask, other=0)
-    write_log = tl.load(plan + 2 * count + row, mask, other=0)
-    tl.store(output + row, tl.where(write_log != 0, slot, -1), mask)
-    tl.store(output + count + row, tl.where(conv == -2, slot, conv), mask)
-    tl.store(output + 2 * count + row,
-             tl.where(conv == -2, position // GRANULARITY, granule), mask)
+    write = tl.load(plan + row, mask, other=-1) == 1
+    slot = tl.load(logs + row, mask & write, other=-1)
+    position = tl.load(offsets + row, mask & write, other=0)
+    tl.store(output + row, slot, mask)
+    tl.store(output + count + row, position // GRANULARITY, mask)
 
 
-def make_logstate_prefill_writes(logs, offsets, plan, granularity):
+def make_logstate_prefill_conv(logs, offsets, plan, granularity):
     count = logs.numel()
-    output = torch.empty((3, count), dtype=logs.dtype, device=logs.device)
+    output = torch.empty((2, count), dtype=logs.dtype, device=logs.device)
     if logs.is_cuda:
-        _logstate_prefill_writes_kernel[(triton.cdiv(count, 128),)](
+        _logstate_prefill_conv_kernel[(triton.cdiv(count, 128),)](
             logs, offsets, plan, output, count, GRANULARITY=granularity, BLOCK=128, num_warps=1,
         )
     else:
-        conv, granules, enabled = plan[:3 * count].view(3, count)
-        output[0] = torch.where(enabled != 0, logs, -1)
-        output[1] = torch.where(conv == -2, logs, conv)
-        output[2] = torch.where(conv == -2, offsets // granularity, granules)
+        write = plan[:count] == 1
+        output[0] = torch.where(write, logs, -1)
+        output[1] = torch.where(write, offsets // granularity, 0)
     return output.unbind(0)
 
 

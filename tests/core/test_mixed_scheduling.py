@@ -426,3 +426,11 @@ def test_cli_scheduling_fields_reach_engine_config(tmp_path, policy):
     assert isinstance(config, EngineConfig)
     assert config.scheduling_policy == policy
     assert config.mixed_prefill_tokens == 192
+
+
+@pytest.mark.parametrize("value, expected", [(None, False), ("false", False), ("true", True)])
+def test_cli_logstate_hit_materialization(tmp_path, value, expected):
+    argv = ["--model", str(tmp_path), "--dummy-weight", "--dtype", "float32", "--cache-type", "logstate"]
+    if value is not None:
+        argv.extend(("--hit-materialization", value))
+    assert parse_args(argv).cache_config.enable_hit_materialization is expected

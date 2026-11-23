@@ -8,7 +8,8 @@ from experiment.ablation_online_analysis.replay_common import replay
 
 @pytest.mark.parametrize("mode", ["default", "online"])
 @pytest.mark.parametrize("repeat", [False, True])
-def test_replay_rebuilds_state_under_an_existing_kv_prefix(tmp_path, mode, repeat):
+@pytest.mark.parametrize("hit_materialization", [False, True])
+def test_replay_recovers_an_existing_kv_prefix(tmp_path, mode, repeat, hit_materialization):
     root = Path(__file__).resolve().parents[2]
     case = json.loads((root / "experiment/ablation_online_analysis/cases.json").read_text())["32"]
     prompt = list(range(39))
@@ -28,15 +29,15 @@ def test_replay_rebuilds_state_under_an_existing_kv_prefix(tmp_path, mode, repea
              dispatch_index=i, prompt_token_ids=ids, generated_token_ids=output)
         for i, (uid, parent, ids, output) in enumerate(requests)
     ]}))
-    result = replay(case, history, mode, batch_size=1)
+    result = replay(case, history, mode, batch_size=1, enable_hit_materialization=hit_materialization)
     assert result["execution"] == "production-scheduler-v1"
     assert result["overlap"] and not result["numerical_values"]
     records = {r["uid"]: r for r in result["requests_detail"]}
     assert records["b"]["tree_match"] == 32
-    assert records["b"]["recoverable"] == (32 if repeat else 0)
+    assert records["b"]["recoverable"] == (0 if hit_materialization and not repeat else 32)
     assert records["b-child"]["recoverable"] == 160
     assert records["b-child"]["historical_state_gap"] == 0
-    assert result["totals"]["rebuilt_state_tokens_on_existing_kv"] >= 32
+    assert (result["totals"]["rebuilt_state_tokens_on_existing_kv"] >= 32) == hit_materialization
     assert result["totals"]["verified_parent_prefixes"] == 2
     assert result["eviction_events"] == []
     for node in result["final_layout"]:
@@ -93,51 +94,6 @@ def test_replay_uses_production_lifecycle_under_pressure(tmp_path, monkeypatch, 
     # The one-token reply finishes during prefill and needs only its final commit.
     assert calls["cache_req"] == 2 * 15 - 1
     assert result["batches"][-1]["frames_after"]["work"] == 2 * result["checkpoint_frames"]
-
-
-@pytest.mark.parametrize("mode", ["default", "online"])
-def test_replay_publishes_remembered_protection_after_prefill(tmp_path, monkeypatch, mode):
-    import torch
-    from logssms.cache.logstate.manager import LogStateCacheManager
-    from logssms.cache.logstate.prefix_cache import LogRadixTree, LogStateEntry, LogStateKind
-    from tests.logstate_helpers import remember_log_tail
-
-    root = Path(__file__).resolve().parents[2]
-    case = json.loads((root / "experiment/ablation_online_analysis/cases.json").read_text())["32"]
-    history = tmp_path / "history.json"
-    history.write_text(json.dumps({"requests": [
-        dict(uid="a", parent=None, tree_id="tree", depth=1, dispatch_index=0,
-             prompt_token_ids=list(range(33)), generated_token_ids=[33]),
-        dict(uid="b", parent="a", tree_id="tree", depth=2, dispatch_index=1,
-             prompt_token_ids=list(range(513)), generated_token_ids=[513]),
-    ]}))
-    original = LogStateCacheManager.cache_req
-    restored = []
-
-    def commit(self, req, *, finished):
-        if finished and req.uid == 1:
-            restored.append(self._recycled_restores[req.table_idx].plan)
-        result = original(self, req, finished=finished)
-        if finished and req.uid == 0:
-            ghost = LogRadixTree(32, torch.device("cpu"))
-            node = ghost.insert(
-                torch.arange(512, dtype=torch.int32), torch.arange(512, dtype=torch.int32),
-                [LogStateEntry(i, LogStateKind.LOG, i * 32, (i + 1) * 32) for i in range(16)],
-                analysis_owner=self.tree.trace(req.input_ids[:32]).node.analysis_owner,
-            ).node
-            ghost.protect_at(node, 256)
-            remember_log_tail(self.recycle_bin, ghost, node)
-        return result
-
-    monkeypatch.setattr(LogStateCacheManager, "cache_req", commit)
-    result = replay(case, history, mode, batch_size=1)
-    assert 256 in restored[0].protected_endpoints
-    assert any(node["end"] == 256 and node["protected"] for node in result["final_layout"])
-    assert not any(node["begin"] < 256 < node["end"] for node in result["final_layout"])
-    for node in result["final_layout"]:
-        kinds = [e["kind"] for e in node["entries"]]
-        if "log" in kinds:
-            assert "checkpoint" not in kinds[kinds.index("log"):]
 
 
 def test_replay_rejects_broken_parent_token_prefix(tmp_path):

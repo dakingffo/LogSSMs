@@ -75,37 +75,6 @@ def test_cpu_ids_need_no_tensor_construction_or_concatenation():
         release_slots.assert_not_called()
 
 
-@pytest.mark.parametrize("lazy", [False, True])
-def test_release_waits_for_pending_materialization(lazy):
-    manager = make_manager()
-    pool = manager.logstate_pool
-    _, logs, _ = pool.reserve(logs=1)
-
-    class PendingEvent:
-        ready = False
-        waits = 0
-
-        def synchronize(self):
-            assert logs[0] in pool.allocator.allocated_slots
-            self.waits += 1
-            self.ready = True
-
-        def query(self):
-            return self.ready
-
-    event = PendingEvent()
-    pool._retired_materializations.append((event, tuple(logs)))
-    with manager.lazy_free_region() if lazy else nullcontext():
-        manager._return_slots([], logs)
-        if lazy:
-            assert event.waits == 0
-            assert logs[0] in pool.allocator.allocated_slots
-    assert event.waits == 1
-    assert not pool._retired_materializations
-    assert logs[0] not in pool.allocator.allocated_slots
-    manager.check_integrity()
-
-
 class _PendingEvent:
     def __init__(self):
         self.ready = False
@@ -190,42 +159,6 @@ def test_tp_reclamation_allocates_identical_frames_with_different_event_progress
     assert fast.reserve(logs=1) == slow.reserve(logs=1)
     fast.allocator.check_integrity()
     slow.allocator.check_integrity()
-
-
-@pytest.mark.parametrize("deterministic, expected", [
-    (False, ((True, 0), (False, 0))),
-    (True, ((True, 1), (True, 1))),
-])
-def test_tp_materialization_credits_admission_independent_of_event_progress(
-    deterministic, expected,
-):
-    def admit(ready):
-        manager = make_manager(granularity=32)
-        pool = manager.logstate_pool
-        pool.deterministic_reclamation = deterministic
-        allocator = pool.allocator
-        # The dummy log already occupies the first decay frame. The last log
-        # is alone in the second frame so its conversion frees one frame.
-        _, logs, _ = pool.reserve(logs=allocator.decay_records_per_frame)
-        event = _PendingEvent()
-        event.ready = ready
-        handle = manager.tree.match_prefix(torch.arange(24, dtype=torch.int32)).cuda_handle
-        demand = manager._reservation_size(24 + 512, handle=handle)
-        assert 0 < demand <= allocator.free_frames
-        pool.reserve(kv=allocator.free_frames - demand + 1)
-        assert manager.admission_capacity == demand - 1
-        with (
-            patch.object(type(pool), "device", property(lambda _: torch.device("cuda"))),
-            patch("torch.cuda.Event", return_value=event),
-            patch("torch.cuda.current_stream", return_value=None),
-            patch.object(pool, "_write_descriptors"),
-        ):
-            pool.materialize(logs[-1])
-        result = manager._try_pin_prefill(demand, handle)
-        allocator.check_integrity()
-        return result, event.waits
-
-    assert (admit(True), admit(False)) == expected
 
 
 @pytest.mark.parametrize("free_frames,expected_uids,expected_waits", [

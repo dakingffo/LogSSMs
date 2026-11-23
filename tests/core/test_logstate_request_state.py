@@ -76,7 +76,7 @@ def test_pending_match_precedes_table_state_and_table_reuse_starts_fresh():
     state = manager._request_states[2]
     assert state is not old_state
     assert state.work_committed_pos == 0 and state.live_granules == []
-    assert state.live_granule_cursor == 0 and state.recycle_match is None
+    assert state.live_granule_cursor == 0
     manager.cache_req(req, finished=True)
     manager.check_integrity()
 

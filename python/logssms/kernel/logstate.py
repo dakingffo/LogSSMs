@@ -151,10 +151,6 @@ class EvictionPlanner:
         ))
 
 
-def make_recycle_bin(capacity_bytes: int):
-    return _load_logstate_module().make_recycle_bin(capacity_bytes)
-
-
 def plan_materialize(paths: Sequence[Sequence[int]], boundaries: Sequence[Sequence[int]],
                      candidates: Sequence[Sequence[int]],
                      granularity: int, log_count: int) -> list[list[int]]:

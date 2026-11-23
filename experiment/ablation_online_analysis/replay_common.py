@@ -53,7 +53,7 @@ def layout_snapshot(tree):
                 checkpoint_spans=dict(spans), log_run_spans=dict(runs))
 
 
-def replay(case, history, mode, batch_size=8, window=8192, half_life=1024):
+def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, enable_hit_materialization=False):
     torch.set_num_threads(1)
     requests = sorted(json.loads(history.read_text())["requests"], key=lambda r: r["dispatch_index"])
     if not requests or mode not in ("default", "online") or batch_size < 1:
@@ -75,7 +75,9 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024):
     samples, batches = {}, []
     cycle = 0
     with numerical_boundaries(), tp_override(DistributedInfo(0, case["tp_size"])):
-        manager = make_manager(case, mode, max_seq_len, window, half_life)
+        manager = make_manager(
+            case, mode, max_seq_len, window, half_life, enable_hit_materialization=enable_hit_materialization,
+        )
         tree, allocator = manager.tree, manager._allocator
 
         def observe_admissions(batch):
@@ -169,7 +171,7 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024):
             execution=EXECUTION, scheduling_policy=scheduler.config.scheduling_policy,
             prefill_budget=scheduler.prefill_budget, mixed_prefill_tokens=scheduler.config.mixed_prefill_tokens,
             arrival_batch_size=batch_size, overlap=True, numerical_values=False,
-            mode=mode, hardware=case, trace_sha256=hashlib.sha256(history.read_bytes()).hexdigest(),
+            mode=mode, enable_hit_materialization=enable_hit_materialization, hardware=case, trace_sha256=hashlib.sha256(history.read_bytes()).hexdigest(),
             requests=len(requests), totals=dict(totals),
             hit_rate=totals["recoverable_tokens"] / totals["input_tokens"],
             historical_hit_rate=totals["history_hit_tokens"] / max(1, totals["history_tokens"]),

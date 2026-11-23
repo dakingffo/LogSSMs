@@ -9,7 +9,6 @@ from .frame_pool import MHALogStatePool
 from .prefix_cache import (
     LogRadixTree, LogRadixEvictionNode, LogRadixTreeNode, LogStateEntry, LogStateKind,
 )
-from .recycler import LogStateRecycleBin
 
 
 class LogStateCapacityError(RuntimeError):
@@ -77,7 +76,6 @@ class LogStateEvictor:
         needed_works : int = 0,
         profile     : dict | None = None,
         *,
-        recycle_bin: LogStateRecycleBin | None = None,
         active_candidates: Callable[[LogRadixTreeNode | None], list] | None = None,
         apply_active: Callable | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
@@ -144,9 +142,6 @@ class LogStateEvictor:
             )
             evicted_nodes = [] if self._profile_enabled else None
             free_frames_before = self._allocator.free_frames if self._profile_enabled else 0
-            if recycle_bin is not None:
-                for snapshot in selected:
-                    recycle_bin.remember(self.tree, snapshot)
             self.tree.prune(selected, evicted_nodes)
             if profile is not None:
                 now = perf_counter_ns()
@@ -279,18 +274,6 @@ class LogStateEvictor:
         stage = perf_counter_ns() if self._profile_enabled else 0
         config = self._eviction_capacity(needed_pages, needed_states, needed_works)
         epoch = self._eviction_epoch()
-        if self._planner is not None and self._planner_epoch is not None:
-            slot_changes = self._allocator.slot_changes
-            if self._planner_slot_version != slot_changes.version:
-                changed = slot_changes.since(self._planner_slot_version)
-                if changed is None or any(
-                    self.tree.has_slot(slot)
-                    and self._slot_descriptions.get(slot, (None,))[0] is not self._allocator.slot(slot)
-                    for slot in changed
-                ):
-                    self._planner_epoch = None
-                else:
-                    self._planner_slot_version = slot_changes.version
         lock_update = None
         if (self._planner is not None and self._planner_epoch is not None
                 and epoch[:1] + epoch[2:] == self._planner_epoch[:1] + self._planner_epoch[2:]
@@ -701,8 +684,7 @@ class LogStateEvictor:
         assert timings is not None
         for name, value in timings.items():
             bucket = "counts" if name in (
-                "waited_materializations", "descriptor_count",
-                "reclamation_count", "failed",
+                "waited_merge_slots", "descriptor_count", "merge_reclamation_count", "failed",
             ) else "timing_ms"
             profile.setdefault(bucket, {})[f"{prefix}_{name}"] = value
 

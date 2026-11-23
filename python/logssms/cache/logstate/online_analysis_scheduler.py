@@ -102,12 +102,14 @@ class OnlineAnalysisScheduler:
         max_density_exponent: float = 16.0,
         hit_half_life: int = 1024,
         profile_enabled: bool = False,
+        enable_hit_materialization: bool = False,
     ) -> None:
         assert granularity > 0 and checkpoint_log_count > 0
         assert min_sampling_len > 0 and max_density_exponent > 0 and hit_half_life > 0
         self.checkpoint_log_count = checkpoint_log_count
         self.granularity = granularity
         self.enable_merge_adjustment = enable_merge_adjustment
+        self.enable_hit_materialization = enable_hit_materialization
         self.min_sampling_len = min_sampling_len
         self.max_density_exponent = max_density_exponent
         self.hit_half_life = hit_half_life
@@ -365,9 +367,8 @@ class OnlineAnalysisScheduler:
                 for values in input_ids
             )
         assert len(traces) == len(input_ids)
-        if snapshot is None:
+        if self.enable_hit_materialization and snapshot is None:
             snapshot = self.snapshot_prefill(tree, traces)
-        analysis_nodes, endpoints = snapshot.analysis_nodes, snapshot.endpoints
         if step_timing_ms is not None:
             step_timing_ms["matched_paths_ms"] = (
                 perf_counter_ns() - step_start
@@ -394,14 +395,18 @@ class OnlineAnalysisScheduler:
             step_start = perf_counter_ns()
         protections = self._plan_protections(pending)
         if step_timing_ms is not None:
-            step_timing_ms["protection_and_restore_plan_ms"] = (
+            step_timing_ms["protection_plan_ms"] = (
                 perf_counter_ns() - step_start
             ) / 1e6
             step_start = perf_counter_ns()
-        path_cache = {"limits": self._analysis_limits(analysis_nodes, endpoints)}
-        materialize = self._plan_materialize(
-            tree, snapshot.eligible_slots, pending, analysis_nodes, path_cache,
-        )
+        materialize = ()
+        if self.enable_hit_materialization:
+            assert snapshot is not None
+            nodes = snapshot.analysis_nodes
+            path_cache = {"limits": self._analysis_limits(nodes, snapshot.endpoints)}
+            materialize = self._plan_materialize(
+                tree, snapshot.eligible_slots, pending, nodes, path_cache,
+            )
         if step_timing_ms is not None:
             step_timing_ms["materialize_plan_ms"] = (
                 perf_counter_ns() - step_start
@@ -595,7 +600,7 @@ class OnlineAnalysisScheduler:
                 paths.append(path)
                 entry_indices.append({value: i for i, value in enumerate(path[0])})
             path_index = path_indices[owner.uuid]
-            candidates.append((path_index, entry_indices[path_index][entry], 1))
+            candidates.append((path_index, entry_indices[path_index][entry]))
             source_entries.append(entry)
         if not candidates:
             return ()

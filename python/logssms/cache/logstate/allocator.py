@@ -319,23 +319,6 @@ class LogStateAllocator:
         state_slots = [self._new_slot("work") for _ in range(states)]
         return kv_frames, log_slots, state_slots
 
-    def materialize(self, slot: int) -> tuple[int, ...]:
-        record = self._slots[slot]
-        assert record.kind == "log" and record.decay is not None
-        assert len(record.payload) >= self.payload_frames, "Compact Log needs merged checkpoint storage"
-        reclaimable = slot in self._reclaimable_slots
-        self.set_reclaimable(slot, False)
-        released = record.payload[self.payload_frames:] + tuple(frame for snapshot in record.conv[:-1] for frame in snapshot)
-        self._free.extend(released)
-        self._release_decay(record.decay)
-        self._slots[slot] = LinearCacheSlot(
-            record.payload[:self.payload_frames], (record.conv[-1],), None, "checkpoint"
-        )
-        self.slot_changes.record(slot)
-        if reclaimable:
-            self.set_reclaimable(slot, True)
-        return released
-
     def checkpoint_frame_capacity(self, slots: Iterable[int]) -> int:
         records = [self._slots[slot] for slot in slots]
         return sum(len(record.payload) + sum(map(len, record.conv)) for record in records) - self.conv_frames
@@ -383,14 +366,6 @@ class LogStateAllocator:
         for decay in record.decays:
             self._set_decay_reclaimable(decay, False)
             self._release_decay(decay)
-
-    def commit_checkpoint(self, slot: int) -> None:
-        record = self._slots[slot]
-        assert record.kind == "work" and record.decay is None
-        self._slots[slot] = LinearCacheSlot(
-            record.payload, record.conv, None, "checkpoint"
-        )
-        self.slot_changes.record(slot)
 
     def release_kv(self, frames: list[int] | tuple[int, ...]) -> None:
         assert len(frames) == len(set(frames)) and set(frames) <= self._kv

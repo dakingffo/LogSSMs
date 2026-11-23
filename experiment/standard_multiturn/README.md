@@ -101,7 +101,7 @@ or pending requests.
 
 Suggested common settings are Qwen3.6-27B BF16, TP=2, memory fraction 0.9,
 prefill budget 8192, maximum output 1024, and CUDA graphs enabled. Use LogSSMs
-LogState32 with memorized eviction and non-eager state, vLLM `align`, and SGLang
+LogState32 with non-eager state, vLLM `align`, and SGLang
 `extra_buffer` with tracking interval 256. Record merge flags, versions, graph
 settings and startup capacities.
 

@@ -1,3 +1,4 @@
+from tests.logstate_helpers import materialize_pool_log, seed_checkpoint_slot
 from random import Random
 from unittest.mock import patch
 
@@ -16,7 +17,7 @@ def make_pressure_tree(chains=16, pages=4, checkpoints=1):
         kv=count, logs=chains * (pages - checkpoints), works=chains * checkpoints,
     )
     for slot in states:
-        manager.logstate_pool.commit_checkpoint(slot)
+        seed_checkpoint_slot(manager.logstate_pool, slot)
     logs, states = iter(logs), iter(states)
     for chain in range(chains):
         frames = kv[chain * pages:(chain + 1) * pages]
@@ -253,31 +254,6 @@ def test_rebase_refreshes_checkpoint_pins_when_node_stays_blocked():
     assert signature(actual) == signature(expected)
 
 
-def test_planner_refreshes_deferred_slot_conversion_without_tree_mutation():
-    manager = make_pressure_tree(chains=2, pages=3, checkpoints=0)
-    tree, evictor, allocator = manager.tree, manager.evictor, manager._allocator
-    leaf = min(tree._leaves.values(), key=lambda node: node.timestamp)
-    log = leaf.entries[0]
-    tree.detach_entry(log.slot)
-    tree.attach_entry(leaf, LogStateEntry(
-        log.slot, LogStateKind.CHECKPOINT, log.begin, log.end, span_granules=1,
-    ))
-    evictor.plan(0, 0, 0)
-    planner = evictor._planner
-    assert planner is not None
-    evictor._planner_epoch = evictor._eviction_epoch()
-    version = tree.revision
-    allocator.materialize(log.slot)
-    assert tree.revision == version
-
-    with patch.object(planner, "rebase", wraps=planner.rebase) as rebase:
-        evictor.plan(1, 0, 0)
-
-    rebase.assert_called_once()
-    assert evictor._planner is planner
-    assert evictor._slot_descriptions[log.slot][0] is allocator.slot(log.slot)
-
-
 def test_exhausted_plan_does_not_keep_tentative_releases():
     from logssms.cache.logstate.evictor import LogStateCapacityError
 
@@ -305,7 +281,7 @@ def test_internal_materialization_keeps_committed_descendant_geometry_dirty():
     parent = tree.split_at(child, 5 * tree.granularity)
     checkpoints = child.entries[:2]
     for entry in checkpoints:
-        pool.materialize(entry.slot)
+        materialize_pool_log(pool, entry.slot)
         tree.detach_entry(entry.slot)
         tree.attach_entry(child, LogStateEntry(
             entry.slot, LogStateKind.CHECKPOINT, entry.begin, entry.end, span_granules=1,

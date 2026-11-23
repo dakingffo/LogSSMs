@@ -1,3 +1,4 @@
+from tests.logstate_helpers import materialize_pool_log
 import torch
 import pytest
 
@@ -275,7 +276,7 @@ def test_linear_descriptors_change_when_log_becomes_checkpoint():
     assert torch.all(pool.conv_frame_table[work, 0] >= 0)
     assert torch.all(pool.conv_frame_table[work, 1:] == -1)
     payload = pool.payload_frame_table[log].clone()
-    pool.materialize(log)
+    materialize_pool_log(pool, log)
     payload[pool.allocator.payload_frames:] = -1
     torch.testing.assert_close(pool.payload_frame_table[log], payload)
     assert torch.all(pool.conv_frame_table[log, :-1] == -1)
@@ -284,35 +285,6 @@ def test_linear_descriptors_change_when_log_becomes_checkpoint():
     pool.allocator.check_integrity()
     pool.release_slots([log])
     assert torch.all(pool.payload_frame_table[log] == -1)
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_batch_materialization_and_partial_release(device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    pool = make_pool(torch.device(device))
-    allocated = pool.reserve(logs=3)
-    assert allocated is not None
-    logs = allocated[1]
-    payload = pool.payload_frame_table[logs].clone()
-    pool.materialize_slots(logs)
-    if device == "cuda":
-        assert len(pool._retired_materializations) == 1
-        assert all(pool.allocator.slot(slot).kind == "log" for slot in logs)
-    pool.release_slots(logs[:1])
-    assert not pool._retired_materializations
-    assert all(pool.allocator.slot(slot).kind == "checkpoint" for slot in logs[1:])
-    payload[:, pool.allocator.payload_frames:] = -1
-    torch.testing.assert_close(pool.payload_frame_table[logs[1:]], payload[1:])
-    assert torch.all(pool.conv_frame_table[logs[1:], :-1] == -1)
-    assert torch.all(pool.decay_frame_table[logs] == -1)
-    assert torch.all(pool.payload_frame_table[logs[0]] == -1)
-    pool.allocator.check_integrity()
-    pool.release_slots(logs[1:])
-    allocated = pool.reserve(logs=3)
-    assert allocated is not None
-    assert torch.all(pool.conv_frame_table[allocated[1]] >= 0)
-    pool.allocator.check_integrity()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -336,28 +308,30 @@ def test_merged_slots_retire_without_reusing_inflight_frames(monkeypatch):
             self.ready = True
 
     monkeypatch.setattr(torch.cuda, "Event", Event)
-    logs = pool.reserve(logs=3)[1]
-    payload = pool.payload_frame_table[logs].clone()
-    pool.materialize_slots(logs)
-    pool.retire_slots(logs[:2])
+    _, logs, works = pool.reserve(logs=4, works=1)
+    pool.materialize_groups([tuple(logs[:3])], works)
+    retired = logs[:2] + logs[3:]
+    pool.retire_slots(retired)
     pool.poll_reclamation()
     assert not any(event.waits for event in events)
-    assert pool.retiring_slots == frozenset(logs[:2])
+    assert pool.retiring_slots == frozenset(retired)
     assert all(slot in pool.allocator.allocated_slots for slot in logs)
-    torch.testing.assert_close(pool.payload_frame_table[logs], payload)
-    # A capacity retry, not the merge commit, is allowed to wait. Consume all
-    # remaining raw frames to force that retry deterministically.
+    payload = pool.payload_frame_table[logs[2]].clone()
     kv = pool.reserve(kv=len(pool.allocator._free))[0]
+    # Rebinding and release are retired independently. Exhaust the frames
+    # returned by rebinding so both events are required for the next request.
+    remainder = pool.reserve(kv=1)
+    assert remainder is not None and events[0].waits == 1
+    used_before_release = pool.reserve(kv=pool.allocator.free_frames)[0]
     replacement = pool.reserve(logs=1)
-    assert replacement is not None
-    assert any(event.waits for event in events)
+    assert replacement is not None and events[1].waits == 1
     assert not pool.retiring_slots
     assert pool.allocator.slot(logs[2]).kind == "checkpoint"
-    payload[2, pool.allocator.payload_frames:] = -1
-    torch.testing.assert_close(pool.payload_frame_table[logs[2]], payload[2])
+    torch.testing.assert_close(pool.payload_frame_table[logs[2]], payload)
+    kv.extend(remainder[0] + used_before_release)
     pool.allocator.check_integrity()
     pool.release_kv(kv)
-    pool.release_slots(replacement[1] + logs[2:])
+    pool.release_slots(replacement[1] + [logs[2]] + works)
     torch.cuda.synchronize()
     assert not pool.allocator.allocated_slots
     pool.allocator.check_integrity()
@@ -377,7 +351,7 @@ def test_head_overlay_and_side_views_survive_noncontiguous_allocation():
     assert torch.all(pool.conv_view(slot, 3) == 5)
     decay_view(pool, slot).fill_(0.75)
     assert torch.all(decay_view(pool, slot) == 0.75)
-    pool.materialize(slot)
+    materialize_pool_log(pool, slot)
     assert torch.all(pool.conv_view(slot, 3) == 5)
     pool.allocator.check_integrity()
 
@@ -397,7 +371,7 @@ def test_cuda_frame_descriptors_and_kv_views():
         pool.payload_frame_table[slot],
         torch.tensor(pool.allocator.slot(slot).payload, dtype=torch.int32, device="cuda"),
     )
-    pool.materialize(slot)
+    materialize_pool_log(pool, slot)
     torch.cuda.synchronize()
     pool.poll_reclamation()
     assert torch.all(pool.conv_frame_table[slot, :-1] == -1)

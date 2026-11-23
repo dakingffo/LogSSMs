@@ -55,11 +55,11 @@ class MarconiCacheConfig(BaseCacheConfig):
 class LogStateCacheConfig(BaseCacheConfig):
     granularity              : int  = LOG_STATE_GRANULARITY
     enable_eager_state       : bool = False
-    enable_memorized_evict   : bool = True
     enable_merge_adjustment  : bool = True
     min_sampling_len         : int  = 8192
     max_density_exponent     : float = 16.0
     hit_half_life            : int = 1024
+    enable_hit_materialization: bool = False
 
     def __post_init__(self) -> None:
         if self.granularity not in LOG_STATE_GRANULARITIES:

@@ -20,7 +20,7 @@ GRANULARITY = 64
 
 def test_batch_branch_points_match_granule_trie_oracle():
     rng = random.Random(711)
-    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True)
     tree = LogRadixTree(PAGE_SIZE, torch.device("cpu"))
     for _ in range(100):
         paths = []
@@ -112,7 +112,7 @@ def test_checkpoint_branch_remains_protected_in_later_batch():
     history = ids(2 * PAGE_SIZE)
     branch = torch.cat([history[:PAGE_SIZE], ids(PAGE_SIZE, 10_000)])
     tree.match_prefix(branch)
-    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True)
     first = scheduler.analyze(tree, [branch])
     assert len(first.protections) == 1
     assert first.protections[0].node is not None
@@ -148,7 +148,7 @@ def test_analysis_only_maintains_chains_touched_by_prefill_batch():
             LogStateEntry(3, LogStateKind.LOG, 64, 128),
         ),
     )
-    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True)
 
     plan = scheduler.analyze(tree, [first])
 
@@ -163,7 +163,7 @@ def test_analysis_only_maintains_chains_touched_by_prefill_batch():
 def test_empty_prefill_batch_does_not_trigger_tree_maintenance():
     tree, _history = make_history()
 
-    plan = OnlineAnalysisScheduler(PAGE_SIZE, 1).analyze(tree, [])
+    plan = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True).analyze(tree, [])
 
     assert plan.materialize == ()
     assert plan.protections == ()
@@ -171,7 +171,7 @@ def test_empty_prefill_batch_does_not_trigger_tree_maintenance():
 
 def test_prefill_snapshot_excludes_rebound_log_slots():
     tree, _history = make_history()
-    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True)
     snapshot = scheduler.snapshot_prefill(tree, [tree.trace(_history)])
     leaf = tuple(tree._leaves.values())[0]
     tree.detach_entry(3)
@@ -208,7 +208,7 @@ def make_checkpoint_history(
 
 def test_analysis_matches_each_request_only_once():
     tree, history = make_history()
-    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1)
+    scheduler = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True)
     request = torch.cat([history, ids(64, 10000)])
     with patch.object(tree, "trace", wraps=tree.trace) as trace:
         plan = scheduler.analyze(tree, [request])
@@ -225,5 +225,5 @@ def test_prefill_snapshot_contains_only_matched_paths():
     tree.insert(ids(64, 20000), ids(64, 10000),
                 (LogStateEntry(999, LogStateKind.LOG, 0, 64),))
     with patch.object(tree, "iter_entries", side_effect=AssertionError):
-        actual = OnlineAnalysisScheduler(PAGE_SIZE, 1).snapshot_prefill(tree, [tree.trace(history)])
+        actual = OnlineAnalysisScheduler(PAGE_SIZE, 1, enable_hit_materialization=True).snapshot_prefill(tree, [tree.trace(history)])
     assert actual.eligible_slots == expected

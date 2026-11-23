@@ -518,7 +518,9 @@ def launch_server(server_argv: list[str], *, port: int, enable_specualtive_decod
     return proc
 
 
-def wait_server_ready(port: int, timeout: float = 900.0) -> str:
+def wait_server_ready(
+    port: int, timeout: float = 900.0, *, proc: subprocess.Popen | None = None,
+) -> str:
     """Poll /v1/models. The server binds its port only after every worker has acked, so
     a 200 means the model is loaded and all ranks are synced."""
     import httpx
@@ -527,6 +529,8 @@ def wait_server_ready(port: int, timeout: float = 900.0) -> str:
     deadline = time.time() + timeout
     last_report = 0.0
     while time.time() < deadline:
+        if proc is not None and (status := proc.poll()) is not None:
+            raise RuntimeError(f"Server on port {port} exited with status {status}")
         try:
             with httpx.Client(timeout=5, trust_env=False) as c:
                 if c.get(f"{base}/v1/models").status_code == 200:

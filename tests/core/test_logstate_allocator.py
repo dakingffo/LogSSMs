@@ -1,3 +1,4 @@
+from tests.logstate_helpers import materialize_log
 from logssms.cache.logstate.allocator import LogStateAllocator
 from logssms.cache.logstate.layout import LogStateSlotLayout
 import random
@@ -76,7 +77,7 @@ def test_lock_frame_cost_matches_bitmap_projection_without_mutation(seed):
     allocator = make_allocator(200)
     _, logs, states = allocator.reserve(logs=12, states=3)
     for slot in logs[:3]:
-        allocator.materialize(slot)
+        materialize_log(allocator, slot)
     slots = logs + states
     for _ in range(100):
         for slot in slots:
@@ -115,7 +116,7 @@ def test_incremental_capacity_matches_full_projection_through_lifecycle(seed, re
         elif action == 3 and slots:
             slot = rng.choice(slots)
             if allocator.slot(slot).kind == "log":
-                allocator.materialize(slot)
+                materialize_log(allocator, slot)
         elif action == 4 and slots:
             allocator.release_slot(rng.choice(slots))
         elif action == 5 and allocator.allocated_kv:
@@ -157,7 +158,7 @@ def test_materialize_releases_three_snapshots_and_decay():
     payload = record.payload
     terminal_conv = record.conv[-1]
     before = allocator.free_frames
-    released = allocator.materialize(slot)
+    released = materialize_log(allocator, slot)
     assert len(released) == 3
     assert allocator.free_frames == before + 4  # three conv frames and one decay frame
     assert allocator.slot(slot).payload == payload
@@ -173,9 +174,9 @@ def test_shared_decay_frame_is_freed_after_last_record():
     assert allocated is not None
     first, second = allocated[1]
     before = allocator.free_frames
-    allocator.materialize(first)
+    materialize_log(allocator, first)
     assert allocator.free_frames == before + 3
-    allocator.materialize(second)
+    materialize_log(allocator, second)
     assert allocator.free_frames == before + 7
     allocator.check_integrity()
 
@@ -185,7 +186,7 @@ def test_projected_reclamation_matches_checkpoint_and_shared_decay_release():
     allocated = allocator.reserve(logs=3)
     assert allocated is not None
     first, second, third = allocated[1]
-    allocator.materialize(first)
+    materialize_log(allocator, first)
 
     projected = allocator.projected_free_capacity((first, second))
     allocator.release_slot(first)
@@ -283,7 +284,7 @@ def test_qwen35_2b_layout_and_released_side_data():
     assert allocated is not None
     assert allocator.free_frames == 256 - 1 - 12 - 4 - 1
     slot = allocated[1][0]
-    allocator.materialize(slot)
+    materialize_log(allocator, slot)
     assert allocator.free_frames == 256 - 1 - 12 - 1
     allocator.check_integrity()
 

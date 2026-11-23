@@ -201,7 +201,7 @@ class LogStateLinearAttnBackend(BaseLinearAttnBackend):
         )
         item_calls = item_cpu_ns = 0
         if batch.is_prefill:
-            item_calls, item_cpu_ns = self._prepare_direct_prefill(batch, metadata, pool)
+            item_calls, item_cpu_ns = self._prepare_prefill_writes(batch, metadata, pool)
         batch.linear_attn_metadata = metadata
         if profile:
             self._profile_prefill_samples.append({
@@ -212,8 +212,8 @@ class LogStateLinearAttnBackend(BaseLinearAttnBackend):
                 "item_cpu_ms": item_cpu_ns / 1e6,
             })
 
-    def _prepare_direct_prefill(self, batch, metadata, pool):
-        from logssms.kernel.metadata import make_logstate_prefill_writes
+    def _prepare_prefill_writes(self, batch, metadata, pool):
+        from logssms.kernel.metadata import make_logstate_prefill_conv
 
         lengths = [req.extend_len for req in batch.reqs]
         granularity = pool.layout.granularity
@@ -227,49 +227,22 @@ class LogStateLinearAttnBackend(BaseLinearAttnBackend):
             item_calls = 1
             item_cpu_ns = perf_counter_ns() - start if self._profile_enabled else 0
         total = sum(lengths)
-        host = torch.empty(3 * total + len(metadata.prefill_indices.chunk_indices),
+        host = torch.empty(total + len(metadata.prefill_indices.chunk_indices),
                            dtype=torch.int32, pin_memory=pool.device.type == "cuda")
-        conv_slots, conv_granules, log_mask = host[:3 * total].view(3, total).numpy()
-        chunk_writes = host[3 * total:].numpy()
-        conv_slots.fill(-1)
-        conv_granules.fill(0)
-        log_mask.fill(1)
-        chunk_writes.fill(-1)
-        checkpoints = iter(sorted(batch.cache_metadata.checkpoint_writes))
-        checkpoint = next(checkpoints, None)
-        ranges = {}
-        for req, begin, end in batch.cache_metadata.checkpoint_ranges:
-            ranges.setdefault(req, []).append((begin, end))
-        token_begin = chunk_begin = 0
-        for i, req in enumerate(batch.reqs):
-            length, first = lengths[i], first_offsets[i]
+        host.fill_(-1)
+        conv_plan = host[:total].numpy()
+        token_begin = 0
+        for length, first in zip(lengths, first_offsets, strict=True):
             token_end = token_begin + length
-            conv_slots[token_begin + granularity - 1 - first % granularity:token_end:granularity] = -2
+            conv_plan[token_begin + granularity - 1 - first % granularity:token_end:granularity] = 1
             if length:
-                conv_slots[token_end - 1] = -2
-            for begin, end in ranges.get(i, ()):
-                begin = max(0, begin - req.cached_len)
-                end = min(length, end - req.cached_len)
-                if begin < end:
-                    log_mask[token_begin + begin:token_begin + end] = 0
-                    conv_slots[token_begin + begin:token_begin + end] = -1
-            while checkpoint is not None and checkpoint[0] < token_end:
-                global_row, slot = checkpoint
-                row = global_row - token_begin
-                assert row >= 0
-                if (first + row + 1) % granularity == 0 or row + 1 == length:
-                    conv_slots[global_row] = slot
-                    conv_granules[global_row] = (
-                        0 if pool.allocator.slot(slot).kind == "work" else pool.layout.num_granules - 1
-                    )
-                    chunk_writes[chunk_begin + row // granularity] = slot
-                checkpoint = next(checkpoints, None)
-            token_begin += length
-            chunk_begin += (length + granularity - 1) // granularity
+                conv_plan[token_end - 1] = 1
+            token_begin = token_end
         packet = host.to(pool.device, non_blocking=pool.device.type == "cuda")
-        metadata.chunk_write_slots = packet[3 * total:]
-        metadata.log_write_slots, metadata.conv_token_slots, metadata.conv_token_granules = (
-            make_logstate_prefill_writes(metadata.log_slots, metadata.token_offsets, packet, granularity)
+        metadata.chunk_write_slots = packet[total:]
+        metadata.log_write_slots = metadata.log_slots
+        metadata.conv_token_slots, metadata.conv_token_granules = make_logstate_prefill_conv(
+            metadata.log_slots, metadata.token_offsets, packet, granularity,
         )
         return item_calls, item_cpu_ns
 

@@ -591,7 +591,7 @@ def history(count, g=32, n=2):
     tokens = torch.arange(count * g, dtype=torch.int32)
     entries = tuple(LogStateEntry(i, LogStateKind.LOG, i * g, (i + 1) * g) for i in range(count))
     node = tree.insert(tokens, tokens, entries).node
-    analyzer = OnlineAnalysisScheduler(g, n, enable_merge_adjustment=False)
+    analyzer = OnlineAnalysisScheduler(g, n, enable_merge_adjustment=False, enable_hit_materialization=True)
     return tree, tokens, entries, node, analyzer
 
 

@@ -33,7 +33,7 @@ def test_materialize_respects_granule_groups_and_node_boundaries():
     path = [value for slot in range(5) for value in (
         slot, slot * 32, (slot + 1) * 32, -1, int(slot != 4),
     )]
-    candidates = [(0, slot, 1) for slot in range(5)]
+    candidates = [(0, slot) for slot in range(5)]
     assert planning.plan_materialize([path], [()], candidates, 32, 2) == [[0, 1], [2, 3]]
     assert planning.plan_materialize([path], [(32,)], candidates, 32, 2) == [[1, 2]]
 
@@ -66,14 +66,14 @@ def test_materialize_eligibility_matches_serial_recovery_oracle():
                 expected.append([i])
         path = [v for entry in values for v in entry]
         actual = planning.plan_materialize(
-            [path], [boundaries], [(0, i, 1) for i in range(len(values))], 32, 1,
+            [path], [boundaries], [(0, i) for i in range(len(values))], 32, 1,
         )
         assert actual == expected
 
 
 def test_materialize_returns_bounded_metadata_for_long_log_chain():
     path = [v for i in range(128) for v in (i, i * 32, (i + 1) * 32, -1, 1)]
-    result = planning.plan_materialize([path], [()], [(0, i, 1) for i in range(128)], 32, 2)
+    result = planning.plan_materialize([path], [()], [(0, i) for i in range(128)], 32, 2)
     assert result == [[i, i + 1] for i in range(0, 128, 2)]
 
 

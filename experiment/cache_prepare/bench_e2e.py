@@ -35,7 +35,7 @@ def main():
                "--cuda-graph-max-bs", "4", "--memory-ratio", "0.65",
                "--num-pages", "2048", "--cache-type", "logstate",
                "--granularity", "32", "--eager-state", "false",
-               "--memorized-evict", "true", "--port", str(args.port)]
+               "--port", str(args.port)]
     (directory / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     with (directory / "server.log").open("w") as log:
         server = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,

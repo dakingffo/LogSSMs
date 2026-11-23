@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import torch
 
 from logssms.cache.logstate.frame_pool import MHALogStatePool
@@ -39,21 +41,6 @@ def eviction_node(tree, node):
     from logssms.cache.logstate.prefix_cache import LogRadixEvictionNode
     return LogRadixEvictionNode(
         node, node.begin, node.depth, node.eviction_slots, tree,
-    )
-
-
-def remember_log_tail(recycle, tree, node) -> None:
-    for part in reversed(tree.path(node)):
-        recycle.remember(tree, eviction_node(tree, part))
-
-
-def recycled_bytes(branch):
-    return (
-        256
-        + 8 * len(branch.tokens)
-        + 16 * len(branch.logs)
-        + 8 * len(branch.protected_endpoints)
-        + 24 * sum(log.analysis_owner is not None for log in branch.logs)
     )
 
 
@@ -111,3 +98,22 @@ def plan_eviction(nodes, kv, node_slots, slots, occupied, config, actions, model
         past_tails=past_tails,
     )
     return planner.plan(config, occupied)
+
+
+def materialize_log(allocator, slot):
+    retired = allocator.materialize_group((slot,))
+    allocator.release_retirement(retired)
+    return retired.frames
+
+
+def materialize_pool_log(pool, slot):
+    materialize_log(pool.allocator, slot)
+    pool._write_descriptors([slot])
+
+
+def seed_checkpoint_slot(pool, slot):
+    allocator = pool.allocator
+    record = allocator.slot(slot)
+    assert record.kind == "work" and record.decay is None
+    allocator._slots[slot] = replace(record, kind="checkpoint")
+    pool._write_descriptors([slot])

@@ -104,7 +104,6 @@ class MHALogStatePool:
             self._kv_view(layer * layer_bytes + k_bytes)
             for layer in range(num_attention_layers)
         ]
-        self._retired_materializations: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
         self._retired_releases: list[tuple[torch.cuda.Event, tuple[int, ...]]] = []
         self._retiring_slots: set[int] = set()
         self._retired_rebindings: list[tuple[torch.cuda.Event, tuple[RetiredResources, ...]]] = []
@@ -381,16 +380,11 @@ class MHALogStatePool:
             now = perf_counter_ns()
             timings["allocator_reserve_ms"] = (now - stage) / 1e6
             stage = now
-        while allocated is None and (self._retired_materializations or self._retired_releases or self._retired_rebindings):
+        while allocated is None and (self._retired_releases or self._retired_rebindings):
             if timings is not None:
-                timings.setdefault("waited_materializations", 0)
                 timings.setdefault("waited_merge_slots", 0)
             if self._retired_rebindings:
                 event, _records = self._retired_rebindings[0]
-            elif self._retired_materializations:
-                event, slots = self._retired_materializations[0]
-                if timings is not None:
-                    timings["waited_materializations"] += len(slots)
             else:
                 event, slots = self._retired_releases[0]
                 if timings is not None:
@@ -429,30 +423,6 @@ class MHALogStatePool:
             ) / 1e6
             timings["descriptor_count"] = len(allocated[1]) + len(allocated[2])
         return allocated
-
-    def materialize(self, slot: int) -> None:
-        self.materialize_slots((slot,))
-
-    def materialize_slots(self, slots: Sequence[int]) -> None:
-        if not slots:
-            return
-        if self.device.type == "cuda":
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(self.device))
-            self._retired_materializations.append((event, tuple(slots)))
-            if self.deterministic_reclamation:
-                # This conversion does not credit its surplus until the slot is
-                # updated. Commit it at the same point on every rank.
-                event.synchronize()
-                self.poll_reclamation(completed_event=event)
-        else:
-            for slot in slots:
-                self.allocator.materialize(slot)
-            self._write_descriptors(slots)
-
-    def commit_checkpoint(self, slot: int) -> None:
-        self.allocator.commit_checkpoint(slot)
-        self._write_descriptors((slot,))
 
     def copy_states(self, sources: Sequence[int], destinations: Sequence[int]) -> None:
         """Copy recurrent states between allocated slots without changing ownership."""
@@ -524,7 +494,7 @@ class MHALogStatePool:
             return
         if completed_event is not None:
             assert any(queue and queue[0][0] is completed_event for queue in (
-                self._retired_rebindings, self._retired_materializations, self._retired_releases,
+                self._retired_rebindings, self._retired_releases,
             )), "Reclamation must complete the selected queue head"
 
         def ready(event: torch.cuda.Event) -> bool:
@@ -545,41 +515,6 @@ class MHALogStatePool:
             else:
                 rebindings.append((event, records))
         self._retired_rebindings = rebindings
-        materialization_events, remaining = select(self._retired_materializations)
-        completed = []
-        for event, slots in materialization_events:
-            start = perf_counter_ns() if timings is not None else 0
-            if ready(event):
-                if timings is not None:
-                    timings["reclamation_query_ms"] = (
-                        timings.get("reclamation_query_ms", 0.0)
-                        + (perf_counter_ns() - start) / 1e6
-                    )
-                    start = perf_counter_ns()
-                materialized = 0
-                for slot in slots:
-                    if slot in self._retiring_slots:
-
-                        continue
-                    self.allocator.materialize(slot)
-                    completed.append(slot)
-                    materialized += 1
-                if timings is not None:
-                    timings["reclamation_materialize_ms"] = (
-                        timings.get("reclamation_materialize_ms", 0.0)
-                        + (perf_counter_ns() - start) / 1e6
-                    )
-                    timings["reclamation_count"] = (
-                        timings.get("reclamation_count", 0) + materialized
-                    )
-            else:
-                if timings is not None:
-                    timings["reclamation_query_ms"] = (
-                        timings.get("reclamation_query_ms", 0.0)
-                        + (perf_counter_ns() - start) / 1e6
-                    )
-                remaining.append((event, slots))
-        self._retired_materializations = remaining
         release_events, remaining_releases = select(self._retired_releases)
         for event, slots in release_events:
             if ready(event):
@@ -592,13 +527,6 @@ class MHALogStatePool:
             else:
                 remaining_releases.append((event, slots))
         self._retired_releases = remaining_releases
-        start = perf_counter_ns() if timings is not None else 0
-        self._write_descriptors(completed)
-        if timings is not None:
-            timings["reclamation_descriptor_ms"] = (
-                timings.get("reclamation_descriptor_ms", 0.0)
-                + (perf_counter_ns() - start) / 1e6
-            )
 
     def release_kv(self, frames: list[int] | tuple[int, ...]) -> None:
         self.allocator.release_kv(frames)
@@ -611,17 +539,6 @@ class MHALogStatePool:
         assert len(slots) == len(set(slots))
         assert not self._retiring_slots.intersection(slots), "Slot already queued for reclamation"
         stage = perf_counter_ns() if timings is not None else 0
-        selected = set(slots)
-        for event, pending_slots in self._retired_materializations:
-            if selected.intersection(pending_slots):
-                event.synchronize()
-        if timings is not None:
-            now = perf_counter_ns()
-            timings["wait_materialization_ms"] = (
-                timings.get("wait_materialization_ms", 0.0)
-                + (now - stage) / 1e6
-            )
-            stage = now
         self.poll_reclamation(timings)
         if timings is not None:
             now = perf_counter_ns()
@@ -629,7 +546,6 @@ class MHALogStatePool:
                 timings.get("poll_reclamation_ms", 0.0)
                 + (now - stage) / 1e6
             )
-            stage = now
         self._release_slots(slots, timings=timings)
 
     def _release_slots(
