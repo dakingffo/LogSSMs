@@ -22,6 +22,10 @@ EXECUTION = "production-scheduler-v1"
 
 
 def frame_usage(allocator):
+    if hasattr(allocator, "frame_usage_summary"):
+        usage = allocator.frame_usage_summary()
+        assert sum(usage[k] for k in ("log", "checkpoint", "work", "kv", "free")) == allocator.num_frames
+        return usage
     usage = Counter(log=0, checkpoint=0, work=0)
     for slot in allocator.allocated_slots:
         record = allocator.slot(slot)
@@ -123,7 +127,7 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
         manager = make_manager(
             case, mode, max_seq_len, window, half_life, enable_hit_materialization=enable_hit_materialization,
         )
-        tree, allocator = manager.tree, manager._allocator
+        tree, allocator = getattr(manager, "tree", manager.prefix_cache), manager._allocator
         granularity = manager.granularity
 
         def observe_admissions(batch):
@@ -170,13 +174,17 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
         )
         if diagnostics is not None:
             diagnostics.attach(scheduler, manager)
-        original_event = manager.evictor._record_lifecycle_event
+        evictor = getattr(manager, "evictor", None)
+        if evictor is not None:
+            original_event = evictor._record_lifecycle_event
 
-        def record_event(event):
-            event.update(iteration=cycle, completed=len(scheduler.finished))
-            if clock is not None:
-                event["time_s"] = clock.now / 1_000_000_000
-            original_event(event)
+            def record_event(event):
+                event.update(iteration=cycle, completed=len(scheduler.finished))
+                if clock is not None:
+                    event["time_s"] = clock.now / 1_000_000_000
+                original_event(event)
+
+            evictor._record_lifecycle_event = record_event
 
         state_usage = []
 
@@ -192,7 +200,6 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
         if record_state_usage:
             sample_state_usage()
 
-        manager.evictor._record_lifecycle_event = record_event
         data = None
         forward_counts = Counter()
         min_free_frames = allocator.free_frames
@@ -204,7 +211,8 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
                 diagnostics.iteration = cycle
             if record_layout:
                 before_frames = frame_usage(allocator)
-                before = Counter(e.kind.value for e in tree.iter_entries())
+                before = (manager.layout_snapshot() if hasattr(manager, "layout_snapshot")
+                          else Counter(e.kind.value for e in tree.iter_entries()))
                 admitted_before, completed_before = len(samples), len(scheduler.finished)
                 evictions_before = len(manager._profile_lifecycle_events)
             had_inflight = data is not None
@@ -229,9 +237,12 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
                 or len(manager._profile_lifecycle_events) != evictions_before
                 or (batch is not None and batch.prefill_count)
             ):
-                tree.check_integrity()
+                if hasattr(tree, "check_integrity") and hasattr(tree, "iter_entries"):
+                    tree.check_integrity()
                 allocator.check_integrity()
                 fresh = list(samples.values())[admitted_before:]
+                snap = (manager.layout_snapshot() if hasattr(manager, "layout_snapshot")
+                        else layout_snapshot(tree))
                 batches.append(dict(
                     batch=len(batches) + 1, iteration=cycle,
                     phase="drain" if batch is None else batch.phase,
@@ -243,7 +254,7 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
                     free_frames_before=before_frames["free"], frames_before=before_frames,
                     frames_after=frame_usage(allocator), free_frames=allocator.free_frames,
                     used_bytes_per_rank=(allocator.num_frames - allocator.free_frames) * allocator.frame_bytes,
-                    **layout_snapshot(tree),
+                    **snap,
                 ))
                 if clock is not None:
                     batches[-1]["time_s"] = clock.now / 1_000_000_000
@@ -291,13 +302,16 @@ def replay(case, history, mode, batch_size=8, window=8192, half_life=1024, *, en
             prefill_steps=scheduler.prefill_steps, state_usage=state_usage,
             forward_batches=dict(forward_counts),
             batches=batches, requests_detail=[samples[i] for i in range(len(requests))],
-            analysis=manager.analyzer.profile_result(), evictions=dict(manager._profile_stats),
+            analysis=(manager.analyzer.profile_result() if hasattr(manager, "analyzer") else None),
+            evictions=(manager.eviction_stats() if hasattr(manager, "eviction_stats")
+                       else dict(manager._profile_stats)),
             eviction_events=manager._profile_lifecycle_events,
-            final_layout=[dict(
+            final_layout=(manager.final_layout_snapshot() if hasattr(manager, "final_layout_snapshot")
+                          else [dict(
                 prefix_sha256=hashlib.sha256(torch.cat([p.key for p in tree.path(node)]).numpy().tobytes()).hexdigest(),
                 begin=node.begin, end=node.depth, protected=node.is_protected,
                 entries=[dict(begin=e.begin, end=e.end, kind=e.kind.value) for e in node.entries],
-            ) for node in tree._iter_nodes() if not node.is_root()],
+            ) for node in tree._iter_nodes() if not node.is_root()]),
         )
 
 def main(*, extra_report=None):

@@ -35,7 +35,6 @@ class ReplayDiagnostics:
 
     def attach(self, scheduler, manager):
         admit = manager.admit_prefill
-        plan = manager.evictor.plan
 
         def admit_prefill(req, *args, **kwargs):
             return self._measure("admit_prefill", admit, (req, *args), kwargs, {
@@ -43,15 +42,28 @@ class ReplayDiagnostics:
                 "output_cap": req.output_len,
             })
 
-        def plan_eviction(needed_pages, needed_states, needed_works, active_candidates=()):
-            return self._measure("eviction_plan", plan,
-                                 (needed_pages, needed_states, needed_works, active_candidates), {}, {
-                "needed_pages": needed_pages, "needed_states": needed_states, "needed_works": needed_works,
-                "active_candidates": len(active_candidates),
-            })
-
         manager.admit_prefill = admit_prefill
-        manager.evictor.plan = plan_eviction
+        evictor = getattr(manager, "evictor", None)
+        if evictor is not None:
+            plan = evictor.plan
+
+            def plan_eviction(needed_pages, needed_states, needed_works, active_candidates=()):
+                return self._measure("eviction_plan", plan,
+                                     (needed_pages, needed_states, needed_works, active_candidates), {}, {
+                    "needed_pages": needed_pages, "needed_states": needed_states, "needed_works": needed_works,
+                    "active_candidates": len(active_candidates),
+                })
+
+            evictor.plan = plan_eviction
+        else:
+            alloc_fn = manager.allocate
+
+            def allocate_wrapped(reqs, *args, **kwargs):
+                return self._measure("eviction_plan", alloc_fn, (reqs, *args), kwargs, {
+                    "batch_size": len(reqs),
+                })
+
+            manager.allocate = allocate_wrapped
         if self.heartbeat_seconds:
             self._arm_watchdog()
             self._thread = Thread(target=self._heartbeat, args=(scheduler,), daemon=True)

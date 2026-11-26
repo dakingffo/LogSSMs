@@ -1,1447 +1,1157 @@
-#include <limits>
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstdint>
-#include <cmath>
+#include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
-#include <optional>
-#include <queue>
 #include <set>
-#include <string>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
-#include <tvm/ffi/string.h>
 #include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
+#include <tvm/ffi/string.h>
+
+#include "logstate/allocator.hpp"
+#include "logstate/eviction_planner.hpp"
+#include "logstate/radix_tree.hpp"
+#include "logstate/reuse_model.hpp"
 
 namespace logssms {
 namespace {
 
-using Int = int64_t;
-using Vector = std::vector<Int>;
+using namespace logssms::logstate;
 using List = tvm::ffi::Array<Int>;
 using Rows = tvm::ffi::Array<List>;
 using Result = tvm::ffi::Map<tvm::ffi::String, tvm::ffi::Any>;
 
-void check(bool value, const char* message) {
-  if (!value) {
-    throw std::runtime_error(message);
+template <class Fn>
+void reg(Result& r, const char* name, Fn&& fn) {
+  r.Set(name, tvm::ffi::Function::FromTyped(std::forward<Fn>(fn)));
+}
+
+struct CPUNDAlloc {
+  void AllocData(DLTensor* t) {
+    size_t bytes = 1;
+    for (int i = 0; i < t->ndim; ++i) bytes *= static_cast<size_t>(t->shape[i]);
+    bytes *= static_cast<size_t>((t->dtype.bits * t->dtype.lanes + 7) / 8);
+    t->data = bytes ? std::malloc(bytes) : nullptr;
   }
-}
-
-const Int* cpu_ints(tvm::ffi::TensorView tensor) {
-  check(tensor.ndim() == 1 && tensor.is_contiguous()
-        && tensor.device().device_type == kDLCPU && tensor.dtype().code == kDLInt
-        && tensor.dtype().bits == 64 && tensor.dtype().lanes == 1,
-        "Planning metadata must be contiguous CPU int64");
-  return static_cast<const Int*>(tensor.data_ptr());
-}
-
-struct Entry {
-  Int slot, begin, end, span;
-  bool eligible;
+  void FreeData(DLTensor* t) { std::free(t->data); }
 };
 
-std::vector<Entry> entries(const List& row) {
-  check(row.size() % 5 == 0, "Invalid LogState entry metadata");
-  std::vector<Entry> result;
-  result.reserve(row.size() / 5);
-  for (size_t i = 0; i < row.size(); i += 5) {
-    result.push_back({row[i], row[i + 1], row[i + 2], row[i + 3], bool(row[i + 4])});
-  }
-  return result;
+tvm::ffi::Tensor make_i32_tensor(Int n) {
+  return tvm::ffi::Tensor::FromNDAlloc(CPUNDAlloc(), tvm::ffi::ShapeView(&n, 1),
+                                       DLDataType{kDLInt, 32, 1}, DLDevice{kDLCPU, 0});
+}
+tvm::ffi::Tensor make_i32_2d(Int r, Int c) {
+  std::array<Int, 2> shape{r, c};
+  return tvm::ffi::Tensor::FromNDAlloc(CPUNDAlloc(), tvm::ffi::ShapeView(shape.data(), 2),
+                                       DLDataType{kDLInt, 32, 1}, DLDevice{kDLCPU, 0});
+}
+const int32_t* cpu_i32(tvm::ffi::TensorView t, std::vector<int32_t>& scratch) {
+  check(t.ndim() == 1 && t.is_contiguous() && t.device().device_type == kDLCPU &&
+            t.dtype().code == kDLInt && (t.dtype().bits == 32 || t.dtype().bits == 64),
+        "Expected contiguous 1-D CPU int32/int64 tensor");
+  if (t.dtype().bits == 32) return static_cast<const int32_t*>(t.data_ptr());
+  const auto* p64 = static_cast<const int64_t*>(t.data_ptr());
+  scratch.resize(static_cast<size_t>(t.size(0)));
+  for (size_t i = 0; i < scratch.size(); ++i) scratch[i] = static_cast<int32_t>(p64[i]);
+  return scratch.data();
+}
+tvm::ffi::Tensor to_i32_tensor(const std::vector<int32_t>& v) {
+  auto t = make_i32_tensor(static_cast<Int>(v.size()));
+  if (!v.empty()) std::memcpy(t.data_ptr(), v.data(), v.size() * sizeof(int32_t));
+  return t;
+}
+std::vector<int32_t> from_i32_tensor(tvm::ffi::TensorView t) {
+  std::vector<int32_t> scratch;
+  const int32_t n = static_cast<int32_t>(t.size(0));
+  if (n == 0) return {};
+  const int32_t* p = cpu_i32(t, scratch);
+  return {p, p + n};
+}
+List to_list(const std::vector<int32_t>& v) {
+  std::vector<Int> tmp(v.begin(), v.end());
+  return List(tmp.begin(), tmp.end());
+}
+std::vector<int32_t> from_list(const List& l) {
+  std::vector<int32_t> out;
+  out.reserve(l.size());
+  for (Int v : l) out.push_back(static_cast<int32_t>(v));
+  return out;
 }
 
-Rows batch_branch_points(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs, Int granularity) {
-  check(granularity > 0, "Invalid LogState granularity");
-  std::vector<Int> order(inputs.size()), lengths(inputs.size());
-  std::vector<const int32_t*> ints32(inputs.size());
-  std::vector<const Int*> ints64(inputs.size());
-  std::iota(order.begin(), order.end(), 0);
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    const auto& t = inputs[i];
-    check(t.ndim() == 1 && t.is_contiguous() && t.device().device_type == kDLCPU
-          && t.dtype().code == kDLInt && (t.dtype().bits == 32 || t.dtype().bits == 64),
-          "Branch tokens must be contiguous 1-D CPU int32/int64 tensors");
-    lengths[i] = t.size(0) / granularity * granularity;
-    if (t.dtype().bits == 32) {
-      ints32[i] = static_cast<const int32_t*>(t.data_ptr());
-    }
-    else {
-      ints64[i] = static_cast<const Int*>(t.data_ptr());
-    }
+struct AllocRegistry {
+  std::mutex mu;
+  int64_t next_id = 1;
+  std::unordered_map<int64_t, std::weak_ptr<AllocatorCore>> map;
+  int64_t insert(const std::shared_ptr<AllocatorCore>& p) {
+    std::lock_guard<std::mutex> lk(mu);
+    map[next_id] = p;
+    return next_id++;
   }
-  auto token = [&](Int i, Int j) -> Int {
-    return ints32[i] ? ints32[i][j] : ints64[i][j];
-  };
-  std::sort(order.begin(), order.end(), [&](Int a, Int b) {
-    for (Int j = 0, n = std::min(lengths[a], lengths[b]); j < n; ++j) {
-      const auto x = token(a, j), y = token(b, j);
-      if (x != y) {
-        return x < y;
-      }
-    }
+  std::shared_ptr<AllocatorCore> get(int64_t id) {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = map.find(id);
+    check(it != map.end(), "Invalid AllocatorCore handle");
+    auto sp = it->second.lock();
+    check(sp != nullptr, "Expired AllocatorCore handle");
+    return sp;
+  }
+};
+AllocRegistry& alloc_registry() { static AllocRegistry reg; return reg; }
+
+std::vector<std::vector<int32_t>> compute_branch_protections(
+    const std::vector<std::pair<const int32_t*, int32_t>>& inputs,
+    const std::vector<std::pair<int32_t, int32_t>>& forced, int32_t g) {
+  check(g > 0, "Invalid LogState granularity");
+  const int32_t n = static_cast<int32_t>(inputs.size());
+  std::vector<int32_t> order(n), lengths(n);
+  std::iota(order.begin(), order.end(), 0);
+  for (int32_t i = 0; i < n; ++i) lengths[i] = (inputs[i].second / g) * g;
+  std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+    int32_t m = std::min(lengths[a], lengths[b]);
+    const int32_t *pa = inputs[a].first, *pb = inputs[b].first;
+    for (int32_t j = 0; j < m; ++j) if (pa[j] != pb[j]) return pa[j] < pb[j];
     return lengths[a] != lengths[b] ? lengths[a] < lengths[b] : a < b;
   });
-  std::vector<std::pair<Int, Int>> stack;
-  Rows result;
-  for (Int i = 0; i < static_cast<Int>(order.size()); ++i) {
-    Int depth = 0, begin = i;
-    if (i + 1 < static_cast<Int>(order.size())) {
-      const auto a = order[i], b = order[i + 1];
-      while (depth < std::min(lengths[a], lengths[b]) && token(a, depth) == token(b, depth)) {
-        ++depth;
-      }
-      depth = depth / granularity * granularity;
+  std::map<std::vector<int32_t>, std::set<int32_t>> cands;
+  auto make_key = [&](int32_t req, int32_t pos) {
+    check(req >= 0 && req < n && pos >= 0 && pos <= inputs[req].second, "Invalid branch endpoint");
+    return std::vector<int32_t>(inputs[req].first, inputs[req].first + pos);
+  };
+  std::vector<std::pair<int32_t, int32_t>> stack;
+  for (int32_t i = 0; i < n; ++i) {
+    int32_t depth = 0, begin = i;
+    if (i + 1 < n) {
+      int32_t a = order[i], b = order[i + 1], m = std::min(lengths[a], lengths[b]);
+      while (depth < m && inputs[a].first[depth] == inputs[b].first[depth]) ++depth;
+      depth = (depth / g) * g;
     }
     while (!stack.empty() && stack.back().first > depth) {
-      const auto branch_depth = stack.back().first;
+      int32_t bd = stack.back().first;
       begin = stack.back().second;
       stack.pop_back();
-      Vector requests(order.begin() + begin, order.begin() + i + 1);
-      std::sort(requests.begin(), requests.end());
-      requests.insert(requests.begin(), branch_depth);
-      result.push_back(List(requests.begin(), requests.end()));
+      auto& s = cands[make_key(order[begin], bd)];
+      for (int32_t k = begin; k <= i; ++k) s.insert(order[k]);
     }
-    if (depth && (stack.empty() || stack.back().first < depth)) {
-      stack.emplace_back(depth, begin);
-    }
+    if (depth > 0 && (stack.empty() || stack.back().first < depth)) stack.emplace_back(depth, begin);
   }
-  return result;
+  for (const auto& [req, pos] : forced) {
+    check(pos % g == 0, "Invalid forced branch");
+    cands[make_key(req, pos)].insert(req);
+  }
+  std::vector<std::vector<int32_t>> out;
+  for (const auto& [key, reqs] : cands) {
+    if (key.empty()) continue;
+    std::vector<int32_t> row{static_cast<int32_t>(key.size())};
+    row.insert(row.end(), reqs.begin(), reqs.end());
+    out.push_back(std::move(row));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
-Rows plan_materialize(const Rows& paths, const Rows& boundaries,
-                      const Rows& candidates, Int granularity, Int log_count) {
-  check(paths.size() == boundaries.size() && granularity > 0 && log_count > 0, "Invalid materialize metadata");
-  struct PathIndex {
-    std::vector<Entry> values;
-    Vector checkpoints, boundaries;
-    std::vector<std::pair<Int, Int>> logs;
-  };
-  std::vector<PathIndex> unpacked(paths.size());
-  for (size_t p = 0; p < paths.size(); ++p) {
-    auto& index = unpacked[p];
-    index.values = entries(paths[p]);
-    index.boundaries.assign(boundaries[p].begin(), boundaries[p].end());
-    std::sort(index.boundaries.begin(), index.boundaries.end());
-    std::vector<std::pair<Int, Int>> logs;
-    for (const auto& value : index.values) {
-      if (value.span >= 0) {
-        index.checkpoints.push_back(value.end);
-      } else {
-        logs.emplace_back(value.begin, value.end);
-      }
-    }
-    std::sort(index.checkpoints.begin(), index.checkpoints.end());
-    std::sort(logs.begin(), logs.end());
-    for (const auto& interval : logs) {
-      if (!index.logs.empty() && interval.first <= index.logs.back().second) {
-        index.logs.back().second = std::max(index.logs.back().second, interval.second);
-      } else {
-        index.logs.push_back(interval);
-      }
-    }
-
-  }
-  Rows result;
-  for (Int candidate = 0; candidate < static_cast<Int>(candidates.size()); ++candidate) {
-    const auto& row = candidates[candidate];
-    check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(paths.size()),
-          "Invalid materialize candidate path");
-    const auto& index = unpacked[row[0]];
-    check(row[1] >= 0 && row[1] < static_cast<Int>(index.values.size()), "Invalid candidate entry");
-    const auto& entry = index.values[row[1]];
-    if (!entry.eligible || entry.span >= 0
-        || entry.end - entry.begin != granularity) {
-      continue;
-    }
-    const auto boundary = std::upper_bound(index.boundaries.begin(), index.boundaries.end(), entry.begin);
-    if (boundary != index.boundaries.end() && *boundary < entry.end) {
-      continue;
-    }
-    auto checkpoint = std::upper_bound(index.checkpoints.begin(), index.checkpoints.end(), entry.begin);
-    const Int base = checkpoint == index.checkpoints.begin() ? 0 : *std::prev(checkpoint);
-    auto log = std::upper_bound(
-        index.logs.begin(), index.logs.end(), base,
-        [](Int position, const auto& interval) { return position < interval.first; });
-    if (log != index.logs.begin() && std::prev(log)->second >= entry.end) {
-      result.push_back(List({candidate}));
-    }
-  }
-  if (log_count == 1) {
-    return result;
-  }
-  Rows grouped;
-  Vector group;
-  Int path = -1, previous_end = -1;
-  for (const auto& accepted : result) {
-    const auto candidate = accepted[0];
-    const auto& source = candidates[candidate];
-    const auto& entry = unpacked[source[0]].values[source[1]];
-    const auto& index = unpacked[source[0]];
-    if (source[0] != path || entry.begin != previous_end
-        || std::binary_search(index.boundaries.begin(), index.boundaries.end(), entry.begin)) {
-      group.clear();
-    }
-    path = source[0];
-    previous_end = entry.end;
-    group.push_back(candidate);
-    if (static_cast<Int>(group.size()) == log_count) {
-      grouped.push_back(List(group.begin(), group.end()));
-      group.clear();
-    }
-  }
-  return grouped;
-}
-
-
-Rows read_rows(tvm::ffi::TensorView tensor) {
-  const auto data = cpu_ints(tensor);
-  Rows result;
-  for (Int i = 0; i < tensor.size(0);) {
-    const auto size = data[i++];
-    check(size >= 0 && size <= tensor.size(0) - i, "Invalid packed planning row");
-    result.push_back(List(data + i, data + i + size));
-    i += size;
-  }
-  return result;
-}
-
-tvm::ffi::Tensor make_int_tensor(Int size) {
-  return tvm::ffi::Tensor::FromEnvAlloc(
-      TVMFFIEnvTensorAlloc, tvm::ffi::ShapeView(&size, 1),
-      DLDataType{kDLInt, 64, 1}, DLDevice{kDLCPU, 0});
-}
-
-tvm::ffi::Tensor write_rows(const Rows& rows) {
-  Int size = 0;
-  for (const auto& row : rows) {
-    size += 1 + row.size();
-  }
-  auto result = make_int_tensor(size);
-  auto data = static_cast<Int*>(result.data_ptr());
-  for (const auto& row : rows) {
-    *data++ = row.size();
-    data = std::copy(row.begin(), row.end(), data);
-  }
-  return result;
-}
-
-Rows branch_protections(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs,
-                        const Rows& forced, Int granularity) {
-
-  std::map<Vector, std::set<Int>> candidates;
-  auto prefix = [&](Int request, Int position) {
-    check(request >= 0 && request < static_cast<Int>(inputs.size()), "Invalid branch request");
-    const auto& tensor = inputs[request];
-    check(position >= 0 && position <= tensor.size(0), "Invalid branch endpoint");
-    Vector key(position);
-    for (Int i = 0; i < position; ++i) {
-      key[i] = tensor.dtype().bits == 32 ? static_cast<const int32_t*>(tensor.data_ptr())[i]
-                                        : static_cast<const Int*>(tensor.data_ptr())[i];
-    }
-    return key;
-  };
-  for (const auto& row : batch_branch_points(inputs, granularity)) {
-    auto& requests = candidates[prefix(row[1], row[0])];
-    requests.insert(row.begin() + 1, row.end());
-  }
-  for (const auto& row : forced) {
-    check(row.size() == 2 && row[1] % granularity == 0, "Invalid forced branch");
-    candidates[prefix(row[0], row[1])].insert(row[0]);
-  }
-  std::vector<Vector> sorted;
-  for (const auto& [key, requests] : candidates) {
-    if (!key.empty()) {
-      Vector row{static_cast<Int>(key.size())};
-      row.insert(row.end(), requests.begin(), requests.end());
-      sorted.push_back(std::move(row));
-    }
-  }
-  std::sort(sorted.begin(), sorted.end());
-  Rows result;
-  for (const auto& row : sorted) {
-    result.push_back(List(row.begin(), row.end()));
-  }
-  return result;
-}
-
-constexpr Int kEvictionBlocked = 1;
-
-template <typename NodeRows>
-class EvictionQueue {
-public:
-  explicit EvictionQueue(const NodeRows& nodes) : nodes_(nodes) { reset(); }
-
-  void reset() {
-    children_.assign(nodes_.size(), 0);
-    alive_.assign(nodes_.size(), true);
-    indices_.clear();
-    leaves_.clear();
-    for (Int i = 0; i < static_cast<Int>(nodes_.size()); ++i) {
-      if (nodes_[i].empty()) {
-        alive_[i] = false;
-        continue;
-      }
-      check(nodes_[i].size() == 4 && nodes_[i][2] >= 0 && nodes_[i][2] <= kEvictionBlocked,
-            "Invalid eviction node");
-      check(indices_.emplace(nodes_[i][0], i).second, "Duplicate eviction node");
-    }
-    for (const auto& node : nodes_) {
-      if (!node.empty() && indices_.contains(node[1])) {
-        ++children_[indices_.at(node[1])];
-      }
-    }
-    for (Int i = 0; i < static_cast<Int>(nodes_.size()); ++i) {
-      if (alive_[i] && !children_[i] && nodes_[i][2] != kEvictionBlocked) {
-        push(i);
-      }
-    }
-  }
-
-  Int take(Int index) {
-    check(leaves_.erase(index) == 1, "Eviction node is not an unlocked leaf");
-    alive_[index] = false;
-    const auto parent = indices_.find(nodes_[index][1]);
-    if (parent != indices_.end() && !--children_[parent->second] && nodes_[parent->second][2] != kEvictionBlocked) {
-      push(parent->second);
-      return parent->second;
-    }
-    return -1;
-  }
-
-  void update(Int index) {
-    if (alive_[index] && !children_[index] && nodes_[index][2] != kEvictionBlocked)
-      push(index);
-    else leaves_.erase(index);
-  }
-  bool is_leaf(Int index) const { return leaves_.contains(index); }
-  bool can_materialize(Int index) const { return alive_.at(index) && nodes_[index][2] == 0; }
-  const std::unordered_set<Int>& leaves() const { return leaves_; }
-
-private:
-  void push(Int index) {
-    leaves_.insert(index);
-  }
-
-  const NodeRows& nodes_;
-  Vector children_;
-  std::vector<bool> alive_;
-  std::unordered_map<Int, Int> indices_;
-  std::unordered_set<Int> leaves_;
+struct PendingMatch {
+  int32_t position = 0, match_node = 0, trace_node = 0, trace_len = 0, trace_input_len = 0;
+  int64_t trace_rev = -1;
 };
 
-class EvictionPlanner {
-  using NodeRows = std::vector<Vector>;
-  static constexpr size_t kDensityFields = 9;
-  struct Density {
-    double origin = 0, tail = 0, atom = 0, g = 1;
-    std::vector<double> probability{0.};
-    double prefix(double position) const {
-      auto i = static_cast<Int>(std::floor((tail - position) / g));
-      return probability[std::clamp<Int>(i, 0, probability.size() - 1)];
-    }
-    double mass(double begin, double end) const {
-      begin = std::max(begin, origin + 1.);
-      if (begin >= end)
-        return 0.;
-      const auto discrete = begin <= tail && tail < end ? atom : 0.;
-      return discrete + std::max(0., prefix(begin) - (end <= tail ? prefix(end) : 0.));
-    }
-  };
-  struct Sum {
-    double value = 0., error = 0.;
-    void add(double x) {
-      const double result = value + x;
-      error += std::abs(value) >= std::abs(x) ? (value - result) + x : (x - result) + value;
-      value = result;
-    }
-    double total() const { return error && std::isfinite(error) ? value + error : value; }
-  };
+class LogStateCore {
+ public:
+  std::shared_ptr<AllocatorCore> alloc;
+  RadixTreeCore tree;
+  ReuseModelCore reuse;
+  EvictionPlannerCore planner;
+  bool enable_hit_materialization = false;
 
-  struct ActiveDensity {
-    Int tail, g, bins, origin;
-    double atom;
-    std::vector<double> prefix{0.};
+  std::vector<ActiveRequestState> req_states;
+  std::unordered_map<int32_t, PendingMatch> pending;
+  std::unordered_map<int64_t, std::vector<int32_t>> protected_prefixes;
+  std::unordered_set<int64_t> sampled_queries;
 
-    ActiveDensity(const double *p, const double *end)
-        : tail(p[0]), g(p[1]), bins(p[2]), origin(p[6]), atom(p[5]) {
-      check(g > 0 && bins >= 1 && end - p >= 7, "Invalid active density");
-      Sum total;
-      std::vector<double> masses;
-      masses.reserve(bins);
-      for (Int j = 1; j <= bins; ++j) {
-        const double mass = g * p[3] * std::pow(j * g, -p[4]);
-        masses.push_back(mass);
-        total.add(mass);
-      }
-      const auto scale =
-          std::min(1., std::max(0., 1. - atom) / std::max(1e-300, total.total()));
-      prefix.reserve(bins + 1);
-      for (auto mass : masses)
-        prefix.push_back(prefix.back() + mass * scale);
-    }
+  int32_t dummy_kv_frame = -1, dummy_log_slot = -1, dummy_work_slot = -1, pressure_work_slot = -1;
+  int64_t stat_eviction_rounds = 0, stat_pressure_dropped_checkpoints = 0;
+  int64_t stat_pressure_pruned_checkpoints = 0, stat_evicted_kv_tokens = 0, stat_released_slots_eviction = 0;
 
-    double mass(Int begin, Int end) const {
-      begin = std::max(begin, origin + 1);
-      if (begin >= end)
-        return 0.;
-      auto bucket = [&](Int position) {
-        return std::min(bins, std::max(Int{0}, tail - position) / g);
-      };
-      const double discrete = begin <= tail && tail < end ? atom : 0.;
-      return prefix[bucket(begin)] - prefix[bucket(end)] + discrete;
+  LogStateCore(std::shared_ptr<AllocatorCore> alloc_, int32_t g, int32_t ps,
+               bool enable_merge_adj, int32_t min_sampling_len, double max_exp,
+               int32_t half_life, bool enable_hit_mat)
+      : alloc(std::move(alloc_)),
+        tree(g, ps, alloc->materialize_log_count, alloc.get()),
+        reuse(g, min_sampling_len, half_life, max_exp, enable_merge_adj),
+        planner(tree, *alloc, reuse),
+        enable_hit_materialization(enable_hit_mat) {
+    if (enable_merge_adj) {
+      tree.analysis_factory = [this](int32_t o, int64_t gid) { return reuse.new_chain(o, gid); };
+      tree.chain_group_fn = [this](int32_t cid) { return reuse.chain(cid).group_id; };
+      tree.chain_unused_fn = [this](int32_t cid) { const auto& c = reuse.chain(cid); return c.tail == c.origin; };
     }
-  };
-
-  struct ActiveCandidate {
-    const Int *begin, *end;
-    Int frames;
-    double cost;
-    double score() const { return cost / frames; }
-  };
-
-  static std::vector<ActiveCandidate> active_costs(tvm::ffi::TensorView geometry,
-                                                   tvm::ffi::TensorView density) {
-    const auto *packed = cpu_ints(geometry);
-    const auto size = geometry.size(0);
-    if (!size)
-      return {};
-    check(size >= 2 && packed[0] >= 0 && packed[0] <= (size - 2) / 8 &&
-              packed[1] >= 0 && packed[1] <= size - 2 - 8 * packed[0],
-          "Invalid active reclamation geometry");
-    check(density.ndim() == 1 && density.is_contiguous() &&
-              density.device().device_type == kDLCPU && density.dtype().code == kDLFloat &&
-              density.dtype().bits == 64,
-          "Invalid active density parameters");
-    const auto *cursor = static_cast<const double *>(density.data_ptr());
-    const auto *model_end = cursor + density.size(0);
-    std::vector<ActiveDensity> models;
-    while (cursor < model_end) {
-      check(model_end - cursor >= 7, "Truncated active density");
-      models.emplace_back(cursor, model_end);
-      cursor += 7;
-    }
-    const auto count = packed[0];
-    const auto *dep = packed + 2 + count * 8;
-    const auto *dep_end = dep + packed[1];
-    const auto *decay = dep_end;
-    std::vector<ActiveCandidate> result;
-    result.reserve(count);
-    for (Int i = 0; i < count; ++i) {
-      const auto *row = packed + 2 + i * 8;
-      check(row[0] >= 0 && row[0] < static_cast<Int>(models.size()) &&
-                row[6] >= dep - (packed + 2 + count * 8) && row[6] <= packed[1] &&
-                row[7] % 2 == 0 && row[7] >= decay - dep_end && row[7] <= packed + size - dep_end,
-            "Invalid active reclamation offsets");
-      const auto &model = models[row[0]];
-      Int frames = row[5];
-      for (; decay < dep_end + row[7]; decay += 2)
-        frames += decay[0] == decay[1];
-      check(frames > 0, "Invalid active reclamation capacity");
-      double cost = 0.;
-      if (row[4]) {
-        Sum increments;
-        for (auto x = row[1] + model.g; x < row[3]; x += model.g)
-          increments.add((x - row[1]) * model.mass(x, x + model.g));
-        cost = row[4] * 1e-12 + increments.total();
-      } else {
-        cost = (row[2] - row[1]) * model.mass(row[2], row[3]);
-      }
-      const auto *next = packed + 2 + count * 8 + row[6];
-      result.push_back({dep, next, frames, cost});
-      dep = next;
-    }
-    check(dep == dep_end && decay == packed + size, "Unexpected active reclamation metadata");
-    return result;
   }
 
-  struct Candidate {
-    double phase, score;
-    Int timestamp, id, kind, version;
-    double cost_score = 0.;
-    Int depth = 0, owner = 0, begin = 0;
-    bool operator>(const Candidate &o) const {
-      return std::tie(phase, score, timestamp, kind, depth, owner, begin, id) >
-             std::tie(o.phase, o.score, o.timestamp, o.kind, o.depth, o.owner,
-                      o.begin, o.id);
-    }
-  };
-  class CandidateQueue
-      : public std::priority_queue<Candidate, std::vector<Candidate>,
-                                   std::greater<Candidate>> {
-    using Base = std::priority_queue<Candidate, std::vector<Candidate>,
-                                     std::greater<Candidate>>;
-    bool collecting = false;
+  void ensure_req_slot(int32_t row) { if (row >= static_cast<int32_t>(req_states.size())) req_states.resize(row + 1); }
+  static int32_t div_ceil(int32_t a, int32_t b) { return (a + b - 1) / b; }
 
-  public:
-    void begin_update() {
-      this->c.clear();
-      collecting = true;
-    }
-    void push(const Candidate &candidate) {
-      if (collecting)
-        this->c.push_back(candidate);
-      else
-        Base::push(candidate);
-    }
-    void finish_update() {
-      std::make_heap(this->c.begin(), this->c.end(), this->comp);
-      collecting = false;
-    }
-  };
-
-  static constexpr size_t kSlotRecordSize = 6;
-  struct SlotRecord {
-    Int frames, decay, begin, end;
-    bool checkpoint;
-  };
-
-  template <typename Row>
-  static SlotRecord read_slot(const Row &row, size_t offset = 0) {
-    check(row.size() >= offset + kSlotRecordSize, "Truncated eviction slot");
-    const auto frames = row[offset + 1], decay = row[offset + 2], kind = row[offset + 5];
-    check(frames >= 0 && (kind == 1 || (kind == 0 && decay >= 0)), "Invalid eviction slot");
-    return {frames, decay, row[offset + 3], row[offset + 4], kind == 1};
+  int32_t decode_reservation(int32_t begin, int32_t end, bool has_ckpt) const {
+    int32_t kv = std::max<int32_t>(0, div_ceil(end, tree.page_size) - div_ceil(begin, tree.page_size));
+    int32_t logs = std::min(kv, alloc->materialize_log_count + 1);
+    return std::min(alloc->required_frames(kv, logs, (logs < kv && !has_ckpt) ? 1 : 0, 0),
+                    alloc->required_frames(kv, kv, 0, 0));
   }
 
-  NodeRows nodes, kv, node_slots;
-  List config;
-  EvictionQueue<NodeRows> queue;
-  std::vector<double> model_storage;
-  const double *model_data = nullptr;
-  std::unordered_map<Int, SlotRecord> slot_info;
-  std::unordered_map<Int, Vector> actions;
-  std::unordered_map<Int, Int> decay_occupied, decay_released, pages,
-      page_delta;
-  Int free = 0, decay = 0, kv_free = 0;
-  Vector selected, released, page_order, compressed;
-  std::unordered_set<Int> released_set;
-  std::unordered_map<Int, Density> densities;
-  Vector model_ids, node_version;
-  std::vector<Vector> ordered_slots, order_keys;
-  std::unordered_map<Int, Int> previous, slot_node, successors, action_version;
-  std::unordered_map<Int, std::vector<Int>> kv_users, decay_users, owner_nodes;
-  std::unordered_map<Int, Int> pending_depths;
-  CandidateQueue candidates, leaf_candidates;
-  NodeRows materializations;
-  std::vector<size_t> materialization_starts;
-  std::vector<Vector> node_materializations;
+  int32_t prefill_peak(int32_t begin, int32_t prompt_end, int32_t end, int32_t prompt_frames, bool is_new) const {
+    int32_t pp = std::max<int32_t>(0, div_ceil(prompt_end, tree.page_size) - div_ceil(begin, tree.page_size));
+    int32_t dp = std::max<int32_t>(0, div_ceil(end, tree.page_size) - div_ceil(prompt_end, tree.page_size));
+    int32_t w = alloc->materialize_log_count + 1, tr = std::min(dp, w);
+    int32_t tr_peak = prompt_frames + alloc->required_frames(tr, tr, 0, 0);
+    if (dp <= w) return tr_peak;
+    int32_t cf = alloc->payload_frames + alloc->conv_frames;
+    int32_t steady = pp + (1 + static_cast<int32_t>(is_new)) * cf + alloc->required_frames(dp, w, 0, 0);
+    return std::min(prompt_frames + alloc->required_frames(dp, dp, 0, 0), std::max(tr_peak, steady));
+  }
 
-  bool fits() {
-    const auto required_decay =
-        (std::max(Int{0}, config[7] - decay) + config[5] - 1) / config[5];
-    const auto log_frames = config[9];
-    return config[6] + config[7] * log_frames + config[8] * config[2] +
-               (config[7] * config[4] + config[8]) * config[3] +
-               required_decay <=
-           free + kv_free;
+  int32_t reservation_size(int32_t token_len, int32_t handle_cached_len, int32_t row, int32_t end_at) const {
+    const bool is_new = (row < 0);
+    int32_t begin = is_new ? handle_cached_len
+                           : (req_states[row].live_granules.empty()
+                                  ? std::max<int32_t>(0, req_states[row].request_end - token_len)
+                                  : req_states[row].live_granules.back().end);
+    int32_t end = is_new ? (begin + token_len) : req_states[row].request_end;
+    if (end_at >= 0) end = std::min(end, end_at);
+    if (begin >= end) return 0;
+    int32_t kv = div_ceil(end, tree.page_size) - (begin / tree.page_size);
+    return alloc->required_frames(kv, kv, is_new ? 1 : 0, 0);
   }
-  void release(Int slot) {
-    check(slot_info.contains(slot), "Missing eviction slot");
-    check(released_set.insert(slot).second, "Duplicate eviction slot release");
-    const auto &record = slot_info.at(slot);
-    released.push_back(slot);
-    free += record.frames;
-    if (record.decay >= 0) {
-      check(decay_occupied.contains(record.decay),
-            "Missing decay frame occupancy");
-      if (++decay_released[record.decay] == decay_occupied.at(record.decay)) {
-        ++free;
-        decay -= config[5] - 1;
-      } else {
-        ++decay;
-      }
+
+  int32_t admission_capacity() const { return alloc->projected_free_capacity().first + tree.evictable_kv_frames(); }
+  int32_t available_size() const { return alloc->admissible_pages(tree.evictable_kv_frames()) * tree.page_size; }
+
+  void release_cached_kv(const std::vector<std::pair<int32_t, int32_t>>& kv_rel) {
+    std::vector<int32_t> freed;
+    for (const auto& [f, cnt] : kv_rel) {
+      tree.add_cached_page_tokens(f, -cnt);
+      if (tree.cached_page_tokens(f) == 0) freed.push_back(f);
     }
+    if (!freed.empty()) alloc->release_kv(freed);
   }
-  void prune(Int index) {
-    selected.push_back(index);
-    check(kv[index].size() % 3 == 0, "Invalid eviction KV references");
-    for (size_t i = 0; i < kv[index].size(); i += 3) {
-      const auto frame = kv[index][i];
-      auto page = pages.try_emplace(frame, 0).first;
-      if (!page_delta.contains(frame))
-        page_order.push_back(frame);
-      auto &count = page->second;
-      count += kv[index][i + 1];
-      page_delta[frame] += kv[index][i + 1];
-      check(count <= kv[index][i + 2], "Eviction exceeds cached KV references");
-      kv_free += count == kv[index][i + 2];
+};
+
+Result make_allocator_ffi(Int num_frames, Int frame_bytes, Int payload_bytes,
+                          Int conv_snapshot_bytes, Int decay_bytes, Int num_granules, Int log_payload_bytes) {
+  auto alloc = std::make_shared<AllocatorCore>(
+      static_cast<int32_t>(num_frames), frame_bytes, payload_bytes,
+      conv_snapshot_bytes, decay_bytes, static_cast<int32_t>(num_granules), log_payload_bytes);
+  Result r;
+  r.Set("_id", alloc_registry().insert(alloc));
+  r.Set("num_frames", static_cast<Int>(alloc->num_frames));
+  r.Set("frame_bytes", static_cast<Int>(alloc->frame_bytes));
+  r.Set("payload_frames", static_cast<Int>(alloc->payload_frames));
+  r.Set("log_payload_frames", static_cast<Int>(alloc->log_payload_frames));
+  r.Set("descriptor_frames", static_cast<Int>(alloc->descriptor_frames));
+  r.Set("checkpoint_log_count", static_cast<Int>(alloc->checkpoint_log_count));
+  r.Set("conv_frames", static_cast<Int>(alloc->conv_frames));
+  r.Set("decay_records_per_frame", static_cast<Int>(alloc->decay_records_per_frame));
+  r.Set("num_granules", static_cast<Int>(alloc->num_granules));
+  r.Set("materialize_log_count", static_cast<Int>(alloc->materialize_log_count));
+
+  reg(r, "free_frames", [alloc]() -> Int { return alloc->free_frames_count(); });
+  reg(r, "free_decay_records", [alloc]() -> Int { return alloc->free_decay_records(); });
+  reg(r, "set_reclaimable", [alloc](Int s, bool v) { alloc->set_reclaimable(static_cast<int32_t>(s), v); });
+  reg(r, "required_frames", [alloc](Int kv, Int l, Int st, Int fd) -> Int {
+    return alloc->required_frames(static_cast<int32_t>(kv), static_cast<int32_t>(l),
+                                  static_cast<int32_t>(st), static_cast<int32_t>(fd));
+  });
+  reg(r, "projected_free_capacity", [alloc]() -> List {
+    auto [ff, fd] = alloc->projected_free_capacity();
+    return List({static_cast<Int>(ff), static_cast<Int>(fd)});
+  });
+  reg(r, "lock_frame_cost", [alloc](const List& s) -> Int { return alloc->lock_frame_cost(from_list(s)); });
+  reg(r, "admissible_pages", [alloc](Int ekv) -> Int { return alloc->admissible_pages(static_cast<int32_t>(ekv)); });
+  reg(r, "reserve", [alloc](Int kv, Int l, Int st) -> Result {
+    auto res = alloc->reserve(static_cast<int32_t>(kv), static_cast<int32_t>(l), static_cast<int32_t>(st));
+    Result out;
+    out.Set("ok", res.ok);
+    if (res.ok) {
+      out.Set("kv", to_i32_tensor(res.kv_frames));
+      out.Set("logs", to_i32_tensor(res.log_slots));
+      out.Set("works", to_i32_tensor(res.work_slots));
     }
-    for (const auto slot : node_slots[index]) {
-      if (released_set.contains(slot)) {
-        continue;
-      }
-      check(slot_info.contains(slot), "Missing eviction slot");
-      release(slot);
+    return out;
+  });
+  reg(r, "checkpoint_frame_capacity", [alloc](const List& s) -> Int { return alloc->checkpoint_frame_capacity(from_list(s)); });
+  reg(r, "checkpoint_frame_savings", [alloc](const List& s) -> Int { return alloc->checkpoint_frame_savings(from_list(s)); });
+  reg(r, "materialize_group", [alloc](const List& s) -> Result {
+    int64_t rid = alloc->materialize_group(from_list(s));
+    Result out;
+    out.Set("id", rid);
+    out.Set("frames", to_i32_tensor(alloc->retired_frames(rid)));
+    return out;
+  });
+  reg(r, "release_retirement", [alloc](Int rid) { alloc->release_retirement(rid); });
+  reg(r, "release_kv", [alloc](const List& f) { alloc->release_kv(from_list(f)); });
+  reg(r, "release_slot", [alloc](Int s) { alloc->release_slot(static_cast<int32_t>(s)); });
+  reg(r, "release_slots", [alloc](const List& sl) { for (Int s : sl) alloc->release_slot(static_cast<int32_t>(s)); });
+  reg(r, "seed_checkpoint_slot", [alloc](Int s) { alloc->seed_checkpoint_slot(static_cast<int32_t>(s)); });
+  reg(r, "pack_descriptors", [alloc](const List& sl) -> Result {
+    auto sids = from_list(sl);
+    const Int n = static_cast<Int>(sids.size());
+    auto idx_t = to_i32_tensor(sids);
+    auto p_t = make_i32_tensor(n * alloc->descriptor_frames);
+    auto c_t = make_i32_tensor(n * alloc->num_granules * alloc->conv_frames);
+    auto d_t = make_i32_tensor(n * 2);
+    alloc->pack_descriptors(sids, static_cast<int32_t*>(p_t.data_ptr()),
+                            static_cast<int32_t*>(c_t.data_ptr()), static_cast<int32_t*>(d_t.data_ptr()));
+    Result out;
+    out.Set("indices", idx_t); out.Set("payload", p_t); out.Set("conv", c_t); out.Set("decay", d_t);
+    return out;
+  });
+  reg(r, "slot_info", [alloc](Int slot) -> tvm::ffi::Tensor {
+    const auto& sr = alloc->slot(static_cast<int32_t>(slot));
+    const Int np = static_cast<Int>(sr.payload.size()), nc = static_cast<Int>(sr.conv.size());
+    auto t = make_i32_tensor(5 + np + nc);
+    auto* p = static_cast<int32_t*>(t.data_ptr());
+    p[0] = static_cast<int32_t>(sr.kind); p[1] = sr.conv_granules;
+    p[2] = sr.decay.frame; p[3] = sr.decay.index; p[4] = static_cast<int32_t>(np);
+    if (np > 0) std::memcpy(p + 5, sr.payload.data(), static_cast<size_t>(np) * sizeof(int32_t));
+    if (nc > 0) std::memcpy(p + 5 + np, sr.conv.data(), static_cast<size_t>(nc) * sizeof(int32_t));
+    return t;
+  });
+  reg(r, "usage_stats", [alloc]() -> Result {
+    auto u = alloc->usage_stats();
+    Result out;
+    out.Set("total_frames", static_cast<Int>(u.total_frames)); out.Set("free_frames", static_cast<Int>(u.free_frames));
+    out.Set("kv_frames", static_cast<Int>(u.kv_frames)); out.Set("payload_frames", static_cast<Int>(u.payload_frames));
+    out.Set("conv_frames", static_cast<Int>(u.conv_frames)); out.Set("decay_frames", static_cast<Int>(u.decay_frames));
+    out.Set("free_decay_records", static_cast<Int>(u.free_decay_records)); out.Set("log_slots", static_cast<Int>(u.log_slots));
+    out.Set("checkpoint_slots", static_cast<Int>(u.checkpoint_slots)); out.Set("work_slots", static_cast<Int>(u.work_slots));
+    out.Set("log_payload_conv", static_cast<Int>(u.log_payload_conv));
+    out.Set("checkpoint_payload_conv", static_cast<Int>(u.checkpoint_payload_conv));
+    out.Set("work_payload_conv", static_cast<Int>(u.work_payload_conv));
+    return out;
+  });
+  reg(r, "allocated_kv", [alloc]() { return to_i32_tensor(alloc->allocated_kv_list()); });
+  reg(r, "allocated_slots", [alloc]() { return to_i32_tensor(alloc->allocated_slot_list()); });
+  reg(r, "reclaimable_slots", [alloc]() { return to_i32_tensor(alloc->reclaimable_slot_list()); });
+  reg(r, "check_integrity", [alloc]() { alloc->check_integrity(); });
+  return r;
+}
+
+Result make_core_ffi(Int alloc_id, Int g, Int ps, bool enable_merge_adj, Int min_sampling_len,
+                     double max_exp, Int half_life, bool enable_hit_mat) {
+  auto core = std::make_shared<LogStateCore>(
+      alloc_registry().get(alloc_id), static_cast<int32_t>(g), static_cast<int32_t>(ps),
+      enable_merge_adj, static_cast<int32_t>(min_sampling_len), max_exp,
+      static_cast<int32_t>(half_life), enable_hit_mat);
+  Result r;
+
+  reg(r, "set_virtual_clock", [core](bool en, Int ns) { core->tree.set_virtual_clock(en, ns); });
+  reg(r, "advance_virtual_clock", [core](Int ns) { core->tree.advance_virtual_clock(ns); });
+  reg(r, "set_fixed_clock", [core](Int ts) { core->tree.set_fixed_clock(ts); });
+  reg(r, "clear_fixed_clock", [core]() { core->tree.clear_fixed_clock(); });
+  reg(r, "set_reserved_dummies", [core](Int kv, Int ls, Int ws, Int pw) {
+    core->dummy_kv_frame = static_cast<int32_t>(kv); core->dummy_log_slot = static_cast<int32_t>(ls);
+    core->dummy_work_slot = static_cast<int32_t>(ws); core->pressure_work_slot = static_cast<int32_t>(pw);
+  });
+  reg(r, "admission_capacity", [core]() -> Int { return core->admission_capacity(); });
+  reg(r, "available_size", [core]() -> Int { return core->available_size(); });
+  reg(r, "size_info", [core]() -> List { return List({core->tree.evictable_size, core->tree.locked_size}); });
+  reg(r, "pin_recovery", [core](tvm::ffi::TensorView s, bool rel) {
+    if (s.size(0) > 0) core->tree.pin_recovery(from_i32_tensor(s), rel);
+  });
+  reg(r, "lock_node", [core](Int nid, bool unl, Int pos) {
+    if (nid > 0) core->tree.lock(static_cast<int32_t>(nid), unl, static_cast<int32_t>(pos));
+  });
+  reg(r, "unlock_handle", [core](Int nid, Int clen, tvm::ffi::TensorView rs) {
+    if (rs.size(0) > 0) core->tree.pin_recovery(from_i32_tensor(rs), true);
+    if (clen > 0 && nid > 0 && nid < core->tree.num_nodes_capacity() && core->tree.node(static_cast<int32_t>(nid)).alive)
+      core->tree.lock(static_cast<int32_t>(nid), true, static_cast<int32_t>(clen));
+  });
+
+  reg(r, "match_prefix", [core](tvm::ffi::TensorView input_ids) -> Result {
+    std::vector<int32_t> scratch;
+    const int32_t* toks = cpu_i32(input_ids, scratch);
+    const int32_t usable = (static_cast<int32_t>(input_ids.size(0)) / core->tree.granularity) * core->tree.granularity;
+    auto tr = core->tree.trace(toks, usable);
+    auto rec = core->tree.recovery_at(tr.node_id, tr.matched_len);
+    int32_t rec_node = 0;
+    if (rec.position > 0) {
+      rec_node = tr.node_id;
+      while (rec_node > 0 && rec.position <= core->tree.node(rec_node).begin()) rec_node = core->tree.node(rec_node).parent;
     }
-  }
-  tvm::ffi::Tensor result(const Vector *materialize = nullptr, Int active_action = -1,
-                          const ActiveCandidate *active = nullptr) {
-    std::sort(released.begin(), released.end());
-    const auto action_size = materialize ? materialize->size() + 1 : active ? 5 : 0;
-    auto packed = make_int_tensor(4 + selected.size() + 2 * page_order.size() +
-                                  released.size() + compressed.size() + action_size);
-    auto data = static_cast<Int *>(packed.data_ptr());
-    auto write = [&](const Vector &row) {
-      *data++ = row.size();
-      data = std::copy(row.begin(), row.end(), data);
-    };
-    write(selected);
-    *data++ = 2 * page_order.size();
-    for (const auto frame : page_order) {
-      *data++ = frame;
-      *data++ = page_delta.at(frame);
-    }
-    write(released);
-    write(compressed);
-    if (materialize)
-      write(*materialize);
-    else if (active) {
-      *data++ = 4;
-      *data++ = -2;
-      *data++ = active_action;
-      *data++ = active->frames;
-      *data = std::bit_cast<Int>(active->cost);
-    }
-    return packed;
-  }
-  Int successor(Int slot) {
-    while (slot >= 0 && successors.contains(slot))
-      slot = successors.at(slot);
-    return slot;
-  }
-  double recovery_before(Int index, Int slot) {
-    if (previous.contains(slot))
-      return static_cast<double>(slot_info.at(previous.at(slot)).end);
-    const auto end = slot_info.at(slot).end;
-    double restored = model_data[index * kDensityFields + 7];
-    for (auto preceding : ordered_slots[index]) {
-      if (released_set.contains(preceding))
-        continue;
-      const auto &record = slot_info.at(preceding);
-      if (record.end >= end)
-        break;
-      if (record.checkpoint || record.begin == restored)
-        restored = record.end;
-    }
-    return restored;
-  }
-  Int slot_credit(Int slot) {
-    if (released_set.contains(slot))
-      return Int{0};
-    const auto &record = slot_info.at(slot);
-    Int credit = record.frames;
-    if (record.decay >= 0 &&
-        decay_released[record.decay] + 1 == decay_occupied.at(record.decay))
-      ++credit;
-    return credit;
-  }
-  Int prune_credit(Int index) {
-    Int credit = 0;
-    std::unordered_map<Int, Int> decays;
-    for (auto slot : node_slots[index])
-      if (!released_set.contains(slot)) {
-        const auto &record = slot_info.at(slot);
-        credit += record.frames;
-        if (record.decay >= 0)
-          ++decays[record.decay];
-      }
-    for (const auto &[frame, count] : decays)
-      credit += decay_released[frame] + count == decay_occupied.at(frame);
-    for (size_t j = 0; j < kv[index].size(); j += 3) {
-      const auto found = pages.find(kv[index][j]);
-      const auto count = found == pages.end() ? 0 : found->second;
-      credit += count + kv[index][j + 1] == kv[index][j + 2];
-    }
-    return credit;
-  }
-  bool has_node_merge(Int index) {
-    for (auto slot : node_slots[index]) {
-      if (released_set.contains(slot) || !actions.contains(slot))
-        continue;
-      const auto right = successor(actions.at(slot)[1]);
-      if (right >= 0 && !released_set.contains(right))
-        return true;
-    }
-    return false;
-  }
-  bool has_node_materialization(Int index) {
-    for (const auto id : node_materializations[index]) {
-      const auto &row = materializations[id];
-      if (row.empty() || released_set.contains(row[0]) || released_set.contains(row.back()))
-        continue;
-      const auto start = materialization_starts[id];
-      if (std::any_of(row.begin() + 2, row.begin() + start, [&](Int source) {
-            return released_set.contains(-source - 2);
-          }))
-        continue;
-      const bool absorb = row[1] < 0;
-      if (absorb && nodes[slot_node.at(row[0])][2] != 0)
-        continue;
-      bool feasible = true;
-      Int credit = absorb ? 0 : -(config[2] + config[3]);
-      std::unordered_map<Int, Int> records;
-      for (size_t j = start; j < row.size(); ++j) {
-        const auto slot = row[j];
-        if (released_set.contains(slot) || nodes[slot_node.at(slot)][2] != 0) {
-          feasible = false;
-          break;
+    auto kv_t = make_i32_tensor(rec.position);
+    if (rec.position > 0) core->tree.copy_matched_kv(rec_node, rec.position, static_cast<int32_t*>(kv_t.data_ptr()));
+    std::vector<int32_t> rec_slots, ls, lb, le;
+    if (rec.base_checkpoint_slot >= 0) rec_slots.push_back(rec.base_checkpoint_slot);
+    for (const auto& e : rec.logs) { rec_slots.push_back(e.slot); ls.push_back(e.slot); lb.push_back(e.begin); le.push_back(e.end); }
+    if (rec.conv_slot >= 0) rec_slots.push_back(rec.conv_slot);
+    std::sort(rec_slots.begin(), rec_slots.end());
+    rec_slots.erase(std::unique(rec_slots.begin(), rec_slots.end()), rec_slots.end());
+    int32_t tnode = tr.node_id;
+    while (tnode > 0 && tr.matched_len <= core->tree.node(tnode).begin()) tnode = core->tree.node(tnode).parent;
+
+    Result out;
+    out.Set("matched_len", static_cast<Int>(tr.matched_len));
+    out.Set("trace_node", static_cast<Int>(tnode));
+    out.Set("trace_is_exact", tr.is_exact);
+    out.Set("trace_has_children", !core->tree.node(tnode).is_leaf());
+    out.Set("trace_rev", core->tree.revision);
+    out.Set("trace_input_len", static_cast<Int>(usable));
+    out.Set("cached_len", static_cast<Int>(rec.position));
+    out.Set("node_id", static_cast<Int>(rec_node));
+    out.Set("base_ckpt", static_cast<Int>(rec.base_checkpoint_slot));
+    out.Set("log_slots", to_i32_tensor(ls));
+    out.Set("log_begins", to_i32_tensor(lb));
+    out.Set("log_ends", to_i32_tensor(le));
+    out.Set("conv_slot", static_cast<Int>(rec.conv_slot));
+    out.Set("conv_granule", static_cast<Int>(rec.conv_granule));
+    out.Set("recovery_slots", to_i32_tensor(rec_slots));
+    out.Set("kv_indices", kv_t);
+    out.Set("source_owner", static_cast<Int>(rec_node > 0 ? core->tree.node(rec_node).analysis_owner : -1));
+    return out;
+  });
+
+  reg(r, "acquire_prefill",
+      [core](Int uid, Int tnode, Int mlen, bool texact, bool tchildren, Int rnode, Int clen, Int bckpt,
+             tvm::ffi::TensorView rslots_t, Int total_len, bool has_adm,
+             const List& dec_rows_l, const List& dec_conf_l, Int gid, Int src_owner) -> Result {
+        auto rslots = from_i32_tensor(rslots_t);
+        Result out;
+        for (int32_t s : rslots) if (!core->tree.has_slot(s)) { out.Set("admitted", false); return out; }
+        auto dec_rows = from_list(dec_rows_l), dec_conf = from_list(dec_conf_l);
+        for (size_t i = 0; i < dec_rows.size(); ++i) {
+          if (dec_rows[i] >= 0 && dec_rows[i] < static_cast<int32_t>(core->req_states.size()))
+            core->req_states[dec_rows[i]].confirmed_decode_prefix_len = dec_conf[i];
         }
-        const auto &record = slot_info.at(slot);
-        credit += record.frames;
-        ++records[record.decay];
-      }
-      if (!feasible)
-        continue;
-      for (const auto &[frame, count] : records)
-        credit += decay_released[frame] + count == decay_occupied.at(frame);
-      if (credit > 0)
-        return true;
-    }
-    return false;
-  }
-  void push_node(Int index) {
-    if (index < 0 || !queue.is_leaf(index))
-      return;
-    const auto version = ++node_version[index];
-    if (has_node_merge(index) || has_node_materialization(index))
-      return;
-    const auto &order = order_keys[index];
-    const auto *p = model_data + index * kDensityFields;
-    const auto &density = densities.at(model_ids[index]);
-    double cost = 0., restored = p[7];
-    for (auto slot : ordered_slots[index]) {
-      if (released_set.contains(slot))
-        continue;
-      const auto &record = slot_info.at(slot);
-      if (record.checkpoint || record.begin == restored) {
-        cost += std::max(0., record.end - restored) *
-                density.mass(record.end, std::numeric_limits<double>::infinity());
-        restored = record.end;
-      }
-    }
-    const auto credit = prune_credit(index);
-    const auto score = credit ? cost / credit : std::numeric_limits<double>::infinity();
-    leaf_candidates.push({0., score, nodes[index][3], index, 0,
-                          version, score, order[0], order[1], order[2]});
-  }
-  void push_action(Int slot) {
-    const auto version = ++action_version[slot];
-    if (!actions.contains(slot) || released_set.contains(slot))
-      return;
-    const auto &action = actions.at(slot);
-    const auto right = successor(action[1]);
-    if (right < 0 || released_set.contains(right))
-      return;
-    const auto &left_record = slot_info.at(slot),
-               &right_record = slot_info.at(right);
-    const auto left_span = left_record.end - left_record.begin;
-    const auto right_span = right_record.end - right_record.begin;
-    const auto &density = densities.at(model_ids[action[3]]);
-    const auto distance = left_record.end - recovery_before(action[3], slot);
-    const auto cost = std::max(0., distance) * density.mass(left_record.end, right_record.end);
-    const auto credit = slot_credit(slot);
-    const auto score = credit ? cost / credit : std::numeric_limits<double>::infinity();
-    candidates.push({1., static_cast<double>(std::max(left_span, right_span)),
-                     action[2], slot, 1, version, score});
-  }
-  bool valid(const Candidate &c) {
-    if (c.kind == 0)
-      return c.version == node_version[c.id] && queue.is_leaf(c.id) &&
-             !has_node_merge(c.id) && !has_node_materialization(c.id);
-    if (!actions.contains(c.id) || c.version != action_version[c.id] || released_set.contains(c.id))
-      return false;
-    const auto right = successor(actions.at(c.id)[1]);
-    return right >= 0 && !released_set.contains(right);
-  }
-
-  std::optional<Candidate> pressure_materialization() {
-    std::optional<Candidate> best;
-    for (Int i = 0; i < static_cast<Int>(materializations.size()); ++i) {
-      const auto &row = materializations[i];
-      if (row.empty() || released_set.contains(row[0]) || released_set.contains(row.back()))
-        continue;
-      const auto start = materialization_starts[i];
-      if (std::any_of(row.begin() + 2, row.begin() + start, [&](Int source) {
-            return released_set.contains(-source - 2);
-          }))
-        continue;
-      const auto index = slot_node.at(row.back());
-      const auto begin = slot_info.at(row[start]).begin, end = slot_info.at(row.back()).end;
-      const auto &density = densities.at(model_ids[index]);
-      const bool absorb = row[1] < 0;
-      bool feasible = true;
-      Int credit = absorb ? 0 : -(config[2] + config[3]);
-      const auto replay_begin = row[0] < 0 ? 0 : slot_info.at(row[0]).end;
-      double cost = (end - replay_begin) * 1e-12;
-      if (absorb) {
-        const auto owner = slot_node.at(row[0]);
-        if (nodes[owner][2] != 0)
-          continue;
-        cost += std::max(0., begin - recovery_before(owner, row[0])) * density.mass(begin, end);
-      }
-      std::unordered_map<Int, Int> records;
-      for (size_t j = start; j < row.size(); ++j) {
-        const auto slot = row[j];
-        if (released_set.contains(slot) || nodes[slot_node.at(slot)][2] != 0) {
-          feasible = false;
-          break;
-        }
-        const auto &record = slot_info.at(slot);
-        credit += record.frames;
-        ++records[record.decay];
-        if (record.end < end)
-          cost += (record.end - begin) * density.mass(record.end, record.end + density.g);
-      }
-      if (!feasible || credit <= 0)
-        continue;
-      for (const auto &[frame, count] : records)
-        credit += decay_released[frame] + count == decay_occupied.at(frame);
-      const auto &order = order_keys[index];
-      Candidate candidate{0., cost / credit, nodes[index][3], i, 2, 0,
-                          cost / credit, order[0], order[1], order[2]};
-      if (!best || *best > candidate)
-        best = candidate;
-    }
-    return best;
-  }
-
-  template <typename Indices>
-  void load_models(const Indices &indices, tvm::ffi::TensorView models) {
-    check(models.ndim() == 1 && models.is_contiguous() &&
-              models.device().device_type == kDLCPU &&
-              models.dtype().code == kDLFloat && models.dtype().bits == 64,
-          "Invalid eviction density models");
-    const auto model_size = static_cast<Int>(indices.size() * kDensityFields);
-    check(models.size(0) == model_size, "Invalid eviction density models");
-    const auto *input = static_cast<const double *>(models.data_ptr());
-    for (size_t row = 0; row < indices.size(); ++row) {
-      const auto index = indices[row];
-      check(index >= 0 && index < static_cast<Int>(nodes.size()),
-            "Invalid eviction model index");
-      std::copy_n(input + row * kDensityFields, kDensityFields,
-                  model_storage.data() + index * kDensityFields);
-    }
-    densities.clear();
-    for (const auto i : indices) {
-      const auto *p = model_data + i * kDensityFields;
-      const auto id = static_cast<Int>(p[0]);
-      model_ids[i] = id;
-      if (densities.contains(id))
-        continue;
-      Density d;
-      d.origin = p[1];
-      d.tail = p[2];
-      d.atom = std::clamp(p[5], 0., 1.);
-      d.g = p[6];
-      check(d.g > 0 && std::isfinite(p[3]) && std::isfinite(p[4]),
-            "Invalid hit density");
-      const auto count =
-          std::max<Int>(1, static_cast<Int>((d.tail - p[1]) / d.g));
-      for (Int j = 1; j <= count; ++j) {
-        const auto a = j * d.g;
-        const auto mass = std::exp(p[4] - p[3] * std::log(a)) * d.g;
-        d.probability.push_back(d.probability.back() + mass);
-      }
-      const auto scale =
-          std::min(1., std::max(0., 1. - d.atom) / std::max(1e-300, d.probability.back()));
-      for (auto &v : d.probability)
-        v *= scale;
-      densities.emplace(id, std::move(d));
-    }
-  }
-
-  size_t materialization_start(const Vector &row) const {
-    check(row.size() >= 3 &&
-              (row[1] < 0 || slot_node.contains(row[1])) &&
-              slot_node.contains(row.back()) &&
-              (row[0] < 0 || (slot_info.contains(row[0]) && slot_info.at(row[0]).checkpoint)),
-          "Invalid pressure materialization");
-    check(row[1] >= 0 || (row[0] >= 0 && slot_node.at(row[0]) == slot_node.at(row.back())),
-          "Log tail absorption must stay inside one node");
-    auto cursor = row[0] < 0 ? 0 : slot_info.at(row[0]).end;
-    size_t start = 2;
-    for (; start < row.size() && row[start] < 0; ++start) {
-      const auto &record = slot_info.at(-row[start] - 2);
-      check(row[1] >= 0 && !record.checkpoint && record.begin == cursor,
-            "Invalid ancestor Log recovery");
-      cursor = record.end;
-    }
-    for (size_t j = start; j < row.size(); ++j) {
-      const auto &record = slot_info.at(row[j]);
-      check(!record.checkpoint && record.begin == cursor, "Noncontiguous pressure materialization");
-      cursor = record.end;
-    }
-    if (row[1] >= 0) {
-      const auto &tail = slot_info.at(row[1]);
-      check(!tail.checkpoint && tail.end >= cursor, "Invalid pressure materialization tail boundary");
-    }
-    return start;
-  }
-
-public:
-  EvictionPlanner(std::array<NodeRows, 7> groups, const List &capacity,
-                  tvm::ffi::TensorView models, const Rows &order)
-      : nodes(std::move(groups[0])), kv(std::move(groups[1])),
-        node_slots(std::move(groups[2])), config(capacity), queue(nodes),
-        node_version(nodes.size()), ordered_slots(nodes.size()),
-        materializations(std::move(groups[6])) {
-    auto &slots = groups[3];
-    const auto &occupied = groups[4];
-    auto &checkpoint_actions = groups[5];
-    for (const auto &row : order)
-      order_keys.emplace_back(row.begin(), row.end());
-    check(order_keys.size() == nodes.size(),
-          "Invalid eviction ordering metadata");
-    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i)
-      owner_nodes[order_keys[i][1]].push_back(i);
-    check(nodes.size() == kv.size() && nodes.size() == node_slots.size() &&
-              config.size() == 10 && config[5] > 0,
-          "Invalid eviction capacity metadata");
-    for (auto &row : slots) {
-      const auto record = read_slot(row);
-      slot_info.emplace(row[0], record);
-    }
-    for (const auto &row : occupied) {
-      check(row.size() == 2 && row[1] > 0 && row[1] <= config[5],
-            "Invalid decay occupancy");
-      decay_occupied.emplace(row[0], row[1]);
-    }
-    model_ids.resize(nodes.size());
-    model_storage.resize(nodes.size() * kDensityFields);
-    model_data = model_storage.data();
-    Vector indices(nodes.size());
-    std::iota(indices.begin(), indices.end(), 0);
-    load_models(indices, models);
-    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-      bool ordered = true;
-      auto end = std::numeric_limits<Int>::min();
-      for (auto slot : node_slots[i]) {
-        slot_node.emplace(slot, i);
-        const auto next_end = slot_info.at(slot).end;
-        ordered &= end < next_end;
-        end = next_end;
-      }
-      auto &ordered_row = ordered_slots[i];
-      ordered_row = node_slots[i];
-      if (!ordered)
-        std::sort(ordered_row.begin(), ordered_row.end(), [&](Int a, Int b) {
-          return slot_info.at(a).end < slot_info.at(b).end;
-        });
-    }
-    node_materializations.resize(nodes.size());
-    for (size_t id = 0; id < materializations.size(); ++id) {
-      const auto &row = materializations[id];
-      materialization_starts.push_back(materialization_start(row));
-      node_materializations[slot_node.at(row.back())].push_back(id);
-    }
-    for (auto &row : checkpoint_actions) {
-      check(row.size() >= 4, "Invalid checkpoint eviction action");
-      check(slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
-            "Checkpoint action has an invalid owner");
-      check(row[1] < 0 || (slot_node.contains(row[1]) &&
-                           slot_node.at(row[0]) == slot_node.at(row[1])),
-            "Checkpoint merging must stay inside one node");
-      const auto slot = row[0], right = row[1];
-      actions.emplace(slot, std::move(row));
-      if (right >= 0)
-        previous[right] = slot;
-    }
-    for (Int i = 0; i < static_cast<Int>(nodes.size()); ++i) {
-      for (size_t j = 0; j < kv[i].size(); j += 3)
-        kv_users[kv[i][j]].push_back(i);
-      for (auto slot : node_slots[i])
-        if (slot_info.at(slot).decay >= 0)
-          decay_users[slot_info.at(slot).decay].push_back(i);
-    }
-    for (const auto index : queue.leaves())
-      push_node(index);
-    for (const auto &[slot, action] : actions)
-      push_action(slot);
-  }
-  bool replace_materialized_node(Int index, Int timestamp, const Rows &records,
-                                 const Rows &checkpoint_rows, const Rows &frontiers,
-                                 const Rows &groups) {
-    if (!pages.empty() || !queue.can_materialize(index))
-      return false;
-
-    remove_node_slots(index);
-    install_node_slots(index, records);
-    install_checkpoint_actions(checkpoint_rows);
-    size_t first = 0;
-    for (const auto &row : frontiers) {
-      check(row.size() == 3 && row[0] >= 0 && row[0] < static_cast<Int>(nodes.size()) &&
-                row[2] >= 0 && row[2] <= static_cast<Int>(groups.size() - first),
-            "Invalid replacement recovery frontier");
-      const auto owner = row[0];
-      set_materializations(owner, groups, first, row[2]);
-      first += row[2];
-      if (model_storage[owner * kDensityFields + 7] != row[1]) {
-        model_storage[owner * kDensityFields + 7] = row[1];
-        push_node(owner);
-        for (const auto slot : node_slots[owner])
-          if (actions.contains(slot)) push_action(slot);
-      }
-    }
-    check(first == groups.size(), "Unexpected replacement materializations");
-
-    nodes[index][3] = timestamp;
-    push_node(index);
-    for (const auto slot : node_slots[index])
-      if (actions.contains(slot))
-        push_action(slot);
-    return true;
-  }
-
-  void remove_node_slots(Int index) {
-    auto &slots = node_slots[index];
-    for (const auto slot : slots) {
-      const auto frame = slot_info.at(slot).decay;
-      if (frame >= 0)
-        std::erase(decay_users.at(frame), index);
-      ++action_version[slot];
-      actions.erase(slot);
-      successors.erase(slot);
-      previous.erase(slot);
-      released_set.erase(slot);
-      slot_node.erase(slot);
-      slot_info.erase(slot);
-    }
-    slots.clear();
-    ordered_slots[index].clear();
-  }
-
-  template <typename Records>
-  void install_node_slots(Int index, const Records &records) {
-    auto &slots = node_slots[index];
-    for (const auto &row : records) {
-      const auto record = read_slot(row);
-      const auto slot = row[0], frame = record.decay;
-      check(!slot_node.contains(slot),
-            "Invalid replacement slot ownership");
-      slots.push_back(slot);
-      slot_node.emplace(slot, index);
-      slot_info.emplace(slot, record);
-      if (frame >= 0)
-        decay_users[frame].push_back(index);
-    }
-    ordered_slots[index] = slots;
-  }
-
-  template <typename Checkpoints>
-  void install_checkpoint_actions(const Checkpoints &checkpoint_rows) {
-    for (const auto &row : checkpoint_rows) {
-      check(row.size() == 4 && slot_node.at(row[0]) == row[3] &&
-                (row[1] < 0 || slot_node.at(row[1]) == row[3]),
-            "Invalid replacement checkpoint action");
-      actions.emplace(row[0], Vector(row.begin(), row.end()));
-      if (row[1] >= 0)
-        previous[row[1]] = row[0];
-    }
-  }
-
-  void set_materializations(Int index, const Rows &groups, size_t first, size_t count) {
-    auto &ids = node_materializations[index];
-    while (ids.size() < count) {
-      ids.push_back(materializations.size());
-      materializations.emplace_back();
-      materialization_starts.push_back(0);
-    }
-    for (size_t i = 0; i < count; ++i) {
-      const auto id = ids[i];
-      const auto &source = groups[first + i];
-      auto &row = materializations[id];
-      row.assign(source.begin(), source.end());
-      materialization_starts[id] = materialization_start(row);
-      check(slot_node.at(row.back()) == index, "Invalid replacement materialization owner");
-    }
-    for (size_t i = count; i < ids.size(); ++i)
-      materializations[ids[i]].clear();
-  }
-
-  void rebase(Int size, const List &removed, const Rows &rows, const List &indices,
-              tvm::ffi::TensorView models, const Rows &order) {
-    check(size >= static_cast<Int>(nodes.size()) && !rows.empty() &&
-              order.size() == indices.size(),
-          "Invalid eviction rebase");
-    const auto &header = rows[0];
-    check(header.size() == 5, "Invalid eviction rebase header");
-    const auto nodes_count = header[0], actions_count = header[1], groups_count = header[2];
-    const auto occupancy_count = header[3], kv_count = header[4];
-    check(nodes_count >= 0 && actions_count >= 0 && groups_count >= 0 &&
-              occupancy_count >= 0 && kv_count >= 0 &&
-              1 + 4 * nodes_count + actions_count + groups_count + occupancy_count + kv_count ==
-                  static_cast<Int>(rows.size()),
-          "Invalid eviction rebase metadata");
-    nodes.resize(size);
-    node_slots.resize(size);
-    ordered_slots.resize(size);
-    node_materializations.resize(size);
-    kv.resize(size);
-    order_keys.resize(size);
-    node_version.resize(size);
-    model_ids.resize(size);
-    model_storage.resize(size * kDensityFields);
-    model_data = model_storage.data();
-
-    auto clear_node = [&](Int index) {
-      check(index >= 0 && index < size, "Invalid eviction rebase node");
-      remove_node_slots(index);
-      for (size_t j = 0; j < kv[index].size(); j += 3)
-        std::erase(kv_users.at(kv[index][j]), index);
-      kv[index].clear();
-      nodes[index].clear();
-      set_materializations(index, {}, 0, 0);
-    };
-    for (const auto index : removed)
-      clear_node(index);
-    for (Int i = 0; i < nodes_count; ++i) {
-      const auto &row = rows[1 + i * 4];
-      check(row.size() == 4, "Invalid replacement topology");
-      clear_node(row[0]);
-    }
-    for (Int i = 0; i < nodes_count; ++i) {
-      const auto first = 1 + i * 4;
-      const auto &row = rows[first];
-      const auto index = row[0];
-      nodes[index].assign(row.begin(), row.end());
-      const auto &kv_row = rows[first + 1];
-      check(kv_row.size() % 3 == 0, "Invalid replacement KV metadata");
-      kv[index].assign(kv_row.begin(), kv_row.end());
-      for (size_t j = 0; j < kv_row.size(); j += 3)
-        kv_users[kv_row[j]].push_back(index);
-      const auto &slot_row = rows[first + 2];
-      check(slot_row.size() % kSlotRecordSize == 0, "Invalid replacement slot metadata");
-      for (size_t j = 0; j < slot_row.size(); j += kSlotRecordSize) {
-        const auto record = read_slot(slot_row, j);
-        const auto slot = slot_row[j], frame = record.decay;
-        check(slot_node.emplace(slot, index).second, "Duplicate replacement slot");
-        node_slots[index].push_back(slot);
-        slot_info.emplace(slot, record);
-        if (frame >= 0)
-          decay_users[frame].push_back(index);
-      }
-      ordered_slots[index] = node_slots[index];
-    }
-    const auto action_first = 1 + 4 * nodes_count;
-    const auto group_first = action_first + actions_count;
-    const auto occupied_first = group_first + groups_count;
-    const auto kv_first = occupied_first + occupancy_count;
-    install_checkpoint_actions(Rows(rows.begin() + action_first, rows.begin() + group_first));
-    size_t group = group_first;
-    for (Int i = 0; i < nodes_count; ++i) {
-      const auto &count = rows[4 + i * 4];
-      check(count.size() == 1 && count[0] >= 0 &&
-                count[0] <= static_cast<Int>(occupied_first - group),
-            "Invalid replacement group count");
-      set_materializations(rows[1 + i * 4][0], rows, group, count[0]);
-      group += count[0];
-    }
-    check(group == static_cast<size_t>(occupied_first), "Unexpected replacement groups");
-    decay_occupied.clear();
-    for (Int i = occupied_first; i < kv_first; ++i) {
-      const auto &row = rows[i];
-      decay_occupied.emplace(row[0], row[1]);
-    }
-    for (Int i = kv_first; i < static_cast<Int>(rows.size()); ++i) {
-      const auto &row = rows[i];
-      const auto found = kv_users.find(row[0]);
-      if (found == kv_users.end())
-        continue;
-      for (const auto index : found->second)
-        for (size_t j = 0; j < kv[index].size(); j += 3)
-          if (kv[index][j] == row[0]) {
-            kv[index][j + 2] = row[1];
-            break;
+        if (!has_adm) {
+          int32_t avail = core->admission_capacity();
+          if (core->alloc->free_frames_count() < total_len && total_len <= avail) {
+            auto [kvf, lks] = core->tree.lock_footprint(static_cast<int32_t>(rnode), static_cast<int32_t>(clen));
+            for (int32_t s : rslots) if (core->tree.is_evictable_slot(s)) lks.push_back(s);
+            std::sort(lks.begin(), lks.end()); lks.erase(std::unique(lks.begin(), lks.end()), lks.end());
+            avail -= kvf + core->alloc->lock_frame_cost(lks);
           }
-    }
-    pages.clear();
-    decay_released.clear();
-    released_set.clear();
-    successors.clear();
-    previous.clear();
-    for (const auto &[slot, action] : actions)
-      if (action[1] >= 0) previous[action[1]] = slot;
-    pending_depths.clear();
-    owner_nodes.clear();
-    for (size_t i = 0; i < indices.size(); ++i) {
-      const auto index = indices[i];
-      const auto &row = order[i];
-      order_keys[index].assign(row.begin(), row.end());
-      owner_nodes[row[1]].push_back(index);
-    }
-    queue.reset();
-    refresh_models(indices, models);
-  }
-
-  void update_locks(Int num_blocked, const Rows &rows) {
-    check(num_blocked > 0 && num_blocked <= static_cast<Int>(rows.size()),
-          "Invalid eviction lock update");
-    for (Int i = 0; i < num_blocked; ++i) {
-      const auto &row = rows[i];
-      check(row.size() == 2 && row[0] >= 0 && row[0] < static_cast<Int>(nodes.size()),
-            "Invalid eviction lock metadata");
-      const auto index = row[0];
-      nodes[index][2] = row[1];
-      queue.update(index);
-      for (const auto slot : node_slots[index]) {
-        ++action_version[slot];
-        actions.erase(slot);
-        previous.erase(slot);
-        successors.erase(slot);
-      }
-    }
-    for (Int i = num_blocked; i < static_cast<Int>(rows.size()); ++i) {
-      const auto &row = rows[i];
-      check(row.size() == 4 && slot_node.contains(row[0]) && slot_node.at(row[0]) == row[3],
-            "Invalid checkpoint lock metadata");
-      actions.emplace(row[0], Vector(row.begin(), row.end()));
-      if (row[1] >= 0) previous[row[1]] = row[0];
-    }
-    for (Int i = 0; i < num_blocked; ++i) {
-      const auto index = rows[i][0];
-      push_node(index);
-      for (const auto slot : node_slots[index])
-        if (actions.contains(slot)) push_action(slot);
-    }
-  }
-  void refresh_models(const List &indices, tvm::ffi::TensorView models) {
-    load_models(indices, models);
-    for (const auto &[owner, depth] : pending_depths)
-      for (const auto index : owner_nodes[owner])
-        order_keys[index][0] = depth;
-    pending_depths.clear();
-    candidates.begin_update();
-    leaf_candidates.begin_update();
-    for (const auto index : queue.leaves())
-      push_node(index);
-    for (const auto &[slot, action] : actions)
-      push_action(slot);
-    candidates.finish_update();
-    leaf_candidates.finish_update();
-  }
-  template <typename Occupancy>
-  tvm::ffi::Tensor plan(const List &capacity, const Occupancy &occupancy,
-                       tvm::ffi::TensorView active_geometry, tvm::ffi::TensorView active_models) {
-    check(capacity.size() == 10, "Invalid eviction capacity metadata");
-    config = capacity;
-    free = config[0];
-    decay = config[1];
-    kv_free = 0;
-    selected.clear();
-    released.clear();
-    compressed.clear();
-    page_order.clear();
-    page_delta.clear();
-    for (const auto &row : occupancy) {
-      const auto frame = row[0], count = row[1] + decay_released[frame];
-      if (decay_occupied.at(frame) == count)
-        continue;
-      decay_occupied[frame] = count;
-      for (const auto user : decay_users[frame]) {
-        push_node(user);
-        for (const auto slot : node_slots[user])
-          if (!released_set.contains(slot) && actions.contains(slot))
-            push_action(slot);
-      }
-    }
-    for (const auto &[owner, depth] : pending_depths)
-      for (const auto index : owner_nodes[owner]) {
-        order_keys[index][0] = depth;
-        push_node(index);
-      }
-    pending_depths.clear();
-    if (fits())
-      return result();
-    const auto active = active_costs(active_geometry, active_models);
-    std::optional<Candidate> active_action;
-    auto valid_active = [&](const ActiveCandidate &candidate) {
-      return std::none_of(candidate.begin, candidate.end, [&](Int slot) {
-        return released_set.contains(slot);
+          if (total_len > avail) { out.Set("admitted", false); return out; }
+        }
+        core->tree.pin_recovery(rslots, false);
+        if (clen > 0) core->tree.lock(static_cast<int32_t>(rnode), false, static_cast<int32_t>(clen));
+        int32_t avail = core->admission_capacity();
+        bool ok = (total_len <= avail) ||
+                  (has_adm && !dec_rows.empty() &&
+                   total_len <= avail + core->planner.active_reclaimable_frames(core->req_states, dec_rows, core->protected_prefixes));
+        if (!ok) {
+          if (clen > 0) core->tree.lock(static_cast<int32_t>(rnode), true, static_cast<int32_t>(clen));
+          core->tree.pin_recovery(rslots, true);
+          out.Set("admitted", false);
+          return out;
+        }
+        int32_t fn = static_cast<int32_t>(rnode);
+        if (clen > 0 && core->tree.node(fn).depth > clen) fn = core->tree.node_at_depth(fn, static_cast<int32_t>(clen));
+        if (mlen > 0 && (!texact || tchildren)) {
+          int32_t tn = static_cast<int32_t>(tnode);
+          if (core->tree.node(tn).alive && mlen <= core->tree.node(tn).depth) {
+            core->tree.protect_at(tn, static_cast<int32_t>(mlen));
+            core->protected_prefixes[uid].push_back(static_cast<int32_t>(mlen));
+          }
+        }
+        if (clen > 0) core->tree.touch_path(fn, static_cast<int32_t>(bckpt));
+        int32_t owner = -1;
+        if (core->reuse.enabled) {
+          if (core->sampled_queries.insert(uid).second)
+            core->reuse.record_query(core->tree, static_cast<int32_t>(tnode), static_cast<int32_t>(mlen), gid);
+          owner = (src_owner > 0) ? static_cast<int32_t>(src_owner)
+                                  : core->reuse.new_chain(static_cast<int32_t>(clen), gid);
+        }
+        out.Set("admitted", true);
+        out.Set("node_id", static_cast<Int>(fn));
+        out.Set("analysis_owner", static_cast<Int>(owner));
+        return out;
       });
-    };
-    auto discard_stale = [&](CandidateQueue &heap) {
-      while (!heap.empty() && !valid(heap.top()))
-        heap.pop();
-    };
-    while (true) {
-      const auto materialize = pressure_materialization();
-      discard_stale(candidates);
-      if (!active_action || !valid_active(active[active_action->id])) {
-        active_action.reset();
-        for (Int i = 0; i < static_cast<Int>(active.size()); ++i) {
-          if (!valid_active(active[i]))
-            continue;
-          const auto score = active[i].score();
-          Candidate candidate{0., score, std::numeric_limits<Int>::max(), i, 3, 0, score};
-          if (!active_action || *active_action > candidate)
-            active_action = candidate;
-        }
-      }
-      auto conversion = materialize;
-      if (active_action && (!conversion || active_action->score < conversion->score))
-        conversion = active_action;
-      CandidateQueue *selected_queue = nullptr;
-      std::optional<Candidate> merge;
-      if (!candidates.empty()) {
-        selected_queue = &candidates;
-        merge = candidates.top();
-        merge->phase = 0.;
-        merge->score = merge->cost_score;
-      }
-      discard_stale(leaf_candidates);
-      if (!leaf_candidates.empty() && (!merge || *merge > leaf_candidates.top())) {
-        selected_queue = &leaf_candidates;
-        merge = leaf_candidates.top();
-      }
-      if (conversion && (!merge || !(*conversion > *merge))) {
-        return conversion->kind == 3 ? result(nullptr, conversion->id, &active[conversion->id]) :
-                                       result(&materializations[conversion->id]);
-      }
-      if (!selected_queue)
-        break;
-      const auto c = selected_queue->top();
-      selected_queue->pop();
-      if (c.kind == 0) {
-        if (c.version != node_version[c.id] || !queue.is_leaf(c.id))
-          continue;
-        const auto parent = queue.take(c.id);
-        prune(c.id);
-        if (parent >= 0 && order_keys[c.id][1] >= 0 &&
-            order_keys[parent][1] == order_keys[c.id][1])
-          pending_depths[order_keys[c.id][1]] = order_keys[c.id][2];
-        push_node(parent);
-        for (size_t j = 0; j < kv[c.id].size(); j += 3)
-          for (const auto user : kv_users[kv[c.id][j]])
-            push_node(user);
-        for (const auto slot : node_slots[c.id]) {
-          if (actions.contains(slot)) {
-            const auto right = successor(actions.at(slot)[1]);
-            successors[slot] = -1;
-            if (previous.contains(slot))
-              push_action(previous.at(slot));
-            if (right >= 0)
-              previous.erase(right);
+
+  reg(r, "begin_prefill_admission",
+      [core](const List& dr, const List& dcan, const List& ir, const List& ipe, const List& iml, const List& irem) -> Int {
+        int32_t res = 0;
+        for (size_t i = 0; i < dr.size(); ++i) {
+          if (!dcan[i]) continue;
+          const auto& st = core->req_states[static_cast<int32_t>(dr[i])];
+          int32_t b = st.live_granules.empty() ? st.handle_cached_len : st.live_granules.back().end;
+          bool rec_ok = (st.compacted_end > 0 || st.handle_cached_len == 0) ||
+                        (core->tree.recovery_at(st.handle_node_id, st.handle_cached_len).position == st.handle_cached_len);
+          if (rec_ok) res += core->decode_reservation(b, st.request_end, st.compacted_end > 0);
+          else {
+            int32_t pages = std::max<int32_t>(0, LogStateCore::div_ceil(st.request_end, core->tree.page_size) -
+                                                     LogStateCore::div_ceil(b, core->tree.page_size));
+            res += core->alloc->required_frames(pages, pages, 0, 0);
           }
-          const auto frame = slot_info.at(slot).decay;
-          if (frame >= 0)
-            for (const auto user : decay_users[frame])
-              push_node(user);
         }
-      } else {
-        if (!actions.contains(c.id) || c.version != action_version[c.id] || released_set.contains(c.id))
-          continue;
-        const auto right = successor(actions.at(c.id)[1]);
-        if (right < 0 || released_set.contains(right))
-          continue;
-        compressed.insert(compressed.end(), {c.id, right});
-        slot_info.at(right).begin = slot_info.at(c.id).begin;
-        successors[c.id] = right;
-        release(c.id);
-        if (previous.contains(c.id)) {
-          previous[right] = previous.at(c.id);
-          push_action(previous.at(c.id));
-        } else
-          previous.erase(right);
-        push_action(right);
-        push_node(slot_node.at(c.id));
-        push_node(slot_node.at(right));
+        for (size_t i = 0; i < ir.size(); ++i) {
+          int32_t row = static_cast<int32_t>(ir[i]);
+          const auto& st = core->req_states[row];
+          int32_t b = st.live_granules.empty() ? st.handle_cached_len : st.live_granules.back().end;
+          int32_t pe = static_cast<int32_t>(ipe[i]);
+          int32_t prompt = core->reservation_size(static_cast<int32_t>(irem[i]), 0, row, pe);
+          res += core->prefill_peak(b, pe, static_cast<int32_t>(iml[i]), prompt, false);
+        }
+        return res;
+      });
+
+  reg(r, "request_prefill_peak", [core](Int prev_row, Int hclen, Int ilen, Int olen) -> Int {
+    const bool is_new = (prev_row < 0);
+    int32_t b = is_new ? static_cast<int32_t>(hclen)
+                       : (core->req_states[static_cast<int32_t>(prev_row)].live_granules.empty()
+                              ? core->req_states[static_cast<int32_t>(prev_row)].handle_cached_len
+                              : core->req_states[static_cast<int32_t>(prev_row)].live_granules.back().end);
+    int32_t end = static_cast<int32_t>(ilen + olen);
+    int32_t prompt = core->reservation_size(end - b, static_cast<int32_t>(hclen),
+                                            static_cast<int32_t>(prev_row), static_cast<int32_t>(ilen));
+    return core->prefill_peak(b, static_cast<int32_t>(ilen), end, prompt, is_new);
+  });
+
+  reg(r, "init_request",
+      [core](Int row_i, Int uid, Int wslot, Int clen, Int req_end, Int hnid, Int owner,
+             const List& prots, Int tnode, Int tlen, Int tilen, Int trev, Int, Int, Int) {
+        int32_t row = static_cast<int32_t>(row_i);
+        core->ensure_req_slot(row);
+        auto& st = core->req_states[row];
+        check(!st.active, "table_idx already active");
+        st = ActiveRequestState{};
+        st.active = true; st.table_idx = row; st.req_uid = uid;
+        st.work_slot = static_cast<int32_t>(wslot);
+        st.work_committed_pos = st.handle_cached_len = static_cast<int32_t>(clen);
+        st.request_end = static_cast<int32_t>(req_end);
+        st.handle_node_id = static_cast<int32_t>(hnid);
+        st.analysis_owner = static_cast<int32_t>(owner);
+        st.protected_endpoints = from_list(prots);
+        core->pending[row] = {static_cast<int32_t>(clen), static_cast<int32_t>(hnid),
+                              static_cast<int32_t>(tnode), static_cast<int32_t>(tlen),
+                              static_cast<int32_t>(tilen), trev};
+      });
+
+  reg(r, "try_allocate_batch",
+      [core](const List& rows, const List& dev_lens, const List& max_lens, const List& clens, Int pt_w_i) -> Result {
+        const int32_t ps = core->tree.page_size, pt_w = static_cast<int32_t>(pt_w_i);
+        std::vector<std::tuple<int32_t, int32_t, int32_t, int32_t>> info;
+        std::vector<int32_t> fresh_works;
+        int32_t needed = 0;
+        for (size_t i = 0; i < rows.size(); ++i) {
+          int32_t row = static_cast<int32_t>(rows[i]), dl = static_cast<int32_t>(dev_lens[i]);
+          int32_t ml = static_cast<int32_t>(max_lens[i]), cl = static_cast<int32_t>(clens[i]);
+          auto& st = core->req_states[row];
+          st.request_end = ml;
+          int32_t b = st.live_granules.empty() ? cl : st.live_granules.back().end;
+          if (dl > b) {
+            int32_t count = 1 + (std::max<int32_t>(0, dl - b - (ps - (b % ps))) + ps - 1) / ps;
+            info.emplace_back(row, b, count, ml);
+            needed += count;
+          }
+          auto pit = core->pending.find(row);
+          if (cl == 0 && (pit == core->pending.end() || pit->second.position == 0)) fresh_works.push_back(st.work_slot);
+        }
+        Result out;
+        out.Set("fresh_work_slots", to_i32_tensor(fresh_works));
+        out.Set("needed", static_cast<Int>(needed));
+        if (needed == 0) { out.Set("ok", true); return out; }
+        auto res = core->alloc->reserve(needed, needed, 0);
+        if (!res.ok) { out.Set("ok", false); return out; }
+        auto regions_t = make_i32_2d(needed, 5);
+        auto* rptr = static_cast<int32_t*>(regions_t.data_ptr());
+        int32_t off = 0;
+        for (const auto& [row, begin, count, ml] : info) {
+          auto& lgs = core->req_states[row].live_granules;
+          for (int32_t k = 0, lb = begin; k < count; ++k) {
+            int32_t le = ((lb / ps) + 1) * ps, kvo = res.kv_frames[off] * ps, ss = res.log_slots[off];
+            lgs.push_back({lb, le, kvo, ss, -1});
+            int32_t* regp = rptr + off++ * 5;
+            regp[0] = row; regp[1] = lb; regp[2] = std::min({le, ml, pt_w}); regp[3] = kvo; regp[4] = ss;
+            lb = le;
+          }
+        }
+        auto p_t = make_i32_tensor(needed * core->alloc->descriptor_frames);
+        auto c_t = make_i32_tensor(needed * core->alloc->num_granules * core->alloc->conv_frames);
+        auto d_t = make_i32_tensor(needed * 2);
+        core->alloc->pack_descriptors(res.log_slots, static_cast<int32_t*>(p_t.data_ptr()),
+                                      static_cast<int32_t*>(c_t.data_ptr()), static_cast<int32_t*>(d_t.data_ptr()));
+        out.Set("ok", true); out.Set("regions", regions_t);
+        out.Set("slot_indices", to_i32_tensor(res.log_slots));
+        out.Set("payload", p_t); out.Set("conv", c_t); out.Set("decay", d_t);
+        return out;
+      });
+
+  reg(r, "plan_and_apply_eviction",
+      [core](Int np, Int ns, Int nw, const List& dr_l, const List& dc_l, const List& dcan_l) -> Result {
+        auto dr = from_list(dr_l), dc = from_list(dc_l);
+        std::vector<int32_t> active_rows;
+        for (size_t i = 0; i < dr.size(); ++i) {
+          if (dr[i] >= 0 && dr[i] < static_cast<int32_t>(core->req_states.size()) && core->req_states[dr[i]].active) {
+            core->req_states[dr[i]].confirmed_decode_prefix_len = dc[i];
+            if (dcan_l[i]) { core->req_states[dr[i]].is_decode_active = true; active_rows.push_back(dr[i]); }
+          }
+        }
+        for (const auto& st : core->req_states) {
+          if (st.active && st.is_decode_active &&
+              std::find(active_rows.begin(), active_rows.end(), st.table_idx) == active_rows.end())
+            active_rows.push_back(st.table_idx);
+        }
+        std::sort(active_rows.begin(), active_rows.end());
+        std::vector<ActiveCompactionAction> active_cands;
+        if (!active_rows.empty())
+          active_cands = core->planner.compute_active_candidates(core->req_states, active_rows, core->protected_prefixes, true);
+        auto plan = core->planner.plan(static_cast<int32_t>(np), static_cast<int32_t>(ns), static_cast<int32_t>(nw), active_cands);
+        Result out;
+        out.Set("ok", plan.ok);
+        if (!plan.ok) return out;
+
+        int64_t ev_toks = 0, pr_ckpts = 0;
+        for (const auto& [l, rr] : plan.checkpoint_drops) core->tree.drop_checkpoint(l, rr);
+        for (int32_t nid : plan.pruned_nodes) {
+          const auto& n = core->tree.node(nid);
+          ev_toks += n.length;
+          pr_ckpts += static_cast<int64_t>(n.checkpoint_slots.size());
+          core->tree.prune_leaf(nid);
+        }
+        core->release_cached_kv(plan.kv_releases);
+        ++core->stat_eviction_rounds;
+        core->stat_pressure_dropped_checkpoints += static_cast<int64_t>(plan.checkpoint_drops.size());
+        core->stat_pressure_pruned_checkpoints += pr_ckpts;
+        core->stat_evicted_kv_tokens += ev_toks;
+        core->stat_released_slots_eviction += static_cast<int64_t>(plan.retired_slots.size());
+
+        out.Set("retired_slots", to_i32_tensor(plan.retired_slots));
+        out.Set("has_materialization", !plan.materialization.empty());
+        if (!plan.materialization.empty()) {
+          const auto& row = plan.materialization;
+          int32_t base = row[0]; bool absorb = (row[1] < 0);
+          size_t fs = 2; while (fs < row.size() && row[fs] < 0) ++fs;
+          std::vector<int32_t> ls, ll, slots;
+          for (size_t j = 2; j < fs; ++j) {
+            int32_t s = -row[j] - 2; const auto& e = core->tree.entry_for_slot(s);
+            ls.push_back(s); ll.push_back(e.end - e.begin);
+          }
+          int32_t fb = core->tree.entry_for_slot(row[fs]).begin, le = core->tree.entry_for_slot(row.back()).end;
+          int32_t onid = core->tree.slot_owner(row.back()); int64_t ots = core->tree.node(onid).timestamp;
+          for (size_t j = fs; j < row.size(); ++j) {
+            int32_t s = row[j]; const auto& e = core->tree.entry_for_slot(s);
+            ls.push_back(s); ll.push_back(e.end - e.begin); slots.push_back(s);
+          }
+          int32_t begin = absorb ? core->tree.entry_for_slot(base).begin : fb;
+          int32_t dest = absorb ? base : slots.back();
+          for (int32_t s : slots) core->tree.detach_entry(s);
+          if (absorb) core->tree.detach_entry(base);
+          Result mcmd;
+          mcmd.Set("base", static_cast<Int>(base)); mcmd.Set("absorb", absorb);
+          mcmd.Set("owner_nid", static_cast<Int>(onid)); mcmd.Set("owner_ts", ots);
+          mcmd.Set("dest", static_cast<Int>(dest)); mcmd.Set("begin", static_cast<Int>(begin));
+          mcmd.Set("end", static_cast<Int>(le));
+          mcmd.Set("slots", to_i32_tensor(slots)); mcmd.Set("log_slots", to_i32_tensor(ls));
+          mcmd.Set("log_lens", to_i32_tensor(ll));
+          out.Set("mat_cmd", mcmd);
+        }
+        out.Set("has_active", plan.active_action.has_value());
+        if (plan.active_action.has_value()) {
+          const auto& act = *plan.active_action;
+          auto& st = core->req_states[act.table_idx]; auto& lgs = st.live_granules;
+          std::vector<int32_t> sources, ls, ll;
+          for (size_t i = 0; i + 1 < act.indices.size(); ++i) {
+            sources.push_back(lgs[act.indices[i]].state_slot);
+            lgs[act.indices[i]].state_slot = lgs[act.indices[i]].checkpoint_begin = -1;
+          }
+          int32_t last_s = lgs[act.indices.back()].state_slot;
+          int32_t fb = lgs[act.indices.front()].begin, le = lgs[act.indices.back()].end;
+          lgs[act.indices.back()].checkpoint_begin = act.begin;
+          st.compacted_end = std::max(st.compacted_end, le);
+          for (const auto& [s, b, e] : act.logs) { ls.push_back(s); ll.push_back(e - b); }
+          Result acmd;
+          acmd.Set("table_idx", static_cast<Int>(act.table_idx)); acmd.Set("base", static_cast<Int>(act.base_slot));
+          acmd.Set("first_begin", static_cast<Int>(fb)); acmd.Set("last_end", static_cast<Int>(le));
+          acmd.Set("sources", to_i32_tensor(sources)); acmd.Set("last_slot", static_cast<Int>(last_s));
+          acmd.Set("log_slots", to_i32_tensor(ls)); acmd.Set("log_lens", to_i32_tensor(ll));
+          out.Set("active_cmd", acmd);
+        }
+        return out;
+      });
+
+  reg(r, "finish_pressure_materialization", [core](Int onid, Int dest, Int b, Int e, Int ots) {
+    StateEntry cp{static_cast<int32_t>(dest), EntryKind::kCheckpoint, static_cast<int32_t>(b),
+                  static_cast<int32_t>(e), static_cast<int32_t>((e - b) / core->tree.granularity), 0};
+    core->tree.attach_entry(static_cast<int32_t>(onid), cp, ots);
+  });
+
+  reg(r, "prepare_decode_replay_counts", [core](const List& rows, const List& clens, Int pad_sz, Int rw) -> List {
+    std::vector<Int> counts;
+    counts.reserve(static_cast<size_t>(pad_sz));
+    for (size_t i = 0; i < rows.size(); ++i) {
+      auto& st = core->req_states[static_cast<int32_t>(rows[i])];
+      int32_t cl = static_cast<int32_t>(clens[i]);
+      const auto& lgs = st.live_granules;
+      check(!lgs.empty(), "Decode token has no LogState granule");
+      int32_t cur = std::min<int32_t>(st.live_granule_cursor, static_cast<int32_t>(lgs.size()) - 1), idx = -1;
+      if (lgs[cur].begin <= cl && cl < lgs[cur].end) idx = cur;
+      else if (lgs.back().begin <= cl && cl < lgs.back().end) idx = static_cast<int32_t>(lgs.size()) - 1;
+      else {
+        int32_t j = (cl < lgs[cur].begin) ? 0 : cur;
+        while (j < static_cast<int32_t>(lgs.size()) && lgs[j].end <= cl) ++j;
+        if (j < static_cast<int32_t>(lgs.size()) && lgs[j].begin <= cl) idx = j;
       }
-      if (fits()) {
-        return result();
+      check(idx >= 0, "Decode token has no LogState granule");
+      st.live_granule_cursor = idx;
+      int32_t cnt = cl - st.work_committed_pos;
+      check(cnt >= 0 && cnt < rw, "Invalid replay count");
+      counts.push_back(cnt);
+      if ((cl - lgs[idx].begin + 1) % rw == 0) st.work_committed_pos = cl + 1;
+    }
+    counts.resize(static_cast<size_t>(pad_sz), 0);
+    return List(counts.begin(), counts.end());
+  });
+
+  reg(r, "prepare_prefill_protections",
+      [core](const List& rows, const List& uids, const tvm::ffi::Array<tvm::ffi::Tensor>& inputs) {
+        const int32_t gr = core->tree.granularity;
+        std::vector<std::vector<int32_t>> scratches(inputs.size());
+        std::vector<std::pair<const int32_t*, int32_t>> views;
+        std::vector<RadixTrace> traces;
+        std::vector<std::pair<int32_t, int32_t>> forced;
+        for (size_t i = 0; i < inputs.size(); ++i) {
+          const int32_t* p = cpu_i32(inputs[i], scratches[i]);
+          int32_t len = static_cast<int32_t>(inputs[i].size(0)), usable = (len / gr) * gr;
+          views.emplace_back(p, len);
+          int32_t row = static_cast<int32_t>(rows[i]);
+          RadixTrace tr;
+          auto pit = core->pending.find(row);
+          if (pit != core->pending.end() && pit->second.trace_rev == core->tree.revision &&
+              usable >= pit->second.trace_input_len &&
+              (pit->second.trace_len < pit->second.trace_input_len ||
+               usable == pit->second.trace_input_len || core->tree.node(pit->second.trace_node).is_leaf())) {
+            int32_t nid = pit->second.trace_node, ml = pit->second.trace_len;
+            int32_t in_n = ml - core->tree.node(nid).begin();
+            tr = {nid, ml, in_n, nid == 0 || in_n == core->tree.node(nid).length};
+          } else {
+            tr = core->tree.trace(p, usable);
+          }
+          traces.push_back(tr);
+          if (tr.matched_len > 0 && (!tr.is_exact || (tr.matched_len <= usable && !core->tree.node(tr.node_id).is_leaf())))
+            forced.emplace_back(static_cast<int32_t>(i), tr.matched_len);
+        }
+        for (const auto& prow : compute_branch_protections(views, forced, gr)) {
+          int32_t pos = prow[0], r0 = prow[1];
+          if (pos <= traces[r0].matched_len) {
+            if (auto tp = core->tree.trace_prefix(traces[r0], pos); tp.matched_len == pos && tp.node_id > 0)
+              core->tree.protect_at(tp.node_id, pos);
+          }
+          for (size_t k = 1; k < prow.size(); ++k) core->protected_prefixes[uids[prow[k]]].push_back(pos);
+        }
+      });
+
+  reg(r, "prepare_prefill_batch",
+      [core](const List& rows, const List& clens, const List& dlens, const List&,
+             const tvm::ffi::Array<tvm::ffi::Tensor>& inputs) -> Result {
+        const int32_t gr = core->tree.granularity;
+        std::vector<Int> first_offsets;
+        bool all_offsets = true;
+        for (size_t i = 0; i < rows.size(); ++i) {
+          auto& st = core->req_states[static_cast<int32_t>(rows[i])];
+          int32_t cl = static_cast<int32_t>(clens[i]);
+          bool found = false;
+          for (const auto& lg : st.live_granules) {
+            if (lg.begin <= cl && cl < lg.end) { first_offsets.push_back(cl - lg.begin); found = true; break; }
+          }
+          if (!found) { all_offsets = false; break; }
+        }
+        for (size_t i = 0; i < rows.size(); ++i)
+          core->req_states[static_cast<int32_t>(rows[i])].work_committed_pos = static_cast<int32_t>(dlens[i]);
+
+        std::vector<std::vector<int32_t>> mat_groups;
+        if (core->enable_hit_materialization) {
+          std::vector<std::vector<int32_t>> scratches(inputs.size());
+          std::unordered_set<int32_t> nodes;
+          std::unordered_map<int32_t, int32_t> limits, cur_pins;
+          for (size_t i = 0; i < inputs.size(); ++i) {
+            const int32_t* p = cpu_i32(inputs[i], scratches[i]);
+            auto tr = core->tree.trace(p, (static_cast<int32_t>(inputs[i].size(0)) / gr) * gr);
+            if (tr.matched_len == 0) continue;
+            bool is_ep = true;
+            for (int32_t cur = tr.node_id; cur > 0; cur = core->tree.node(cur).parent, is_ep = false) {
+              nodes.insert(cur);
+              int32_t lim = is_ep ? tr.matched_len : core->tree.node(cur).depth;
+              auto it = limits.find(cur);
+              if (it == limits.end() || lim > it->second) limits[cur] = lim;
+            }
+          }
+          for (size_t i = 0; i < rows.size(); ++i) {
+            auto pit = core->pending.find(static_cast<int32_t>(rows[i]));
+            if (pit == core->pending.end() || pit->second.position == 0) continue;
+            auto rec = core->tree.recovery_at(pit->second.match_node, pit->second.position);
+            std::unordered_set<int32_t> uniq;
+            if (rec.base_checkpoint_slot >= 0) uniq.insert(rec.base_checkpoint_slot);
+            for (const auto& le : rec.logs) uniq.insert(le.slot);
+            if (rec.conv_slot >= 0) uniq.insert(rec.conv_slot);
+            for (int32_t s : uniq) ++cur_pins[s];
+          }
+          const int32_t log_cnt = core->alloc->materialize_log_count;
+          for (int32_t nid : nodes) {
+            const auto& n = core->tree.node(nid);
+            int32_t lim = limits[nid];
+            std::vector<int32_t> bounds;
+            for (const auto& [p, c] : n.endpoint_refs) if (c > 0) bounds.push_back(p);
+            std::sort(bounds.begin(), bounds.end());
+            std::vector<int32_t> grp;
+            int32_t prev_end = -1;
+            for (const auto& e : n.entries) {
+              if (e.end > lim) break;
+              int32_t refs = core->tree.recovery_slot_ref(e.slot);
+              if (refs > cur_pins[e.slot] || refs > 1 || e.kind != EntryKind::kLog || e.end - e.begin != gr) {
+                grp.clear(); prev_end = -1; continue;
+              }
+              if (e.begin != prev_end || std::binary_search(bounds.begin(), bounds.end(), e.begin)) grp.clear();
+              if (grp.empty() && core->tree.recovery_at(nid, e.begin).position != e.begin) { prev_end = -1; continue; }
+              prev_end = e.end;
+              grp.push_back(e.slot);
+              if (static_cast<int32_t>(grp.size()) == log_cnt) {
+                if (core->alloc->checkpoint_frame_savings(grp) > 0) mat_groups.push_back(grp);
+                grp.clear();
+              }
+            }
+          }
+          std::sort(mat_groups.begin(), mat_groups.end(), [&](const auto& a, const auto& b) {
+            const auto &ea = core->tree.entry_for_slot(a.back()), &eb = core->tree.entry_for_slot(b.back());
+            return std::tie(ea.end, ea.begin, a.back()) < std::tie(eb.end, eb.begin, b.back());
+          });
+        }
+        Rows mat_rows;
+        for (const auto& mg : mat_groups) mat_rows.push_back(to_list(mg));
+        Result out;
+        out.Set("has_first_offsets", all_offsets);
+        if (all_offsets) out.Set("first_offsets", List(first_offsets.begin(), first_offsets.end()));
+        out.Set("materialize_groups", mat_rows);
+        return out;
+      });
+
+  reg(r, "commit_hit_materializations", [core](const Rows& groups) -> Rows {
+    Rows accepted;
+    const int32_t gr = core->tree.granularity;
+    for (const auto& gl : groups) {
+      auto slots = from_list(gl);
+      bool ok = !slots.empty();
+      for (int32_t s : slots) if (!core->tree.has_slot(s) || core->tree.recovery_slot_ref(s) > 0) { ok = false; break; }
+      if (!ok) continue;
+      int32_t b = core->tree.entry_for_slot(slots.front()).begin, e = core->tree.entry_for_slot(slots.back()).end, pe = b;
+      for (int32_t s : slots) {
+        const auto& en = core->tree.entry_for_slot(s);
+        if (en.kind != EntryKind::kLog || en.end - en.begin != gr || en.begin != pe) { ok = false; break; }
+        pe = en.end;
+      }
+      if (!ok) continue;
+      int32_t owner = core->tree.slot_owner(slots.back());
+      for (int32_t s : slots) core->tree.detach_entry(s);
+      core->tree.attach_entry(owner, {slots.back(), EntryKind::kCheckpoint, b, e, (e - b) / gr, 0});
+      accepted.push_back(gl);
+    }
+    return accepted;
+  });
+
+  reg(r, "get_restore_tasks", [core](const List& rows, bool pop_pending) -> Result {
+    std::vector<int32_t> trows, ws, bs, cs, cg, fls, fll, lo{0}, fps, po{0};
+    for (size_t i = 0; i < rows.size(); ++i) {
+      int32_t row = static_cast<int32_t>(rows[i]);
+      auto pit = core->pending.find(row);
+      if (pit == core->pending.end() || pit->second.position == 0) {
+        if (pop_pending) core->pending.erase(row);
+        continue;
+      }
+      auto rec = core->tree.recovery_at(pit->second.match_node, pit->second.position);
+      check(rec.position == pit->second.position, "Lost recovery during prefill restore");
+      trows.push_back(row); ws.push_back(core->req_states[row].work_slot);
+      bs.push_back(rec.base_checkpoint_slot); cs.push_back(rec.conv_slot); cg.push_back(rec.conv_granule);
+      std::vector<int32_t> pins;
+      if (rec.base_checkpoint_slot >= 0) pins.push_back(rec.base_checkpoint_slot);
+      for (const auto& le : rec.logs) { fls.push_back(le.slot); fll.push_back(le.end - le.begin); pins.push_back(le.slot); }
+      lo.push_back(static_cast<int32_t>(fls.size()));
+      if (pop_pending && !pins.empty()) core->tree.pin_recovery(pins, false);
+      fps.insert(fps.end(), pins.begin(), pins.end());
+      po.push_back(static_cast<int32_t>(fps.size()));
+      if (pop_pending) core->pending.erase(row);
+    }
+    Result out;
+    out.Set("task_rows", to_i32_tensor(trows)); out.Set("work_slots", to_i32_tensor(ws));
+    out.Set("base_slots", to_i32_tensor(bs)); out.Set("conv_slots", to_i32_tensor(cs));
+    out.Set("conv_granules", to_i32_tensor(cg)); out.Set("log_slots", to_i32_tensor(fls));
+    out.Set("log_lens", to_i32_tensor(fll)); out.Set("log_offsets", to_i32_tensor(lo));
+    out.Set("pin_slots", to_i32_tensor(fps)); out.Set("pin_offsets", to_i32_tensor(po));
+    return out;
+  });
+
+  reg(r, "recovery_for_slot_end", [core](Int rs) -> Result {
+    int32_t s = static_cast<int32_t>(rs);
+    auto rec = core->tree.recovery_at(core->tree.slot_owner(s), core->tree.entry_for_slot(s).end);
+    std::vector<int32_t> ls, ll;
+    for (const auto& le : rec.logs) { ls.push_back(le.slot); ll.push_back(le.end - le.begin); }
+    Result out;
+    out.Set("base", static_cast<Int>(rec.base_checkpoint_slot));
+    out.Set("log_slots", to_i32_tensor(ls)); out.Set("log_lens", to_i32_tensor(ll));
+    return out;
+  });
+
+  reg(r, "cache_req",
+      [core](Int row_i, Int uid, tvm::ffi::TensorView input_ids, Int clen_i, bool finished,
+             Int old_nid, Int old_c_i, tvm::ffi::TensorView old_rslots_t, Int old_owner,
+             const List& old_prot, bool can_decode) -> Result {
+        int32_t row = static_cast<int32_t>(row_i), cl = static_cast<int32_t>(clen_i), old_c = static_cast<int32_t>(old_c_i);
+        const int32_t gr = core->tree.granularity, pgs = core->tree.page_size;
+        auto& st = core->req_states[row]; auto& granules = st.live_granules;
+        std::vector<int32_t> prot = from_list(old_prot);
+        if (auto pit = core->protected_prefixes.find(uid); pit != core->protected_prefixes.end())
+          prot.insert(prot.end(), pit->second.begin(), pit->second.end());
+        std::sort(prot.begin(), prot.end()); prot.erase(std::unique(prot.begin(), prot.end()), prot.end());
+
+        std::vector<int32_t> cidx, cend;
+        for (int32_t i = 0; i < static_cast<int32_t>(granules.size()); ++i)
+          if (granules[i].end <= cl) { cidx.push_back(i); cend.push_back(granules[i].end); }
+        if (finished) {
+          for (int32_t i = 0; i < static_cast<int32_t>(granules.size()); ++i) {
+            const auto& lg = granules[i];
+            if (lg.end <= cl || lg.checkpoint_begin >= 0) continue;
+            int32_t bp = 0;
+            for (int32_t p : prot) if (lg.begin < p && p <= cl && cl < lg.end) bp = std::max(bp, p);
+            if (bp > 0) { cidx.push_back(i); cend.push_back(bp); }
+          }
+        }
+        int32_t ins_len = old_c;
+        for (size_t k = 0; k < cidx.size() && granules[cidx[k]].begin == ins_len; ++k) ins_len = cend[k];
+        check(ins_len % gr == 0, "Unaligned insert_len");
+
+        std::vector<KvFrameSpan> spans; spans.reserve(cidx.size());
+        std::vector<int32_t> kv_synth(std::max<int32_t>(ins_len, 0), 0);
+        if (old_c > 0 && old_nid > 0 && old_nid < core->tree.num_nodes_capacity() && core->tree.node(static_cast<int32_t>(old_nid)).alive)
+          core->tree.copy_matched_kv(static_cast<int32_t>(old_nid), std::min(old_c, ins_len), kv_synth.data());
+        for (size_t k = 0; k < cidx.size(); ++k) {
+          const auto& lg = granules[cidx[k]]; int32_t ge = cend[k];
+          spans.push_back({lg.begin, ge, lg.kv_offset / pgs});
+          for (int32_t pos = lg.begin, lim = std::min(ge, ins_len); pos < lim; ++pos) kv_synth[pos] = lg.kv_offset + (pos - lg.begin);
+        }
+        std::vector<int32_t> tok_scratch;
+        const int32_t* toks = cpu_i32(input_ids, tok_scratch);
+        auto ins = core->tree.insert(toks, kv_synth.data(), ins_len, ins_len, static_cast<int32_t>(old_owner), &spans);
+        int32_t covered = core->tree.recovery_at(ins.node_id, ins.inserted_len).position;
+
+        std::vector<int32_t> rel_kv, rel_slots;
+        std::vector<uint8_t> removed(granules.size(), 0);
+        int32_t last_adopted_end = -1, adopted = 0;
+        for (size_t k = 0; k < cidx.size(); ++k) {
+          int32_t gi = cidx[k], ge = cend[k]; const auto& lg = granules[gi];
+          if (old_c <= lg.begin && ge <= ins.inserted_len) {
+            removed[gi] = 1; ++adopted; last_adopted_end = ge;
+            int32_t lb = std::max(lg.begin, covered);
+            if (lg.checkpoint_begin >= 0 && lb < ge) {
+              int32_t cb = std::max(lg.checkpoint_begin, (covered / gr) * gr);
+              core->tree.attach_entry(ins.node_id, {lg.state_slot, EntryKind::kCheckpoint, cb, lg.end, (lg.end - cb) / gr, 0});
+              covered = lg.end;
+            } else if (lg.state_slot >= 0 && lb < ge) {
+              core->tree.attach_entry(ins.node_id, {lg.state_slot, EntryKind::kLog, lb, ge, -1, 0});
+              covered = ge;
+            } else if (lg.state_slot >= 0) rel_slots.push_back(lg.state_slot);
+            if (int32_t kb = std::max(lg.begin, ins.previous_len); kb < ge)
+              core->tree.add_cached_page_tokens(lg.kv_offset / pgs, ge - kb);
+            else rel_kv.push_back(lg.kv_offset / pgs);
+          } else if (ge <= ins.previous_len) {
+            removed[gi] = 1; rel_kv.push_back(lg.kv_offset / pgs);
+            if (lg.state_slot >= 0) rel_slots.push_back(lg.state_slot);
+          }
+        }
+        for (int32_t p : prot) if (p > 0 && p <= ins.inserted_len) core->tree.protect_at(core->tree.trace(toks, p).node_id, p);
+        int32_t new_owner = core->tree.node(ins.node_id).analysis_owner;
+        if (new_owner > 0) core->reuse.publish(new_owner, ins.inserted_len);
+        int32_t new_node = (ins.inserted_len == 0) ? 0
+                           : (ins.inserted_len < core->tree.node(ins.node_id).depth
+                                  ? core->tree.node_at_depth(ins.node_id, ins.inserted_len)
+                                  : ins.node_id);
+        auto new_rec = core->tree.recovery_at(new_node, ins.inserted_len);
+        check(new_rec.position == ins.inserted_len, "Cannot recover newly cached handle");
+        auto new_kv_t = make_i32_tensor(ins.inserted_len);
+        if (ins.inserted_len > 0) core->tree.copy_matched_kv(new_node, ins.inserted_len, static_cast<int32_t*>(new_kv_t.data_ptr()));
+
+        if (old_rslots_t.size(0) > 0) core->tree.pin_recovery(from_i32_tensor(old_rslots_t), true);
+        if (old_c > 0 && old_nid > 0 && old_nid < core->tree.num_nodes_capacity() && core->tree.node(static_cast<int32_t>(old_nid)).alive)
+          core->tree.lock(static_cast<int32_t>(old_nid), true, old_c);
+        core->pending.erase(row);
+
+        std::vector<LiveGranule> rem;
+        for (size_t i = 0; i < granules.size(); ++i) if (!removed[i]) rem.push_back(granules[i]);
+        int32_t cc_src = -1, cc_gran = -1, cc_dst = -1;
+        if (!finished && adopted > 0 && cl == last_adopted_end) {
+          cc_src = new_rec.conv_slot; cc_gran = new_rec.conv_granule; cc_dst = st.work_slot;
+        }
+        if (finished) {
+          core->protected_prefixes.erase(uid); core->sampled_queries.erase(uid);
+          for (const auto& lg : rem) { rel_kv.push_back(lg.kv_offset / pgs); if (lg.state_slot >= 0) rel_slots.push_back(lg.state_slot); }
+          rel_slots.push_back(st.work_slot);
+          st.active = st.is_decode_active = false; st.live_granules.clear(); st.input_ids_prefix.clear();
+        } else {
+          if (ins.inserted_len > 0) core->tree.lock(new_node, false, ins.inserted_len);
+          st.handle_node_id = new_node; st.handle_cached_len = ins.inserted_len;
+          st.cached_recovery_rev = -1; st.analysis_owner = new_owner;
+          st.protected_endpoints = prot; st.is_decode_active = can_decode;
+          st.live_granules = std::move(rem); st.live_granule_cursor = 0; st.compacted_end = 0;
+          for (const auto& lg : st.live_granules) if (lg.checkpoint_begin >= 0) st.compacted_end = std::max(st.compacted_end, lg.end);
+          if (can_decode) st.input_ids_prefix.assign(toks, toks + cl);
+        }
+        std::vector<int32_t> nls, nlb, nle;
+        for (const auto& le : new_rec.logs) { nls.push_back(le.slot); nlb.push_back(le.begin); nle.push_back(le.end); }
+        Result out;
+        out.Set("inserted_len", static_cast<Int>(ins.inserted_len));
+        out.Set("new_node_id", static_cast<Int>(new_node)); out.Set("new_owner", static_cast<Int>(new_owner));
+        out.Set("new_kv_indices", new_kv_t); out.Set("new_base_ckpt", static_cast<Int>(new_rec.base_checkpoint_slot));
+        out.Set("new_conv_slot", static_cast<Int>(new_rec.conv_slot)); out.Set("new_conv_granule", static_cast<Int>(new_rec.conv_granule));
+        out.Set("new_log_slots", to_i32_tensor(nls)); out.Set("new_log_begins", to_i32_tensor(nlb));
+        out.Set("new_log_ends", to_i32_tensor(nle)); out.Set("new_prot_endpoints", to_i32_tensor(prot));
+        out.Set("released_kv_frames", to_i32_tensor(rel_kv)); out.Set("released_slots", to_i32_tensor(rel_slots));
+        out.Set("conv_copy_src", static_cast<Int>(cc_src)); out.Set("conv_copy_gran", static_cast<Int>(cc_gran));
+        out.Set("conv_copy_dst", static_cast<Int>(cc_dst));
+        return out;
+      });
+
+  reg(r, "free_to_cached", [core](Int row_i, Int cl_i) -> Result {
+    auto& st = core->req_states[static_cast<int32_t>(row_i)];
+    int32_t cl = static_cast<int32_t>(cl_i), pgs = core->tree.page_size;
+    std::vector<LiveGranule> keep;
+    std::vector<int32_t> rel_kv, rel_slots, clear_ranges;
+    for (const auto& lg : st.live_granules) {
+      if (lg.begin < cl) keep.push_back(lg);
+      else {
+        rel_kv.push_back(lg.kv_offset / pgs);
+        if (lg.state_slot >= 0) rel_slots.push_back(lg.state_slot);
+        clear_ranges.push_back(lg.begin); clear_ranges.push_back(lg.end);
       }
     }
-    if (!active.empty() && (!selected.empty() || !released.empty()))
-      return result();
-    return make_int_tensor(0);
-  }
-};
-
-struct Planner {
-  static tvm::ffi::Tensor protections(const tvm::ffi::Array<tvm::ffi::Tensor>& inputs,
-                                     tvm::ffi::TensorView forced, Int granularity) {
-    return write_rows(branch_protections(inputs, read_rows(forced), granularity));
-  }
-
-  static std::array<std::vector<Vector>, 7> eviction_groups(
-      tvm::ffi::TensorView packed, const List &counts) {
-    check(counts.size() == 7, "Invalid eviction metadata groups");
-    const auto begin = cpu_ints(packed);
-    const auto end = begin + packed.shape()[0];
-    auto cursor = begin;
-    std::array<std::vector<Vector>, 7> groups;
-    for (size_t group = 0; group < counts.size(); ++group) {
-      check(counts[group] >= 0, "Invalid eviction row count");
-      groups[group].reserve(counts[group]);
-      for (Int row = 0; row < counts[group]; ++row) {
-        check(cursor < end, "Truncated eviction metadata");
-        const auto size = *cursor++;
-        check(size >= 0 && size <= end - cursor, "Invalid eviction row size");
-        groups[group].emplace_back(cursor, cursor + size);
-        cursor += size;
-      }
+    st.live_granules = std::move(keep); st.live_granule_cursor = 0;
+    if (st.compacted_end > cl) {
+      st.compacted_end = 0;
+      for (const auto& lg : st.live_granules) if (lg.checkpoint_begin >= 0) st.compacted_end = std::max(st.compacted_end, lg.end);
     }
-    check(cursor == end, "Unexpected eviction metadata");
-    return groups;
-  }
-  static Result make_eviction(tvm::ffi::TensorView packed, const List &counts,
-                             const List &config, tvm::ffi::TensorView models,
-                             tvm::ffi::TensorView order) {
-    auto planner = std::make_shared<EvictionPlanner>(
-        eviction_groups(packed, counts), config, models, read_rows(order));
-    Result result;
-    result.Set("plan", tvm::ffi::Function::FromTyped(
-      [planner](const List &capacity, tvm::ffi::TensorView occupied,
-                tvm::ffi::TensorView active_geometry, tvm::ffi::TensorView active_models,
-                Int num_blocked, tvm::ffi::TensorView locks,
-                const List &model_indices, tvm::ffi::TensorView models) {
-        if (num_blocked)
-          planner->update_locks(num_blocked, read_rows(locks));
-        if (!model_indices.empty())
-          planner->refresh_models(model_indices, models);
-        return planner->plan(capacity, read_rows(occupied), active_geometry, active_models);
-      }));
-    result.Set("rebase", tvm::ffi::Function::FromTyped(
-      [planner](Int size, const List &removed, tvm::ffi::TensorView geometry,
-                const List &indices, tvm::ffi::TensorView models, tvm::ffi::TensorView order,
-                const List &capacity, tvm::ffi::TensorView active_geometry,
-                tvm::ffi::TensorView active_models) {
-        planner->rebase(size, removed, read_rows(geometry), indices, models, read_rows(order));
-        return planner->plan(capacity, Rows{}, active_geometry, active_models);
-      }));
-    result.Set("replace_materialized_node", tvm::ffi::Function::FromTyped(
-      [planner](Int index, Int timestamp, tvm::ffi::TensorView records,
-                tvm::ffi::TensorView actions, tvm::ffi::TensorView frontiers,
-                tvm::ffi::TensorView groups) {
-        return planner->replace_materialized_node(index, timestamp, read_rows(records),
-            read_rows(actions), read_rows(frontiers), read_rows(groups));
-      }));
-    return result;
-  }
+    Result out;
+    out.Set("released_kv_frames", to_i32_tensor(rel_kv));
+    out.Set("released_slots", to_i32_tensor(rel_slots));
+    out.Set("clear_ranges", to_i32_tensor(clear_ranges));
+    return out;
+  });
 
-  static tvm::ffi::Tensor materialize(tvm::ffi::TensorView paths, tvm::ffi::TensorView boundaries,
-                                    tvm::ffi::TensorView candidates, Int granularity, Int log_count) {
-    return write_rows(plan_materialize(read_rows(paths), read_rows(boundaries), read_rows(candidates), granularity, log_count));
-  }
+  reg(r, "check_integrity", [core](const List& retiring_list) {
+    core->tree.check_integrity();
+    core->alloc->check_integrity();
+    int32_t live_cnt = 0;
+    for (const auto& st : core->req_states) if (st.active) live_cnt += static_cast<int32_t>(st.live_granules.size());
+    check(live_cnt == 0, "LogState cache has request-owned pages while idle.");
+    int64_t total_kv = 0;
+    std::unordered_set<int32_t> exp_kv, exp_slots;
+    if (core->dummy_kv_frame >= 0) exp_kv.insert(core->dummy_kv_frame);
+    for (int32_t f = 0; f < core->alloc->num_frames; ++f) {
+      int32_t c = core->tree.cached_page_tokens(f);
+      total_kv += c;
+      if (c > 0) exp_kv.insert(f);
+    }
+    check(total_kv == core->tree.evictable_size + core->tree.locked_size, "Cached KV token accounting mismatch.");
+    for (int32_t s : {core->dummy_log_slot, core->dummy_work_slot, core->pressure_work_slot})
+      if (s >= 0) exp_slots.insert(s);
+    for (int32_t s : from_list(retiring_list)) exp_slots.insert(s);
+    for (const auto& st : core->req_states) if (st.active && st.work_slot >= 0) exp_slots.insert(st.work_slot);
+    for (int32_t nid = 1; nid < core->tree.num_nodes_capacity(); ++nid) {
+      if (const auto& n = core->tree.node(nid); n.alive)
+        for (const auto& e : n.entries) exp_slots.insert(e.slot);
+    }
+    check(core->alloc->allocated_kv_list().size() == exp_kv.size(), "Allocator KV ownership mismatch");
+    check(core->alloc->allocated_slot_list().size() == exp_slots.size(), "Allocator slot ownership mismatch");
+  });
 
+  reg(r, "eviction_stats", [core]() -> Result {
+    Result out;
+    out.Set("eviction_rounds", core->stat_eviction_rounds);
+    out.Set("pressure_dropped_checkpoints", core->stat_pressure_dropped_checkpoints);
+    out.Set("pressure_pruned_checkpoints", core->stat_pressure_pruned_checkpoints);
+    out.Set("evicted_kv_tokens", core->stat_evicted_kv_tokens);
+    out.Set("released_state_slots_from_eviction", core->stat_released_slots_eviction);
+    return out;
+  });
 
-};
+  reg(r, "tree_layout_snapshot", [core]() -> Result {
+    std::vector<int32_t> cp_spans, log_runs;
+    int64_t ncp = 0, nlog = 0;
+    for (int32_t nid = 1; nid < core->tree.num_nodes_capacity(); ++nid) {
+      const auto& n = core->tree.node(nid);
+      if (!n.alive) continue;
+      int32_t run = 0, last = -1;
+      for (const auto& e : n.entries) {
+        if (e.kind == EntryKind::kCheckpoint) {
+          ++ncp; cp_spans.push_back(e.end - e.begin);
+          if (run > 0) { log_runs.push_back(run); run = 0; }
+        } else {
+          ++nlog;
+          if (run > 0 && e.begin != last) { log_runs.push_back(run); run = 0; }
+          run += e.end - e.begin;
+        }
+        last = e.end;
+      }
+      if (run > 0) log_runs.push_back(run);
+    }
+    Result out;
+    out.Set("checkpoint", ncp); out.Set("log", nlog);
+    out.Set("checkpoint_spans", to_i32_tensor(cp_spans)); out.Set("log_run_spans", to_i32_tensor(log_runs));
+    return out;
+  });
 
+  reg(r, "tree_nodes_summary", [core]() -> Result {
+    Rows nodes_meta, entry_rows;
+    tvm::ffi::Array<tvm::ffi::Tensor> keys;
+    for (int32_t nid = 1; nid < core->tree.num_nodes_capacity(); ++nid) {
+      const auto& n = core->tree.node(nid);
+      if (!n.alive) continue;
+      nodes_meta.push_back(List({static_cast<Int>(nid), static_cast<Int>(n.parent), n.uuid,
+                                 static_cast<Int>(n.begin()), static_cast<Int>(n.depth),
+                                 static_cast<Int>(n.is_protected), static_cast<Int>(n.ref_count),
+                                 n.timestamp, static_cast<Int>(n.is_leaf())}));
+      std::vector<Int> er;
+      for (const auto& e : n.entries) {
+        er.insert(er.end(), {e.slot, static_cast<Int>(e.kind), e.begin, e.end, e.span_granules});
+      }
+      entry_rows.push_back(List(er.begin(), er.end()));
+      std::vector<int32_t> path; core->tree.path_nodes(nid, path);
+      auto kt = make_i32_tensor(n.depth);
+      auto* dst = static_cast<int32_t*>(kt.data_ptr());
+      int32_t off = 0;
+      for (int32_t pid : path) {
+        const auto& pn = core->tree.node(pid);
+        std::memcpy(dst + off, pn.token_data(), static_cast<size_t>(pn.length) * sizeof(int32_t));
+        off += pn.length;
+      }
+      keys.push_back(kt);
+    }
+    Result out;
+    out.Set("nodes", nodes_meta); out.Set("entries", entry_rows); out.Set("prefix_keys", keys);
+    return out;
+  });
+
+  reg(r, "tree_insert_raw", [core](tvm::ffi::TensorView tokens, tvm::ffi::TensorView kv, const List& ef, Int cl) -> Int {
+    std::vector<int32_t> ts, ks;
+    auto ins = core->tree.insert(cpu_i32(tokens, ts), cpu_i32(kv, ks), static_cast<int32_t>(tokens.size(0)),
+                                 static_cast<int32_t>(cl), -1, nullptr);
+    for (size_t i = 0; i < ef.size(); i += 5) {
+      core->tree.attach_entry(ins.node_id, {static_cast<int32_t>(ef[i]), static_cast<EntryKind>(ef[i + 1]),
+                                            static_cast<int32_t>(ef[i + 2]), static_cast<int32_t>(ef[i + 3]),
+                                            static_cast<int32_t>(ef[i + 4]), 0});
+    }
+    return ins.node_id;
+  });
+  reg(r, "tree_reset", [core]() { core->tree.reset(); core->reuse.reset(); });
+  return r;
 }
-}
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_materialize, logssms::Planner::materialize);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(branch_protections, logssms::Planner::protections);
+}  // namespace
+}  // namespace logssms
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_eviction_planner, logssms::Planner::make_eviction);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_allocator, logssms::make_allocator_ffi);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_core, logssms::make_core_ffi);

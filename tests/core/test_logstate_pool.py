@@ -317,7 +317,7 @@ def test_merged_slots_retire_without_reusing_inflight_frames(monkeypatch):
     assert pool.retiring_slots == frozenset(retired)
     assert all(slot in pool.allocator.allocated_slots for slot in logs)
     payload = pool.payload_frame_table[logs[2]].clone()
-    kv = pool.reserve(kv=len(pool.allocator._free))[0]
+    kv = pool.reserve(kv=pool.allocator.free_frames)[0]
     # Rebinding and release are retired independently. Exhaust the frames
     # returned by rebinding so both events are required for the next request.
     remainder = pool.reserve(kv=1)

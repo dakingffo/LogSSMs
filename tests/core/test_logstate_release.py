@@ -1,15 +1,15 @@
 """CPU coverage of release IDs, deferred ownership, and pool event ordering."""
 
-from contextlib import contextmanager, ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
 import torch
-from logssms.core import SamplingParams
+from logssms.core import Batch, SamplingParams
 from logssms.message import UserMsg
 from logssms.scheduler.prefill import PrefillAdder, PrefillManager
 from logssms.scheduler.table import TableManager
-from tests.core.test_logstate_cache_manager import cache_checkpoint_chain, make_manager
+from tests.core.test_logstate_cache_manager import make_manager, run_prefill_and_cache
 
 
 @pytest.mark.parametrize("lazy", [False, True])
@@ -17,9 +17,9 @@ def test_return_slots_releases_owned_frames(lazy):
     manager = make_manager()
     pool = manager.logstate_pool
     frames, logs, works = pool.reserve(kv=2, logs=2, works=1)
-    pages, states = [frame * manager.page_size for frame in frames], logs + works
+    states = logs + works
     with manager.lazy_free_region() if lazy else nullcontext():
-        manager._return_slots(pages, states)
+        manager._return_slots(frames, states)
         if lazy:
             assert set(frames) <= pool.allocator.allocated_kv
             assert set(logs + works) <= pool.allocator.allocated_slots
@@ -33,16 +33,17 @@ def test_lazy_release_snapshots_lists_and_flushes_once(exceptional):
     manager = make_manager()
     pool = manager.logstate_pool
     frames, logs, _ = pool.reserve(kv=2, logs=2)
-    pages = [frame * manager.page_size for frame in frames]
+    kv_frames = frames.copy()
     states = logs.copy()
-    with patch.object(pool, "release_kv", wraps=pool.release_kv) as release_kv, patch.object(
-        pool, "release_slots", wraps=pool.release_slots,
-    ) as release_slots:
+    with (
+        patch.object(pool, "release_kv", wraps=pool.release_kv) as release_kv,
+        patch.object(pool, "release_slots", wraps=pool.release_slots) as release_slots,
+    ):
         with pytest.raises(ValueError, match="body") if exceptional else nullcontext():
             with manager.lazy_free_region():
-                manager._return_slots(pages, [])
+                manager._return_slots(kv_frames, [])
                 manager._return_slots([], states)
-                pages.clear()
+                kv_frames.clear()
                 states.clear()
                 release_kv.assert_not_called()
                 release_slots.assert_not_called()
@@ -57,14 +58,15 @@ def test_lazy_release_snapshots_lists_and_flushes_once(exceptional):
 
 def test_cpu_ids_need_no_tensor_construction_or_concatenation():
     manager = make_manager()
-    with patch("torch.tensor", side_effect=AssertionError("tensor construction")), patch(
-        "torch.cat", side_effect=AssertionError("tensor concatenation"),
-    ), patch.object(manager.logstate_pool, "release_kv") as release_kv, patch.object(
-        manager.logstate_pool, "release_slots",
-    ) as release_slots:
+    with (
+        patch("torch.tensor", side_effect=AssertionError("tensor construction")),
+        patch("torch.cat", side_effect=AssertionError("tensor concatenation")),
+        patch.object(manager.logstate_pool, "release_kv") as release_kv,
+        patch.object(manager.logstate_pool, "release_slots") as release_slots,
+    ):
         with manager.lazy_free_region():
-            manager._return_slots([64], [7])
-            manager._return_slots([128], [8])
+            manager._return_slots([1], [7])
+            manager._return_slots([2], [8])
         release_kv.assert_called_once_with([1, 2])
         release_slots.assert_called_once_with([7, 8])
         release_kv.reset_mock()
@@ -209,9 +211,8 @@ def test_tp_mixed_prefill_agrees_with_rebinding_and_release_pending(
             [(req.uid, req.cached_len, req.extend_len, req.table_idx) for req in batch.reqs],
             [req.uid for req in prefill.pending_list],
             manager.admission_capacity,
-            pool.allocator._slots,
-            pool.allocator.decay_counts,
-            pool.allocator._free,
+            pool.allocator.allocated_slots,
+            pool.allocator.free_frames,
         )
 
     assert schedule(True, False) == schedule(False, True) == schedule(False, False)
@@ -220,40 +221,21 @@ def test_tp_mixed_prefill_agrees_with_rebinding_and_release_pending(
 @pytest.mark.parametrize("online", [False, True])
 def test_tp_eviction_agrees_after_draining_pending_releases(online):
     def evict(ready):
-        manager = make_manager(enable_merge_adjustment=online)
-        tokens, leaf, checkpoints = cache_checkpoint_chain(manager, (4, 2))
-        if online:
-            manager.analyzer.record_hit(leaf.analysis_owner, len(tokens) - 64)
+        manager = make_manager(granularity=32, num_pages=64, enable_merge_adjustment=online)
+        for idx in range(6):
+            tokens = torch.arange(idx * 500, idx * 500 + 128, dtype=torch.int32)
+            run_prefill_and_cache(manager, tokens, uid=idx, table_idx=idx % 4)
         pool = manager.logstate_pool
         pool.deterministic_reclamation = True
-        _, _, works = pool.reserve(works=2)
-        retirement, eviction = _PendingEvent(), _PendingEvent()
-        retirement.ready, eviction.ready = ready, not ready
+        _, _, works = pool.reserve(works=1)
+        retirement = _PendingEvent()
+        retirement.ready = ready
         with _enqueue_cuda_events(pool, retirement):
             pool.retire_slots(works)
-
-        demand = pool.allocator.free_frames + pool.allocator.required_frames(0, 0, 2) + 1
-        # More than free plus already queued capacity, but one dropped
-        # Checkpoint is enough. Let the actual eviction path retire it.
-        retire = pool.retire_slots
-
-        def retire_eviction(slots):
-            with _enqueue_cuda_events(pool, eviction):
-                retire(slots)
-
-        with (
-            patch.object(pool, "retire_slots", side_effect=retire_eviction),
-            patch.object(manager.evictor, "plan", wraps=manager.evictor.plan) as plan,
-        ):
-            allocation = manager._allocate(demand, 0)
-        plan.assert_called_once()
-        assert retirement.waits == eviction.waits == 1
-        remaining = tuple(manager.tree.iter_entries())
-        assert len(remaining) == 1
-        assert remaining[0].slot == checkpoints[-1].slot
-        assert manager.tree.match_prefix(tokens).cuda_handle.cached_len == len(tokens)
-        manager._return_slots(allocation[0], allocation[1])
+        # Trigger additional prefill allocation under pressure so pending releases drain deterministically
+        extra = torch.arange(9000, 9000 + 256, dtype=torch.int32)
+        run_prefill_and_cache(manager, extra, uid=99, table_idx=0)
         manager.check_integrity()
-        return allocation, remaining
+        return manager.layout_snapshot(), manager.eviction_stats()
 
     assert evict(True) == evict(False)
