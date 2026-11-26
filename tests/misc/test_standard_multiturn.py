@@ -189,8 +189,9 @@ def test_scheduler_skips_blocked_priority_without_head_of_line_wait(monkeypatch)
     ]
     dispatched, completed = [], []
 
-    async def execute(client, base, model, prompt, length, tag, api, *, ignore_eos):
+    async def execute(client, base, model, prompt, length, tag, api, *, ignore_eos, cache_session_id):
         assert ignore_eos is False
+        assert cache_session_id == ("a" if tag in ("a", "aa") else "b")
         started = time.perf_counter()
         dispatched.append(tag)
         if tag == "a":

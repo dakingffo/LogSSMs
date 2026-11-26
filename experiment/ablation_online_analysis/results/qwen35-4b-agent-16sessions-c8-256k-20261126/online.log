@@ -1,0 +1,56 @@
+Heartbeat {"iteration": 4414, "completed": 23, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 17.491}
+32/962 completed, 32 admitted, hit=69.4293%, historical=99.9841%, prefill=447,536, historical_recompute=156
+Heartbeat {"iteration": 39756, "completed": 63, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 125.72}
+64/962 completed, 64 admitted, hit=75.8215%, historical=99.9773%, prefill=694,144, historical_recompute=463
+96/962 completed, 96 admitted, hit=80.9177%, historical=99.9795%, prefill=860,064, historical_recompute=706
+128/962 completed, 128 admitted, hit=85.6810%, historical=99.9824%, prefill=975,152, historical_recompute=982
+Heartbeat {"iteration": 72820, "completed": 132, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 215.942}
+160/962 completed, 160 admitted, hit=89.3252%, historical=99.9822%, prefill=1,015,488, historical_recompute=1,435
+Heartbeat {"iteration": 124411, "completed": 182, "total": 962, "pending": 1, "running": 0, "head": {"uid": 388, "tag": "07dd40536557a1d6440a923557c3129dc929:85", "input_tokens": 103104, "output_cap": 129}, "active_operation": {"call": 11563, "iteration": 124411, "operation": "admit_prefill", "uid": 388, "tag": "07dd40536557a1d6440a923557c3129dc929:85", "input_tokens": 103104, "output_cap": 129, "elapsed_ms": 82.9}, "virtual_time_s": 344.405}
+192/962 completed, 192 admitted, hit=91.8644%, historical=99.9847%, prefill=1,034,144, historical_recompute=1,702
+224/962 completed, 224 admitted, hit=92.5507%, historical=99.9856%, prefill=1,208,640, historical_recompute=2,090
+256/962 completed, 256 admitted, hit=93.0399%, historical=99.9850%, prefill=1,254,336, historical_recompute=2,431
+Heartbeat {"iteration": 151780, "completed": 259, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 627.239}
+288/962 completed, 288 admitted, hit=93.7345%, historical=99.9842%, prefill=1,311,552, historical_recompute=3,008
+Heartbeat {"iteration": 206749, "completed": 316, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 1974.104}
+320/962 completed, 320 admitted, hit=94.5803%, historical=99.9847%, prefill=1,348,096, historical_recompute=3,522
+352/962 completed, 352 admitted, hit=94.6575%, historical=99.9847%, prefill=1,449,328, historical_recompute=3,851
+Heartbeat {"iteration": 262320, "completed": 383, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 3890.284}
+384/962 completed, 384 admitted, hit=94.7692%, historical=99.9841%, prefill=1,545,472, historical_recompute=4,340
+416/962 completed, 416 admitted, hit=95.1046%, historical=99.9799%, prefill=1,576,448, historical_recompute=6,015
+Heartbeat {"iteration": 300304, "completed": 439, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 4244.058}
+448/962 completed, 448 admitted, hit=95.1883%, historical=99.9699%, prefill=1,694,160, historical_recompute=9,861
+480/962 completed, 480 admitted, hit=95.4967%, historical=99.9703%, prefill=1,749,408, historical_recompute=10,808
+Heartbeat {"iteration": 351113, "completed": 480, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": {"call": 16631, "iteration": 351113, "operation": "eviction_plan", "needed_pages": 1, "needed_states": 1, "needed_works": 0, "active_candidates": 1, "elapsed_ms": 63.9}, "virtual_time_s": 4565.674}
+512/962 completed, 512 admitted, hit=95.4416%, historical=99.9554%, prefill=1,961,072, historical_recompute=18,005
+Heartbeat {"iteration": 379473, "completed": 514, "total": 962, "pending": 0, "running": 0, "head": null, "active_operation": null, "virtual_time_s": 4939.892}
+544/962 completed, 544 admitted, hit=95.2315%, historical=99.9463%, prefill=2,172,160, historical_recompute=22,871
+Heartbeat {"iteration": 412310, "completed": 551, "total": 962, "pending": 2, "running": 0, "head": {"uid": 717, "tag": "0bc9c4f798d321286bf39f2543c0c4e4c059:5", "input_tokens": 139968, "output_cap": 9655}, "active_operation": {"call": 18549, "iteration": 412310, "operation": "eviction_plan", "needed_pages": 512, "needed_states": 512, "needed_works": 0, "active_candidates": 0, "elapsed_ms": 93.3}, "virtual_time_s": 5539.546}
+Heartbeat {"iteration": 425202, "completed": 564, "total": 962, "pending": 0, "running": 0, "head": null, "active_operation": {"call": 19985, "iteration": 425202, "operation": "eviction_plan", "needed_pages": 462, "needed_states": 462, "needed_works": 0, "active_candidates": 0, "elapsed_ms": 1.0}, "virtual_time_s": 5613.357}
+576/962 completed, 576 admitted, hit=94.8567%, historical=99.9469%, prefill=2,440,000, historical_recompute=23,466
+Heartbeat {"iteration": 440171, "completed": 602, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 5670.788}
+608/962 completed, 608 admitted, hit=94.8690%, historical=99.9493%, prefill=2,589,024, historical_recompute=23,850
+Heartbeat {"iteration": 442107, "completed": 608, "total": 962, "pending": 1, "running": 0, "head": {"uid": 774, "tag": "0bc9c4f798d321286bf39f2543c0c4e4c059:100", "input_tokens": 161088, "output_cap": 400}, "active_operation": {"call": 21932, "iteration": 442107, "operation": "eviction_plan", "needed_pages": 512, "needed_states": 512, "needed_works": 0, "active_candidates": 0, "elapsed_ms": 281.2}, "virtual_time_s": 5683.915}
+Heartbeat {"iteration": 461150, "completed": 622, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": {"call": 22513, "iteration": 461150, "operation": "eviction_plan", "needed_pages": 1, "needed_states": 1, "needed_works": 0, "active_candidates": 3, "elapsed_ms": 64.7}, "virtual_time_s": 5724.875}
+640/962 completed, 640 admitted, hit=95.0168%, historical=99.8193%, prefill=2,719,296, historical_recompute=92,341
+Heartbeat {"iteration": 510826, "completed": 653, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 6203.427}
+672/962 completed, 672 admitted, hit=95.0655%, historical=99.7622%, prefill=2,880,160, historical_recompute=129,479
+Heartbeat {"iteration": 572218, "completed": 692, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 7212.175}
+704/962 completed, 704 admitted, hit=95.2548%, historical=99.7726%, prefill=2,958,208, historical_recompute=131,603
+Heartbeat {"iteration": 632927, "completed": 712, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 7530.412}
+736/962 completed, 736 admitted, hit=95.0086%, historical=99.7712%, prefill=3,220,736, historical_recompute=136,383
+Heartbeat {"iteration": 663009, "completed": 765, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 7655.509}
+768/962 completed, 768 admitted, hit=95.0803%, historical=99.7666%, prefill=3,364,480, historical_recompute=147,814
+Heartbeat {"iteration": 711226, "completed": 792, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 7812.581}
+800/962 completed, 801 admitted, hit=95.2449%, historical=99.7349%, prefill=3,485,232, historical_recompute=180,686
+Heartbeat {"iteration": 760787, "completed": 822, "total": 962, "pending": 1, "running": 0, "head": {"uid": 650, "tag": "0b7f3ca692f15ae2651a310d9411d70794aa:109", "input_tokens": 194560, "output_cap": 675}, "active_operation": null, "virtual_time_s": 8357.578}
+832/962 completed, 832 admitted, hit=95.3019%, historical=99.6986%, prefill=3,627,888, historical_recompute=216,631
+Heartbeat {"iteration": 791604, "completed": 849, "total": 962, "pending": 1, "running": 0, "head": {"uid": 656, "tag": "0b7f3ca692f15ae2651a310d9411d70794aa:115", "input_tokens": 197760, "output_cap": 106}, "active_operation": null, "virtual_time_s": 9615.68}
+864/962 completed, 864 admitted, hit=95.5010%, historical=99.6325%, prefill=3,719,792, historical_recompute=284,132
+896/962 completed, 896 admitted, hit=95.8320%, historical=99.6605%, prefill=3,728,880, historical_recompute=284,754
+Heartbeat {"iteration": 825596, "completed": 905, "total": 962, "pending": 0, "running": 0, "head": null, "active_operation": {"call": 35551, "iteration": 825596, "operation": "eviction_plan", "needed_pages": 424, "needed_states": 424, "needed_works": 0, "active_candidates": 0, "elapsed_ms": 6772.8}, "virtual_time_s": 15298.021}
+928/962 completed, 928 admitted, hit=95.8880%, historical=99.5352%, prefill=3,902,272, historical_recompute=414,842
+Heartbeat {"iteration": 874182, "completed": 955, "total": 962, "pending": 0, "running": 1, "head": null, "active_operation": null, "virtual_time_s": 86816.666}
+960/962 completed, 960 admitted, hit=95.7604%, historical=99.3371%, prefill=4,179,328, historical_recompute=613,768
+Heartbeat {"iteration": 915245, "completed": 962, "total": 962, "pending": 0, "running": 0, "head": null, "active_operation": null, "virtual_time_s": 101469.698}
+DONE CC unified_prior online: reqs=962 overall=0.957693 hist_hit=0.993388 hist_recomp=613,779 prefill=4,180,864 kv_gap=548,211 state_gap=65,568

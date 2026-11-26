@@ -50,9 +50,7 @@ def branch_protections(inputs: Sequence[torch.Tensor], forced: Sequence[Sequence
     return _unpack(_load_logstate_module().branch_protections(inputs, _pack(forced), granularity))
 
 
-def _pack_models(models, past_tails) -> torch.Tensor:
-    if past_tails:
-        models = list(chain.from_iterable(chain(models, past_tails)))
+def _pack_models(models) -> torch.Tensor:
     return torch.tensor(models, dtype=torch.float64).flatten()
 
 
@@ -64,8 +62,7 @@ class ActiveDensity:
     amplitude: float
     exponent: float
     tail_probability: float
-    prior: float
-    past: tuple[tuple[int, float], ...]
+    origin: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,9 +89,8 @@ def _pack_active(candidates, occupied):
             model_id = models[id(density)] = len(models)
             parameters.extend((
                 density.tail, density.granularity, density.bins, density.amplitude,
-                density.exponent, density.tail_probability, density.prior, len(density.past),
+                density.exponent, density.tail_probability, density.origin,
             ))
-            parameters.extend(value for point in density.past for value in point)
         dependencies.extend(candidate.dependencies)
         for frame, count in candidate.decays:
             decays.extend((count, occupied.get(frame, 0)))
@@ -112,20 +108,20 @@ def _pack_active(candidates, occupied):
 
 class EvictionPlanner:
     def __init__(self, nodes, kv, node_slots, slots, occupied, config, checkpoint_actions,
-                 models, order, materializations=(), *, past_tails=()):
+                 models, order, materializations=()):
         groups = (nodes, kv, node_slots, slots, occupied, checkpoint_actions, materializations)
         self._planner = _load_logstate_module().make_eviction_planner(
             _pack(chain.from_iterable(groups)), [len(group) for group in groups], config,
-            _pack_models(models, past_tails), _pack(order),
+            _pack_models(models), _pack(order),
         )
 
     def rebase(
         self, size, removed, geometry, indices, models, order, config, active_candidates, *,
-        past_tails, active_occupied,
+        active_occupied,
     ):
         active_rows, active_models = _pack_active(active_candidates, active_occupied)
         return _unpack(self._planner["rebase"](
-            size, removed, _pack(geometry), indices, _pack_models(models, past_tails), _pack(order),
+            size, removed, _pack(geometry), indices, _pack_models(models), _pack(order),
             config, active_rows, active_models,
         ))
 
@@ -142,8 +138,8 @@ class EvictionPlanner:
             lock_rows = _pack(chain(blocked, actions))
         model_indices, model_rows = (), _empty(torch.float64)
         if models is not None:
-            model_indices, density, past_tails = models
-            model_rows = _pack_models(density, past_tails)
+            model_indices, density = models
+            model_rows = _pack_models(density)
         active_rows, active_models = _pack_active(active_candidates, active_occupied)
         return _unpack(self._planner["plan"](
             config, _pack(occupied), active_rows, active_models,

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-LOG_STATE_GRANULARITY = 32
+LOG_STATE_GRANULARITY = 16
 LOG_STATE_REPLAY_WINDOW = 16
 
 

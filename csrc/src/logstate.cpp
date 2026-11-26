@@ -343,26 +343,20 @@ private:
 
 class EvictionPlanner {
   using NodeRows = std::vector<Vector>;
+  static constexpr size_t kDensityFields = 9;
   struct Density {
-    double tail = 0, atom = 0, g = 1;
-    bool default_order = false;
+    double origin = 0, tail = 0, atom = 0, g = 1;
     std::vector<double> probability{0.};
-    std::vector<std::pair<double, double>> past_tail_prefix;
     double prefix(double position) const {
       auto i = static_cast<Int>(std::floor((tail - position) / g));
-      double mass = probability[std::clamp<Int>(i, 0, probability.size() - 1)];
-      if (!past_tail_prefix.empty()) {
-        const auto end = std::lower_bound(past_tail_prefix.begin(), past_tail_prefix.end(),
-                                          position, [](const auto &point, double value) {
-                                            return point.first < value;
-                                          });
-        const auto before = end == past_tail_prefix.begin() ? 0. : std::prev(end)->second;
-        mass += past_tail_prefix.back().second - before;
-      }
-      return mass;
+      return probability[std::clamp<Int>(i, 0, probability.size() - 1)];
     }
     double mass(double begin, double end) const {
-      return std::max(0., prefix(begin) - prefix(end));
+      begin = std::max(begin, origin + 1.);
+      if (begin >= end)
+        return 0.;
+      const auto discrete = begin <= tail && tail < end ? atom : 0.;
+      return discrete + std::max(0., prefix(begin) - (end <= tail ? prefix(end) : 0.));
     }
   };
   struct Sum {
@@ -376,43 +370,37 @@ class EvictionPlanner {
   };
 
   struct ActiveDensity {
-    Int tail, g, bins;
+    Int tail, g, bins, origin;
+    double atom;
     std::vector<double> prefix{0.};
-    std::vector<std::pair<Int, double>> past;
 
-    ActiveDensity(const double *p, const double *end) : tail(p[0]), g(p[1]), bins(p[2]) {
-      check(g > 0 && bins >= 1 && p[7] >= 0 && p[7] <= (end - p - 8) / 2,
-            "Invalid active density");
-      const auto prior = p[6];
-      Sum total, past_mass;
+    ActiveDensity(const double *p, const double *end)
+        : tail(p[0]), g(p[1]), bins(p[2]), origin(p[6]), atom(p[5]) {
+      check(g > 0 && bins >= 1 && end - p >= 7, "Invalid active density");
+      Sum total;
       std::vector<double> masses;
       masses.reserve(bins);
       for (Int j = 1; j <= bins; ++j) {
-        const double mass = prior > 0. ? 1. / (j * j) : g * p[3] * std::pow(j * g, -p[4]);
+        const double mass = g * p[3] * std::pow(j * g, -p[4]);
         masses.push_back(mass);
         total.add(mass);
       }
-      for (Int j = 0; j < static_cast<Int>(p[7]); ++j) {
-        const auto pos = p[8 + 2 * j], probability = p[9 + 2 * j];
-        past.emplace_back(pos, probability);
-        past_mass.add(probability);
-      }
-      const auto scale = prior > 0. ? prior / total.total() :
-          std::min(1., std::max(0., 1. - p[5] - past_mass.total()) /
-                       std::max(1e-300, total.total()));
+      const auto scale =
+          std::min(1., std::max(0., 1. - atom) / std::max(1e-300, total.total()));
       prefix.reserve(bins + 1);
       for (auto mass : masses)
         prefix.push_back(prefix.back() + mass * scale);
     }
 
     double mass(Int begin, Int end) const {
+      begin = std::max(begin, origin + 1);
+      if (begin >= end)
+        return 0.;
       auto bucket = [&](Int position) {
         return std::min(bins, std::max(Int{0}, tail - position) / g);
       };
-      Sum atoms;
-      for (const auto &[position, probability] : past)
-        if (begin <= position && position < end) atoms.add(probability);
-      return prefix[bucket(begin)] - prefix[bucket(end)] + atoms.total();
+      const double discrete = begin <= tail && tail < end ? atom : 0.;
+      return prefix[bucket(begin)] - prefix[bucket(end)] + discrete;
     }
   };
 
@@ -440,9 +428,9 @@ class EvictionPlanner {
     const auto *model_end = cursor + density.size(0);
     std::vector<ActiveDensity> models;
     while (cursor < model_end) {
-      check(model_end - cursor >= 8, "Truncated active density");
+      check(model_end - cursor >= 7, "Truncated active density");
       models.emplace_back(cursor, model_end);
-      cursor += 8 + 2 * static_cast<Int>(cursor[7]);
+      cursor += 7;
     }
     const auto count = packed[0];
     const auto *dep = packed + 2 + count * 8;
@@ -466,7 +454,7 @@ class EvictionPlanner {
         Sum increments;
         for (auto x = row[1] + model.g; x < row[3]; x += model.g)
           increments.add((x - row[1]) * model.mass(x, x + model.g));
-        cost = row[4] / 64. + increments.total();
+        cost = row[4] * 1e-12 + increments.total();
       } else {
         cost = (row[2] - row[1]) * model.mass(row[2], row[3]);
       }
@@ -545,7 +533,7 @@ class EvictionPlanner {
   std::unordered_map<Int, Int> previous, slot_node, successors, action_version;
   std::unordered_map<Int, std::vector<Int>> kv_users, decay_users, owner_nodes;
   std::unordered_map<Int, Int> pending_depths;
-  CandidateQueue candidates, default_candidates, leaf_candidates;
+  CandidateQueue candidates, leaf_candidates;
   NodeRows materializations;
   std::vector<size_t> materialization_starts;
   std::vector<Vector> node_materializations;
@@ -637,7 +625,7 @@ class EvictionPlanner {
     if (previous.contains(slot))
       return static_cast<double>(slot_info.at(previous.at(slot)).end);
     const auto end = slot_info.at(slot).end;
-    double restored = model_data[index * 10 + 7];
+    double restored = model_data[index * kDensityFields + 7];
     for (auto preceding : ordered_slots[index]) {
       if (released_set.contains(preceding))
         continue;
@@ -678,16 +666,59 @@ class EvictionPlanner {
     }
     return credit;
   }
+  bool has_node_merge(Int index) {
+    for (auto slot : node_slots[index]) {
+      if (released_set.contains(slot) || !actions.contains(slot))
+        continue;
+      const auto right = successor(actions.at(slot)[1]);
+      if (right >= 0 && !released_set.contains(right))
+        return true;
+    }
+    return false;
+  }
+  bool has_node_materialization(Int index) {
+    for (const auto id : node_materializations[index]) {
+      const auto &row = materializations[id];
+      if (row.empty() || released_set.contains(row[0]) || released_set.contains(row.back()))
+        continue;
+      const auto start = materialization_starts[id];
+      if (std::any_of(row.begin() + 2, row.begin() + start, [&](Int source) {
+            return released_set.contains(-source - 2);
+          }))
+        continue;
+      const bool absorb = row[1] < 0;
+      if (absorb && nodes[slot_node.at(row[0])][2] != 0)
+        continue;
+      bool feasible = true;
+      Int credit = absorb ? 0 : -(config[2] + config[3]);
+      std::unordered_map<Int, Int> records;
+      for (size_t j = start; j < row.size(); ++j) {
+        const auto slot = row[j];
+        if (released_set.contains(slot) || nodes[slot_node.at(slot)][2] != 0) {
+          feasible = false;
+          break;
+        }
+        const auto &record = slot_info.at(slot);
+        credit += record.frames;
+        ++records[record.decay];
+      }
+      if (!feasible)
+        continue;
+      for (const auto &[frame, count] : records)
+        credit += decay_released[frame] + count == decay_occupied.at(frame);
+      if (credit > 0)
+        return true;
+    }
+    return false;
+  }
   void push_node(Int index) {
     if (index < 0 || !queue.is_leaf(index))
       return;
     const auto version = ++node_version[index];
+    if (has_node_merge(index) || has_node_materialization(index))
+      return;
     const auto &order = order_keys[index];
-    Int checkpoints = 0;
-    for (auto slot : node_slots[index]) {
-      checkpoints += !released_set.contains(slot) && actions.contains(slot);
-    }
-    const auto *p = model_data + index * 10;
+    const auto *p = model_data + index * kDensityFields;
     const auto &density = densities.at(model_ids[index]);
     double cost = 0., restored = p[7];
     for (auto slot : ordered_slots[index]) {
@@ -696,13 +727,13 @@ class EvictionPlanner {
       const auto &record = slot_info.at(slot);
       if (record.checkpoint || record.begin == restored) {
         cost += std::max(0., record.end - restored) *
-                (density.atom + density.prefix(record.end));
+                density.mass(record.end, std::numeric_limits<double>::infinity());
         restored = record.end;
       }
     }
     const auto credit = prune_credit(index);
     const auto score = credit ? cost / credit : std::numeric_limits<double>::infinity();
-    leaf_candidates.push({checkpoints > 1 ? 1. : 0., score, nodes[index][3], index, 0,
+    leaf_candidates.push({0., score, nodes[index][3], index, 0,
                           version, score, order[0], order[1], order[2]});
   }
   void push_action(Int slot) {
@@ -722,16 +753,13 @@ class EvictionPlanner {
     const auto cost = std::max(0., distance) * density.mass(left_record.end, right_record.end);
     const auto credit = slot_credit(slot);
     const auto score = credit ? cost / credit : std::numeric_limits<double>::infinity();
-    if (density.default_order)
-      default_candidates.push(
-          {1., static_cast<double>(std::max(left_span, right_span)), action[2],
-           slot, 1, version, score});
-    else
-      candidates.push({0., score, action[2], slot, 1, version, score});
+    candidates.push({1., static_cast<double>(std::max(left_span, right_span)),
+                     action[2], slot, 1, version, score});
   }
   bool valid(const Candidate &c) {
     if (c.kind == 0)
-      return c.version == node_version[c.id] && queue.is_leaf(c.id);
+      return c.version == node_version[c.id] && queue.is_leaf(c.id) &&
+             !has_node_merge(c.id) && !has_node_materialization(c.id);
     if (!actions.contains(c.id) || c.version != action_version[c.id] || released_set.contains(c.id))
       return false;
     const auto right = successor(actions.at(c.id)[1]);
@@ -755,10 +783,8 @@ class EvictionPlanner {
       const bool absorb = row[1] < 0;
       bool feasible = true;
       Int credit = absorb ? 0 : -(config[2] + config[3]);
-      // Reconstruction runs over cached rank updates instead of the model.
-      // Express its launch and replay work in equivalent prefill tokens.
       const auto replay_begin = row[0] < 0 ? 0 : slot_info.at(row[0]).end;
-      double cost = (end - replay_begin) / 64.;
+      double cost = (end - replay_begin) * 1e-12;
       if (absorb) {
         const auto owner = slot_node.at(row[0]);
         if (nodes[owner][2] != 0)
@@ -797,25 +823,25 @@ class EvictionPlanner {
               models.device().device_type == kDLCPU &&
               models.dtype().code == kDLFloat && models.dtype().bits == 64,
           "Invalid eviction density models");
-    const auto model_size = static_cast<Int>(indices.size() * 10);
-    check(models.size(0) >= model_size && (models.size(0) - model_size) % 3 == 0,
-          "Invalid eviction tail probabilities");
+    const auto model_size = static_cast<Int>(indices.size() * kDensityFields);
+    check(models.size(0) == model_size, "Invalid eviction density models");
     const auto *input = static_cast<const double *>(models.data_ptr());
     for (size_t row = 0; row < indices.size(); ++row) {
       const auto index = indices[row];
       check(index >= 0 && index < static_cast<Int>(nodes.size()),
             "Invalid eviction model index");
-      std::copy_n(input + row * 10, 10, model_storage.data() + index * 10);
+      std::copy_n(input + row * kDensityFields, kDensityFields,
+                  model_storage.data() + index * kDensityFields);
     }
     densities.clear();
     for (const auto i : indices) {
-      const auto *p = model_data + i * 10;
+      const auto *p = model_data + i * kDensityFields;
       const auto id = static_cast<Int>(p[0]);
       model_ids[i] = id;
       if (densities.contains(id))
         continue;
       Density d;
-      d.default_order = p[9] != 0.;
+      d.origin = p[1];
       d.tail = p[2];
       d.atom = std::clamp(p[5], 0., 1.);
       d.g = p[6];
@@ -828,26 +854,11 @@ class EvictionPlanner {
         const auto mass = std::exp(p[4] - p[3] * std::log(a)) * d.g;
         d.probability.push_back(d.probability.back() + mass);
       }
-      densities.emplace(id, std::move(d));
-    }
-    for (auto i = model_size; i < models.size(0); i += 3) {
-      const auto owner = static_cast<Int>(input[i]);
-      auto &density = densities.at(owner);
-      const auto position = input[i + 1], probability = input[i + 2];
-      auto &points = density.past_tail_prefix;
-      check(position >= 0 && position < density.tail && probability > 0 &&
-                std::isfinite(probability) && (points.empty() || points.back().first < position),
-            "Invalid past tail probability");
-      const auto previous = points.empty() ? 0. : points.back().second;
-      points.emplace_back(position, previous + probability);
-    }
-    for (auto &[id, d] : densities) {
-      const double past_mass = d.past_tail_prefix.empty() ? 0. : d.past_tail_prefix.back().second;
       const auto scale =
-          std::min(1., std::max(0., 1. - d.atom - past_mass) /
-                        std::max(1e-300, d.probability.back()));
+          std::min(1., std::max(0., 1. - d.atom) / std::max(1e-300, d.probability.back()));
       for (auto &v : d.probability)
         v *= scale;
+      densities.emplace(id, std::move(d));
     }
   }
 
@@ -908,7 +919,7 @@ public:
       decay_occupied.emplace(row[0], row[1]);
     }
     model_ids.resize(nodes.size());
-    model_storage.resize(nodes.size() * 10);
+    model_storage.resize(nodes.size() * kDensityFields);
     model_data = model_storage.data();
     Vector indices(nodes.size());
     std::iota(indices.begin(), indices.end(), 0);
@@ -976,8 +987,8 @@ public:
       const auto owner = row[0];
       set_materializations(owner, groups, first, row[2]);
       first += row[2];
-      if (model_storage[owner * 10 + 7] != row[1]) {
-        model_storage[owner * 10 + 7] = row[1];
+      if (model_storage[owner * kDensityFields + 7] != row[1]) {
+        model_storage[owner * kDensityFields + 7] = row[1];
         push_node(owner);
         for (const auto slot : node_slots[owner])
           if (actions.contains(slot)) push_action(slot);
@@ -1081,7 +1092,7 @@ public:
     order_keys.resize(size);
     node_version.resize(size);
     model_ids.resize(size);
-    model_storage.resize(size * 10);
+    model_storage.resize(size * kDensityFields);
     model_data = model_storage.data();
 
     auto clear_node = [&](Int index) {
@@ -1212,14 +1223,12 @@ public:
         order_keys[index][0] = depth;
     pending_depths.clear();
     candidates.begin_update();
-    default_candidates.begin_update();
     leaf_candidates.begin_update();
     for (const auto index : queue.leaves())
       push_node(index);
     for (const auto &[slot, action] : actions)
       push_action(slot);
     candidates.finish_update();
-    default_candidates.finish_update();
     leaf_candidates.finish_update();
   }
   template <typename Occupancy>
@@ -1269,7 +1278,6 @@ public:
     while (true) {
       const auto materialize = pressure_materialization();
       discard_stale(candidates);
-      discard_stale(default_candidates);
       if (!active_action || !valid_active(active[active_action->id])) {
         active_action.reset();
         for (Int i = 0; i < static_cast<Int>(active.size()); ++i) {
@@ -1289,26 +1297,20 @@ public:
       if (!candidates.empty()) {
         selected_queue = &candidates;
         merge = candidates.top();
+        merge->phase = 0.;
+        merge->score = merge->cost_score;
       }
-      if (!default_candidates.empty()) {
-        auto next = default_candidates.top();
-        next.phase = 0.;
-        next.score = next.cost_score;
-        if (!merge || *merge > next) {
-          selected_queue = &default_candidates;
-          merge = next;
-        }
+      discard_stale(leaf_candidates);
+      if (!leaf_candidates.empty() && (!merge || *merge > leaf_candidates.top())) {
+        selected_queue = &leaf_candidates;
+        merge = leaf_candidates.top();
       }
       if (conversion && (!merge || !(*conversion > *merge))) {
         return conversion->kind == 3 ? result(nullptr, conversion->id, &active[conversion->id]) :
                                        result(&materializations[conversion->id]);
       }
-      if (!selected_queue) {
-        discard_stale(leaf_candidates);
-        if (leaf_candidates.empty())
-          break;
-        selected_queue = &leaf_candidates;
-      }
+      if (!selected_queue)
+        break;
       const auto c = selected_queue->top();
       selected_queue->pop();
       if (c.kind == 0) {

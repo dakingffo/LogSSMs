@@ -14,6 +14,7 @@ import torch
 from logssms.cache.prefix_cache import BaseCacheHandle, BasePrefixCache, MatchResult, SizeInfo
 from logssms.utils import align_down
 
+from .hit_model import LogStateHitStats
 from .metadata import ReclamationChanges
 
 KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
@@ -28,26 +29,6 @@ def _get_key_fn(granularity: int) -> KEY_FN:
 class LogStateKind(Enum):
     LOG = "log"
     CHECKPOINT = "checkpoint"
-
-
-@dataclass(eq=False)
-class LogStateHitStats:
-    origin        : int
-    tail          : int
-    hits          : deque[tuple[int, int, int]] = field(default_factory=lambda: deque(maxlen=8192))
-    exposures     : deque[tuple[int, int]] = field(default_factory=deque)
-    exponent      : float = 2.0
-    log_amplitude : float | None = None
-    tail_probability: float = 0.0
-    past_tail_probabilities: tuple[tuple[int, float], ...] = ()
-    tail_query_begin: int | None = None
-    query_begin   : int = 0
-    fit_query     : int = -1
-    fitted_hit_query: int = -1
-    exponent_query: int = -1
-    uuid          : int = field(default_factory=lambda: next(LogStateHitStats.counter))
-
-    counter = count(1)
 
 
 @dataclass(frozen=True)
@@ -277,8 +258,8 @@ class LogStateCacheHandle(BaseCacheHandle):
     recovery          : LogStateRecovery
     analysis_owner: LogStateHitStats | None = None
     source_analysis_owner: LogStateHitStats | None = None
+    analysis_group: str | int | None = None
     query_uid: int | None = None
-    match_position    : int = 0
     request_end       : int = 0
     protected_endpoints: tuple[int, ...] = ()
     match_trace       : LogRadixTrace | None = field(default=None, compare=False)
@@ -363,7 +344,8 @@ class LogRadixTree(BasePrefixCache):
         self._recovery_slot_refs: dict[int, int] = {}
         self._evictable_slots: dict[int, None] = {}
         self._on_slot_reclaimable = on_slot_reclaimable
-        self.analysis_factory: Callable[[int], LogStateHitStats | None] | None = None
+        self.analysis_factory: Callable[[int, str | int | None], LogStateHitStats | None] | None = None
+        self.topology_revision = 0
         self._match_undo: list[Callable[[], None]] | None = None
         self._match_touches: list[LogStateCacheHandle] = []
 
@@ -479,6 +461,7 @@ class LogRadixTree(BasePrefixCache):
         self._evictable_slots.clear()
         self.revision += 1
         self._lock_footprints.clear()
+        self.topology_revision += 1
 
     def trace(self, input_ids: torch.Tensor) -> LogRadixTrace:
         matched_len = 0
@@ -539,19 +522,9 @@ class LogRadixTree(BasePrefixCache):
                 assert covered == inserted_len
             suffix_ids = input_ids[previous_len:inserted_len]
             suffix_kv = kv_indices[previous_len:inserted_len]
-            owner_boundary = (
-                analysis_owner is not None
-                and analysis_owner is not node.analysis_owner
-                and analysis_owner.origin == previous_len
-            )
-            if (
-                not node.is_root()
-                and node.is_leaf()
-                and not node.is_protected
-                and not owner_boundary
-            ):
+            if not node.is_root() and node.is_leaf() and not node.is_protected:
                 if node.analysis_owner is None and self.analysis_factory is not None:
-                    node.analysis_owner = self.analysis_factory(node.begin)
+                    node.analysis_owner = self.analysis_factory(node.begin, None)
                 frame_ids = (torch.div(suffix_kv.to(device="cpu", dtype=torch.int32),
                                       self.granularity, rounding_mode="floor")
                              if kv_frames is None else kv_frames)
@@ -569,16 +542,20 @@ class LogRadixTree(BasePrefixCache):
                 new_node = LogRadixTreeNode(self.key_fn, self.granularity)
                 new_node.initialize(suffix_ids, suffix_kv, kv_frames)
                 new_node.set_parent(node)
-                if analysis_owner is not None and analysis_owner.origin == previous_len:
-                    new_node.analysis_owner = analysis_owner
-                elif not node.is_root() and len(node.children) == 1:
+                if not node.is_root() and len(node.children) == 1:
                     new_node.analysis_owner = node.analysis_owner
-                elif self.analysis_factory is not None:
-                    new_node.analysis_owner = (
-                        analysis_owner
-                        if analysis_owner is not None and analysis_owner.origin == previous_len
-                        else self.analysis_factory(previous_len)
-                    )
+                else:
+                    if analysis_owner is not None and analysis_owner.tail == analysis_owner.origin:
+                        new_node.analysis_owner = analysis_owner
+                    elif self.analysis_factory is not None:
+                        group = analysis_owner.group if analysis_owner is not None else None
+                        new_node.analysis_owner = self.analysis_factory(previous_len, group)
+                    if not node.is_root() and len(node.children) == 2:
+                        shared = node
+                        owner = node.analysis_owner
+                        while owner is not None and shared.analysis_owner is owner:
+                            shared.analysis_owner = None
+                            shared = shared.parent
                 self._remove_leaf(node)
                 self._add_leaf(new_node)
                 if not node.is_root() and len(node.children) > 1:
@@ -588,6 +565,7 @@ class LogRadixTree(BasePrefixCache):
                 self.evictable_size += node.length
             self._refresh_checkpoint_neighbors(node)
             self.revision += 1
+            self.topology_revision += 1
 
         for entry in entries:
             assert entry.end <= inserted_len
@@ -705,6 +683,7 @@ class LogRadixTree(BasePrefixCache):
         for part in (parent, prefix, node):
             self._refresh_checkpoint_neighbors(part)
         self.revision += 1
+        self.topology_revision += 1
         return prefix
 
     def _undo_match_split(self, parent, prefix, node, saved, timestamps) -> None:
@@ -733,6 +712,7 @@ class LogRadixTree(BasePrefixCache):
         for part in (parent, node):
             self._refresh_checkpoint_neighbors(part)
         self.revision += 1
+        self.topology_revision += 1
 
     def lock(
         self, node: LogRadixTreeNode, unlock: bool = False,
@@ -958,10 +938,14 @@ class LogRadixTree(BasePrefixCache):
             del parent.children[self.key_fn(node.key)]
             self._remove_leaf(node)
             if parent.is_leaf() and not parent.is_root():
+                if parent.analysis_owner is None and self.analysis_factory is not None:
+                    group = node.analysis_owner.group if node.analysis_owner is not None else None
+                    parent.analysis_owner = self.analysis_factory(parent.begin, group)
                 self._add_leaf(parent)
             self._refresh_checkpoint_neighbors(parent)
         if nodes:
             self.revision += 1
+            self.topology_revision += 1
 
     def matched_entries(
         self,

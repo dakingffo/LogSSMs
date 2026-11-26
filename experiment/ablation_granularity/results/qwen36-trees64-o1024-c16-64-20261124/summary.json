@@ -1,0 +1,137 @@
+{
+  "case": {
+    "source_run": "qwen36-logstate32-trees64-o1024-hit-materialization-pro6000-20261124-011401/hit-true/g32",
+    "tree_count": 64,
+    "output_cap": 1024,
+    "eos_token_id": 248046,
+    "max_seq_len": 18432,
+    "gpu_count": 2,
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "tp_size": 2,
+    "cache_bytes_per_rank": 62636687360,
+    "max_running_requests": 64,
+    "model": {
+      "name": "Qwen3.6-27B",
+      "attention_layers": 16,
+      "linear_layers": 48,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_key_heads": 16,
+      "linear_value_heads": 48,
+      "linear_key_dim": 128,
+      "linear_value_dim": 128,
+      "conv_width": 4
+    }
+  },
+  "history_sha256": "5f37b2e7833a1b7dee8f9cf232eb221149c6168fbf865a48ce67dc642b3d6eef",
+  "points": [
+    {
+      "granularity": 16,
+      "tree_concurrency": 16,
+      "historical_hit_rate": 0.9905593652941357,
+      "request_hit_rate": 0.9845372126777513,
+      "requests": 595,
+      "num_frames": 119470,
+      "frame_bytes": 524288
+    },
+    {
+      "granularity": 16,
+      "tree_concurrency": 32,
+      "historical_hit_rate": 0.9768289307789293,
+      "request_hit_rate": 0.9728327757047911,
+      "requests": 595,
+      "num_frames": 119470,
+      "frame_bytes": 524288
+    },
+    {
+      "granularity": 16,
+      "tree_concurrency": 48,
+      "historical_hit_rate": 0.951333066822473,
+      "request_hit_rate": 0.9497072350218497,
+      "requests": 595,
+      "num_frames": 119470,
+      "frame_bytes": 524288
+    },
+    {
+      "granularity": 16,
+      "tree_concurrency": 64,
+      "historical_hit_rate": 0.9444816876287708,
+      "request_hit_rate": 0.9436358238124885,
+      "requests": 595,
+      "num_frames": 119470,
+      "frame_bytes": 524288
+    },
+    {
+      "granularity": 32,
+      "tree_concurrency": 16,
+      "historical_hit_rate": 0.9765706202527753,
+      "request_hit_rate": 0.9607869218319595,
+      "requests": 595,
+      "num_frames": 59735,
+      "frame_bytes": 1048576
+    },
+    {
+      "granularity": 32,
+      "tree_concurrency": 32,
+      "historical_hit_rate": 0.9660629170638704,
+      "request_hit_rate": 0.9521587606227442,
+      "requests": 595,
+      "num_frames": 59735,
+      "frame_bytes": 1048576
+    },
+    {
+      "granularity": 32,
+      "tree_concurrency": 48,
+      "historical_hit_rate": 0.9518035609951105,
+      "request_hit_rate": 0.9402475796764349,
+      "requests": 595,
+      "num_frames": 59735,
+      "frame_bytes": 1048576
+    },
+    {
+      "granularity": 32,
+      "tree_concurrency": 64,
+      "historical_hit_rate": 0.9408345890095021,
+      "request_hit_rate": 0.9304827712912548,
+      "requests": 595,
+      "num_frames": 59735,
+      "frame_bytes": 1048576
+    },
+    {
+      "granularity": 64,
+      "tree_concurrency": 16,
+      "historical_hit_rate": 0.9719733079122974,
+      "request_hit_rate": 0.9284577225462606,
+      "requests": 595,
+      "num_frames": 29867,
+      "frame_bytes": 2097152
+    },
+    {
+      "granularity": 64,
+      "tree_concurrency": 32,
+      "historical_hit_rate": 0.9597865863033919,
+      "request_hit_rate": 0.918563939590272,
+      "requests": 595,
+      "num_frames": 29867,
+      "frame_bytes": 2097152
+    },
+    {
+      "granularity": 64,
+      "tree_concurrency": 48,
+      "historical_hit_rate": 0.9485623789169408,
+      "request_hit_rate": 0.9096654698811135,
+      "requests": 595,
+      "num_frames": 29867,
+      "frame_bytes": 2097152
+    },
+    {
+      "granularity": 64,
+      "tree_concurrency": 64,
+      "historical_hit_rate": 0.9431255573664626,
+      "request_hit_rate": 0.9034759700960953,
+      "requests": 595,
+      "num_frames": 29867,
+      "frame_bytes": 2097152
+    }
+  ]
+}

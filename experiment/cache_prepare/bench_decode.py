@@ -35,7 +35,7 @@ class KernelProbe:
 
 
 def benchmark(fn, batch_size, num_key_heads, num_value_heads, count, eager, log_decay,
-              warmup_ms):
+              warmup_ms, granularity):
     globals_ = inspect.unwrap(fn).__globals__
     name = "_fused_recurrent_gated_delta_kernel"
     if not isinstance(globals_[name], KernelProbe):
@@ -44,7 +44,7 @@ def benchmark(fn, batch_size, num_key_heads, num_value_heads, count, eager, log_
     torch.manual_seed(511)
     device, dtype = torch.device("cuda"), torch.bfloat16
     pool = MHALogStatePool(
-        num_frames=batch_size * 12 + 32, page_size=64, granularity=32,
+        num_frames=batch_size * 12 + 32, page_size=64, granularity=granularity,
         num_attention_layers=1, num_kv_heads=8, head_dim=128,
         num_linear_layers=1, num_key_heads=num_key_heads, num_value_heads=num_value_heads,
         head_k_dim=128, head_v_dim=128,
@@ -137,6 +137,7 @@ def main():
     parser.add_argument("--compare-log-decay", action="store_true",
                         help="The saved baseline also stores logarithmic decay")
     parser.add_argument("--batches", default="1,32,64")
+    parser.add_argument("--granularity", type=int, choices=(16, 32, 64), default=16)
     parser.add_argument("--replay-counts", default="0,7,15")
     parser.add_argument("--warmup-ms", type=float, default=200,
                         help="Warm each captured variant before GPU event timing")
@@ -163,26 +164,26 @@ def main():
     for batch in map(int, args.batches.split(",")):
         for count in map(int, args.replay_counts.split(",")):
             if reference:
-                row = benchmark(reference, batch, 8, 24, count, False, args.compare_log_decay, args.warmup_ms)
+                row = benchmark(reference, batch, 8, 24, count, False, args.compare_log_decay, args.warmup_ms, args.granularity)
                 row["variant"] = "baseline"
                 results.append(row)
                 print(json.dumps(row), flush=True)
-            row = benchmark(fn, batch, 8, 24, count, False, args.log_decay, args.warmup_ms)
+            row = benchmark(fn, batch, 8, 24, count, False, args.log_decay, args.warmup_ms, args.granularity)
             row["variant"] = "current"
             results.append(row)
             print(json.dumps(row), flush=True)
         if reference:
-            row = benchmark(reference, batch, 8, 24, 0, True, args.compare_log_decay, args.warmup_ms)
+            row = benchmark(reference, batch, 8, 24, 0, True, args.compare_log_decay, args.warmup_ms, args.granularity)
             row["variant"] = "baseline"
             results.append(row)
-        row = benchmark(fn, batch, 8, 24, 0, True, args.log_decay, args.warmup_ms)
+        row = benchmark(fn, batch, 8, 24, 0, True, args.log_decay, args.warmup_ms, args.granularity)
         row["variant"] = "current"
         results.append(row)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(dict(
         scope="Isolated decode arithmetic, not a serving or prefix-cache comparison",
         gpu=torch.cuda.get_device_name(), dtype="bfloat16", log_decay=args.log_decay,
-        warmup_ms=args.warmup_ms,
+        warmup_ms=args.warmup_ms, granularity=args.granularity,
         reference_log_decay=args.compare_log_decay,
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(), results=results,
         reference_sha256=(hashlib.sha256(args.compare_source.read_bytes()).hexdigest()

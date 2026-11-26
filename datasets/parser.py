@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import random
 from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, count, islice
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -323,6 +324,154 @@ def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
         for line in file:
             if line.strip():
                 yield json.loads(line)
+
+
+def _common_token_prefix(left, right):
+    if isinstance(left, BlockPrompt) and isinstance(right, BlockPrompt):
+        return left.width * next(
+            (i for i, (a, b) in enumerate(zip(left.blocks, right.blocks)) if a != b),
+            min(len(left.blocks), len(right.blocks)),
+        )
+    return next(
+        (i for i, (a, b) in enumerate(zip(left, right)) if a != b),
+        min(len(left), len(right)),
+    )
+
+
+class BlockPrompt:
+    def __init__(self, blocks, width):
+        self.blocks = blocks
+        self.width = width
+
+    def __len__(self):
+        return len(self.blocks) * self.width
+
+    def tensor(self):
+        import torch
+
+        return (torch.tensor(self.blocks, dtype=torch.int32)[:, None]
+                + torch.arange(self.width, dtype=torch.int32)).flatten()
+
+    def suffix(self, start, limit):
+        block = start // self.width
+        return list(islice(
+            (base + offset for base in self.blocks[block:] for offset in range(self.width)),
+            start % self.width, start % self.width + limit,
+        ))
+
+
+def replay_history_prefix(record: dict, parent: dict) -> int:
+    """Measure the common prefix with the parent's prompt and generated output."""
+    prompt = record["prompt_token_ids"]
+    parent_prompt = parent["prompt_token_ids"]
+    shared = _common_token_prefix(prompt, parent_prompt)
+    if shared != len(parent_prompt):
+        return shared
+    output = parent["generated_token_ids"]
+    suffix = (prompt.suffix(shared, len(output)) if isinstance(prompt, BlockPrompt)
+              else prompt[shared:shared + len(output)])
+    return shared + _common_token_prefix(suffix, output)
+
+
+def _load_agent_replay_records(
+    path: Path, session_limit: int | None, max_context: int | None,
+) -> list[dict]:
+    """Build token identities from session-local hashes without expanding stored prompts."""
+    records = []
+    token_ids = count()
+    selected = 0
+    for session in _iter_jsonl(path):
+        width = session["block_size"]
+        if width != 64 or session["hash_id_scope"] != "local":
+            raise ValueError("Expected 64-token, session-local block hashes")
+        bases = {}
+        streams = [[]]
+        for event in session["requests"]:
+            if event["type"] == "subagent":
+                streams.append(event["requests"])
+            else:
+                streams[0].append(event)
+
+        streams = [[event for event in stream if event["out"] > 0 and event["in"] > 0]
+                   for stream in streams]
+        peak = max((event["in"] + event["out"] for stream in streams for event in stream), default=0)
+        if not peak or (max_context is not None and peak > max_context):
+            continue
+        origin = min(event["t"] for stream in streams for event in stream)
+        session_records = []
+        for stream in streams:
+            turns = []
+            for event in sorted(stream, key=lambda event: event["t"]):
+                blocks = []
+                for key in event["hash_ids"]:
+                    if key not in bases:
+                        bases[key] = next(token_ids) * width
+                    blocks.append(bases[key])
+                prompt = BlockPrompt(blocks, width)
+                if len(prompt) != event["in"]:
+                    raise ValueError("Prompt length does not match the block hashes")
+                turns.append(dict(
+                    uid=f'{session["id"]}:{len(session_records)}', tree_id=session["id"],
+                    depth=len(turns), t=event["t"] - origin, api_time=event["api_time"],
+                    prompt_token_ids=prompt, output_cap=event["out"],
+                    ignore_eos=True, parent=None,
+                ))
+                session_records.append(turns[-1])
+
+            for i, record in enumerate(turns):
+                prompt = record["prompt_token_ids"]
+                length = record["output_cap"]
+                continuation = []
+                if i + 1 < len(turns):
+                    child = turns[i + 1]
+                    if child["t"] + 0.001 >= record["t"] + record["api_time"]:
+                        child_prompt = child["prompt_token_ids"]
+                        shared = _common_token_prefix(prompt, child_prompt)
+                        if shared == len(prompt):
+                            continuation = child_prompt.suffix(shared, length)
+                        child["parent"] = record["uid"]
+                while len(continuation) < length:
+                    base = next(token_ids) * width
+                    continuation.extend(range(base, base + min(width, length - len(continuation))))
+                record["generated_token_ids"] = continuation
+
+        for record in sorted(session_records, key=lambda record: record["t"]):
+            record["dispatch_index"] = len(records)
+            records.append(record)
+        selected += 1
+        if selected == session_limit:
+            break
+    return records
+
+
+@dataclass(frozen=True)
+class ReplayHistory:
+    path: Path
+    requests: list[dict]
+
+    def sha256(self) -> str:
+        with self.path.open("rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def load_replay_history(
+    source: str | Path, *, session_limit: int | None = None, max_context: int | None = None,
+) -> ReplayHistory:
+    """Read a token history or an agent trace into scheduler replay records."""
+    path = resolve_dataset_path(source)
+    if path.is_dir():
+        path = path / "traces.jsonl"
+    if path.name.endswith((".jsonl", ".jsonl.gz")):
+        if session_limit is not None and session_limit < 1:
+            raise ValueError("Trace session limit must be positive")
+        if max_context is not None and max_context < 1:
+            raise ValueError("Trace context limit must be positive")
+        return ReplayHistory(path, _load_agent_replay_records(path, session_limit, max_context))
+    if session_limit is not None or max_context is not None:
+        raise ValueError("Session selection requires Agent trace JSONL")
+    with path.open(encoding="utf-8") as file:
+        requests = sorted(json.load(file)["requests"], key=lambda record: record["dispatch_index"])
+    return ReplayHistory(path, requests)
 
 
 def _iter_json(path: Path) -> Iterator[dict[str, Any]]:

@@ -1,0 +1,25 @@
+{
+  "source_run": "qwen36-logstate32-trees64-o1024-hit-materialization-pro6000-20261124-011401/hit-true/g32",
+  "tree_count": 64,
+  "output_cap": 1024,
+  "eos_token_id": 248046,
+  "max_seq_len": 18432,
+  "gpu_count": 2,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "tp_size": 2,
+  "cache_bytes_per_rank": 62636687360,
+  "max_running_requests": 64,
+  "model": {
+    "name": "Qwen3.6-27B",
+    "attention_layers": 16,
+    "linear_layers": 48,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "linear_key_heads": 16,
+    "linear_value_heads": 48,
+    "linear_key_dim": 128,
+    "linear_value_dim": 128,
+    "conv_width": 4
+  },
+  "granularity": 16
+}

@@ -87,15 +87,14 @@ def eviction_slot_records(slots):
     return [(*row, int(row[2] < 0)) for row in slots]
 
 
-def plan_eviction(nodes, kv, node_slots, slots, occupied, config, actions, models=None, *, past_tails=()):
+def plan_eviction(nodes, kv, node_slots, slots, occupied, config, actions, models=None):
     if models is None:
         # Isolate timestamps and span ordering without assigning locality to synthetic rows.
-        models = [(index, 0, 32, 2., -1000., 0., 32, 0, 32, 1)
+        models = [(index, 0, 32, 2., -1000., 0., 32, 0, 32)
                   for index in range(len(nodes))]
     order = [(0, uuid, index) for index, (uuid, *_) in enumerate(nodes)]
     planner = EvictionPlanner(
         nodes, kv, node_slots, eviction_slot_records(slots), occupied, config, actions, models, order,
-        past_tails=past_tails,
     )
     return planner.plan(config, occupied)
 

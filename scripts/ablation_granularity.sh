@@ -5,4 +5,5 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 export PYTHONPATH="$REPO_ROOT/python:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export CUDA_VISIBLE_DEVICES=""
 exec "${PYTHON:-python}" -m experiment.ablation_granularity.run_granularity "$@"

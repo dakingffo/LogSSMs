@@ -17,7 +17,7 @@ Warmup can leave unrelated cache entries in the service. Use `--no-warmup` only
 for an explicitly cold-start measurement.
 
 Run one concurrency point per invocation, with a fresh server for each point.
-The service launchers are documented in `experiment/launch_server/README.md`.
+The service launchers are documented in `experiment/utils/launch_server/README.md`.
 
 ```bash
 python -m experiment.random_multiturn \
@@ -57,7 +57,7 @@ python -m experiment.random_multiturn \
   --seed 0 --name qwen36-vllm-c32-t16-o512
 ```
 
-The server is launched separately (see `experiment/launch_server/README.md`);
+The server is launched separately (see `experiment/utils/launch_server/README.md`);
 set its `--max-model-len 12288 --max-num-seqs 32 --max-num-batched-tokens 8192`
 for the same limits used in the LogSSMs comparison. No vLLM import or installation
 is required in the client environment. Warmup and latency/throughput calculations
@@ -125,7 +125,7 @@ LOGSSMS_PROFILE_SCHEDULER=1 \
 LOGSSMS_PROFILE_SCHEDULER_PATH=/tmp/logssms-execution.json \
 nsys profile --trace=cuda,nvtx --cuda-graph-trace=node \
   --output=/tmp/logssms-execution \
-  python -m experiment.launch_server.launch_logssms <server arguments>
+  python -m experiment.utils.launch_server.launch_logssms <server arguments>
 ```
 
 NVTX ranges include phase and batch ID, so the kernel trace can be matched to JSON

@@ -463,26 +463,27 @@ class LogStateCacheManager(BaseCacheManager):
         with self.record_schedule_step("hit_owner_lookup"):
             trace = handle.match_trace
             assert trace is not None and handle.trace_revision == self.tree.revision
-            source_node = trace.node
-
-            source = source_node.analysis_owner
-            if source is not None and not source.origin <= trace.matched_len <= source.tail:
-                source = None
+            source = trace.node.analysis_owner
+            group = req.cache_session_id
+            if group is None and trace.matched_len:
+                node = trace.node
+                while source is None and node.children:
+                    node = next(iter(node.children.values()))
+                    source = node.analysis_owner
+                if source is not None:
+                    group = source.group
             continues_chain = (
-                source is not None
-                and trace.is_exact
-                and trace.node.is_leaf()
-                and source.tail == trace.matched_len == handle.cached_len
+                source is not None and trace.is_exact and trace.node.is_leaf()
+                and source.tail == trace.matched_len and group == source.group
             )
-            match_position = trace.matched_len
-            stats = source if continues_chain else self.analyzer.make_hit_stats(match_position)
+            stats = source if continues_chain else self.analyzer.make_hit_stats(trace.matched_len, group)
         return MatchResult(
             replace(
                 handle,
                 analysis_owner=stats,
                 source_analysis_owner=source,
+                analysis_group=group,
                 query_uid=req.uid,
-                match_position=match_position,
                 request_end=req.input_len + req.output_len,
                 protected_endpoints=protected,
             ),
@@ -732,7 +733,7 @@ class LogStateCacheManager(BaseCacheManager):
         assert isinstance(handle, LogStateCacheHandle)
         if handle.query_uid not in self._sampled_queries:
             self._sampled_queries.add(handle.query_uid)
-            self.analyzer.record_hit(handle.source_analysis_owner, handle.match_position)
+            self.analyzer.reuse.record_query(self.tree, handle.match_trace, handle.analysis_group)
         return True
 
     @staticmethod
@@ -1171,7 +1172,7 @@ class LogStateCacheManager(BaseCacheManager):
                     analysis_owner = {
                         "origin": owner.origin,
                         "tail": owner.tail,
-                        "queued_hits": len(owner.hits),
+                        "hit_buckets": len(owner.hit_counts),
                     }
                 cached_entries = tuple(
                     entry

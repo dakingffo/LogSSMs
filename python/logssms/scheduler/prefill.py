@@ -40,6 +40,7 @@ class PendingRequest:
     queued_at_ns   : int = field(default_factory=perf_counter_ns)
     admitted       : bool = False
     prefix_cached_len: int = 0
+    cache_session_id: str | None = None
 
     @property
     def input_len(self) -> int:
@@ -194,6 +195,7 @@ class PrefillManager:
             req.sampling_params,
             profile_tag=req.profile_tag,
             return_token_ids=req.return_token_ids,
+            cache_session_id=req.cache_session_id,
         ))
 
     def schedule_next_batch(

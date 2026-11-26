@@ -42,6 +42,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     profile_tag     : str | None       = None
     input_ids       : torch.Tensor | None = None
     return_token_ids: bool             = False
+    cache_session_id: str | None = None
 
 
 @dataclass

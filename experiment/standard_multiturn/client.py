@@ -264,6 +264,7 @@ async def run_point(
             dispatched = time.perf_counter()
             result = await asyncio.wait_for(stream_token_ids(
                 client, base, model, prompt, output_len, node.uid, api, ignore_eos=False,
+                cache_session_id=node.tree_id,
             ), timeout=request_timeout)
             if prompt[:len(shared)] != shared:
                 raise RuntimeError(f"{node.uid}: broken shared token prefix")

@@ -1,26 +1,49 @@
 # Granularity ablation
 
-Compare LogState granularity 16, 32, and 64 on one standard multiturn workload.
+Compare LogState granularity 16, 32, and 64 at 16, 32, 48, and 64 concurrent
+trees using CPU replay.
 
 ```bash
-bash scripts/ablation_granularity.sh --model-path /path/to/Qwen3.6-27B
+bash scripts/ablation_granularity.sh
 ```
 
-The script starts a fresh LogSSMs server for each point and stops it after the
-client finishes. All points use 64 OASST2 trees, up to one concurrent request per
-tree, and a 1024-token output cap with EOS enabled. The server uses TP=2,
-a 0.9 memory ratio, CUDA graphs, and mixed scheduling with prefill budgets of
-128 tokens for mixed batches and 8192 for pure prefill. Online analysis is enabled. Eager state and scheduler profiling are disabled.
+All points replay the same 64 OASST2 trees from `data/history.json`. The
+history contains the actual prompt and output token IDs recorded on
+Qwen3.6-27B with a 1,024-token output cap and EOS enabled. Replay verifies
+each continuation against its parent's exact prompt and generated tokens.
+Admission uses the original 1,024-token budget, and decoding stops at the
+recorded EOS token or at the budget.
+One request per tree can be in flight. A tree retains its client slot until
+the client observes its last response, then another tree takes the slot.
+A finished response passes through one receive interval before it becomes
+visible to the simulated client. This models the frontend round trip while
+the scheduler retains its production deferred-release behavior. The
+client-side history does not record exact server-side receive iterations.
 
-The client warms up with four disjoint trees and excludes them from the
-measurements. Each child request inherits the exact prompt and generated token
-IDs of its parent in the current run. The runner checks that all points used the
-same workload manifest. Compare actual generated token totals alongside latency
-and throughput.
+The production scheduler and LogState allocator run with TP=2 metadata and
+the same cache byte budget per rank at every point. The number of frames
+depends on granularity. The server-side limit stays at 64 requests. Online
+analysis and hit materialization are enabled.
 
-Results are saved in `results/<run>/` by default, with a report and request history
-in each granularity's subdirectory, plus server logs and `summary.md`. The table
-uses token-weighted history hit rate, TTFT P50/P99, TPOT P50, and output tok/s.
-The default seed is 0, and the sequence limit is 18432 tokens. Set `PYTHON` to
-select a Python interpreter. Use `--granularity 32 16` to repeat only selected
-points or change their order.
+The horizontal axis shows the unweighted mean of individual continuation
+request hit fractions. The vertical axis shows the token-weighted historical
+prefix hit rate. Both use the recoverable cache length at admission, capped
+at the parent's prompt and output length. Roots have no parent history and
+are excluded. Marker shapes identify the concurrent tree cap and colors
+identify the granularity in tokens. Gray solid lines connect points at the
+same concurrency.
+
+Dashed curves connect points with the same granularity and extend to the plot
+edges along their endpoint slopes.
+
+The runner writes replay reports, `summary.json`, `granularity.pdf`, and
+`granularity.png` to `results/<run>/`. Use `--out` to select another directory,
+`--granularity` and `--concurrency` to run selected points, and `PYTHON` to
+select the interpreter. The replay requires the LogSSMs Python dependencies
+and Matplotlib, and runs without a GPU.
+
+To redraw an existing complete run from its request-level reports:
+
+```bash
+bash scripts/ablation_granularity.sh --plot-only --out experiment/ablation_granularity/results/<run>
+```

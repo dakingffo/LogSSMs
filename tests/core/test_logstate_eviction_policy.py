@@ -5,15 +5,14 @@ from logssms.kernel.logstate import EvictionPlanner
 from tests.logstate_helpers import eviction_slot_records, plan_eviction
 
 
-@pytest.mark.parametrize("online", [False, True])
-def test_leaf_with_checkpoints_separated_by_log_can_be_pruned_as_fallback(online):
+def test_leaf_with_checkpoints_separated_by_log_can_be_pruned():
     nodes = [(0, -1, 1, 0), (1, 0, 0, 0), (2, 0, 0, 1)]
     kv = [[], [10, 32, 32], [11, 32, 32]]
     refs = [[], [1, 2, 3], [4]]
     slots = [(1, 3, -1, 0, 32), (2, 1, 20, 32, 64),
              (3, 3, -1, 64, 96), (4, 3, -1, 0, 32)]
     actions = [(1, -1, 0, 1), (3, -1, 0, 1), (4, -1, 1, 2)]
-    models = [(i, 0, 96, 2., -12., 0.5, 32, 0, 96, 0) for i in range(3)] if online else None
+    models = [(i, 0, 96, 2., -12., 0.5, 32, 0, 96) for i in range(3)]
 
     def selected(need):
         capacity = (0, 0, 3, 0, 1, 1, need, 0, 0, 3)
@@ -25,7 +24,7 @@ def test_leaf_with_checkpoints_separated_by_log_can_be_pruned_as_fallback(online
 
 def test_active_reclamation_precedes_checkpoint_leaf_eviction():
     capacity = (0, 0, 3, 0, 1, 1, 1, 0, 0, 3)
-    models = [(1, 0, 32, 2., -16., 0.01, 32, 0, end, 1) for end in (0, 32)]
+    models = [(1, 0, 32, 2., -16., 0.01, 32, 0, end) for end in (0, 32)]
     planner = EvictionPlanner(
         [(0, -1, 1, 0), (1, 0, 0, 0)],
         [[], [9, 32, 32]], [[], [1]], [(1, 3, -1, 0, 32, 1)], [], capacity,
@@ -33,7 +32,7 @@ def test_active_reclamation_precedes_checkpoint_leaf_eviction():
     )
     from logssms.kernel.logstate import ActiveCost, ActiveDensity
 
-    candidate = ActiveCost(ActiveDensity(32, 32, 1, 0., 2., 0., 1., ()),
+    candidate = ActiveCost(ActiveDensity(32, 32, 1, 0., 2., 0.),
                            0, 32, 32, 0, 1, (), ())
     result = planner.plan(capacity, [], [candidate])
     assert result == [[], [], [], [], [-2, 0, 1, 0]]
@@ -42,7 +41,7 @@ def test_active_reclamation_precedes_checkpoint_leaf_eviction():
 
 def test_active_reclamation_uses_completed_logs_and_publishes_merged_checkpoint():
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from tests.core.test_logstate_cache_manager import make_manager, new_req
 
     manager = make_manager(num_pages=24, num_states=24, granularity=32)
@@ -76,7 +75,7 @@ def test_active_reclamation_uses_completed_logs_and_publishes_merged_checkpoint(
 
 def test_decode_reclaims_completed_logs_when_allocation_is_short():
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from tests.core.test_logstate_cache_manager import make_manager, new_req
 
     manager = make_manager(num_pages=24, num_states=24, granularity=32)
@@ -103,7 +102,7 @@ def test_decode_reclaims_completed_logs_when_allocation_is_short():
 @pytest.mark.parametrize("history_confirmed", [True, False])
 def test_allocation_can_reclaim_an_active_request_outside_the_batch(phase, history_confirmed):
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.cache.logstate.evictor import LogStateCapacityError
     from tests.core.test_logstate_cache_manager import make_manager, new_req
 
@@ -159,7 +158,7 @@ def test_allocation_can_reclaim_an_active_request_outside_the_batch(phase, histo
 @pytest.mark.parametrize("completed_group", [False, True])
 def test_prefill_admission_counts_active_reclamation_without_executing_it(completed_group):
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.core import SamplingParams
     from logssms.scheduler.prefill import PendingRequest
     from tests.core.test_logstate_cache_manager import make_manager, new_req
@@ -230,7 +229,7 @@ def test_prefill_admission_counts_already_admitted_peaks():
 
 def test_prefill_can_use_reclaimable_tree_capacity_for_its_immediate_allocation():
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.core import SamplingParams
     from logssms.scheduler.prefill import PendingRequest
     from tests.core.test_logstate_cache_manager import make_manager, new_req
@@ -304,7 +303,7 @@ def run(need, *, locked=False):
     slots = [(1, 3, -1, 0, 32), (2, 3, -1, 32, 64), (3, 3, 20, 64, 96)]
     actions = [(1, 2, 0, 1), (2, -1, 1, 1)]
     models = [
-        (1, 0, 96, 2.0, -12.0, 0.9, 32, b, e, 0)
+        (1, 0, 96, 2.0, -12.0, 0.9, 32, b, e)
         for b, e in ((0, 0), (0, 64), (64, 96))
     ]
     return plan_eviction(
@@ -316,7 +315,7 @@ def run(need, *, locked=False):
 @pytest.mark.parametrize("adjustment", ["disabled", "no_internal_hits", "fitted"])
 def test_pressure_materialization_preserves_kv_and_respects_pins(pinned, adjustment):
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.cache.logstate.prefix_cache import LogStateEntry, LogStateKind
     from tests.core.test_logstate_cache_manager import make_manager
     from logssms.cache.logstate.evictor import LogStateCapacityError
@@ -409,7 +408,7 @@ def test_density_orders_leaves_subject_to_tree_dependencies():
     slots = [(i, 2, 20 + i, (i - 1) * 32, i * 32) for i in range(1, 4)]
     # A cold-looking interior Log is unavailable until its hot suffix is gone.
     models = [
-        (i, 0, 96, 2.0, -4.0 if i < 3 else -12.0, 0.8 if i < 3 else 0.01, 32, b, e, 0)
+        (i, 0, 96, 2.0, -4.0 if i < 3 else -12.0, 0.8 if i < 3 else 0.01, 32, b, e)
         for i, b, e in ((0, 0, 0), (1, 0, 32), (1, 32, 64), (2, 64, 96))
     ]
     result = plan_eviction(
@@ -427,7 +426,7 @@ def test_density_orders_leaves_subject_to_tree_dependencies():
 
 @pytest.mark.parametrize("online", [False, True])
 def test_checkpoint_leaf_is_pruned_whole_only_after_internal_thinning(online):
-    models = [(1, 0, 96, 2., -12., .9, 32, 0, end, 0)
+    models = [(1, 0, 96, 2., -12., .9, 32, 0, end)
               for end in (0, 96)] if online else None
     result = plan_eviction(
         [(0, -1, 1, 0), (1, 0, 0, 0)],
@@ -448,25 +447,11 @@ def test_terminal_checkpoint_cost_uses_actual_recovery_frontier():
         [(1, 3, -1, 480, 512), (2, 3, -1, 0, 64)], [],
         (0, 0, 3, 0, 1, 1, 3, 0, 0, 3),
         [(1, -1, 0, 1), (2, -1, 0, 2)],
-        [(0, 0, 512, 2., -100., 1., 32, 0, 0, 0),
-         (1, 0, 512, 2., -100., 1., 32, 416, 512, 0),
-         (2, 0, 64, 2., -100., 1., 32, 0, 64, 0)],
+        [(0, 0, 512, 2., -100., 1., 32, 0, 0),
+         (1, 0, 512, 2., -100., 1., 32, 416, 512),
+         (2, 0, 64, 2., -100., 1., 32, 0, 64)],
     )
     assert selected == [2] and merges == []
-
-
-def test_online_thins_a_node_before_pruning_a_cheaper_checkpoint_leaf():
-    selected, kv, released, merges = plan_eviction(
-        [(0, -1, 1, 0), (1, 0, 0, 0), (2, 0, 0, 0)],
-        [[], [], [10, 32, 32]], [[], [1, 2], [3]],
-        [(1, 3, -1, 0, 32), (2, 3, -1, 32, 64), (3, 3, -1, 0, 32)], [],
-        (0, 0, 3, 0, 1, 1, 3, 0, 0, 3),
-        [(1, 2, 0, 1), (2, -1, 0, 1), (3, -1, 0, 2)],
-        [(0, 0, 64, 2., -12., .9, 32, 0, 0, 0),
-         (1, 0, 64, 2., -2., .9, 32, 0, 64, 0),
-         (2, 0, 32, 2., -30., 0., 32, 0, 32, 0)],
-    )
-    assert selected == [] and kv == [] and released == [1] and merges == [1, 2]
 
 
 def test_density_amplitude_affects_leaf_selection_independently_of_heat_ties():
@@ -475,14 +460,14 @@ def test_density_amplitude_affects_leaf_selection_independently_of_heat_ties():
         [[], [], []], [[], [1], [2]],
         [(1, 2, 21, 64, 96), (2, 2, 22, 64, 96)], [(21, 1), (22, 1)],
         (0, 0, 2, 0, 1, 1, 2, 0, 0, 2), [],
-        [(0, 0, 128, 2., -12., 0., 32, 0, 0, 0),
-         (1, 0, 128, 2., -6., 0., 32, 64, 96, 0),
-         (2, 0, 128, 2., -12., 0., 32, 64, 96, 0)],
+        [(0, 0, 128, 2., -12., 0., 32, 0, 0),
+         (1, 0, 128, 2., -6., 0., 32, 64, 96),
+         (2, 0, 128, 2., -12., 0., 32, 64, 96)],
     )
     assert selected == [2]
 
 
-def test_checkpoint_merge_cost_includes_missing_parent_state():
+def test_checkpoint_merge_prefers_smaller_spans_before_cost():
     selected, _, released, merges = plan_eviction(
         [(0, -1, 1, 0), (1, 0, 0, 0), (2, 0, 0, 0)],
         [[], [], []], [[], [1, 2], [3, 4]],
@@ -490,11 +475,11 @@ def test_checkpoint_merge_cost_includes_missing_parent_state():
          (3, 3, -1, 80, 128), (4, 3, -1, 128, 160)], [],
         (0, 0, 3, 0, 1, 1, 3, 0, 0, 3),
         [(1, 2, 0, 1), (2, -1, 0, 1), (3, 4, 0, 2), (4, -1, 0, 2)],
-        [(0, 0, 192, 0., -10., 0., 16, 0, 0, 0),
-         (1, 0, 192, 0., -10., 0., 16, 64, 160, 0),
-         (2, 0, 192, 0., -10., 0., 16, 80, 160, 0)],
+        [(0, 0, 192, 0., -10., 0., 16, 0, 0),
+         (1, 0, 192, 0., -10., 0., 16, 64, 160),
+         (2, 0, 192, 0., -10., 0., 16, 80, 160)],
     )
-    assert selected == [] and released == [3] and merges == [3, 4]
+    assert selected == [] and released == [1] and merges == [1, 2]
 
 
 def test_native_planner_rejects_cross_node_checkpoint_merges():
@@ -512,7 +497,7 @@ def test_native_planner_rejects_cross_node_checkpoint_merges():
 def test_actual_allocator_accepts_the_projected_reservation(online, seed):
     from random import Random
     from tests.core.test_logstate_eviction_planning import make_pressure_tree
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
 
     rng = Random(seed)
     manager = make_pressure_tree(chains=8, pages=6, checkpoints=seed % 4)
@@ -540,9 +525,9 @@ def test_model_refresh_promotes_a_candidate_below_the_old_heap_top():
     slots = [(1, 2, 20, 0, 32), (2, 2, 21, 0, 32)]
     occupied = [(20, 1), (21, 1)]
     config = (0, 0, 3, 0, 1, 1, 1, 0, 0, 2)
-    models = [(0, 0, 32, 2., -12., .5, 32, 0, 0, 0),
-              (1, 0, 32, 2., -12., .01, 32, 0, 32, 0),
-              (2, 0, 32, 2., -12., .9, 32, 0, 32, 0)]
+    models = [(0, 0, 32, 2., -12., .5, 32, 0, 0),
+              (1, 0, 32, 2., -12., .01, 32, 0, 32),
+              (2, 0, 32, 2., -12., .9, 32, 0, 32)]
     assert plan_eviction(nodes, kv, refs, slots, occupied, config, [], models)[0] == [1]
     planner = EvictionPlanner(nodes, kv, refs, eviction_slot_records(slots), occupied, config, [], models,
                               [(0, 0, 0), (32, 1, 0), (32, 2, 0)])
@@ -550,35 +535,39 @@ def test_model_refresh_promotes_a_candidate_below_the_old_heap_top():
                (*models[2][:5], .01, *models[2][6:])]
     expected = plan_eviction(nodes, kv, refs, slots, occupied, config, [], updated)
     assert expected[0] == [2]
-    assert planner.plan(config, occupied, models=([0, 1, 2], updated, ())) == expected
+    assert planner.plan(config, occupied, models=([0, 1, 2], updated)) == expected
 
 
-def test_merge_cost_preserves_a_previously_observed_tail():
-    from logssms.kernel.logstate import EvictionPlanner
+def test_compacted_leaf_competes_equally_while_uncompacted_leaf_waits():
+    config = (0, 0, 3, 0, 1, 1, 1, 0, 0, 3)
+    # Leaf 1 is already compacted (1 checkpoint, very cold) and beats leaf 2's expensive merge.
+    cold_leaf = EvictionPlanner(
+        [(0, -1, 1, 0), (1, 0, 0, 0), (2, 0, 0, 1)], [[], [], []], [[], [1], [2, 3]],
+        [(1, 3, -1, 0, 16, 1), (2, 3, -1, 0, 16, 1), (3, 3, -1, 16, 32, 1)],
+        [], config, [(1, -1, 0, 1), (2, 3, 1, 2), (3, -1, 1, 2)],
+        [(0, 0, 16, 2., -12., 0., 16, 0, 0),
+         (1, 0, 16, 2., -12., 0., 16, 0, 16),
+         (2, 0, 32, 2., 0., 0., 16, 0, 32)],
+        [(0, 0, 0), (16, 1, 0), (32, 2, 0)],
+    ).plan(config, [])
+    assert cold_leaf[0] == [1] and not cold_leaf[3]
 
-    nodes = [(0, -1, 1, 0), (1, 0, 0, 0)]
-    kv = [[], []]
-    refs = [[], [1, 2, 3]]
-    slots = [(1, 38, -1, 0, 576), (2, 38, -1, 576, 768), (3, 38, -1, 768, 960)]
-    actions = [(1, 2, 0, 1), (2, 3, 0, 1), (3, -1, 0, 1)]
-    config = (0, 0, 37, 1, 1, 7, 1, 0, 0, 13)
-    models = [(0, 0, 32, 2., -7.4, .008, 32, 0, 0, 0),
-              (1, 0, 960, 2., -7.4, .008, 32, 0, 960, 0)]
-    args = (nodes, kv, refs, slots, [], config, actions, models)
-
-    assert plan_eviction(*args)[3] == [1, 2]
-    assert plan_eviction(*args, past_tails=[(1, 576, .008)])[3] == [2, 3]
-    assert plan_eviction(*args, past_tails=[(1, 768, .008)])[3] == [1, 2]
-
-    planner = EvictionPlanner(nodes, kv, refs, eviction_slot_records(slots), [], config,
-                              actions, models, [(0, 0, 0), (960, 1, 0)])
-    assert planner.plan(config, [], models=([0, 1], models, [(1, 576, .008)]))[3] == [2, 3]
+    # When leaf 1 still has a mergeable checkpoint pair, it must compact before pruning.
+    uncompacted = EvictionPlanner(
+        [(0, -1, 1, 0), (1, 0, 0, 0)], [[], []], [[], [1, 2]],
+        [(1, 3, -1, 0, 16, 1), (2, 3, -1, 16, 32, 1)],
+        [], config, [(1, 2, 0, 1), (2, -1, 0, 1)],
+        [(0, 0, 16, 2., -12., 0., 16, 0, 0),
+         (1, 0, 32, 2., -12., 0., 16, 0, 32)],
+        [(0, 0, 0), (32, 1, 0)],
+    ).plan(config, [])
+    assert not uncompacted[0] and uncompacted[3] == [1, 2]
 
 
 @pytest.mark.parametrize("granularity", [16, 32, 64])
 def test_pressure_group_advances_after_materialization(granularity):
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.cache.logstate.prefix_cache import LogStateEntry, LogStateKind
     from tests.core.test_logstate_cache_manager import make_manager
 
@@ -608,7 +597,7 @@ def test_pressure_group_advances_after_materialization(granularity):
 @pytest.mark.parametrize("with_checkpoint", [False, True])
 def test_pressure_treats_short_log_tails_as_one_unit(logs, with_checkpoint, monkeypatch):
     import torch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.cache.logstate.prefix_cache import LogStateEntry, LogStateKind
     from tests.core.test_logstate_cache_manager import make_manager
 
@@ -645,7 +634,7 @@ def test_pressure_treats_short_log_tails_as_one_unit(logs, with_checkpoint, monk
 def test_pressure_materializes_leaf_using_ancestor_log(with_checkpoint):
     import torch
     from unittest.mock import patch
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.cache.logstate.prefix_cache import LogStateEntry, LogStateKind
     from tests.core.test_logstate_cache_manager import make_manager
 

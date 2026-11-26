@@ -1,0 +1,80 @@
+{
+  "case": {
+    "history": "datasets/cc-traces-weka-062126/traces.jsonl",
+    "tree_count": 16,
+    "tree_concurrency": 8,
+    "granularity": 16,
+    "output_cap": 1024,
+    "eos_token_id": 248046,
+    "max_seq_len": 262144,
+    "clock_step_ms": 1.0,
+    "arrival_batch_size": 8,
+    "gpu_count": 2,
+    "tp_size": 2,
+    "cache_bytes_per_rank": 62636687360,
+    "max_running_requests": 64,
+    "model": {
+      "name": "Qwen3.5-4B",
+      "attention_layers": 8,
+      "linear_layers": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "linear_key_heads": 16,
+      "linear_value_heads": 32,
+      "linear_key_dim": 128,
+      "linear_value_dim": 128,
+      "conv_width": 4
+    }
+  },
+  "history_sha256": "29b6a19e751ff5230771519aab755f80a0f43a4ba9cf96b72d3a6a437ec99276",
+  "session_ids": [
+    "006c98de37d819e95b0840e25426bb7ca99d",
+    "00ca01c4aaeccee751ae6285beb54dea262f",
+    "04dba6fe621301a1d01fd63b8d02c9645c48",
+    "05c249572509162371b7b82339674db64b5d",
+    "05f72f78a037cfa5cd4e4541960a574701d9",
+    "063179eb93f4337a662e859c5a2c5638e03f",
+    "077ea9e6554f45bbad9c24a8462bae9a8512",
+    "07dd40536557a1d6440a923557c3129dc929",
+    "085411a4cc4b15108dd9b50007261a2efb65",
+    "0a688303b1ae62a97607af8021f2130c2caf",
+    "0b7f3ca692f15ae2651a310d9411d70794aa",
+    "0bc9c4f798d321286bf39f2543c0c4e4c059",
+    "0bcd99353218b9a386b1c4aec13d77abecdb",
+    "0bed163ac9566086e14ffd85c7481096d49d",
+    "0d41be2aa98333f3662682210647e5971c7b",
+    "0d8a816e4819b765d81ff748da94d463f3b2"
+  ],
+  "policies": {
+    "default": {
+      "peak_state_gib": 53.4990234375,
+      "final_log_gib": 0.971923828125,
+      "final_checkpoint_gib": 23.395751953125,
+      "hit_rate": 0.9561628132892948,
+      "historical_hit_rate": 0.9917767803908326,
+      "historical_recompute_tokens": 763379,
+      "model_prefill_tokens": 4332096,
+      "exponent_fits": 0,
+      "reclamation_rounds": 35814,
+      "evicted_kv_tokens": 3414688,
+      "min_free_frames": 0,
+      "historical_recompute_p95": 256,
+      "historical_recompute_p99": 20224
+    },
+    "online": {
+      "peak_state_gib": 53.498779296875,
+      "final_log_gib": 0.715087890625,
+      "final_checkpoint_gib": 16.547607421875,
+      "hit_rate": 0.9576931545884334,
+      "historical_hit_rate": 0.9933882913880324,
+      "historical_recompute_tokens": 613779,
+      "model_prefill_tokens": 4180864,
+      "exponent_fits": 6579,
+      "reclamation_rounds": 35842,
+      "evicted_kv_tokens": 2794496,
+      "min_free_frames": 0,
+      "historical_recompute_p95": 256,
+      "historical_recompute_p99": 24064
+    }
+  }
+}

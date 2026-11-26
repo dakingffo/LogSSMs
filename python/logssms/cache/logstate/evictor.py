@@ -349,13 +349,13 @@ class LogStateEvictor:
         actions = self.tree.checkpoint_eviction_actions(nodes)
         self._planning_stage("eviction_resource_ms", stage)
         stage = perf_counter_ns() if self._profile_enabled else 0
-        models, past_tails = self.analyzer.eviction_models(nodes)
+        models = self.analyzer.eviction_models(nodes)
         self._planning_stage("eviction_models_ms", stage)
         stage = perf_counter_ns() if self._profile_enabled else 0
         self._planner = planning.EvictionPlanner(
             topology, kv, node_slots, slots, occupied, config, actions, models,
             [(snapshot.node.depth, snapshot.node.uuid, snapshot.begin) for snapshot in nodes],
-            pressure_groups, past_tails=past_tails,
+            pressure_groups,
         )
         self._planning_stage("eviction_build_ms", stage)
         self._planner_model_epoch = self._model_epoch()
@@ -476,13 +476,13 @@ class LogStateEvictor:
         kv_totals = [(frame, self.cached_page_tokens.get(frame * self.page_size, 0))
                      for frame in sorted(changed_frames)]
         header = (len(dirty_indices), len(actions), len(groups), len(occupied), len(kv_totals))
-        models, past_tails = self.analyzer.eviction_models(current)
+        models = self.analyzer.eviction_models(current)
         indices = list(by_uuid.values())
         order = [(s.end, s.node.uuid, s.begin) for s in current]
         result = self._planner.rebase(
             new_index, removed, [header, *geometry, *actions, *groups, *occupied, *kv_totals],
             indices, models, order, config, active_candidates,
-            past_tails=past_tails, active_occupied=allocator.decay_counts,
+            active_occupied=allocator.decay_counts,
         )
         self._planner_nodes = native
         self._planner_index = by_uuid
@@ -596,12 +596,12 @@ class LogStateEvictor:
         live = [(index, snapshot) for index, snapshot in enumerate(self._planner_nodes)
                 if snapshot is not None]
         live.sort(key=lambda item: (item[1].node.depth, item[1].node.uuid, item[1].begin))
-        models, past_tails = self.analyzer.eviction_models([snapshot for _, snapshot in live])
+        models = self.analyzer.eviction_models([snapshot for _, snapshot in live])
         self._planning_stage("eviction_models_ms", stage)
         self._planner_model_epoch = self._model_epoch()
         if self._profile_enabled:
             self._profile_stats["eviction_model_refreshes"] += 1
-        return [index for index, _ in live], models, past_tails
+        return [index for index, _ in live], models
 
     def _eviction_capacity(self, pages, logs, works):
         allocator = self._allocator

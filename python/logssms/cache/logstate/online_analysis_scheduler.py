@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import math
-from collections import Counter, deque
 from dataclasses import dataclass, replace
-from functools import lru_cache
 from time import perf_counter_ns
 from typing import Sequence
-from weakref import WeakValueDictionary
 
 import torch
 from logssms.utils import align_down
 
+from .hit_model import (
+    PRIOR_EXPOSURE,
+    PRIOR_INTERNAL_ALPHA,
+    PRIOR_TAIL_ALPHA,
+    ReuseModel,
+    prior_mass,
+)
 from .layout import LOG_STATE_GRANULARITY
 from .prefix_cache import (
     LogRadixTrace,
@@ -20,11 +24,6 @@ from .prefix_cache import (
     LogStateKind,
     LogStateHitStats,
 )
-
-
-@lru_cache(maxsize=512)
-def _prior_bucket_mass(granularity: int, bins: int) -> float:
-    return sum(granularity * (j * granularity) ** -2 for j in range(1, bins + 1))
 
 
 @dataclass(frozen=True)
@@ -113,16 +112,17 @@ class OnlineAnalysisScheduler:
         self.min_sampling_len = min_sampling_len
         self.max_density_exponent = max_density_exponent
         self.hit_half_life = hit_half_life
-        self.query_count = 0
-        self._owners: WeakValueDictionary[int, LogStateHitStats] = WeakValueDictionary()
-        self._observations = self._owned_hits = self._tail_hits = 0.0
-        self._analysis_profile = (
-            {"aggregate": Counter(), "updates": deque(maxlen=8192)}
-            if profile_enabled else None
-        )
+        self.reuse = ReuseModel(granularity, min_sampling_len, hit_half_life,
+                                max_density_exponent, profile_enabled)
+        self._owners = self.reuse._owners
+
+    @property
+    def query_count(self):
+        return self.reuse.query
 
     def profile_result(self) -> dict | None:
-        if self._analysis_profile is None:
+        profile = self.reuse.profile
+        if profile is None:
             return None
         return dict(
             enabled=self.enable_merge_adjustment,
@@ -130,212 +130,55 @@ class OnlineAnalysisScheduler:
             hit_half_life=self.hit_half_life,
             max_density_exponent=self.max_density_exponent,
             queries=self.query_count,
-            aggregate=dict(self._analysis_profile["aggregate"]),
-            updates=list(self._analysis_profile["updates"]),
-            dropped_updates=max(
-                0, self._analysis_profile["aggregate"]["model_updates"]
-                - len(self._analysis_profile["updates"]),
-            ),
+            aggregate=dict(profile["aggregate"]),
+            updates=list(profile["updates"]),
+            dropped_updates=max(0, profile["aggregate"]["model_updates"] - len(profile["updates"])),
         )
 
-    def make_hit_stats(self, origin: int) -> LogStateHitStats | None:
-        if not self.enable_merge_adjustment:
-            return None
-        stats = LogStateHitStats(origin=origin, tail=origin,
-                                query_begin=self.query_count,
-                                exposures=deque([(origin, self.query_count)]))
-        return stats
+    def make_hit_stats(self, origin, group=None):
+        return self.reuse.new_chain(origin, group) if self.enable_merge_adjustment else None
 
-    def record_hit(self, stats: LogStateHitStats | None, position: int) -> None:
-        self.query_count += 1
-        decay = math.exp2(-1 / self.hit_half_life)
-        self._observations = self._observations * decay + 1
-        self._owned_hits *= decay
-        self._tail_hits *= decay
-        if stats is not None and 0 < position and stats.origin <= position <= stats.tail:
-            if stats.tail_query_begin is None:
-                stats.tail_query_begin = stats.query_begin
-            self._owned_hits += 1
-            self._tail_hits += position == stats.tail
-            stats.hits.append((position, stats.tail, self.query_count))
-            if len(stats.hits) == stats.hits.maxlen:
-                stats.query_begin = max(stats.query_begin, stats.hits[0][2] - 1)
+    def record_hit(self, stats, position):
+        self.reuse.record_hit(stats, position)
 
-    def _prior(self) -> tuple[float, float]:
-        probability = ((self._owned_hits + 1) / (self._observations + 2)
-                       / max(1, len(self._owners)))
-        tail_fraction = (self._tail_hits + 1) / (self._owned_hits + 2)
-        return probability * (1 - tail_fraction), probability * tail_fraction
+    def advance_hit_stats(self, stats, tail):
+        self.reuse.publish(stats, tail)
 
-    def _weight(self, query: int) -> float:
-        return math.exp2(-(self.query_count - query) / self.hit_half_life)
-
-    def _exposure(self, begin: int, end: int) -> float:
-        if end <= begin:
-            return 0.0
-        rate = math.log(2) / self.hit_half_life
-        return self._weight(end) * (-math.expm1(-rate * (end - begin))) / (-math.expm1(-rate))
-
-    def _bucket_exposures(self, stats: LogStateHitStats) -> list[float]:
-        count = min(self.min_sampling_len, stats.tail - stats.origin) // self.granularity
-        result = [0.0] * count
-        events = list(stats.exposures) or [(stats.tail, stats.query_begin)]
-        for i, (tail, begin) in enumerate(events):
-            end = events[i + 1][1] if i + 1 < len(events) else self.query_count
-            exposure = self._exposure(max(begin, stats.query_begin), end)
-            available = min(count, max(0, tail - stats.origin) // self.granularity)
-            for j in range(available):
-                result[j] += exposure
-        return result
-
-    def _fit_hit_bins(
-        self, bins: dict[int, float], bucket_exposures: Sequence[float],
-    ) -> tuple[float, float]:
-        g = self.granularity
-        support = [(math.log((i + 1) * g), e * g)
-                   for i, e in enumerate(bucket_exposures) if e > 0]
-        total = sum(bins.values())
-        prior_mass = _prior_bucket_mass(g, max(1, len(bucket_exposures)))
-        internal_prior, _ = self._prior()
-        alpha, beta = 4.0 * internal_prior, 4.0 * prior_mass
-        if not support:
-            return 2.0, math.log(alpha / beta)
-        observed = sum(c * math.log((i + 1) * g) for i, c in bins.items())
-
-        def terms(k):
-            values = [e * math.exp(-k * x) for x, e in support]
-            return sum(values), sum(v * x for v, (x, _) in zip(values, support))
-
-        exponent = 2.0
-        if total:
-            lo, hi = 0.0, self.max_density_exponent
-            for _ in range(40):
-                mid = (lo + hi) / 2
-                mass, moment = terms(mid)
-                derivative = (total + alpha) * moment / (mass + beta) - observed - (mid - 2.0)
-                if derivative > 0:
-                    lo = mid
-                else:
-                    hi = mid
-                if hi - lo < 1e-6:
-                    break
-            exponent = (lo + hi) / 2
-        mass, _ = terms(exponent)
-        return exponent, math.log((total + alpha) / (mass + beta))
-
-    def refresh_models(self, owners: Sequence[LogStateHitStats | None]) -> None:
-        unique = {id(owner): owner for owner in owners if owner is not None}.values()
-        for owner in unique:
-            if owner.tail > owner.origin:
-                self._owners[owner.uuid] = owner
-        for stats in unique:
-            if stats.fit_query == self.query_count:
-                continue
-            bins = Counter()
-            tail_hits = 0.0
-            past_tail_hits = Counter()
-            latest_internal = -1
-            for position, tail, query in stats.hits:
-                distance = tail - position
-                weight = self._weight(query)
-                if distance == 0:
-                    if position == stats.tail:
-                        tail_hits += weight
-                    else:
-                        past_tail_hits[position] += weight
-                elif distance <= self.min_sampling_len:
-                    bins[(distance - 1) // self.granularity] += weight
-                    latest_internal = max(latest_internal, query)
-            exposures = self._bucket_exposures(stats)
-            refit = (
-                stats.log_amplitude is None
-                or stats.fit_query < 0
-                or latest_internal != stats.fitted_hit_query
-                or self.query_count - stats.exponent_query >= self.hit_half_life
-            )
-            if refit:
-                stats.exponent, stats.log_amplitude = self._fit_hit_bins(bins, exposures)
-                stats.fitted_hit_query = latest_internal
-                stats.exponent_query = self.query_count
-            else:
-                g = self.granularity
-                internal_prior, _ = self._prior()
-                beta = 4 * _prior_bucket_mass(g, max(1, len(exposures)))
-                mass = sum(e * g * ((i + 1) * g) ** -stats.exponent
-                           for i, e in enumerate(exposures))
-                stats.log_amplitude = math.log((sum(bins.values()) + 4 * internal_prior) / (mass + beta))
-            start = stats.tail_query_begin
-            exposure = self._exposure(self.query_count if start is None else start, self.query_count)
-            _, tail_prior = self._prior()
-            normalizer = exposure + 4.0
-            stats.tail_probability = (tail_hits + 4 * tail_prior) / normalizer
-            stats.past_tail_probabilities = tuple(
-                (position, weight / normalizer)
-                for position, weight in sorted(past_tail_hits.items()) if weight > 0
-            )
-            stats.fit_query = self.query_count
-            if self._analysis_profile is not None:
-                self._analysis_profile["aggregate"]["model_updates"] += 1
-                self._analysis_profile["aggregate"]["exponent_fits"] += int(refit and bool(bins))
-                self._analysis_profile["updates"].append(dict(
-                    owner_uuid=stats.uuid, query=self.query_count, exponent=stats.exponent,
-                    log_amplitude=stats.log_amplitude, tail_probability=stats.tail_probability,
-                    past_tail_probabilities=stats.past_tail_probabilities,
-                    weighted_internal_hits=sum(bins.values()), exposure=exposure,
-                ))
-
-    def advance_hit_stats(self, stats: LogStateHitStats, tail: int) -> None:
-        if tail > stats.origin:
-            self._owners[stats.uuid] = stats
-        if tail <= stats.tail:
-            return
-        if stats.tail_query_begin is None:
-            stats.tail_query_begin = self.query_count
-        stats.exposures.append((tail, self.query_count))
-        while len(stats.exposures) > 1 and stats.exposures[1][0] <= tail - self.min_sampling_len:
-            stats.exposures.popleft()
-            stats.query_begin = max(stats.query_begin, stats.exposures[0][1])
-        stats.hits = deque((hit for hit in stats.hits
-                            if hit[0] == hit[1] or (
-                                hit[1] >= tail - self.min_sampling_len and hit[2] > stats.query_begin
-                            )), maxlen=stats.hits.maxlen)
-        stats.tail = tail
-        stats.fit_query = -1
-
-    def eviction_models(self, snapshots) -> tuple[list[tuple], list[tuple[int, int, float]]]:
+    def eviction_models(self, snapshots) -> list[tuple]:
         if self.enable_merge_adjustment:
-            self.refresh_models([snapshot.node.analysis_owner for snapshot in snapshots])
+            self.reuse.refresh(snapshot.node.analysis_owner for snapshot in snapshots)
         result = []
-        past_tails = {}
+        g = self.granularity
         for snapshot in snapshots:
             stats = snapshot.node.analysis_owner if self.enable_merge_adjustment else None
             if stats is None:
-                tail = max(self.granularity, snapshot.node.depth)
-                norm = _prior_bucket_mass(self.granularity, tail // self.granularity)
-                internal_prior, tail_prior = self._prior()
-                result.append((-snapshot.node.uuid - 1, 0, tail, 2., math.log(internal_prior / norm),
-                               tail_prior, self.granularity, snapshot.recovery_begin, snapshot.end, 1))
-            else:
-                if stats.past_tail_probabilities:
-                    past_tails[stats.uuid] = stats.past_tail_probabilities
-                use_default_order = stats.fitted_hit_query < 0 and not stats.past_tail_probabilities
-                result.append((stats.uuid, stats.origin, max(stats.tail, snapshot.node.depth),
-                               stats.exponent, stats.log_amplitude, stats.tail_probability,
-                               self.granularity, snapshot.recovery_begin, snapshot.end, int(use_default_order)))
-        return result, [(owner, position, probability) for owner, points in past_tails.items()
-                        for position, probability in points]
+                tail = max(g, snapshot.node.depth)
+                pm = prior_mass(g, tail // g)
+                result.append((-snapshot.node.uuid - 1, 0, tail, 2.,
+                               math.log((PRIOR_INTERNAL_ALPHA / PRIOR_EXPOSURE) / pm),
+                               PRIOR_TAIL_ALPHA / PRIOR_EXPOSURE, g,
+                               snapshot.recovery_begin, snapshot.end))
+                continue
+            tail = max(stats.tail, snapshot.node.depth)
+            result.append((stats.uuid, stats.origin, tail, stats.exponent,
+                           stats.log_amplitude, stats.tail_probability, g,
+                           snapshot.recovery_begin, snapshot.end))
+        return result
 
     def active_density(self, owner: LogStateHitStats | None, tail: int):
         from logssms.kernel.logstate import ActiveDensity
 
         g = self.granularity
-        bins = max(1, (tail - (0 if owner is None else owner.origin)) // g)
-        if owner is None or not self.enable_merge_adjustment:
-            return ActiveDensity(tail, g, bins, 0., 2., 0., self._prior()[0], ())
-        self.refresh_models([owner])
+        if not self.enable_merge_adjustment or owner is None:
+            bins = max(1, tail // g)
+            pm = prior_mass(g, bins)
+            return ActiveDensity(tail, g, bins, (PRIOR_INTERNAL_ALPHA / PRIOR_EXPOSURE) / pm,
+                                 2., PRIOR_TAIL_ALPHA / PRIOR_EXPOSURE)
+        self.reuse.refresh((owner,))
+        bins = max(1, (tail - owner.origin) // g)
         return ActiveDensity(
-            tail, g, bins, math.exp(owner.log_amplitude), owner.exponent,
-            owner.tail_probability, 0., owner.past_tail_probabilities,
+            tail, g, bins, math.exp(owner.log_amplitude),
+            owner.exponent, owner.tail_probability, owner.origin,
         )
 
     def snapshot_prefill(

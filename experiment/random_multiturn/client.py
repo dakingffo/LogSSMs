@@ -107,6 +107,7 @@ async def stream_token_ids(
     api        : str = "logssms",
     *,
     ignore_eos : bool = True,
+    cache_session_id: str | None = None,
 ) -> TokenStream:
     if api == "logssms":
         endpoint = "/v1/chat/completions"
@@ -121,6 +122,8 @@ async def stream_token_ids(
             "return_token_ids": True,
         }
         headers = {"X-LogSSMs-Profile-Tag": tag}
+        if cache_session_id is not None:
+            headers["X-LogSSMs-Cache-Session-ID"] = cache_session_id
     elif api == "sglang":
         endpoint = "/generate"
         payload = {

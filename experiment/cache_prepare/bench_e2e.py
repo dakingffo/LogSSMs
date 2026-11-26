@@ -20,6 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path("python"))
     parser.add_argument("--name", required=True)
+    parser.add_argument("--granularity", type=int, choices=(16, 32, 64), default=16)
     parser.add_argument("--port", type=int, default=28610)
     args = parser.parse_args()
     directory = Path("benchmark-results/metadata-study") / args.name
@@ -34,7 +35,7 @@ def main():
                "--max-seq-len-override", "2048", "--max-decode-tokens", "4",
                "--cuda-graph-max-bs", "4", "--memory-ratio", "0.65",
                "--num-pages", "2048", "--cache-type", "logstate",
-               "--granularity", "32", "--eager-state", "false",
+               "--granularity", str(args.granularity), "--eager-state", "false",
                "--port", str(args.port)]
     (directory / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     with (directory / "server.log").open("w") as log:

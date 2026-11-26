@@ -17,6 +17,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--source-root", type=Path, default=Path("python"))
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--repeats", type=int, default=50)
+parser.add_argument("--granularity", type=int, choices=(16, 32, 64), default=16)
 args = parser.parse_args()
 sys.path.insert(0, str(args.source_root.resolve()))
 
@@ -51,7 +52,7 @@ class TransferCounter(TorchDispatchMode):
 
 def make_pool():
     return MHALogStatePool(
-        num_frames=2048, page_size=64, granularity=32,
+        num_frames=2048, page_size=64, granularity=args.granularity,
         num_attention_layers=2, num_kv_heads=1, head_dim=32,
         num_linear_layers=2, num_key_heads=2, num_value_heads=2,
         head_k_dim=32, head_v_dim=32, conv_dim=192, state_len=3,
@@ -167,9 +168,9 @@ def reclamation_case():
 
 
 results = [metadata_case(bs, "decode", page, linear)
-           for linear, page in (("logstate", 32), ("native", 128)) for bs in (1, 32, 64)]
-results += [metadata_case(4, "prefill", 32, "logstate")]
-report = dict(source_root=str(args.source_root.resolve()), metadata=results,
+           for linear, page in (("logstate", args.granularity), ("native", 128)) for bs in (1, 32, 64)]
+results += [metadata_case(4, "prefill", args.granularity, "logstate")]
+report = dict(source_root=str(args.source_root.resolve()), granularity=args.granularity, metadata=results,
               reclamation=reclamation_case(), serving_benchmark=False)
 args.out.parent.mkdir(parents=True, exist_ok=True)
 args.out.write_text(json.dumps(report, indent=2) + "\n")

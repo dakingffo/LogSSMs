@@ -22,6 +22,7 @@ datasets/agentic_coding_trajectories/sessions.parquet
 datasets/oasst2/.cache/
 datasets/oasst2/*.jsonl.gz
 datasets/oasst2/data/
+datasets/cc-traces-weka-062126/
 benchmark-results/
 benchmark-result/
 

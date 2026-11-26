@@ -6,7 +6,7 @@ Request behavior emerges from a seeded randomized topological order, completion
 order and server load. There are no behavior quotas or artificial revisit delays.
 Run `python -m experiment.standard_multiturn` from the repository root against an
 already-running server. Server launch remains separate under
-`experiment/launch_server/`; the client never starts or stops the service.
+`experiment/utils/launch_server/`; the client never starts or stops the service.
 
 ```bash
 python -m experiment.standard_multiturn \

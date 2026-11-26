@@ -757,11 +757,12 @@ def test_adaptive_sampling_records_hit_only_after_successful_admission():
     )
     failed = manager.match_req(pending).cuda_handle
     assert not manager._try_pin_prefill(manager.available_size + 1, failed)
-    assert tuple(source.hits) == ()
+    assert not manager.analyzer.reuse._events
 
     admitted = manager.match_req(pending).cuda_handle
     assert manager._try_pin_prefill(PAGE_SIZE, admitted)
-    assert sum(p == tail for p, tail, _ in source.hits) == 1
+    manager.analyzer.reuse.refresh()
+    assert source.tail_hits == 1
     manager.unlock(admitted)
 
 
@@ -853,7 +854,7 @@ def test_internal_fork_keeps_original_statistics_and_starts_an_empty_owner():
     req.cached_len = 258
     manager.cache_req(req, finished=True)
     original.exponent = 6
-    original.hits.append((192, 256, 0))
+    original.hit_counts[2] = 1
 
     pending = PendingRequest(
         uid=1,
@@ -866,15 +867,16 @@ def test_internal_fork_keeps_original_statistics_and_starts_an_empty_owner():
     assert handle.analysis_owner is not original
     assert handle.analysis_owner.origin == handle.analysis_owner.tail == 128
     assert handle.analysis_owner.exponent == 2
-    assert not handle.analysis_owner.hits
+    assert not handle.analysis_owner.hit_counts
     assert original.origin == 0 and original.tail == 256
     assert original.exponent == 6
-    assert tuple(hit[0] for hit in original.hits) == (192,)
+    assert sum(original.hit_counts.values()) == 1
     assert manager.tree.trace(req.input_ids).node.analysis_owner is original
     assert handle.source_analysis_owner is original
     assert manager._try_pin_prefill(PAGE_SIZE, handle)
-    assert tuple(hit[0] for hit in original.hits) == (192, 128)
-    assert not handle.analysis_owner.hits
+    manager.analyzer.reuse.refresh()
+    assert sum(original.hit_counts.values()) > 1
+    assert not handle.analysis_owner.hit_counts
     manager.unlock(handle)
 
 

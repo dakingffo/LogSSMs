@@ -82,7 +82,7 @@ class LogStateCacheArgumentParser(CacheArgumentParserBase):
             default=LogStateCacheConfig.granularity,
             help=(
                 "LogState storage, prefix-match, recovery and intermediate prefill-chunk "
-                "alignment in tokens."
+                "alignment in tokens (default: %(default)s)."
             ),
         )
         parser.add_argument(

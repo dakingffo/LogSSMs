@@ -72,6 +72,7 @@ def tokenize_worker(
                             sampling_params=msg.sampling_params,
                             profile_tag=msg.profile_tag,
                             return_token_ids=msg.return_token_ids,
+                            cache_session_id=msg.cache_session_id,
                         )
                         for msg, t in zip(tokenize_msg, tensors, strict=True)
                     ]

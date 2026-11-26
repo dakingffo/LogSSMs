@@ -47,7 +47,7 @@ def signature(plan):
 @pytest.mark.parametrize("internal", [False, True])
 def test_materialized_node_refresh_matches_rebuilt_plan(internal):
     from contextlib import nullcontext
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
 
     def run(rebuild):
         manager = make_pressure_tree(chains=6, pages=12, checkpoints=1)
@@ -271,7 +271,7 @@ def test_exhausted_plan_does_not_keep_tentative_releases():
 
 
 def test_internal_materialization_keeps_committed_descendant_geometry_dirty():
-    from experiment.ablation_online_analysis.cpu_common import NumericalKernels, numerical_boundaries
+    from experiment.utils.cpu_replay.scheduler import NumericalKernels, numerical_boundaries
     from logssms.cache.logstate.evictor import LogStateEvictor
 
     manager = make_pressure_tree(chains=2, pages=12)

@@ -241,6 +241,7 @@ async def generate(req: GenerateRequest, request: fastapi.Request):
         TokenizeMsg(
             uid=uid,
             text=req.prompt,
+            cache_session_id=request.headers.get("x-logssms-cache-session-id"),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
@@ -298,6 +299,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: fastapi.Request)
                 top_p=req.top_p,
             ),
             profile_tag=request.headers.get("x-logssms-profile-tag"),
+            cache_session_id=request.headers.get("x-logssms-cache-session-id"),
         )
     )
 
