@@ -19,8 +19,9 @@ from datasets.parser import replay_history_prefix
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 VARIANTS = {
-    "default": ("Default", "#66717d", "--", 1.8),
-    "online": ("Online", "#0072b2", "-", 1.8),
+    "marconi": ("MARCONI", "#d55e00", "-.", 1.8),
+    "default": ("LogState Default", "#66717d", "--", 1.8),
+    "online": ("LogState Online", "#0072b2", "-", 1.9),
 }
 
 
@@ -31,17 +32,25 @@ def run_variant(out, history, case, variant, heartbeat_seconds):
     if log_path.exists():
         previous = log_path.with_name(f"{log_path.stem}-{datetime.now(ZoneInfo('Asia/Shanghai')):%Y%m%d-%H%M%S}.log")
         log_path.rename(previous)
+    cmd = [
+        sys.executable, "-m", "experiment.utils.cpu_replay.replay", "--mode", variant,
+        "--case", str(out / "case.json"), "--history", str(history), "--out", str(destination),
+        "--batch-size", str(case["arrival_batch_size"]), "--tree-concurrency", str(concurrency),
+        "--trace-mode", "virtual_clock", "--trace-sessions", str(case["tree_count"]),
+        "--trace-max-context", str(case["max_seq_len"]), "--clock-step-ms", str(case["clock_step_ms"]),
+        "--skip-layout-snapshots", "--record-state-usage", "--progress-every", "32",
+        "--heartbeat-seconds", str(heartbeat_seconds),
+        "--timings", str(out / f"{variant}-timings.jsonl"),
+    ]
+    if variant != "marconi":
+        cmd.append("--hit-materialization")
+    else:
+        cmd.extend([
+            "--block-size", str(case.get("marconi_block_size", 128)),
+            "--bootstrap-multiplier", str(case.get("marconi_bootstrap_multiplier", 5)),
+        ])
     with log_path.open("w") as log:
-        result = subprocess.run([
-            sys.executable, "-m", "experiment.utils.cpu_replay.replay", "--mode", variant,
-            "--case", str(out / "case.json"), "--history", str(history), "--out", str(destination),
-            "--batch-size", str(case["arrival_batch_size"]), "--tree-concurrency", str(concurrency),
-            "--trace-mode", "virtual_clock", "--trace-sessions", str(case["tree_count"]),
-            "--trace-max-context", str(case["max_seq_len"]), "--clock-step-ms", str(case["clock_step_ms"]),
-            "--hit-materialization", "--skip-layout-snapshots", "--record-state-usage", "--progress-every", "32",
-            "--heartbeat-seconds", str(heartbeat_seconds),
-            "--timings", str(out / f"{variant}-timings.jsonl"),
-        ], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        result = subprocess.run(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     if result.returncode:
         raise RuntimeError(f"{variant} replay failed. See {log_path}")
     print(f"Completed {variant}", flush=True)
@@ -50,6 +59,8 @@ def run_variant(out, history, case, variant, heartbeat_seconds):
 def analyze(data, records, case, digest, variant):
     rows = data["requests_detail"]
     concurrency = case["tree_concurrency"]
+    expected_gran = case.get("marconi_block_size", 128) if variant == "marconi" else case["granularity"]
+    expected_hit_mat = variant != "marconi"
     if (data["trace_sha256"] != digest or data["mode"] != variant
             or data["trace_mode"] != "virtual_clock" or data["clock_step_ms"] != case["clock_step_ms"]
             or data["arrival_batch_size"] != case["arrival_batch_size"]
@@ -59,7 +70,8 @@ def analyze(data, records, case, digest, variant):
             or data["totals"]["verified_parent_prefixes"] != sum(record[2] for record in records.values())
             or {row["uid"] for row in rows} != records.keys() or len(rows) != len(records)
             or any((row["history_tokens"], row["output_cap"]) != records[row["uid"]][:2] for row in rows)
-            or not data["enable_hit_materialization"] or data["granularity"] != case["granularity"]
+            or data["enable_hit_materialization"] != expected_hit_mat
+            or data["granularity"] != expected_gran
             or data["num_frames"] != case["cache_bytes_per_rank"] // data["frame_bytes"]):
         raise RuntimeError(f"Workload or cache configuration mismatch for {variant}")
 
@@ -107,7 +119,7 @@ def plot(results, out, requests):
         arr = np.asarray(u, dtype=float)
         return np.sign(arr) * (np.abs(arr) ** (1.0 / power)) * scale
 
-    fig, ax = plt.subplots(figsize=(6.4, 3.5), layout="constrained")
+    fig, ax = plt.subplots(figsize=(6.8, 3.8), layout="constrained")
     xs = list(range(requests + 1))
     series = {}
     for variant, (label, color, style, width) in VARIANTS.items():
@@ -120,11 +132,11 @@ def plot(results, out, requests):
                 linewidth=width, label=label)
         ax.plot(requests, cumulative[-1], marker="o", markersize=4, color=color, zorder=4)
 
-    default_y, online_y = series["default"], series["online"]
-    ymax = max(default_y[-1], online_y[-1], 1)
+    default_y, online_y, marconi_y = series["default"], series["online"], series["marconi"]
+    ymax = max(default_y[-1], online_y[-1], marconi_y[-1], 1)
     ax.fill_between(xs, online_y, default_y, step="post",
                     where=[o <= d for o, d in zip(online_y, default_y)],
-                    color="#0072b2", alpha=0.15, linewidth=0)
+                    color="#0072b2", alpha=0.14, linewidth=0)
 
     ax.set_xscale("function", functions=(fwd, inv))
     tick_fracs = (0.0, 0.45, 0.62, 0.73, 0.83, 0.90, 0.96, 1.0)
@@ -132,29 +144,51 @@ def plot(results, out, requests):
     ax.set_xticks(ticks)
     ax.set_xticklabels([str(t) for t in ticks])
 
-    right_u = 1.025
-    arrow_x = float(inv(1.012))
-    text_x = float(inv(right_u))
-    ax.text(text_x, default_y[-1], f"{default_y[-1] / 1000:.0f}k",
-            color="#4a535c", fontsize=8.5, va="center", ha="left")
-    ax.text(text_x, online_y[-1], f"{online_y[-1] / 1000:.0f}k",
-            color="#005a8d", fontsize=8.5, va="center", ha="left", fontweight="bold")
-    if default_y[-1] > 0 and online_y[-1] < default_y[-1]:
-        delta_pct = (default_y[-1] - online_y[-1]) / default_y[-1] * 100
-        mid_y = (default_y[-1] + online_y[-1]) / 2
-        ax.annotate("", xy=(arrow_x, online_y[-1]), xytext=(arrow_x, default_y[-1]),
-                    arrowprops=dict(arrowstyle="<->", color="#0072b2", lw=1.0, shrinkA=2, shrinkB=2))
-        ax.text(text_x, mid_y, f"−{delta_pct:.1f}%", color="#0072b2",
-                fontsize=8.5, va="center", ha="left", fontweight="bold")
+    u_num = 1.008
+    u_gray = 1.055
+    u_orange = 1.150
+    x_num = float(inv(u_num))
+    x_gray = float(inv(u_gray))
+    x_orange = float(inv(u_orange))
 
-    ax.set(xlabel="Processed requests (non-linear scale)",
-           ylabel="Cumulative historical recomputation (k tokens)",
-           xlim=(0, float(inv(1.14))), ylim=(0, ymax * 1.08))
+    def fmt_k(val):
+        return f"{val / 1000:.0f}k" if val >= 100_000 else f"{val / 1000:.1f}k"
+
+    # Horizontal dashed guide extensions from x=requests out to the vertical comparison arrows
+    ax.hlines(online_y[-1], requests, x_orange, colors="#005a8d", linestyles=":", linewidth=0.9, alpha=0.55)
+    ax.hlines(default_y[-1], requests, x_gray, colors="#66717d", linestyles=":", linewidth=0.9, alpha=0.55)
+    ax.hlines(marconi_y[-1], requests, x_orange, colors="#d55e00", linestyles=":", linewidth=0.9, alpha=0.55)
+
+    y_off = ymax * 0.015
+    ax.text(x_num, marconi_y[-1] + y_off, fmt_k(marconi_y[-1]),
+            color="#b24d00", fontsize=8.3, va="bottom", ha="left", fontweight="bold")
+    ax.text(x_num, default_y[-1] + y_off, fmt_k(default_y[-1]),
+            color="#4a535c", fontsize=8.3, va="bottom", ha="left")
+    ax.text(x_num, online_y[-1] - y_off, fmt_k(online_y[-1]),
+            color="#005a8d", fontsize=8.3, va="top", ha="left", fontweight="bold")
+
+    if default_y[-1] > 0 and online_y[-1] < default_y[-1]:
+        delta_d = (default_y[-1] - online_y[-1]) / default_y[-1] * 100
+        ax.annotate("", xy=(x_gray, online_y[-1]), xytext=(x_gray, default_y[-1]),
+                    arrowprops=dict(arrowstyle="-|>", color="#66717d", lw=1.3, mutation_scale=10, shrinkA=0, shrinkB=0))
+        ax.text(float(inv(u_gray + 0.010)), (default_y[-1] + online_y[-1]) / 2,
+                f"−{delta_d:.1f}%", color="#4a535c", fontsize=8.3, va="center", ha="left", fontweight="bold")
+
+    if marconi_y[-1] > 0 and online_y[-1] < marconi_y[-1]:
+        delta_m = (marconi_y[-1] - online_y[-1]) / marconi_y[-1] * 100
+        ax.annotate("", xy=(x_orange, online_y[-1]), xytext=(x_orange, marconi_y[-1]),
+                    arrowprops=dict(arrowstyle="-|>", color="#d55e00", lw=1.3, mutation_scale=10, shrinkA=0, shrinkB=0))
+        ax.text(float(inv(u_orange + 0.010)), (marconi_y[-1] + online_y[-1]) / 2,
+                f"−{delta_m:.1f}%", color="#b24d00", fontsize=8.3, va="center", ha="left", fontweight="bold")
+
+    ax.set(xlabel="Processed requests",
+           ylabel="Historical recomputation (k tokens)",
+           xlim=(0, float(inv(1.28))), ylim=(0, ymax * 1.10))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y / 1000:g}"))
     ax.grid(alpha=0.25)
 
     handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside upper center", ncols=2, frameon=False)
+    fig.legend(handles, labels, loc="outside upper center", ncols=3, frameon=False)
     for suffix in ("pdf", "png"):
         fig.savefig(out / f"online_analysis.{suffix}", dpi=200)
     plt.close(fig)

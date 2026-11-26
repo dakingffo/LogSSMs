@@ -10,12 +10,22 @@ from unittest.mock import patch
 import torch
 
 from logssms.cache import CacheResources
-from logssms.cache.config import LogStateCacheConfig
+from logssms.cache.config import LogStateCacheConfig, MarconiCacheConfig
 from logssms.cache.logstate.frame_pool import MHALogStatePool
 from logssms.cache.logstate.manager import LogStateCacheManager
+from logssms.cache.marconi.block_pool import HybridBlockPool
+from logssms.cache.marconi.manager import (
+    MarconiCacheManager,
+    MarconiCachePlan,
+    marconi_layout,
+)
+from logssms.cache.marconi.prefix_cache import MarconiPrefixCache
 from logssms.core import ChunkedRequest, Request, SamplingParams
+from logssms.distributed.info import DistributedInfo
 from logssms.engine import Engine, ForwardOutput
 from logssms.engine.mixed_graph import MixedGraphRunner
+from logssms.models.config import RotaryConfig
+from logssms.models.qwen3_next import Qwen3_5Config
 from logssms.scheduler.decode import DecodeManager
 from logssms.scheduler.prefill import PrefillManager
 from logssms.scheduler.profile import SchedulerProfiler
@@ -108,7 +118,128 @@ class MetadataPool(MHALogStatePool):
         self.validate_conv(output_slot, output_granule)
 
 
-def make_manager(case, mode, max_seq_len, window, half_life, *, enable_hit_materialization=False):
+class MarconiMetadataPool(HybridBlockPool):
+    """Production block/group allocation with tensor storage on the meta device."""
+
+    def __init__(self, layout, num_blocks: int, dtype: torch.dtype):
+        super().__init__(layout, num_blocks, torch.device("meta"), dtype)
+        self._device = torch.device("cpu")
+        self.group_table = torch.zeros(num_blocks, layout.state_groups, device="cpu", dtype=torch.int64)
+
+    def copy_state(self, source, target):
+        assert source in self.state_blocks and target in self.state_blocks
+
+    def zero_state(self, slot):
+        assert slot in self.state_blocks
+
+
+class _SyncFuture:
+    def __init__(self, value):
+        self._value = value
+
+    def done(self):
+        return True
+
+    def result(self):
+        return self._value
+
+
+class _SyncExecutor:
+    def submit(self, fn, *args, **kwargs):
+        return _SyncFuture(fn(*args, **kwargs))
+
+    def shutdown(self, wait=False, cancel_futures=False):
+        pass
+
+
+_KNOWN_MODEL_DIMS = {
+    "Qwen3.5-0.8B": (8, 1024, 3584),
+    "Qwen3.5-2B": (8, 2048, 6144),
+    "Qwen3.5-4B": (16, 2560, 9216),
+}
+
+
+def _marconi_model_config(case, max_seq_len):
+    model = case["model"]
+    attn_layers, lin_layers = model["attention_layers"], model["linear_layers"]
+    total_layers = attn_layers + lin_layers
+    interval = max(1, total_layers // max(1, attn_layers))
+    layer_types = [
+        "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+        for i in range(total_layers)
+    ]
+    defaults = _KNOWN_MODEL_DIMS.get(model.get("name"), (16, 2560, 9216))
+    num_qo_heads = model.get("attention_heads", defaults[0])
+    hidden_size = model.get("hidden_size", defaults[1])
+    intermediate_size = model.get("intermediate_size", defaults[2])
+    return Qwen3_5Config(
+        num_layers=total_layers,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=model["kv_heads"],
+        head_dim=model["head_dim"],
+        hidden_size=hidden_size,
+        vocab_size=248320,
+        rms_norm_eps=1e-6,
+        rotary_config=RotaryConfig(64, max_seq_len, 10000000.0, None),
+        tie_word_embeddings=True,
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        layer_types=layer_types,
+        linear_num_key_heads=model["linear_key_heads"],
+        linear_num_value_heads=model["linear_value_heads"],
+        linear_key_head_dim=model["linear_key_dim"],
+        linear_value_head_dim=model["linear_value_dim"],
+        linear_conv_kernel_dim=model["conv_width"],
+        intermediate_size=intermediate_size,
+        hidden_act="silu",
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        norm_topk_prob=False,
+        mlp_only_layers=[],
+        decoder_sparse_step=1,
+        mtp_num_hidden_layers=0,
+    )
+
+
+def _make_marconi_manager(case, max_seq_len, *, block_size=128, bootstrap_multiplier=5):
+    config = SimpleNamespace(
+        model_config=_marconi_model_config(case, max_seq_len),
+        tp_info=DistributedInfo(0, case["tp_size"]),
+        dtype=torch.bfloat16,
+        cache_config=MarconiCacheConfig(block_size=block_size, bootstrap_multiplier=bootstrap_multiplier),
+        max_running_req=case["max_running_requests"],
+        max_seq_len=max_seq_len,
+    )
+    layout = marconi_layout(config)
+    block_bytes = layout.block_bytes(config.dtype.itemsize)
+    num_blocks = case["cache_bytes_per_rank"] // block_bytes
+    max_len = (max_seq_len + 63) // 64 * 64
+    plan = MarconiCachePlan(
+        num_blocks, num_blocks * layout.block_size, max_seq_len, max_len,
+        layout, num_blocks, 0,
+    )
+    pool = MarconiMetadataPool(layout, num_blocks, config.dtype)
+    dummy_page, = pool.allocator.allocate(1)
+    dummy_state = pool.allocate_state()
+    pool.zero_state(dummy_state)
+    rows = case["max_running_requests"] + 1
+    pages = torch.zeros((rows, max_len), dtype=torch.int32)
+    pages[-1] = dummy_page * layout.block_size + torch.arange(max_len, dtype=torch.int32) % layout.block_size
+    states = torch.full((rows, max_len), dummy_state, dtype=torch.int32)
+    resources = CacheResources(pool, pages, pool, states, None)
+    return MarconiCacheManager(resources, config, plan)
+
+
+def make_manager(case, mode, max_seq_len, window, half_life, *, enable_hit_materialization=False,
+                 block_size=128, bootstrap_multiplier=5):
+    if mode == "marconi":
+        assert case["tp_size"] == case["gpu_count"]
+        return _make_marconi_manager(
+            case, max_seq_len,
+            block_size=case.get("marconi_block_size", block_size),
+            bootstrap_multiplier=case.get("marconi_bootstrap_multiplier", bootstrap_multiplier),
+        )
     model, tp, g = case["model"], case["tp_size"], case.get("granularity", LogStateCacheConfig.granularity)
     assert tp == case["gpu_count"] == 2
     frame_bytes = (2 * model["attention_layers"] * g * (model["kv_heads"] // tp)
@@ -171,7 +302,7 @@ def cpu_batch_mapping(indices, page_table, *, decode=False, dummy_row=0):
 
 
 @contextmanager
-def numerical_boundaries():
+def numerical_boundaries(mode="default"):
     def pin(tensor, *args, **kwargs):
         assert tensor.device.type == "cpu"
         return tensor
@@ -186,6 +317,22 @@ def numerical_boundaries():
             "logssms.layers.linear_attention_backend.mixed.prepare_mixed_linear_metadata",
             lambda *args: None,
         ))
+        if mode == "marconi":
+            orig_blocks = MarconiPrefixCache._blocks
+
+            def cached_blocks(self, node):
+                cached = getattr(node, "_cached_blocks", None)
+                if cached is None:
+                    cached = orig_blocks(self, node)
+                    node._cached_blocks = cached
+                return cached
+
+            stack.enter_context(patch(
+                "logssms.cache.marconi.manager.ProcessPoolExecutor",
+                lambda *args, **kwargs: _SyncExecutor(),
+            ))
+            stack.enter_context(patch("torch.distributed.broadcast", lambda *args, **kwargs: None))
+            stack.enter_context(patch.object(MarconiPrefixCache, "_blocks", cached_blocks))
         yield
 
 
@@ -196,7 +343,7 @@ class RecordedEngine(Engine):
         self.device = torch.device("cpu")
         self.page_table = manager.page_table
         self.cache_manager = manager
-        self.ctx = SimpleNamespace(kv_cache=manager.logstate_pool)
+        self.ctx = SimpleNamespace(kv_cache=getattr(manager, "logstate_pool", getattr(manager, "pool", None)))
         self.stream = SimpleNamespace(wait_stream=lambda _: None)
         self.profiler = SimpleNamespace(enabled=False)
         self.piecewise_graph_runner = None
@@ -233,6 +380,7 @@ class RecordedEngine(Engine):
         return super().prepare_batch(batch, cache_manager)
 
     def forward_batch(self, batch, args):
+        self.cache_manager.after_forward(batch)
         tokens = []
         for req in batch.reqs:
             if isinstance(req, ChunkedRequest):
@@ -267,11 +415,14 @@ class ReplayScheduler(Scheduler):
         self.arrival_batch_size = batch_size
         self.observe_admissions = observe_admissions
         self.prefill_steps = []
+        granularity = getattr(manager, "granularity", manager.page_size)
+        cache_cfg = getattr(getattr(manager, "config", None), "cache_config", None)
+        prefill_alignment = getattr(cache_cfg, "prefill_alignment", granularity)
         self.config = SimpleNamespace(
-            max_running_req=case["max_running_requests"], page_size=manager.granularity,
+            max_running_req=case["max_running_requests"], page_size=granularity,
             decode_batch_budget=case["max_running_requests"],
             scheduling_policy=scheduling_policy, mixed_prefill_tokens=128,
-            cache_config=SimpleNamespace(prefill_alignment=manager.granularity),
+            cache_config=SimpleNamespace(prefill_alignment=prefill_alignment),
             model_config=SimpleNamespace(is_hybrid=True),
         )
         self.cache_manager = manager

@@ -233,3 +233,41 @@ def test_virtual_clock_waits_for_arrivals_with_blocked_prefill(tmp_path, monkeyp
         with pytest.raises(RuntimeError, match=r"stalled at iteration 2; pending=2, running=0"):
             replay(case, history, "default", trace_mode="virtual_clock")
     assert arrivals == [(0, 0), (1, 180_000_000_000)]
+
+
+def test_marconi_replay_runs_virtual_clock_and_pressure_eviction(tmp_path):
+    case = make_case()
+    case.update(
+        max_running_requests=2,
+        cache_bytes_per_rank=400 * 1024**2,
+        output_cap=64,
+        model={**case["model"], "attention_heads": 16, "hidden_size": 2560, "intermediate_size": 9216},
+    )
+    requests = []
+    for tree in range(3):
+        parent, prefix = None, []
+        for turn in range(3):
+            base = tree * 10000 + turn * 200
+            prompt = prefix + list(range(base, base + 192))
+            output = [*range(base + 192, base + 255), case["eos_token_id"]]
+            uid = f"{tree}-{turn}"
+            requests.append(dict(
+                uid=uid, parent=parent, tree_id=str(tree), depth=turn,
+                dispatch_index=turn * 3 + tree, t=float(turn * 10 + tree),
+                prompt_token_ids=prompt, generated_token_ids=output,
+            ))
+            parent, prefix = uid, prompt + output
+    history = tmp_path / "history.json"
+    history.write_text(json.dumps({"requests": requests}))
+    result = replay(
+        case, history, "marconi", batch_size=2, trace_mode="virtual_clock",
+        block_size=128, bootstrap_multiplier=1, record_state_usage=True,
+    )
+    assert result["mode"] == "marconi"
+    assert result["granularity"] == 128
+    assert result["hit_rate"] > 0
+    assert result["totals"]["verified_parent_prefixes"] == 6
+    assert result["state_usage"][0]["completed"] == 0
+    assert result["state_usage"][-1]["completed"] == 9
+    assert len(result["batches"]) > 0
+    assert len(result["final_layout"]) > 0

@@ -1,8 +1,10 @@
 # CPU cache replay
 
 The replay runs the production scheduler and cache manager with recorded output
-tokens and CPU cache metadata. Choose a trace mode independently of the eviction
-policy.
+tokens and CPU cache metadata. Supported `--mode` policies are `default` and
+`online` (LogState), and `marconi` (Marconi hybrid block cache with optional
+`--block-size` and `--bootstrap-multiplier`). Choose a trace mode independently
+of the eviction policy.
 
 | Trace mode | Input | Request release |
 | --- | --- | --- |

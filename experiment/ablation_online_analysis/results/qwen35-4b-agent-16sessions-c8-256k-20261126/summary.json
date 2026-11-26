@@ -46,6 +46,21 @@
     "0d8a816e4819b765d81ff748da94d463f3b2"
   ],
   "policies": {
+    "marconi": {
+      "peak_state_gib": 12.005859375,
+      "final_log_gib": 0.0,
+      "final_checkpoint_gib": 9.80859375,
+      "hit_rate": 0.949434622109967,
+      "historical_hit_rate": 0.9894546533678086,
+      "historical_recompute_tokens": 978947,
+      "model_prefill_tokens": 4996992,
+      "exponent_fits": 0,
+      "reclamation_rounds": 624,
+      "evicted_kv_tokens": 0,
+      "min_free_frames": 0,
+      "historical_recompute_p95": 3584,
+      "historical_recompute_p99": 24000
+    },
     "default": {
       "peak_state_gib": 53.4990234375,
       "final_log_gib": 0.971923828125,
